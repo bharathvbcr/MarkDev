@@ -8,7 +8,6 @@
 import Foundation
 
 /// How much Markdown syntax the editor shows.
-/// How much Markdown syntax the editor shows.
 ///
 /// Backed by stable string names rather than ordinals because the chosen mode
 /// is written to user defaults: an integer raw value would silently change
@@ -48,7 +47,7 @@ public enum RevealPolicy {
             where intersects(block: block.range, selection: selection) {
                 revealed.insert(index)
             }
-            return revealed
+            return expandingTables(revealed, in: document)
         }
     }
 
@@ -69,6 +68,35 @@ public enum RevealPolicy {
         mode == .livePreview
     }
 
+    /// Reveals every block of a table any part of which is revealed.
+    ///
+    /// A table is one construct, not a stack of independent rows. Its rows are
+    /// drawn against columns solved across all of them, so revealing a single
+    /// row leaves the reader with one line of raw pipes — laid out to a width
+    /// nothing else shares — between rows that still agree with each other,
+    /// while the rows around it show their cell text with the pipes hidden and
+    /// no alignment at all. Caret in the table means the whole table is
+    /// Markdown; caret out of it means the whole table is a grid.
+    ///
+    /// Costs nothing for a document whose caret is not in a table, which is
+    /// almost every keystroke.
+    private static func expandingTables(
+        _ revealed: Set<Int>, in document: ParsedDocument
+    ) -> Set<Int> {
+        let tables = document.blocks.enumerated()
+            .filter { $0.element.kind == .table && revealed.contains($0.offset) }
+            .map(\.element.range)
+        guard !tables.isEmpty else { return revealed }
+
+        var expanded = revealed
+        for (index, block) in document.blocks.enumerated() where !expanded.contains(index) {
+            if tables.contains(where: { NSIntersectionRange($0, block.range).length > 0 }) {
+                expanded.insert(index)
+            }
+        }
+        return expanded
+    }
+
     /// A caret sitting exactly on a block boundary counts as inside it, so
     /// typing at the end of a heading keeps its `# ` visible instead of
     /// having the prefix vanish on the last character.
@@ -79,6 +107,32 @@ public enum RevealPolicy {
         }
         let selectionEnd = selection.location + selection.length
         return selection.location < blockEnd && selectionEnd > block.location
+    }
+
+    /// Ranges whose *entire* text is replaced by rendered content.
+    ///
+    /// Unlike a marker, the whole block goes: a formula's source is replaced
+    /// by the typeset formula, not merely stripped of its `$$`. These hide
+    /// only while the caret is elsewhere — the source has to come back to be
+    /// edited, which is the same bargain live preview makes everywhere else.
+    public static func blocksRenderedAsContent(
+        in document: ParsedDocument,
+        revealed: Set<Int>
+    ) -> [NSRange] {
+        // Table rows included: a row's cells are drawn in place of its
+        // source, exactly as a formula's are. `revealed` already carries the
+        // rule that a table reveals whole — see `expandingTables`.
+        var ranges: [NSRange] = []
+        for (index, block) in document.blocks.enumerated() {
+            switch block.kind {
+            case .mathBlock, .mermaidBlock, .tableRow, .tableHead:
+                guard !revealed.contains(index) else { continue }
+            default:
+                continue
+            }
+            ranges.append(block.range)
+        }
+        return ranges
     }
 
     /// Ranges that must stay visible because hiding them would destroy
@@ -136,8 +190,14 @@ extension HiddenRanges {
             protected.insert(integersIn: range.location..<(range.location + range.length))
         }
 
-        // Rendered blocks hide entirely, not just their delimiters.
-        let replaced = rendered.collapsedRanges(revealed: revealed)
+        // Rendered blocks and table rows hide entirely, not just their delimiters.
+        let tableRows: [NSRange] = document.blocks.enumerated().compactMap { index, block in
+            guard (block.kind == .tableRow || block.kind == .tableHead) && !revealed.contains(index) else {
+                return nil
+            }
+            return block.range
+        }
+        let replaced = rendered.collapsedRanges(revealed: revealed) + tableRows
 
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }

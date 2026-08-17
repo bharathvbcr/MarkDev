@@ -112,8 +112,19 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// ``RevealPolicy/markersRequiringReplacement`` exists to prevent.
     var listMarker: String?
 
+    /// The drawn grid this fragment's table row belongs to, resolved by the
+    /// delegate while the row's source is collapsed.
+    ///
+    /// `nil` whenever the row is showing its own Markdown — the caret is in
+    /// the table, or the mode is `.source` — in which case TextKit lays the
+    /// pipes out as ordinary text and this fragment adds nothing.
+    var tableRow: TableRowLayout?
+
     /// Height the rendered content needs, including its own padding.
     private var contentHeight: CGFloat {
+        // A drawn table row stands in for text that has been collapsed to
+        // nothing, so the row's whole height is the fragment's to add.
+        if let tableRow { return tableRow.height }
         if let renderedContent {
             return renderedContent.size.height + Metrics.blockPadding * 2
         }
@@ -856,6 +867,12 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
 
 extension MarkdownLayoutFragment {
     /// Draws a table row's shading and its separating rule.
+    ///
+    /// When the row's source is collapsed this also draws the row's cells,
+    /// each wrapped inside the column the grid solved for it. When it is not —
+    /// the caret is in the table, so the Markdown is on screen to be edited —
+    /// only the shading and the rule are drawn, and TextKit lays the pipes out
+    /// as the ordinary text they are.
     private func drawTableRow(
         isHeader: Bool, isLast: Bool, in context: CGContext, at point: CGPoint
     ) {
@@ -878,6 +895,46 @@ extension MarkdownLayoutFragment {
             context.move(to: CGPoint(x: rect.minX, y: rect.maxY - 0.5))
             context.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - 0.5))
             context.strokePath()
+        }
+
+        guard let tableRow else { return }
+        drawTableCells(tableRow, in: context, within: rect)
+    }
+
+    /// Paints each cell into the column the grid gave it.
+    ///
+    /// The cells are drawn from the row's leading text edge, which is the
+    /// panel inset the styler reserved — the same inset a code block's text
+    /// gets, so the first column's letters do not sit on the row's border.
+    private func drawTableCells(
+        _ row: TableRowLayout, in context: CGContext, within rect: CGRect
+    ) {
+        let origin = CGPoint(
+            x: rect.minX + Metrics.panelInset,
+            y: rect.minY + TableRowLayout.Metrics.verticalPadding)
+
+        for (column, cell) in row.cells.enumerated() {
+            let frame = row.grid.rect(forColumn: column, height: cell.height)
+            guard frame.width > 0 else { continue }
+            let at = CGPoint(x: origin.x + frame.minX, y: origin.y)
+
+            if let pill = palette?.codeBackground {
+                context.setFillColor(pill)
+                for rect in cell.pills {
+                    let placed = rect.offsetBy(dx: at.x, dy: at.y)
+                        .insetBy(dx: -Metrics.inlineCodePadding, dy: 0)
+                    guard placed.width > 0, placed.height > 0 else { continue }
+                    context.addPath(
+                        CGPath(
+                            roundedRect: placed,
+                            cornerWidth: Metrics.inlineCodeRadius,
+                            cornerHeight: Metrics.inlineCodeRadius,
+                            transform: nil))
+                    context.fillPath()
+                }
+            }
+
+            cell.draw(in: context, at: at)
         }
     }
 

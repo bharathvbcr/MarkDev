@@ -420,55 +420,113 @@ final class TaskAndTableTests: XCTestCase {
         XCTAssertFalse(bodyIsHeader)
     }
 
-    func testColumnsAreAlignedByKerningTheSeparators() {
-        // The text is never rewritten, so alignment rides on the collapsed
-        // `|` separators the document already has.
-        let view = makeView(table())
-        guard let storage = view.textStorage else { return XCTFail("no storage") }
-
-        var kerned = 0
-        storage.enumerateAttribute(
-            .kern, in: NSRange(location: 0, length: storage.length)
-        ) { value, _, _ in
-            if let kern = value as? CGFloat, kern > 0 { kerned += 1 }
-        }
-        XCTAssertGreaterThan(kerned, 0, "table cells should be padded to their columns")
+    /// A view showing `markdown` with the caret parked off the table.
+    ///
+    /// The caret matters: live preview reveals the block holding it, and a
+    /// revealed table shows its Markdown instead of its grid. A fixture that
+    /// leaves the caret where `setMarkdown` puts it — the end of the document
+    /// — is asserting about a table that is deliberately not being drawn.
+    private func drawnTableView(_ markdown: String, width: CGFloat = 520)
+        -> MarkdownTextView
+    {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: width, height: 420)
+        view.setMarkdown("Intro.\n\n" + markdown)
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        return view
     }
 
-    func testAShorterCellIsPaddedMoreThanALongerOneInTheSameColumn() throws {
-        // The property that makes columns line up: within a column, padding
-        // makes up the difference, so the shorter cell gets more of it.
-        let view = makeView(table())
-        let storage = try XCTUnwrap(view.textStorage)
-
-        // First-column cells, in row order.
-        let rows = view.parsed.blocks.filter { $0.kind == .tableRow || $0.kind == .tableHead }
-            .sorted { $0.range.location < $1.range.location }
-        let firstColumn: [BlockDescriptor] = rows.compactMap { row in
-            view.parsed.blocks
-                .filter {
-                    $0.kind == .tableCell
-                        && NSIntersectionRange($0.range, row.range).length > 0
-                }
-                .min { $0.range.location < $1.range.location }
+    /// The solved rows the fragments actually hold, in document order.
+    private func drawnRows(in view: MarkdownTextView) -> [TableRowLayout] {
+        var rows: [TableRowLayout] = []
+        guard let manager = view.textLayoutManager else { return rows }
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            if let row = (fragment as? MarkdownLayoutFragment)?.tableRow { rows.append(row) }
+            return true
         }
-        XCTAssertGreaterThanOrEqual(firstColumn.count, 3)
+        return rows
+    }
 
-        /// Padding applied to a cell, read from its final character.
-        func padding(_ cell: BlockDescriptor) -> CGFloat {
-            let last = cell.range.location + cell.range.length - 1
-            return storage.attribute(.kern, at: last, effectiveRange: nil) as? CGFloat ?? 0
+    func testEveryRowIsDrawnAgainstTheSameColumns() {
+        // This is what "the columns line up" means once the grid is drawn
+        // rather than kerned: one solved geometry, shared by every row. The
+        // kerning this replaced made the same promise per cell, and could
+        // only keep it by re-measuring the whole table on every pass.
+        let rows = drawnRows(in: drawnTableView(table()))
+        XCTAssertGreaterThanOrEqual(rows.count, 3, "expected a header and two body rows")
+
+        let first = rows[0].grid
+        for row in rows.dropFirst() {
+            XCTAssertEqual(row.grid.columns.map(\.width), first.columns.map(\.width))
+            XCTAssertEqual(row.grid.offsets, first.offsets)
         }
+    }
 
-        let text = view.markdown as NSString
-        let widest = firstColumn.max { text.substring(with: $0.range).count < text.substring(with: $1.range).count }
-        let narrowest = firstColumn.min { text.substring(with: $0.range).count < text.substring(with: $1.range).count }
-        let wide = try XCTUnwrap(widest)
-        let narrow = try XCTUnwrap(narrowest)
+    func testAColumnStartsAtTheSameOffsetInEveryRow() {
+        let rows = drawnRows(in: drawnTableView(table()))
+        XCTAssertFalse(rows.isEmpty)
 
+        // Every row's second column begins at one x, whatever its first cell
+        // holds — the property a reader sees as a straight edge down the page.
+        let offsets = Set(rows.compactMap { $0.grid.offsets.indices.contains(1)
+            ? $0.grid.offsets[1] : nil })
+        XCTAssertEqual(offsets.count, 1, "a column moved between rows")
+    }
+
+    func testALongCellWrapsInsideItsColumnRatherThanRunningPastTheTable() {
+        let source = """
+            | Concern | Details |
+            |---|---|
+            | Local dependencies | a value long enough that it cannot possibly \
+            sit on one line inside a column of this width, and so has to wrap |
+            """
+        let width: CGFloat = 420
+        let view = drawnTableView(source, width: width)
+        let rows = drawnRows(in: view)
+        XCTAssertFalse(rows.isEmpty)
+
+        let body = rows[rows.count - 1]
         XCTAssertGreaterThan(
-            padding(narrow), padding(wide),
-            "the shorter cell needs more padding to reach the same column edge")
+            body.cells[1].lines.count, 1, "the long cell should have wrapped")
+        XCTAssertLessThanOrEqual(
+            body.grid.width, width,
+            "the table overran the view it was solved for")
+        // Wrapped inside its own column: the second column's lines start at
+        // the column, not back at the row's leading edge.
+        XCTAssertTrue(
+            body.cells[1].lines.allSatisfy { $0.x >= 0 },
+            "a wrapped line escaped its column")
+    }
+
+    func testARowsSourceIsCollapsedWhileItsGridIsDrawn() throws {
+        let view = drawnTableView(table())
+        let storage = try XCTUnwrap(view.textStorage)
+        let pipe = (view.markdown as NSString).range(of: "| Rust |")
+        XCTAssertNotEqual(pipe.location, NSNotFound)
+
+        let font = storage.attribute(.font, at: pipe.location, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(
+            font?.pointSize ?? 0, EditorTheme.hiddenMarkerFontSize, accuracy: 0.001,
+            "a drawn row must not also lay its pipes out as text")
+    }
+
+    func testTheGridGivesWayToTheSourceWhenTheCaretEntersTheTable() {
+        let view = drawnTableView(table())
+        XCTAssertFalse(drawnRows(in: view).isEmpty, "the grid should be drawn to begin with")
+
+        let inside = (view.markdown as NSString).range(of: "Rust")
+        view.setSelectedRange(NSRange(location: inside.location, length: 0))
+        view.textLayoutManager?.invalidateLayout(for: view.textLayoutManager!.documentRange)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        // The whole table, not merely the row holding the caret: rows are
+        // solved against columns they share, so revealing one row's pipes in
+        // the middle of a drawn grid would put a line laid out to a width
+        // nothing else uses between two rows that still agree with each other.
+        XCTAssertTrue(
+            drawnRows(in: view).isEmpty,
+            "the table should show its Markdown while the caret is inside it")
     }
 
     func testATableWithoutBodyRowsIsLeftAlone() {

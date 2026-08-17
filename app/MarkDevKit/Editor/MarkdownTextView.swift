@@ -68,6 +68,10 @@ public final class MarkdownTextView: ScrollingTextView {
     public private(set) var parsed: ParsedDocument = .empty {
         didSet {
             listItems = parsed.blocks.filter { $0.kind == .listItem }
+            tableBlocks = parsed.blocks.filter { $0.kind == .table }
+            // The solved grids describe the previous parse's offsets, so they
+            // go; the styled cells are keyed on their own source and stay.
+            tableLayout.invalidate()
             // Resolved here, not per fragment and not per styling pass, so the
             // collapse and the drawing are handed *the same* answer — see
             // ``RenderedBlocks``. Both assignments to `parsed` happen after the
@@ -77,6 +81,14 @@ public final class MarkdownTextView: ScrollingTextView {
                 document: parsed, text: textStorage?.string as NSString?)
         }
     }
+
+    /// The parse's tables, in document order.
+    ///
+    /// Kept for the same reason ``listItems`` is: the layout delegate asks
+    /// "which table is this row in" once per row fragment, and scanning every
+    /// block to answer it is the quadratic this codebase has paid for three
+    /// times already.
+    private var tableBlocks: [BlockDescriptor] = []
 
     /// The blocks drawn as content — a formula, a diagram, an image — instead
     /// of as their own source. Rebuilt with each parse.
@@ -146,6 +158,16 @@ public final class MarkdownTextView: ScrollingTextView {
     /// actually collapsed. Recomputing it in a test is a second implementation
     /// of the one question the editor and the renderer must agree on.
     private(set) var hiddenRanges: HiddenRanges = .none
+
+    /// The width the laid-out tables were last solved for.
+    private var lastTableWidth: CGFloat = 0
+
+    /// Solved table grids, kept across layout passes.
+    ///
+    /// The delegate asks for one per row fragment — several times for one
+    /// table, and again on every resize — so the styling of each cell and the
+    /// solving of each grid are both cached here rather than redone per row.
+    let tableLayout = TableLayoutResolver()
 
     /// Which blocks are revealed *because the caret is in them*, cached so
     /// caret movement only restyles when the answer actually changes. Without
@@ -341,39 +363,6 @@ public final class MarkdownTextView: ScrollingTextView {
                     scope = scope.map { NSUnionRange($0, range) }
                 }
             }
-        }
-
-        // Whatever *was* a table joins the scope whole, taken from the old
-        // parse and shifted to where its text now sits.
-        //
-        // `alignTableColumns` is the one layer that writes outside the scope:
-        // a cell's width can decide a column far away, so a scoped restyle
-        // re-kerns every table in the file however small the scope was. That
-        // pass clears and recomputes the padding of every table the *current*
-        // parse has, so the scope owes those nothing — but nothing at all
-        // clears the padding left on text that has **stopped** being a table.
-        // Only the styler's base pass does, and only inside the scope. Before
-        // the scope reached them, an 18pt gap turned up in the middle of a
-        // code block, hundreds of characters from the edit that caused it.
-        //
-        // The new parse's tables were unioned in here as well until it was
-        // measured: over the random editing corpus — 2,032 scoped reparses —
-        // adding them never once changed the resulting scope. Nor can they,
-        // given what divergence promises. A table the new parse holds either
-        // agrees with the old parse, in which case it is already here as its
-        // shifted self, or disagrees, in which case it lies inside the
-        // divergence this scope is built from.
-        //
-        // That is a simplification and not a saving: a table-heavy document's
-        // old tables span it from end to end by themselves, so it still
-        // restyles whole on every keystroke.
-        //
-        // Costs nothing for a document with no tables, which is most of them.
-        let tablesBefore = previous.blocks
-            .filter { $0.kind == .table }
-            .map { shift($0.range, by: delta, at: editedRange) }
-        for range in tablesBefore {
-            scope = scope.map { NSUnionRange($0, range) }
         }
 
         restyle(scope: scope)
@@ -1086,8 +1075,37 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     /// laid out have to be handed the new palette — otherwise a switch to dark
     /// mode leaves every panel painted for the light one until the text
     /// happens to change.
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        resolveTablesIfWidthChanged()
+    }
+
+    /// Re-solves tables once the geometry has settled.
+    ///
+    /// Three hooks for one question, because none of them alone is late
+    /// enough. `setFrameSize` fires while the text container is still
+    /// reporting the previous width; `layout()` fires before TextKit has laid
+    /// the text out into the new container; only by the time the view is about
+    /// to draw are the frame, the container and the fragments all settled.
+    /// Each is guarded by the width last solved for, so whichever runs second
+    /// and third does nothing.
+    public override func layout() {
+        super.layout()
+        resolveTablesIfWidthChanged()
+    }
+
+    public override func viewWillDraw() {
+        super.viewWillDraw()
+        resolveTablesIfWidthChanged()
+    }
+
     public override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        // Table cells are styled into attributed strings, which bake their
+        // colours in — unlike the palette, they cannot be swapped on a
+        // fragment already laid out, so they are rebuilt from scratch.
+        tableLayout.flush()
+        reresolveTableFragments()
         let captured = makePalette()
         textLayoutManager?.enumerateTextLayoutFragments(
             from: textLayoutManager?.documentRange.location
@@ -1119,8 +1137,137 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         fragment.decoration = BlockDecoration.decoration(
             for: range, in: parsed, rendered: renderedBlocks, hidden: hiddenRanges)
         resolveRenderedContent(for: fragment)
+        resolveTableRow(for: fragment, at: range)
         resolveCollapsedSyntax(for: fragment, at: range)
         return fragment
+    }
+}
+
+extension MarkdownTextView {
+    /// Solves the grid this fragment's table row is drawn against.
+    ///
+    /// Only while the row's source is collapsed. With the caret in the table
+    /// the Markdown is on screen to be edited, and a grid drawn over it would
+    /// be the same row stated twice.
+    func resolveTableRow(for fragment: MarkdownLayoutFragment, at range: NSRange) {
+        // Cleared first: this runs again on a fragment that already has a
+        // grid — after a resize, or a change of appearance — and a row that
+        // has since been revealed must lose the grid rather than keep the one
+        // it had.
+        fragment.tableRow = nil
+
+        guard case .tableRow = fragment.decoration,
+            let text = textStorage?.string as NSString?,
+            hiddenRanges.covers(range),
+            let table = table(containing: range)
+        else { return }
+
+        fragment.tableRow = tableLayout.layout(
+            forRowAt: range, inTable: table, document: parsed, text: text,
+            availableWidth: tableWidth, theme: theme)
+    }
+
+    /// Re-solves the grid of every table row already laid out.
+    ///
+    /// Needed because TextKit caches a fragment against its text *element*,
+    /// and neither a resize nor a change of appearance changes any element —
+    /// so `invalidateLayout` alone re-lays-out the same fragments, holding the
+    /// same grid, solved for a width or a palette that no longer applies. A
+    /// window dragged narrower kept its old columns and drew them straight
+    /// past the margin.
+    ///
+    /// The same shape as the palette hand-out in
+    /// ``viewDidChangeEffectiveAppearance``, and for the same reason.
+    @discardableResult
+    func reresolveTableFragments() -> Int {
+        guard let manager = textLayoutManager else { return 0 }
+        guard !tableBlocks.isEmpty else {
+            manager.invalidateLayout(for: manager.documentRange)
+            return 0
+        }
+        let start = manager.documentRange.location
+        var resolved = 0
+
+        manager.enumerateTextLayoutFragments(from: start) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment,
+                case .tableRow = fragment.decoration,
+                let element = fragment.textElement?.elementRange
+            else { return true }
+            let from = manager.offset(from: start, to: element.location)
+            let to = manager.offset(from: start, to: element.endLocation)
+            guard from >= 0, to >= from else { return true }
+            resolveTableRow(for: fragment, at: NSRange(location: from, length: to - from))
+            resolved += 1
+            return true
+        }
+
+        manager.invalidateLayout(for: manager.documentRange)
+        return resolved
+    }
+
+    /// Re-solves the tables when the width they are solved against changes.
+    ///
+    /// Called from `setFrameSize` rather than watched from the container: the
+    /// frame is what a live resize drives, and the container tracks it.
+    func resolveTablesIfWidthChanged() {
+        guard !tableBlocks.isEmpty else {
+            lastTableWidth = tableWidth
+            return
+        }
+        let width = tableWidth
+        // A half-point tolerance, matching the viewport clamp: backing-store
+        // rounding routinely moves the width by less than that, and re-solving
+        // every table on every frame of a live resize would be a cost paid for
+        // nothing.
+        guard abs(width - lastTableWidth) > 0.5 else { return }
+        // Recorded only once it has actually been applied. A width noted
+        // before any fragment exists — which is every call during the first
+        // layout pass — would otherwise close the door on the pass that could
+        // have done the work, and the tables would keep the geometry of
+        // whatever size the window happened to open at.
+        guard reresolveTableFragments() > 0 else { return }
+        lastTableWidth = width
+    }
+
+    /// The width a table has to lay itself out in.
+    ///
+    /// Read from the text container rather than from `bounds`: the container
+    /// is what the text is actually wrapped to, and it is correct during the
+    /// first layout pass, when `bounds` can still be zero. The floor matters
+    /// more than it looks — a row's source is collapsed whether or not a grid
+    /// was solved for it, so a width of zero would not render a narrow table,
+    /// it would render *no* table, and the check that failed would be
+    /// indistinguishable from a table with nothing in it.
+    var tableWidth: CGFloat {
+        let inset = MarkdownLayoutFragment.Metrics.panelInset * 2
+        if let container = textLayoutManager?.textContainer {
+            let width = container.size.width - container.lineFragmentPadding * 2 - inset
+            if width.isFinite, width > 1 { return width }
+        }
+        return max(bounds.width - theme.insets.width * 2 - inset, Metrics.narrowestTable)
+    }
+
+    /// The table containing `range`, found by binary search.
+    private func table(containing range: NSRange) -> BlockDescriptor? {
+        var low = 0
+        var high = tableBlocks.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if NSMaxRange(tableBlocks[mid].range) <= range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        guard low < tableBlocks.count,
+            NSIntersectionRange(tableBlocks[low].range, range).length > 0
+        else { return nil }
+        return tableBlocks[low]
+    }
+
+    enum Metrics {
+        /// The least width a table is ever solved for.
+        static let narrowestTable: CGFloat = 120
     }
 }
 
