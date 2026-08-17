@@ -291,6 +291,32 @@ public final class MarkdownTextView: ScrollingTextView {
             }
         }
 
+        // Tables join the scope whole, from both parses.
+        //
+        // `alignTableColumns` is the one layer that writes outside the scope:
+        // a cell's width can decide a column far away, so a scoped restyle
+        // still re-kerns every table in the file. Nothing clears that padding
+        // except a scope that reaches it, so text which *stopped* being a
+        // table kept an 18pt gap — one turned up in the middle of a code
+        // block, hundreds of characters from an edit. Taking the old parse's
+        // tables (shifted to where their text now sits) and the new parse's
+        // together means the padding is always cleared and recomputed
+        // wherever a table was or is. It also makes the pass idempotent: the
+        // kern rides on a cell's last character and the measurement includes
+        // that character, so re-measuring a half-cleared table drifts wider
+        // every time.
+        //
+        // Costs nothing for a document with no tables, which is most of them.
+        let tablesBefore = previous.blocks
+            .filter { $0.kind == .table }
+            .map { shift($0.range, by: delta, at: editedRange) }
+        let tablesAfter = parsed.blocks.filter { $0.kind == .table }.map(\.range)
+        if scope != nil, !tablesBefore.isEmpty || !tablesAfter.isEmpty {
+            for range in tablesBefore + tablesAfter {
+                scope = scope.map { NSUnionRange($0, range) }
+            }
+        }
+
         restyle(scope: scope)
         onParse?(parsed)
     }

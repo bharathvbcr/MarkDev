@@ -101,14 +101,46 @@ public enum MarkdownStyler {
         )
     }
 
+    /// Task-marker ranges, in document order, for answering "is this a task
+    /// item" without rescanning every span.
+    ///
+    /// Built once per styling pass and searched, rather than scanned inside
+    /// the block loop. Both list items and spans grow with the document, so
+    /// the scan this replaced was O(blocks × spans) — a genuine quadratic
+    /// that stayed invisible in the keystroke tests, where the scope is a
+    /// block or two, and only showed up on open: 10,000 lines cost 8x what
+    /// 2,500 did, against 4x the text.
+    private static func taskMarkerRanges(in document: ParsedDocument) -> [NSRange] {
+        document.spans
+            .lazy
+            .filter { $0.kind == .taskMarker }
+            .map(\.range)
+            .sorted { $0.location < $1.location }
+    }
+
     /// Whether a list item carries a task checkbox.
+    ///
+    /// - Parameter taskMarkers: ``taskMarkerRanges(in:)`` for this document.
+    ///   Task markers never overlap, so sorting by location also sorts by
+    ///   end, which is what lets this binary-search.
     private static func isTaskItem(
-        _ block: BlockDescriptor, in document: ParsedDocument
+        _ block: BlockDescriptor, taskMarkers: [NSRange]
     ) -> Bool {
-        document.spans.contains { span in
-            span.kind == .taskMarker
-                && NSIntersectionRange(span.range, block.range).length > 0
+        // The first marker that could still reach into the block: everything
+        // before it ends at or before the block starts.
+        var low = 0
+        var high = taskMarkers.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if NSMaxRange(taskMarkers[mid]) <= block.range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
         }
+        guard low < taskMarkers.count else { return false }
+        // Overlap, matching the intersection test this replaced.
+        return taskMarkers[low].location < NSMaxRange(block.range)
     }
 
     @MainActor
@@ -120,6 +152,11 @@ public enum MarkdownStyler {
         scope: NSRange,
         theme: EditorTheme
     ) {
+        // Built on first use, not up front: a scoped restyle usually covers a
+        // block or two, and one holding no list items should not pay to walk
+        // the document's spans at all.
+        var taskMarkers: [NSRange]?
+
         for block in blocks {
             let range = NSIntersectionRange(clamp(block.range, to: limit), scope)
             guard range.length > 0 else { continue }
@@ -147,7 +184,14 @@ public enum MarkdownStyler {
                 var indent = CGFloat(block.depth) * 8 + 16
                 // A task item needs a gutter for its drawn checkbox, since
                 // the `- [ ]` it replaces has been collapsed to nothing.
-                if isTaskItem(block, in: document) {
+                let markers: [NSRange]
+                if let built = taskMarkers {
+                    markers = built
+                } else {
+                    markers = taskMarkerRanges(in: document)
+                    taskMarkers = markers
+                }
+                if isTaskItem(block, taskMarkers: markers) {
                     indent += MarkdownLayoutFragment.Metrics.checkboxGutter
                 }
                 paragraph.firstLineHeadIndent = indent
@@ -346,6 +390,7 @@ extension MarkdownStyler {
         theme: EditorTheme
     ) {
         let tables = document.blocks.filter { $0.kind == .table }
+
         guard !tables.isEmpty else { return }
 
         for table in tables {
@@ -367,17 +412,16 @@ extension MarkdownStyler {
             // Clear the padding this pass is about to recompute, before
             // anything is measured.
             //
-            // The kern rides on the cell's final character and `measure`
-            // measures the cell *including* that character — so without this
-            // the function reads back its own previous padding and adds to
-            // it. A full restyle got away with it because `applyMarkers`
-            // zeroes kerning on every collapsed marker first, and the pipes
-            // are collapsed markers. A *scoped* restyle only zeroes the ones
-            // inside its scope, so the columns of a table reached from
-            // outside that scope drifted a little wider on every keystroke.
-            // Zeroing rather than removing matches what `applyMarkers` leaves
-            // behind, so an incrementally styled document and a freshly
-            // parsed one carry the same attributes.
+            // The kern rides on the cell's last character and `measure`
+            // measures the cell *including* that character, so without this
+            // the pass reads back its own previous padding and adds to it.
+            // The restyle scope cannot be relied on to have cleared it: this
+            // layer alone writes across the whole document — one cell's width
+            // can decide a column far outside the scope — so it has to clear
+            // what it is about to rewrite. Zero rather than removed, matching
+            // what `applyMarkers` leaves on a collapsed marker, so an
+            // incrementally styled document and a freshly parsed one carry
+            // the same attributes.
             for cells in cellsByRow {
                 for cell in cells {
                     guard let last = lastCharacter(of: cell.range, in: limit) else { continue }
