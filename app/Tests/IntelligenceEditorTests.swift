@@ -150,6 +150,29 @@ final class IntelligenceEditorTests: XCTestCase {
             view.textStorage?.attribute(.underlineStyle, at: 1, effectiveRange: nil))
     }
 
+    /// An underline on the line above an edit survives it.
+    ///
+    /// The same scope rule the code highlighting needs.
+    /// ``MarkdownStyler/apply(document:hidden:to:theme:scope:)`` grows the
+    /// scope to whole lines — one either side — and opens by clearing what it
+    /// settled on, so an edit in the paragraph clears the heading's underline
+    /// above it. Reapplying over the range the styler was *asked* for rather
+    /// than the one it wrote left that underline gone for good: nothing
+    /// revisits it, because the next edit scopes itself to where it lands.
+    func testUnderlinesSurviveAnEditOnTheLineBelow() throws {
+        let view = makeView("# We was ready\npara text here\nmore text below\n")
+        view.issues = ProofreadingIssues(issues: [issue(view, of: "We was", replacement: "We were")])
+
+        let underlined = (view.markdown as NSString).range(of: "We was")
+        view.setSelectedRange((view.markdown as NSString).range(of: "text"))
+        view.insertText("prose", replacementRange: view.selectedRange())
+
+        XCTAssertNotNil(
+            view.textStorage?.attribute(
+                .underlineStyle, at: underlined.location, effectiveRange: nil),
+            "the underline was cleared by the styler's grown scope and never put back")
+    }
+
     func testUnrelatedTextIsNotUnderlined() {
         let view = makeView("We was ready for it.")
         view.issues = ProofreadingIssues(issues: [issue(view, of: "We was", replacement: "We were")])

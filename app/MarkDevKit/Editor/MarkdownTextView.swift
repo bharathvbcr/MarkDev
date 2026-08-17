@@ -400,16 +400,25 @@ public final class MarkdownTextView: ScrollingTextView {
 
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus)
-        MarkdownStyler.apply(
+        // The styler grows the scope to whole lines and reports what it
+        // actually wrote. Every layer below is scoped to *that*, not to
+        // `scope`: the styler opens by clearing the range it settled on, so a
+        // layer working from the narrower range leaves the difference erased —
+        // and nothing comes back for it, because the next edit scopes itself
+        // to where *it* landed. A fence one line off the scope lost its
+        // tree-sitter colours this way and kept them lost, and a proofreading
+        // underline a line above an edit went the same way.
+        let written = MarkdownStyler.apply(
             document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope)
+        let touched = scope == nil ? nil : written
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
-        applyCodeHighlighting(in: storage, scope: scope)
-        applyProofreadingUnderlines(in: storage, scope: scope)
+        applyCodeHighlighting(in: storage, scope: touched)
+        applyProofreadingUnderlines(in: storage, scope: touched)
         // After every attribute layer, not between two of them: this discards
         // cached layout fragments, and a fragment rebuilt before the
         // underlines land would draw the pre-proofread text.
-        invalidateFragments(scope: scope)
+        invalidateFragments(scope: touched)
         repairTypingAttributes()
     }
 
@@ -419,6 +428,11 @@ public final class MarkdownTextView: ScrollingTextView {
     /// comes after the styler: `MarkdownStyler.apply` opens with
     /// `setAttributes`, which drops everything already in range. An underline
     /// applied before it simply is not there afterwards.
+    ///
+    /// `scope` must be the range the styler reported writing, for the reason
+    /// ``applyCodeHighlighting(in:scope:)`` gives: the styler clears a wider
+    /// range than it is asked for, and an underline inside the difference is
+    /// gone for good if this pass does not reach it.
     private func applyProofreadingUnderlines(in storage: NSTextStorage, scope: NSRange?) {
         guard !storedIssues.isEmpty else { return }
         let full = NSRange(location: 0, length: storage.length)
@@ -441,6 +455,15 @@ public final class MarkdownTextView: ScrollingTextView {
     ///
     /// Applied after the styler's own attributes so language colours win over
     /// the flat monospace treatment the block-level pass gives code.
+    ///
+    /// `scope` must be the range ``MarkdownStyler/apply(document:hidden:to:theme:scope:)``
+    /// reported writing, not the one it was asked for — a block the styler
+    /// cleared but this pass does not visit stays cleared for good.
+    ///
+    /// A block that is visited is recoloured whole, including the part of it
+    /// lying outside `scope`. Those characters already carry these exact
+    /// colours, so nothing drifts; the alternative is splitting a token across
+    /// the scope edge and colouring half of it.
     private func applyCodeHighlighting(in storage: NSTextStorage, scope: NSRange?) {
         let full = NSRange(location: 0, length: storage.length)
         let target = scope ?? full
