@@ -82,10 +82,27 @@ public struct CommandPalette: View {
     public let commands: [Command]
     public let onRun: (Command) -> Void
 
+    /// What last moved the highlight.
+    ///
+    /// Only the keyboard scrolls the list to follow it. Centring a row the
+    /// pointer merely passed over slides the *next* row under a stationary
+    /// cursor, which hovers, which scrolls again — the list walks itself
+    /// while the mouse is only crossing it. The reader scrolls the results;
+    /// the results never scroll themselves under the reader.
+    private enum HighlightSource { case keyboard, pointer }
+
     @State private var query = ""
     @State private var highlighted = 0
+    @State private var highlightSource: HighlightSource = .keyboard
+    /// Where the pointer was when it last took the highlight, in the list's
+    /// own coordinate space — which does not move when the content scrolls.
+    /// A hover arriving at an unchanged point is the list having moved, not
+    /// the pointer, and must not steal the highlight from the keyboard.
+    @State private var pointerLocation: CGPoint?
     @FocusState private var isFieldFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private static let listSpace = "CommandPalette.results"
 
     public init(isPresented: Binding<Bool>, commands: [Command], onRun: @escaping (Command) -> Void) {
         self._isPresented = isPresented
@@ -116,7 +133,7 @@ public struct CommandPalette: View {
         .frame(width: 560)
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
         .shadow(color: .black.opacity(0.28), radius: 30, y: 12)
-        .onAppear { highlighted = 0 }
+        .onAppear { resetHighlight() }
         .task {
             // Focus has to be claimed *after* the field is in the window.
             // Setting it in `onAppear` runs too early: the assignment is
@@ -126,7 +143,7 @@ public struct CommandPalette: View {
             await Task.yield()
             isFieldFocused = true
         }
-        .onChange(of: query) { _, _ in highlighted = 0 }
+        .onChange(of: query) { _, _ in resetHighlight() }
         .onKeyPress(.upArrow) {
             moveHighlight(by: -1)
             return .handled
@@ -174,18 +191,51 @@ public struct CommandPalette: View {
                         CommandRow(command: command, isHighlighted: index == highlighted)
                             .id(index)
                             .onTapGesture { run(command) }
-                            .onHover { if $0 { highlighted = index } }
+                            .onContinuousHover(coordinateSpace: .named(Self.listSpace)) { phase in
+                                guard case .active(let location) = phase else { return }
+                                pointerMoved(to: location, highlighting: index)
+                            }
                     }
                 }
                 .padding(GlassTheme.Spacing.tight)
             }
             .frame(maxHeight: 380)
+            .coordinateSpace(.named(Self.listSpace))
             .onChange(of: highlighted) { _, new in
+                guard highlightSource == .keyboard else { return }
                 withAnimation(GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion)) {
                     proxy.scrollTo(new, anchor: .center)
                 }
             }
         }
+    }
+
+    /// A new result set is a keyboard-driven jump back to the top: the list
+    /// scrolls there even if the pointer happens to be resting on a row.
+    private func resetHighlight() {
+        highlightSource = .keyboard
+        pointerLocation = nil
+        highlighted = 0
+    }
+
+    // MARK: - Pointer
+
+    /// Take the highlight for a row the pointer is over — but only if the
+    /// pointer is what moved.
+    private func pointerMoved(to location: CGPoint, highlighting index: Int) {
+        guard Self.pointerMoved(from: pointerLocation, to: location) else { return }
+        pointerLocation = location
+        highlightSource = .pointer
+        highlighted = index
+    }
+
+    /// Whether a hover at `location` came from the pointer moving rather than
+    /// from the list scrolling beneath a pointer that did not.
+    ///
+    /// The tolerance absorbs float noise only; a mouse moves in whole points.
+    nonisolated static func pointerMoved(from previous: CGPoint?, to location: CGPoint) -> Bool {
+        guard let previous else { return true }
+        return abs(location.x - previous.x) > 0.5 || abs(location.y - previous.y) > 0.5
     }
 
     // MARK: - Keyboard
@@ -198,6 +248,7 @@ public struct CommandPalette: View {
         guard let next = Self.movedHighlight(
             highlighted, by: offset, resultCount: results.count)
         else { return }
+        highlightSource = .keyboard
         highlighted = next
     }
 
