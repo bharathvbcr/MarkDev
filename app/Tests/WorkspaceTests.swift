@@ -548,4 +548,22 @@ final class CommandPaletteNavigationTests: XCTestCase {
     func testEmptyResultsHaveNoSelection() {
         XCTAssertNil(CommandPalette.movedHighlight(0, by: 1, resultCount: 0))
     }
+
+    /// A hover fired because the list scrolled under a stationary pointer
+    /// arrives at the point the pointer is already at. Taking the highlight
+    /// there lets a keyboard-driven scroll — or a mouse merely crossing the
+    /// palette — walk the list on its own.
+    func testAStationaryPointerDoesNotTakeTheHighlight() {
+        let resting = CGPoint(x: 120, y: 64)
+        XCTAssertFalse(CommandPalette.pointerMoved(from: resting, to: resting))
+        XCTAssertFalse(
+            CommandPalette.pointerMoved(from: resting, to: CGPoint(x: 120.2, y: 63.8)))
+    }
+
+    func testAMovedPointerTakesTheHighlight() {
+        let resting = CGPoint(x: 120, y: 64)
+        XCTAssertTrue(CommandPalette.pointerMoved(from: nil, to: resting))
+        XCTAssertTrue(CommandPalette.pointerMoved(from: resting, to: CGPoint(x: 120, y: 86)))
+        XCTAssertTrue(CommandPalette.pointerMoved(from: resting, to: CGPoint(x: 98, y: 64)))
+    }
 }
