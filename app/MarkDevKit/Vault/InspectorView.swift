@@ -11,11 +11,13 @@ import SwiftUI
 public enum InspectorTab: String, CaseIterable, Sendable {
     case outline = "Outline"
     case links = "Links"
+    case assist = "Assist"
 
     var symbol: String {
         switch self {
         case .outline: "list.bullet.indent"
         case .links: "link"
+        case .assist: "apple.intelligence"
         }
     }
 }
@@ -25,25 +27,35 @@ public struct InspectorView: View {
     public let outline: [VaultHeading]
     public let backlinks: [Backlink]
     public let mentions: [UnlinkedMention]
-    /// Called with a heading's UTF-16 offset.
-    public let onSelectHeading: (UInt32) -> Void
+    /// The window's writing-tools state, for the Assist tab.
+    public let assistant: DocumentAssistant
+    /// Called with a UTF-16 offset in the current document to scroll to.
+    ///
+    /// Shared by the outline and the proofreading list: "take me to this
+    /// offset" is one behaviour, and giving each panel its own callback for it
+    /// would be two names for the same seam.
+    public let onReveal: (Int) -> Void
     /// Called with a vault-relative path and an offset to reveal.
     public let onOpenNote: (String, UInt32) -> Void
 
-    @State private var tab: InspectorTab = .outline
+    @Binding private var tab: InspectorTab
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
         outline: [VaultHeading],
         backlinks: [Backlink],
         mentions: [UnlinkedMention],
-        onSelectHeading: @escaping (UInt32) -> Void,
+        assistant: DocumentAssistant,
+        tab: Binding<InspectorTab>,
+        onReveal: @escaping (Int) -> Void,
         onOpenNote: @escaping (String, UInt32) -> Void
     ) {
         self.outline = outline
         self.backlinks = backlinks
         self.mentions = mentions
-        self.onSelectHeading = onSelectHeading
+        self.assistant = assistant
+        self._tab = tab
+        self.onReveal = onReveal
         self.onOpenNote = onOpenNote
     }
 
@@ -55,6 +67,8 @@ public struct InspectorView: View {
                     switch tab {
                     case .outline: outlineSection
                     case .links: linksSection
+                    case .assist:
+                        AssistInspectorView(assistant: assistant, onReveal: onReveal)
                     }
                 }
                 .padding(.horizontal, GlassTheme.Spacing.tight)
@@ -86,7 +100,7 @@ public struct InspectorView: View {
         } else {
             ForEach(outline) { heading in
                 Button {
-                    onSelectHeading(heading.offset)
+                    onReveal(Int(heading.offset))
                 } label: {
                     HStack(spacing: GlassTheme.Spacing.tight) {
                         // Indentation carries the level; a bare list of

@@ -22,6 +22,15 @@ public enum CommandAction: Sendable, Equatable {
     case livePreview
     case sourceMode
     case readingMode
+    /// Open the inline writing panel on the selection.
+    case writingTools
+    /// Proofread the whole document and underline what it finds.
+    case proofreadDocument
+    /// Remove the proofreading underlines.
+    case clearProofreading
+    case summarizeDocument
+    case suggestTitle
+    case suggestTags
 }
 
 /// Something the palette can run.

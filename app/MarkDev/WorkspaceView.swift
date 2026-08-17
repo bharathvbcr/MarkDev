@@ -20,6 +20,7 @@ struct WorkspaceView: View {
     @AppStorage("shell.showSidebar") private var showSidebar = true
     @AppStorage("shell.showInspector") private var showInspector = true
     @AppStorage("shell.editorMode") private var mode: EditorMode = .livePreview
+    @AppStorage("shell.inspectorTab") private var inspectorTab: InspectorTab = .outline
     @AppStorage("shell.sidebarWidth") private var storedSidebarWidth =
         Double(GlassTheme.sidebar.preferred)
     @AppStorage("shell.inspectorWidth") private var storedInspectorWidth =
@@ -41,6 +42,9 @@ struct WorkspaceView: View {
     @State private var documentStats: [OpenDocument.ID: DocumentStats] = [:]
     @State private var documentOutlines: [OpenDocument.ID: [VaultHeading]] = [:]
     @State private var statsTasks: [OpenDocument.ID: Task<Void, Never>] = [:]
+
+    /// Apple Intelligence for this window.
+    @State private var writingTools = WritingTools()
 
     /// The vault's link graph. Owned here so every pane shares one index.
     @State private var vault = VaultIndex()
@@ -335,7 +339,14 @@ struct WorkspaceView: View {
                     guard let current = workspace.document(in: pane) else { return }
                     handleParse(parsed, text: current.text, document: current.id, pane: pane)
                 },
-                onFollowWikiLink: { followWikiLink($0) }
+                onFollowWikiLink: { followWikiLink($0) },
+                onSurface: { surface in
+                    // Whichever editor holds the keyboard is the one the
+                    // writing tools act on, so the pane that reports a
+                    // surface is also the focused pane by definition.
+                    workspace.focusedPane = pane
+                    writingTools.attach(to: surface)
+                }
             )
             .onTapGesture { workspace.focusedPane = pane }
 
@@ -353,8 +364,10 @@ struct WorkspaceView: View {
             outline: outline,
             backlinks: backlinks,
             mentions: mentions,
-            onSelectHeading: { offset in
-                reveals[workspace.focusedPane] = RevealRequest(offset: Int(offset))
+            assistant: writingTools.document,
+            tab: $inspectorTab,
+            onReveal: { offset in
+                reveals[workspace.focusedPane] = RevealRequest(offset: offset)
             },
             onOpenNote: { path, offset in
                 guard let url = vault.url(for: path) else { return }
@@ -546,6 +559,24 @@ struct WorkspaceView: View {
                 title: "Source Mode", symbol: "chevron.left.forwardslash.chevron.right",
                 kind: .action(.sourceMode)),
             Command(title: "Reading Mode", symbol: "book", kind: .action(.readingMode)),
+            Command(
+                title: "Rewrite Selection…", symbol: "apple.intelligence",
+                kind: .action(.writingTools), shortcut: "⇧⌘E"),
+            Command(
+                title: "Proofread Document", symbol: "text.badge.checkmark",
+                kind: .action(.proofreadDocument), shortcut: "⇧⌘P"),
+            Command(
+                title: "Clear Proofreading Marks", symbol: "eraser",
+                kind: .action(.clearProofreading)),
+            Command(
+                title: "Summarize Document", symbol: WritingTask.summarize.symbol,
+                kind: .action(.summarizeDocument)),
+            Command(
+                title: "Suggest a Title", symbol: WritingTask.suggestTitle.symbol,
+                kind: .action(.suggestTitle)),
+            Command(
+                title: "Suggest Tags", symbol: WritingTask.suggestTags.symbol,
+                kind: .action(.suggestTags)),
         ]
 
         // Every vault note is reachable, not just an already-open tab. URLs
@@ -600,7 +631,30 @@ struct WorkspaceView: View {
         case .livePreview: mode = .livePreview
         case .sourceMode: mode = .source
         case .readingMode: mode = .reading
+        case .writingTools: writingTools.inline.open()
+        case .proofreadDocument: runProofreading()
+        case .clearProofreading: writingTools.document.clearIssues()
+        case .summarizeDocument: runDocumentTask(.summarize)
+        case .suggestTitle: runDocumentTask(.suggestTitle)
+        case .suggestTags: runDocumentTask(.suggestTags)
         }
+    }
+
+    /// Starts a proofreading pass and shows where its results will appear.
+    ///
+    /// Revealing the panel is part of the action, not a nicety: a pass whose
+    /// findings land in a hidden tab reads as a menu item that did nothing
+    /// except draw some underlines with no way to act on them.
+    private func runProofreading() {
+        showInspector = true
+        inspectorTab = .assist
+        writingTools.document.proofread()
+    }
+
+    private func runDocumentTask(_ task: WritingTask) {
+        showInspector = true
+        inspectorTab = .assist
+        writingTools.document.generate(task)
     }
 
     private func openVault() {

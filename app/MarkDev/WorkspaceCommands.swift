@@ -81,6 +81,24 @@ struct WorkspaceCommands: Commands {
             actionButton("Source Mode", action: .sourceMode)
             actionButton("Reading Mode", action: .readingMode)
         }
+
+        // Its own menu rather than items inside Editor: these are the actions
+        // people go looking for by name, and burying "Proofread" under a menu
+        // called Editor is how a feature ships and is never found.
+        CommandMenu("Writing Tools") {
+            actionButton(
+                "Rewrite Selection…", action: .writingTools, key: "e",
+                modifiers: [.command, .shift])
+            Divider()
+            actionButton(
+                "Proofread Document", action: .proofreadDocument, key: "p",
+                modifiers: [.command, .shift])
+            actionButton("Clear Proofreading Marks", action: .clearProofreading)
+            Divider()
+            actionButton("Summarize Document", action: .summarizeDocument)
+            actionButton("Suggest a Title", action: .suggestTitle)
+            actionButton("Suggest Tags", action: .suggestTags)
+        }
     }
 
     /// Sends one of AppKit's find actions down the responder chain.
