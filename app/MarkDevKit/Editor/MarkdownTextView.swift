@@ -22,7 +22,10 @@
 public final class MarkdownTextView: NSTextView {
     /// Visual configuration. Setting it restyles.
     public var theme: EditorTheme = .standard {
-        didSet { restyle() }
+        didSet {
+            palette = makePalette()
+            restyle()
+        }
     }
 
     /// How much syntax is shown. Setting it restyles.
@@ -46,8 +49,34 @@ public final class MarkdownTextView: NSTextView {
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
 
+    /// Called with a `#tag` when one is clicked.
+    public var onSelectTag: ((String) -> Void)?
+
+    /// Called when a code or diagram block's pop-out control is clicked.
+    public var onExpandBlock: ((BlockExcerpt) -> Void)?
+
+    /// Asked for a preview of a `[[wikilink]]`'s target while the pointer
+    /// rests on it. Returning `nil` shows nothing, which is the right answer
+    /// for a link to a note that does not exist yet.
+    public var peekProvider: ((String) -> NotePeek?)?
+
     /// Currently collapsed ranges.
     private var hiddenRanges: HiddenRanges = .none
+
+    /// Decoration for the current parse, indexed once so the per-line
+    /// fragment callback is a binary search rather than a scan of every block.
+    private var decorations: DocumentDecorations = .empty
+
+    /// Drawing colours captured from the theme. Held rather than rebuilt per
+    /// fragment: TextKit asks for one fragment per line, and each rebuild
+    /// allocates a `CTFont`.
+    private var palette: BlockDecorationPalette = BlockDecorationPalette(theme: .standard)
+
+    /// The link peek currently on screen, and what it is showing.
+    private var peek: (popover: NSPopover, target: String)?
+    /// Fires after the pointer has rested on a link long enough to mean it.
+    private var peekTimer: Timer?
+    private var hoverTracking: NSTrackingArea?
 
     /// Which blocks are revealed, cached so caret movement only restyles when
     /// the answer actually changes. Without this, every arrow key would
@@ -133,6 +162,7 @@ public final class MarkdownTextView: NSTextView {
         pendingEdit = nil
         document.rebuild(from: markdown)
         parsed = document.parsed
+        decorations = DocumentDecorations(document: parsed)
         revealedBlocks = RevealPolicy.revealedBlocks(
             in: parsed, selection: selectedRange(), mode: mode)
         restyle()
@@ -163,6 +193,7 @@ public final class MarkdownTextView: NSTextView {
             document.rebuild(from: text)
         }
         parsed = document.parsed
+        decorations = DocumentDecorations(document: parsed)
         revealedBlocks = RevealPolicy.revealedBlocks(
             in: parsed, selection: selectedRange(), mode: mode)
 
@@ -210,7 +241,8 @@ public final class MarkdownTextView: NSTextView {
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus)
         MarkdownStyler.apply(
-            document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope)
+            document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope,
+            drawsReplacements: mode != .source, contentWidth: usableContentWidth)
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: scope)
@@ -233,7 +265,7 @@ public final class MarkdownTextView: NSTextView {
 
             // The fence lines are syntax, not code; highlighting them would
             // colour the ``` as if it were part of the program.
-            guard let body = codeBody(of: block, in: text) else { continue }
+            guard let body = codeBody(of: block.range, in: text) else { continue }
             let code = text.substring(with: body)
 
             for span in SyntaxHighlighter.shared.spans(language: language, code: code) {
@@ -247,8 +279,8 @@ public final class MarkdownTextView: NSTextView {
     }
 
     /// The code inside a fence, excluding the delimiter lines.
-    private func codeBody(of block: BlockDescriptor, in text: NSString) -> NSRange? {
-        let range = NSIntersectionRange(block.range, NSRange(location: 0, length: text.length))
+    private func codeBody(of block: NSRange, in text: NSString) -> NSRange? {
+        let range = NSIntersectionRange(block, NSRange(location: 0, length: text.length))
         guard range.length > 0 else { return nil }
 
         // Markers cover the fence lines; the body is what they leave behind.
@@ -267,6 +299,50 @@ public final class MarkdownTextView: NSTextView {
         }
         guard end > start else { return nil }
         return NSRange(location: start, length: end - start)
+    }
+
+    /// Captures the theme's drawing colours against *this view's* appearance.
+    ///
+    /// `NSColor.cgColor` resolves a dynamic colour there and then, against
+    /// `NSAppearance.current` — which outside a draw call is whatever AppKit
+    /// last set, not the view's. Read carelessly, a panel meant to be 4% black
+    /// in light mode is captured as 7% *white*, and paints invisibly onto a
+    /// white page. Only the vivid colours survive that, which is why a callout
+    /// would still show while a code panel silently would not.
+    private func makePalette() -> BlockDecorationPalette {
+        var palette: BlockDecorationPalette?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            palette = BlockDecorationPalette(theme: theme)
+        }
+        return palette ?? BlockDecorationPalette(theme: theme)
+    }
+
+    /// Recaptures the palette when the system flips between light and dark.
+    ///
+    /// Fragments hold the colours they were built with, so the ones already
+    /// laid out have to be handed the new palette — otherwise a switch to dark
+    /// mode leaves every panel painted for the light one until the text
+    /// happens to change.
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        palette = makePalette()
+        let captured = palette
+        textLayoutManager?.enumerateTextLayoutFragments(
+            from: textLayoutManager?.documentRange.location
+        ) { fragment in
+            (fragment as? MarkdownLayoutFragment)?.palette = captured
+            return true
+        }
+        needsDisplay = true
+    }
+
+    /// Width a line of text may actually occupy, which is what decides
+    /// whether a table's natural columns will fit.
+    private var usableContentWidth: CGFloat? {
+        guard let container = textContainer else { return nil }
+        let width = container.size.width - container.lineFragmentPadding * 2
+        guard width > 0, width < CGFloat.greatestFiniteMagnitude else { return nil }
+        return width
     }
 
     /// Whether this view holds keyboard focus.
@@ -337,14 +413,21 @@ public final class MarkdownTextView: NSTextView {
     public override func clicked(onLink link: Any, at charIndex: Int) {
         let url: URL? =
             (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
-        guard let url, url.scheme == MarkdownStyler.wikiLinkScheme else {
+        guard let url, let scheme = url.scheme,
+            scheme == MarkdownStyler.wikiLinkScheme || scheme == MarkdownStyler.tagScheme
+        else {
             super.clicked(onLink: link, at: charIndex)
             return
         }
         // The target rides in the host, percent-decoded back to its raw form.
-        let target = (url.host(percentEncoded: false) ?? url.absoluteString)
-            .replacingOccurrences(of: "\(MarkdownStyler.wikiLinkScheme)://", with: "")
-        onFollowWikiLink?(target.removingPercentEncoding ?? target)
+        let raw = (url.host(percentEncoded: false) ?? url.absoluteString)
+            .replacingOccurrences(of: "\(scheme)://", with: "")
+        let target = raw.removingPercentEncoding ?? raw
+        if scheme == MarkdownStyler.tagScheme {
+            onSelectTag?(target)
+        } else {
+            onFollowWikiLink?(target)
+        }
     }
 
     public override func becomeFirstResponder() -> Bool {
@@ -440,7 +523,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     ) -> NSTextLayoutFragment {
         let fragment = MarkdownLayoutFragment(
             textElement: textElement, range: textElement.elementRange)
-        fragment.palette = BlockDecorationPalette(theme: theme)
+        fragment.palette = palette
 
         guard let documentStart = textLayoutManager.documentRange.location as NSTextLocation?,
             let elementRange = textElement.elementRange
@@ -450,8 +533,187 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         let end = textLayoutManager.offset(from: documentStart, to: elementRange.endLocation)
         guard start >= 0, end >= start else { return fragment }
 
-        fragment.decoration = BlockDecoration.decoration(
-            for: NSRange(location: start, length: end - start), in: parsed)
+        let range = NSRange(location: start, length: end - start)
+        fragment.documentRange = range
+        fragment.decoration = decorations.decoration(for: range)
+        // Source mode shows the characters as written, so nothing may be drawn
+        // over them — a checkbox on top of a `[ ]` the reader asked to see is
+        // the one thing source mode must not do.
+        fragment.ornaments = mode == .source ? [] : decorations.ornaments(in: range)
         return fragment
     }
+}
+
+// MARK: - Interaction
+
+extension MarkdownTextView {
+    /// Routes a click to whatever is drawn under it before treating it as
+    /// caret placement.
+    ///
+    /// Ornaments and controls are painted by a layout fragment, not by views,
+    /// so there is nothing for AppKit to hit-test — this is where a drawn
+    /// checkbox becomes a clickable one. Anything not claimed here falls
+    /// through to `NSTextView`, so ordinary selection is untouched.
+    public override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if expandBlock(at: point) { return }
+        if toggleTask(at: point) { return }
+        super.mouseDown(with: event)
+    }
+
+    /// Opens the code or diagram block whose pop-out control was clicked.
+    private func expandBlock(at point: NSPoint) -> Bool {
+        guard onExpandBlock != nil, let manager = textLayoutManager else { return false }
+        let origin = textContainerOrigin
+        let inContainer = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+
+        var hit: MarkdownLayoutFragment?
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment else { return true }
+            let frame = fragment.layoutFragmentFrame
+            // Stop once past the click: fragments are enumerated in document
+            // order, so everything below it is irrelevant.
+            if frame.minY > inContainer.y + frame.height { return false }
+            if let control = fragment.expandControlRect {
+                let rect = control.offsetBy(dx: frame.origin.x, dy: frame.origin.y)
+                if rect.insetBy(dx: -3, dy: -3).contains(inContainer) {
+                    hit = fragment
+                    return false
+                }
+            }
+            return true
+        }
+
+        guard let hit, let excerpt = excerpt(for: hit) else { return false }
+        onExpandBlock?(excerpt)
+        return true
+    }
+
+    /// The content of the block a fragment belongs to, ready to pop out.
+    private func excerpt(for fragment: MarkdownLayoutFragment) -> BlockExcerpt? {
+        guard case .code(_, let language, let isDiagram) = fragment.decoration,
+            let blockRange = decorations.blockRange(containing: fragment.documentRange.location)
+        else { return nil }
+
+        let text = markdown as NSString
+        let clamped = NSIntersectionRange(blockRange, NSRange(location: 0, length: text.length))
+        guard clamped.length > 0 else { return nil }
+        let body = codeBody(of: blockRange, in: text) ?? clamped
+        return BlockExcerpt(
+            language: language,
+            isDiagram: isDiagram,
+            content: text.substring(with: body))
+    }
+
+    /// Ticks or unticks the task whose checkbox was clicked.
+    ///
+    /// Live preview only. In source mode the literal `[ ]` is what the reader
+    /// asked to see and a click belongs to the caret; in reading mode the
+    /// document is not editable, and quietly making one construct writable
+    /// would break the promise the mode makes.
+    private func toggleTask(at point: NSPoint) -> Bool {
+        guard mode == .livePreview, isEditable else { return false }
+        let index = characterIndexForInsertion(at: point)
+        guard let span = parsed.spans.first(where: {
+            $0.kind == .taskMarker
+                && index >= $0.range.location
+                && index <= $0.range.location + $0.range.length
+        }) else { return false }
+
+        // `[ ]` — the state lives in the single character between brackets, so
+        // toggling is a one-character edit and undo reads as one step.
+        let inner = NSRange(location: span.range.location + 1, length: 1)
+        guard inner.location + inner.length <= (markdown as NSString).length else { return false }
+        let replacement = span.data != 0 ? " " : "x"
+
+        guard shouldChangeText(in: inner, replacementString: replacement) else { return true }
+        textStorage?.replaceCharacters(in: inner, with: replacement)
+        didChangeText()
+        return true
+    }
+
+    // MARK: - Link peek
+
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self)
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+
+    public override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        guard peekProvider != nil else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        schedulePeek(at: point)
+    }
+
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        dismissPeek()
+    }
+
+    /// Arms the peek, or dismisses one showing a link the pointer has left.
+    ///
+    /// Deliberately delayed: a preview that appears the instant the pointer
+    /// crosses a link flashes open and shut while someone is only moving
+    /// across the line, which is worse than not having one.
+    private func schedulePeek(at point: NSPoint) {
+        guard let target = wikiLinkTarget(at: point) else {
+            dismissPeek()
+            return
+        }
+        guard peek?.target != target else { return }
+        peekTimer?.invalidate()
+        peekTimer = Timer.scheduledTimer(withTimeInterval: Self.peekDelay, repeats: false) {
+            [weak self] _ in
+            Task { @MainActor in self?.showPeek(for: target, at: point) }
+        }
+    }
+
+    /// The `[[wikilink]]` target under `point`, if any.
+    private func wikiLinkTarget(at point: NSPoint) -> String? {
+        // Outside the text entirely, `characterIndexForInsertion` still
+        // returns the nearest index, so the glyph rect has to be confirmed —
+        // otherwise the whole right margin of a line would peek its link.
+        guard bounds.contains(point) else { return nil }
+        let index = characterIndexForInsertion(at: point)
+        guard let span = parsed.spans.first(where: {
+            $0.kind == .wikiLink && index >= $0.range.location
+                && index < $0.range.location + $0.range.length
+        }) else { return nil }
+        return parsed.target(for: span)
+    }
+
+    private func showPeek(for target: String, at point: NSPoint) {
+        peekTimer = nil
+        guard let content = peekProvider?(target) else { return }
+        dismissPeek()
+
+        let popover = NSPopover()
+        popover.behavior = .semitransient
+        popover.animates = true
+        popover.contentViewController = NotePeekController(
+            peek: content,
+            onOpen: { [weak self] in
+                self?.dismissPeek()
+                self?.onFollowWikiLink?(target)
+            })
+        let anchor = NSRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)
+        popover.show(relativeTo: anchor, of: self, preferredEdge: .maxY)
+        peek = (popover, target)
+    }
+
+    private func dismissPeek() {
+        peekTimer?.invalidate()
+        peekTimer = nil
+        peek?.popover.performClose(nil)
+        peek = nil
+    }
+
+    private static let peekDelay: TimeInterval = 0.45
 }

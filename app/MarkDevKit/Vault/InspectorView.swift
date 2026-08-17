@@ -31,6 +31,8 @@ public struct InspectorView: View {
     public let onOpenNote: (String, UInt32) -> Void
 
     @State private var tab: InspectorTab = .outline
+    /// Which connected notes are showing their longer preview.
+    @State private var expanded: Set<String> = []
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
@@ -124,6 +126,7 @@ public struct InspectorView: View {
                 sectionHeader("Linked mentions", count: backlinks.count)
                 ForEach(backlinks) { backlink in
                     reference(
+                        id: backlink.id,
                         title: backlink.title,
                         context: backlink.context,
                         path: backlink.path,
@@ -139,6 +142,7 @@ public struct InspectorView: View {
                     .padding(.top, backlinks.isEmpty ? 0 : GlassTheme.Spacing.snug)
                 ForEach(mentions) { mention in
                     reference(
+                        id: mention.id,
                         title: mention.title,
                         context: mention.context,
                         path: mention.path,
@@ -165,42 +169,84 @@ public struct InspectorView: View {
         .padding(.top, 2)
     }
 
+    /// One connected note, which expands in place for a longer look.
+    ///
+    /// # Why expand rather than open
+    ///
+    /// Two lines of context answers "is this the mention I meant?" perhaps
+    /// half the time. The other half currently costs a jump to the other note
+    /// and a jump back, losing the reader's place to answer a yes/no question.
+    /// Expanding trades a click for the answer without moving anyone.
     private func reference(
+        id: String,
         title: String,
         context: String,
         path: String,
         emphasised: Bool,
         action: @escaping () -> Void
     ) -> some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: GlassTheme.Spacing.tight) {
-                    Image(systemName: emphasised ? "arrow.turn.up.left" : "text.magnifyingglass")
-                        .font(.caption2)
-                        .foregroundStyle(emphasised ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                    Text(title)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
+        let isExpanded = expanded.contains(id)
+        return VStack(alignment: .leading, spacing: GlassTheme.Spacing.tight) {
+            HStack(spacing: GlassTheme.Spacing.tight) {
+                Image(systemName: emphasised ? "arrow.turn.up.left" : "text.magnifyingglass")
+                    .font(.caption2)
+                    .foregroundStyle(
+                        emphasised ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
                 if !context.isEmpty {
-                    Text(context)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
+                    Button {
+                        if isExpanded { expanded.remove(id) } else { expanded.insert(id) }
+                    } label: {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel(isExpanded ? "Collapse preview" : "Expand preview")
                 }
             }
-            .padding(GlassTheme.Spacing.tight)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: GlassTheme.Radius.small)
-                    .fill(Color.primary.opacity(0.05))
-            )
-            .contentShape(Rectangle())
+
+            if !context.isEmpty {
+                Text(context)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(isExpanded ? nil : 2)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+            }
+
+            if isExpanded {
+                HStack {
+                    Text(path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer(minLength: GlassTheme.Spacing.tight)
+                    Button("Open", action: action)
+                        .font(.caption2)
+                        .buttonStyle(.borderless)
+                }
+            }
         }
-        .buttonStyle(.plain)
+        .padding(GlassTheme.Spacing.tight)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: GlassTheme.Radius.small)
+                .fill(Color.primary.opacity(isExpanded ? 0.09 : 0.05))
+        )
+        .contentShape(Rectangle())
+        // A plain click still jumps, so expanding never becomes the only way
+        // to reach the note.
+        .onTapGesture(count: 2, perform: action)
         .help(path)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isExpanded)
     }
 
     private func empty(_ title: String, symbol: String, hint: String) -> some View {

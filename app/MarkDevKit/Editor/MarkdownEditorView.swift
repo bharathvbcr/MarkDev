@@ -21,6 +21,12 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public var onParse: ((ParsedDocument) -> Void)?
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
+    /// Called with a `#tag` when one is clicked.
+    public var onSelectTag: ((String) -> Void)?
+    /// Called when a code or diagram block's pop-out control is clicked.
+    public var onExpandBlock: ((BlockExcerpt) -> Void)?
+    /// Supplies a preview of a `[[wikilink]]`'s target on hover.
+    public var peekProvider: ((String) -> NotePeek?)?
     /// Set to scroll the editor to an offset; applied once per request.
     public var reveal: RevealRequest?
 
@@ -30,7 +36,10 @@ public struct MarkdownEditorView: NSViewRepresentable {
         theme: EditorTheme = .standard,
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
-        onFollowWikiLink: ((String) -> Void)? = nil
+        onFollowWikiLink: ((String) -> Void)? = nil,
+        onSelectTag: ((String) -> Void)? = nil,
+        onExpandBlock: ((BlockExcerpt) -> Void)? = nil,
+        peekProvider: ((String) -> NotePeek?)? = nil
     ) {
         self._text = text
         self.mode = mode
@@ -38,6 +47,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self.reveal = reveal
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
+        self.onSelectTag = onSelectTag
+        self.onExpandBlock = onExpandBlock
+        self.peekProvider = peekProvider
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -56,6 +68,15 @@ public struct MarkdownEditorView: NSViewRepresentable {
         textView.onFollowWikiLink = { [weak coordinator = context.coordinator] target in
             coordinator?.onFollowWikiLink?(target)
         }
+        textView.onSelectTag = { [weak coordinator = context.coordinator] tag in
+            coordinator?.onSelectTag?(tag)
+        }
+        textView.onExpandBlock = { [weak coordinator = context.coordinator] excerpt in
+            coordinator?.onExpandBlock?(excerpt)
+        }
+        textView.peekProvider = { [weak coordinator = context.coordinator] target in
+            coordinator?.peekProvider?(target)
+        }
         textView.setMarkdown(text)
 
         let scrollView = NSScrollView()
@@ -73,6 +94,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
 
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
+        context.coordinator.onSelectTag = onSelectTag
+        context.coordinator.onExpandBlock = onExpandBlock
+        context.coordinator.peekProvider = peekProvider
         if textView.mode != mode { textView.mode = mode }
 
         // Only push text in when it genuinely differs, or every keystroke
@@ -106,6 +130,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
         private let text: Binding<String>
         var onParse: ((ParsedDocument) -> Void)?
         var onFollowWikiLink: ((String) -> Void)?
+        var onSelectTag: ((String) -> Void)?
+        var onExpandBlock: ((BlockExcerpt) -> Void)?
+        var peekProvider: ((String) -> NotePeek?)?
         var appliedReveal: UUID?
         weak var textView: MarkdownTextView?
 

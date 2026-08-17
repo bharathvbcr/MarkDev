@@ -574,6 +574,25 @@ pub unsafe extern "C" fn md_vault_tags(handle: *mut VaultHandle) -> *const c_cha
     handle.serve(&value)
 }
 
+/// JSON array of the paths of every note carrying `tag`.
+///
+/// The tag is given without its leading `#`, matching what the index stores.
+///
+/// # Safety
+///
+/// `handle` must be live; `tag` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_notes_with_tag(
+    handle: *mut VaultHandle,
+    tag: *const c_char,
+) -> *const c_char {
+    let (Some(handle), Some(tag)) = (handle.as_mut(), read_str(tag)) else {
+        return ptr::null();
+    };
+    let value = handle.vault.notes_with_tag(tag);
+    handle.serve(&value)
+}
+
 /// JSON object resolving a `[[wikilink]]`, or `null` when it is broken.
 ///
 /// # Safety
@@ -880,6 +899,13 @@ mod tests {
         let hits = read(unsafe { md_vault_search(handle, query.as_ptr(), 10) }).expect("json");
         assert!(hits.contains("A.md"));
 
+        let tag = CString::new("tag").expect("tag");
+        let tagged = read(unsafe { md_vault_notes_with_tag(handle, tag.as_ptr()) }).expect("json");
+        assert!(
+            tagged.contains("A.md") && !tagged.contains("B.md"),
+            "only the tagged note should be listed: {tagged}"
+        );
+
         let tags = read(unsafe { md_vault_tags(handle) }).expect("json");
         assert!(tags.contains("tag"));
 
@@ -944,6 +970,7 @@ mod tests {
         assert_eq!(unsafe { md_vault_note_count(ptr::null()) }, 0);
         assert!(unsafe { md_vault_backlinks(ptr::null_mut(), ptr::null()) }.is_null());
         assert!(unsafe { md_vault_tags(ptr::null_mut()) }.is_null());
+        assert!(unsafe { md_vault_notes_with_tag(ptr::null_mut(), ptr::null()) }.is_null());
         unsafe { md_vault_free(ptr::null_mut()) };
     }
 

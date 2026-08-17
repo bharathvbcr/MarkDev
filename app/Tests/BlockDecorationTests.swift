@@ -25,7 +25,7 @@ final class BlockDecorationTests: XCTestCase {
 
     func testFencedCodeGetsCodeDecorationWithItsLanguage() {
         let source = "```swift\nlet x = 1\n```"
-        guard case .code(_, let language) = decoration(
+        guard case .code(_, let language, _) = decoration(
             source, at: range(of: "let x = 1", in: source))
         else { return XCTFail("expected code decoration") }
         XCTAssertEqual(language, "swift")
@@ -94,12 +94,133 @@ final class BlockDecorationTests: XCTestCase {
     func testRulesDrawNoBackground() {
         XCTAssertFalse(BlockDecoration.rule.hasBackground)
         XCTAssertFalse(BlockDecoration.none.hasBackground)
-        XCTAssertTrue(BlockDecoration.code(edge: .only, language: nil).hasBackground)
+        XCTAssertTrue(BlockDecoration.code(edge: .only, language: nil, isDiagram: false).hasBackground)
     }
 
     func testEmptyDocumentIsHandled() {
         XCTAssertEqual(
             BlockDecoration.decoration(for: NSRange(location: 0, length: 0), in: .empty), .none)
+    }
+
+    // MARK: - Tables
+
+    private func tableDecorations(_ source: String) -> [BlockDecoration] {
+        let document = ParsedDocument.parse(source)
+        let index = DocumentDecorations(document: document)
+        let text = source as NSString
+        var out: [BlockDecoration] = []
+        var start = 0
+        while start < text.length {
+            let line = text.lineRange(for: NSRange(location: start, length: 0))
+            out.append(index.decoration(for: line))
+            start = line.location + line.length
+        }
+        return out
+    }
+
+    func testATableResolvesHeaderSeparatorAndBodyRows() {
+        let source = """
+            | Name | Qty |
+            |---|---|
+            | Apple | 3 |
+            | Pear | 9 |
+
+            """
+        let decorations = tableDecorations(source)
+
+        guard decorations.count >= 4 else {
+            return XCTFail("expected a decoration per line, got \(decorations.count)")
+        }
+        XCTAssertEqual(decorations[0], .table(edge: .first, role: .header))
+        XCTAssertEqual(decorations[1], .table(edge: .middle, role: .separator))
+        XCTAssertEqual(decorations[2], .table(edge: .middle, role: .body(row: 0)))
+        XCTAssertEqual(decorations[3], .table(edge: .last, role: .body(row: 1)))
+    }
+
+    func testBodyRowsAreNumberedPerTable() {
+        // Numbering drives the alternating fill. Carrying a count across
+        // tables would start the second one on the wrong stripe.
+        let source = """
+            | A |
+            |---|
+            | 1 |
+
+            text
+
+            | B |
+            |---|
+            | 2 |
+
+            """
+        let rows = tableDecorations(source).compactMap { decoration -> Int? in
+            guard case .table(_, .body(let row)) = decoration else { return nil }
+            return row
+        }
+        XCTAssertEqual(rows, [0, 0], "each table numbers its own rows from zero")
+    }
+
+    func testTableEdgesAreMeasuredAgainstTheWholeTable() {
+        // A row is its own block, but it must round the *table's* corners —
+        // otherwise every row would draw as a separate rounded card.
+        let source = "| A |\n|---|\n| 1 |\n| 2 |\n\n"
+        let edges = tableDecorations(source).compactMap { decoration -> BlockEdge? in
+            guard case .table(let edge, _) = decoration else { return nil }
+            return edge
+        }
+        XCTAssertEqual(edges.first, .first)
+        XCTAssertEqual(edges.last, .last)
+        XCTAssertEqual(edges.filter { $0 == .only }.count, 0)
+    }
+
+    // MARK: - Ornaments
+
+    func testOrnamentsAreFoundForTasksTagsAndInlineCode() {
+        let source = "- [x] ship `now` #urgent\n"
+        let index = DocumentDecorations(document: ParsedDocument.parse(source))
+        let ornaments = index.ornaments(in: NSRange(location: 0, length: (source as NSString).length))
+
+        XCTAssertEqual(ornaments.count, 3, "got \(ornaments)")
+        guard case .checkbox(_, let checked) = ornaments[0] else {
+            return XCTFail("expected the task marker first, got \(ornaments[0])")
+        }
+        XCTAssertTrue(checked)
+        guard case .codePill = ornaments[1] else {
+            return XCTFail("expected the inline code pill, got \(ornaments[1])")
+        }
+        guard case .tagPill = ornaments[2] else {
+            return XCTFail("expected the tag pill, got \(ornaments[2])")
+        }
+    }
+
+    func testOrnamentsComeBackInDocumentOrder() {
+        // `ornaments(in:)` binary-searches this list, so the order is a
+        // correctness requirement and not a nicety. It holds because the
+        // parser sorts its spans and the build preserves that — assert it
+        // rather than trusting the chain.
+        let source = "#alpha `code` #beta and [x](y) `more` #gamma\n"
+        let index = DocumentDecorations(document: ParsedDocument.parse(source))
+        let found = index.ornaments(in: NSRange(location: 0, length: (source as NSString).length))
+        let starts = found.map(\.range.location)
+        XCTAssertEqual(starts, starts.sorted(), "ornaments must be ascending: \(starts)")
+        XCTAssertEqual(found.count, 5)
+    }
+
+    func testOrnamentLookupIsLimitedToTheRangeAsked() {
+        let source = "#one and #two\n"
+        let index = DocumentDecorations(document: ParsedDocument.parse(source))
+        let first = (source as NSString).range(of: "#one")
+        XCTAssertEqual(index.ornaments(in: first).count, 1)
+        XCTAssertEqual(
+            index.ornaments(in: NSRange(location: 0, length: (source as NSString).length)).count, 2)
+    }
+
+    func testNoOrnamentsInsideACodeFence() {
+        // A `#` in code is code. The parser already declines to make it a tag;
+        // this is the assertion that the renderer never invents one.
+        let source = "```sh\n# not a tag\n```\n"
+        let index = DocumentDecorations(document: ParsedDocument.parse(source))
+        XCTAssertTrue(
+            index.ornaments(in: NSRange(location: 0, length: (source as NSString).length)).isEmpty)
     }
 }
 

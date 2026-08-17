@@ -52,7 +52,7 @@ final class SyntaxHighlightingTests: XCTestCase {
 
         XCTAssertEqual(
             BlockDecoration.decoration(for: block.range, in: document),
-            .code(edge: .only, language: "swift"))
+            .code(edge: .only, language: "swift", isDiagram: false))
         XCTAssertEqual(
             BlockDecoration.edge(
                 of: NSRange(location: block.range.location, length: 2), within: block.range),

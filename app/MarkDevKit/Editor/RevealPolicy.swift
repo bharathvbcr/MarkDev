@@ -48,8 +48,35 @@ public enum RevealPolicy {
             where intersects(block: block.range, selection: selection) {
                 revealed.insert(index)
             }
-            return revealed
+            return revealingWholeTables(revealed, in: document)
         }
+    }
+
+    /// Extends the revealed set so a table reveals as one unit.
+    ///
+    /// Rows are separate blocks, so revealing them one at a time shows the
+    /// caret's row as raw `| … |` while its neighbours stay laid out — and
+    /// because the row's own pipes then take up space, it jumps sideways out
+    /// of the grid the moment the caret arrives. A table is one construct and
+    /// shows its syntax all at once, exactly as a code fence does.
+    private static func revealingWholeTables(
+        _ revealed: Set<Int>,
+        in document: ParsedDocument
+    ) -> Set<Int> {
+        var out = revealed
+        for index in revealed where document.blocks[index].kind == .table {
+            let table = document.blocks[index].range
+            let end = table.location + table.length
+            // A table's rows and cells follow it contiguously in block order.
+            var cursor = index + 1
+            while cursor < document.blocks.count,
+                document.blocks[cursor].range.location < end
+            {
+                out.insert(cursor)
+                cursor += 1
+            }
+        }
+        return out
     }
 
     /// A caret sitting exactly on a block boundary counts as inside it, so
@@ -64,24 +91,30 @@ public enum RevealPolicy {
         return selection.location < blockEnd && selectionEnd > block.location
     }
 
-    /// Ranges that must stay visible because hiding them would destroy
-    /// information no drawn stand-in replaces yet.
+    /// Ranges that must stay visible because a drawn stand-in needs the space
+    /// they reserve.
     ///
-    /// A `- [x]` checkbox and a `---` rule are *entirely* syntax: unlike
-    /// `**`, there is no content left behind once they are hidden. They only
-    /// become hideable once the editor draws a checkbox and a horizontal
-    /// line in their place, which is fragment work. Until then they stay
-    /// visible — a blank line where a rule used to be would read as data
-    /// loss.
+    /// A `- [x]` checkbox is *entirely* syntax: unlike `**`, there is no
+    /// content left behind once it is hidden. The renderer draws a checkbox
+    /// over it, and that checkbox needs somewhere to sit — so the characters
+    /// keep their size, on the baseline, at whatever the body font is, and the
+    /// styler merely paints them clear.
+    ///
+    /// The marker is protected one character wider than it is. The space after
+    /// `[ ]` is its own marker, and hiding it closes the gap between the
+    /// checkbox and the text, rendering `- [ ] first` as `☐first`.
+    ///
+    /// A `---` rule is *not* in this list. Its replacement is a drawn line
+    /// spanning the text container, which needs no character to sit on — and
+    /// keeping the dashes visible under it shows the reader a line struck
+    /// through some text rather than a section break.
     public static func markersRequiringReplacement(in document: ParsedDocument) -> [NSRange] {
         var ranges: [NSRange] = []
         ranges.reserveCapacity(8)
 
         for span in document.spans where span.kind == .taskMarker {
-            ranges.append(span.range)
-        }
-        for block in document.blocks where block.kind == .rule {
-            ranges.append(block.range)
+            ranges.append(
+                NSRange(location: span.range.location, length: span.range.length + 1))
         }
         return ranges
     }

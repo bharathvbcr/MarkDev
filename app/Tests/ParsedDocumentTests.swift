@@ -135,4 +135,62 @@ final class PreviewRendererTests: XCTestCase {
         let rendered = PreviewRenderer.attributedString(for: "🎉 **bold** tail")
         XCTAssertEqual(rendered.string, "🎉 bold tail")
     }
+
+    func testChecklistsKeepTheirBoxes() {
+        // This path deletes hidden syntax rather than drawing over it, and a
+        // `- [x]` is entirely syntax — dropped outright, a checklist arrives
+        // in Quick Look as an unmarked list with its state gone.
+        let rendered = PreviewRenderer.attributedString(for: "- [x] done\n- [ ] todo\n")
+        XCTAssertTrue(rendered.string.contains("☑"), "a ticked box, got \(rendered.string.debugDescription)")
+        XCTAssertTrue(rendered.string.contains("☐"), "an empty box, got \(rendered.string.debugDescription)")
+        XCTAssertTrue(rendered.string.contains("done"))
+        XCTAssertTrue(rendered.string.contains("todo"))
+    }
+
+    func testThematicBreaksLeaveAVisibleBreak() {
+        let rendered = PreviewRenderer.attributedString(for: "before\n\n---\n\nafter")
+        XCTAssertTrue(
+            rendered.string.contains("─"),
+            "a section break must not render as a blank line: \(rendered.string.debugDescription)")
+    }
+
+    func testSubstitutionsDoNotDisturbLaterText() {
+        // Insertions run back to front. Front to back, each one would shift
+        // every offset still to come and the later boxes would land inside
+        // the words they belong beside.
+        let rendered = PreviewRenderer.attributedString(
+            for: "- [ ] alpha\n- [x] beta\n- [ ] gamma\n")
+        let text = rendered.string
+        for word in ["alpha", "beta", "gamma"] {
+            XCTAssertTrue(text.contains(word), "\(word) survived intact in \(text.debugDescription)")
+        }
+        XCTAssertEqual(text.filter { $0 == "☐" }.count, 2)
+        XCTAssertEqual(text.filter { $0 == "☑" }.count, 1)
+    }
+}
+
+final class BlockExcerptTests: XCTestCase {
+    func testAnExcerptReportsItsShape() {
+        // The header shows these so the reader can tell at a glance whether
+        // the block was ever going to fit the writing column.
+        let excerpt = BlockExcerpt(
+            language: "mermaid", isDiagram: true, content: "graph TD\n  A-->B\n  B-->C")
+        XCTAssertEqual(excerpt.title, "Diagram")
+        XCTAssertEqual(excerpt.lineCount, 3)
+        // "graph TD" is the longest of the three at eight characters.
+        XCTAssertEqual(excerpt.widestLine, 8)
+    }
+
+    func testAnUnlabelledFenceStillHasATitle() {
+        XCTAssertEqual(
+            BlockExcerpt(language: nil, isDiagram: false, content: "x").title, "Code Block")
+        XCTAssertEqual(
+            BlockExcerpt(language: "swift", isDiagram: false, content: "x").title, "SWIFT")
+    }
+
+    func testAnEmptyBlockHasNoLines() {
+        let excerpt = BlockExcerpt(language: nil, isDiagram: false, content: "")
+        XCTAssertEqual(excerpt.lineCount, 0)
+        XCTAssertEqual(excerpt.widestLine, 0)
+    }
 }

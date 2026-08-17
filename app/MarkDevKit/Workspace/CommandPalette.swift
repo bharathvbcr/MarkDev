@@ -71,9 +71,19 @@ public struct CommandPalette: View {
     @FocusState private var isFieldFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(isPresented: Binding<Bool>, commands: [Command], onRun: @escaping (Command) -> Void) {
+    /// - Parameter query: text the field opens with. A tag clicked in the
+    ///   editor arrives this way, so the palette opens already narrowed to the
+    ///   notes it gathers rather than making the reader retype what they just
+    ///   clicked.
+    public init(
+        isPresented: Binding<Bool>,
+        commands: [Command],
+        query: String = "",
+        onRun: @escaping (Command) -> Void
+    ) {
         self._isPresented = isPresented
         self.commands = commands
+        self._query = State(initialValue: query)
         self.onRun = onRun
     }
 

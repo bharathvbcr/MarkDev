@@ -55,6 +55,16 @@ struct WorkspaceView: View {
     /// Pending scroll-to-offset per pane, from the outline and from links.
     @State private var reveals: [PaneID: RevealRequest] = [:]
 
+    /// The block currently popped out for reading, if any.
+    @State private var expandedBlock: BlockExcerpt?
+
+    /// Text the palette opens with. A clicked `#tag` seeds it, so the palette
+    /// arrives already narrowed to that tag's notes.
+    @State private var paletteQuery = ""
+    /// The clicked tag and the notes it gathers, offered at the top of the
+    /// palette's list until it is dismissed.
+    @State private var activeTag: (name: String, paths: [String])?
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var glass
 
@@ -134,9 +144,14 @@ struct WorkspaceView: View {
             Text(errorMessage ?? "")
         }
         .animation(GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion), value: showSidebar)
+        .sheet(item: $expandedBlock) { block in
+            BlockExcerptView(excerpt: block) { expandedBlock = nil }
+        }
         .overlay(alignment: .top) {
             if showPalette {
-                CommandPalette(isPresented: $showPalette, commands: commands) { run($0) }
+                CommandPalette(
+                    isPresented: $showPalette, commands: commands, query: paletteQuery
+                ) { run($0) }
                     .padding(.top, 90)
                     .transition(
                         reduceMotion
@@ -233,7 +248,7 @@ struct WorkspaceView: View {
 
     private var searchButton: some View {
         Button {
-            showPalette.toggle()
+            if showPalette { showPalette = false } else { openPalette() }
         } label: {
             HStack(spacing: GlassTheme.Spacing.tight) {
                 Image(systemName: "magnifyingglass")
@@ -335,7 +350,10 @@ struct WorkspaceView: View {
                     guard let current = workspace.document(in: pane) else { return }
                     handleParse(parsed, text: current.text, document: current.id, pane: pane)
                 },
-                onFollowWikiLink: { followWikiLink($0) }
+                onFollowWikiLink: { followWikiLink($0) },
+                onSelectTag: { showNotes(taggedWith: $0) },
+                onExpandBlock: { expandedBlock = $0 },
+                peekProvider: { peek(at: $0) }
             )
             .onTapGesture { workspace.focusedPane = pane }
 
@@ -502,6 +520,65 @@ struct WorkspaceView: View {
         }
     }
 
+    /// Opens the palette narrowed to the notes carrying `tag`.
+    ///
+    /// A tag is a query someone already wrote down; clicking one should run
+    /// it, not merely colour it.
+    private func showNotes(taggedWith tag: String) {
+        activeTag = (tag, vault.notes(taggedWith: tag))
+        paletteQuery = tag
+        showPalette = true
+    }
+
+    /// Opens the palette empty, forgetting any tag that seeded it last time.
+    private func openPalette() {
+        activeTag = nil
+        paletteQuery = ""
+        showPalette = true
+    }
+
+    /// A preview of a `[[wikilink]]`'s target, for the hover peek.
+    ///
+    /// Prefers the text held in an open pane over the file on disk, so a peek
+    /// at a note being edited in the next pane shows what is on screen rather
+    /// than the last save — the same rule the backlinks panel follows.
+    private func peek(at raw: String) -> NotePeek? {
+        let (target, anchor) = Self.splitAnchor(raw)
+        guard let resolution = vault.resolve(target: target, anchor: anchor),
+            let url = vault.url(for: resolution.path)
+        else { return nil }
+
+        let text: String
+        if let open = workspace.documentsWithUnsavedChanges.first(where: { $0.url == url }) {
+            text = open.text
+        } else if fileIsSmallEnoughToPeek(url),
+            let onDisk = try? String(contentsOf: url, encoding: .utf8)
+        {
+            text = onDisk
+        } else {
+            return nil
+        }
+
+        let headings = vault.outline(for: resolution.path)
+        let excerpt = String(text.prefix(NotePeek.excerptLimit))
+        return NotePeek(
+            title: headings.first(where: { $0.level == 1 })?.text
+                ?? url.deletingPathExtension().lastPathComponent,
+            path: resolution.path,
+            excerpt: PreviewRenderer.attributedString(for: excerpt, theme: .peek),
+            headings: headings.map(\.text),
+            backlinkCount: vault.backlinks(for: resolution.path).count)
+    }
+
+    /// A peek reads its note synchronously, on the main thread, because it
+    /// must appear while the pointer is still resting on the link. That is
+    /// fine for a note and not for a megabyte of pasted log, so anything
+    /// unreasonably large simply does not peek.
+    private func fileIsSmallEnoughToPeek(_ url: URL) -> Bool {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+        return (size ?? 0) <= 1_048_576
+    }
+
     private static func splitAnchor(_ raw: String) -> (String, String?) {
         guard let hash = raw.firstIndex(of: "#") else { return (raw, nil) }
         return (
@@ -513,7 +590,23 @@ struct WorkspaceView: View {
     // MARK: - Commands
 
     private var commands: [Command] {
-        var list: [Command] = [
+        var list: [Command] = []
+
+        // A clicked tag's notes lead the list, and carry the tag as their
+        // subtitle so the seeded query matches them however they are titled.
+        if let activeTag {
+            for path in activeTag.paths {
+                guard let url = vault.url(for: path) else { continue }
+                list.append(
+                    Command(
+                        title: url.deletingPathExtension().lastPathComponent,
+                        subtitle: "#\(activeTag.name) · \(path)",
+                        symbol: "number",
+                        kind: .file(url)))
+            }
+        }
+
+        list += [
             Command(
                 title: "New Document", symbol: "doc.badge.plus",
                 kind: .action(.newDocument), shortcut: "⌘N"),
@@ -550,7 +643,8 @@ struct WorkspaceView: View {
 
         // Every vault note is reachable, not just an already-open tab. URLs
         // are deduplicated because one document may be visible in many panes.
-        var seen: Set<URL> = []
+        var seen: Set<URL> = Set(
+            (activeTag?.paths ?? []).compactMap { vault.url(for: $0) })
         for path in vault.notePaths() {
             guard let url = vault.url(for: path), seen.insert(url).inserted else { continue }
             list.append(
@@ -588,7 +682,8 @@ struct WorkspaceView: View {
         case .newDocument:
             workspace.newDocument(in: workspace.focusedPane)
             refreshVault()
-        case .toggleCommandPalette: showPalette.toggle()
+        case .toggleCommandPalette:
+            if showPalette { showPalette = false } else { openPalette() }
         case .openFile: openFilePanel()
         case .openVault: openVault()
         case .save: _ = saveDocument()

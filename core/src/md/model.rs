@@ -92,6 +92,27 @@ pub enum CalloutKind {
     Caution = 4,
 }
 
+/// How a table column's cells sit in their column.
+///
+/// Packed into [`BlockKind::TableCell`]'s `data` alongside the column index —
+/// see [`BlockDescriptor::data`]. Two bits, so a column index of any plausible
+/// width still fits above it.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TableAlignment {
+    /// No `:` in the delimiter row. Renders left, but is distinct from an
+    /// explicit `:---` so a formatter can round-trip the source unchanged.
+    Auto = 0,
+    Left = 1,
+    Center = 2,
+    Right = 3,
+}
+
+/// Bits of a `TableCell`'s `data` given over to its alignment.
+pub const TABLE_ALIGNMENT_BITS: u32 = 2;
+/// Mask selecting the alignment out of a `TableCell`'s `data`.
+pub const TABLE_ALIGNMENT_MASK: u32 = (1 << TABLE_ALIGNMENT_BITS) - 1;
+
 /// An inline range carrying character attributes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +153,10 @@ pub struct BlockDescriptor {
     pub end: u32,
     pub kind: u16,
     pub depth: u16,
-    /// Heading level, callout kind, or list orderedness.
+    /// Heading level, callout kind, list orderedness, or a table's column
+    /// count. For [`BlockKind::TableCell`] it packs two values —
+    /// `(column << TABLE_ALIGNMENT_BITS) | alignment` — because a cell needs
+    /// both to be laid out and there is only one payload field.
     pub data: u32,
     /// Index into the string table (code fence language), or `u32::MAX`.
     pub info: u32,

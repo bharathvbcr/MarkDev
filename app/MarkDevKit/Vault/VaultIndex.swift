@@ -181,6 +181,19 @@ public final class VaultIndex {
         #endif
     }
 
+    /// Paths of every note carrying `tag`, given without its leading `#`.
+    ///
+    /// This is what makes a rendered `#tag` a control rather than a colour:
+    /// clicking one can list the notes it gathers.
+    public func notes(taggedWith tag: String) -> [String] {
+        #if canImport(CMarkDev)
+            guard let handle, !tag.isEmpty else { return [] }
+            return tag.withCString { decode(md_vault_notes_with_tag(handle, $0)) } ?? []
+        #else
+            return []
+        #endif
+    }
+
     public func search(_ text: String, limit: Int = 50) -> [SearchHit] {
         #if canImport(CMarkDev)
             guard let handle, !text.isEmpty, limit > 0 else { return [] }

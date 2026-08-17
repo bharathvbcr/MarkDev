@@ -24,13 +24,14 @@
 //! [`OffsetIter`]: pulldown_cmark::OffsetIter
 
 use pulldown_cmark::{
-    BlockQuoteKind, CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser,
+    Tag, TagEnd,
 };
 use std::ops::Range;
 
 use super::model::{
     BlockDescriptor, BlockKind, CalloutKind, ParseResult, SpanKind, StyleSpan, SyntaxMarker,
-    Utf16Mapper, NO_INFO,
+    TableAlignment, Utf16Mapper, NO_INFO, TABLE_ALIGNMENT_BITS,
 };
 
 /// Parser options MarkDev renders with.
@@ -51,6 +52,69 @@ pub fn options() -> Options {
         | Options::ENABLE_DEFINITION_LIST
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+}
+
+/// Column alignment for the table currently being walked.
+///
+/// `pulldown-cmark` reports alignment once, on the table's `Start` tag, but a
+/// renderer needs it per *cell* — the cell is what gets padded left, centred,
+/// or right. Rather than make every consumer re-find the owning table and
+/// count columns, the alignments are stashed here and stamped onto each cell
+/// as it opens.
+///
+/// A stack, not a single value: a table can sit inside a blockquote inside a
+/// list, and while GFM tables cannot nest directly, a malformed document can
+/// still open a second table before the first closes. Popping the wrong
+/// alignment vector would silently right-align an unrelated column.
+#[derive(Default)]
+struct TableState {
+    /// Alignment per column, innermost table last.
+    tables: Vec<Vec<TableAlignment>>,
+    /// Which column the next cell in the current row is.
+    column: usize,
+}
+
+impl TableState {
+    fn open(&mut self, alignments: &[Alignment]) {
+        self.tables
+            .push(alignments.iter().copied().map(alignment).collect());
+        self.column = 0;
+    }
+
+    fn close(&mut self) {
+        self.tables.pop();
+        self.column = 0;
+    }
+
+    /// Starts a new row. Header and body rows both restart at column zero.
+    fn new_row(&mut self) {
+        self.column = 0;
+    }
+
+    /// Alignment for the next cell, consuming one column.
+    ///
+    /// A row with more cells than the delimiter row declared falls back to
+    /// `Auto` rather than panicking: GFM tolerates ragged rows, and a parse
+    /// must never be the thing that crashes an edit.
+    fn next_cell(&mut self) -> TableAlignment {
+        let alignment = self
+            .tables
+            .last()
+            .and_then(|columns| columns.get(self.column))
+            .copied()
+            .unwrap_or(TableAlignment::Auto);
+        self.column += 1;
+        alignment
+    }
+}
+
+fn alignment(a: Alignment) -> TableAlignment {
+    match a {
+        Alignment::None => TableAlignment::Auto,
+        Alignment::Left => TableAlignment::Left,
+        Alignment::Center => TableAlignment::Center,
+        Alignment::Right => TableAlignment::Right,
+    }
 }
 
 /// One open construct while walking the event stream.
@@ -78,6 +142,7 @@ pub fn parse(source: &str) -> ParseResult {
     // contents arrive as `Text` events but must not be scanned for `#tag` or
     // `==highlight==` — a `#` inside a code fence is code, not a tag.
     let mut verbatim: usize = 0;
+    let mut tables = TableState::default();
 
     for (event, range) in Parser::new_ext(source, options()).into_offset_iter() {
         match event {
@@ -92,6 +157,7 @@ pub fn parse(source: &str) -> ParseResult {
                     &mut result,
                     &mut block_stack,
                     inline_depth,
+                    &mut tables,
                 );
                 if frame.span.is_some() {
                     inline_depth += 1;
@@ -102,6 +168,9 @@ pub fn parse(source: &str) -> ParseResult {
             Event::End(end) => {
                 if is_verbatim_end(&end) {
                     verbatim = verbatim.saturating_sub(1);
+                }
+                if end == TagEnd::Table {
+                    tables.close();
                 }
                 let Some(frame) = stack.pop() else { continue };
                 if frame.span.is_some() {
@@ -243,6 +312,7 @@ fn open_frame(
     result: &mut ParseResult,
     block_stack: &mut Vec<usize>,
     inline_depth: u16,
+    tables: &mut TableState,
 ) -> Frame {
     let depth = block_stack.len() as u16;
     let mut frame = Frame {
@@ -311,10 +381,33 @@ fn open_frame(
             ));
         }
         Tag::Item => frame.block = Some(reserve(result, BlockKind::ListItem, 0, NO_INFO)),
-        Tag::Table(_) => frame.block = Some(reserve(result, BlockKind::Table, 0, NO_INFO)),
-        Tag::TableHead => frame.block = Some(reserve(result, BlockKind::TableHead, 0, NO_INFO)),
-        Tag::TableRow => frame.block = Some(reserve(result, BlockKind::TableRow, 0, NO_INFO)),
-        Tag::TableCell => frame.block = Some(reserve(result, BlockKind::TableCell, 0, NO_INFO)),
+        Tag::Table(alignments) => {
+            tables.open(alignments);
+            // The column count rides on the table so a renderer can size the
+            // grid without walking every row first.
+            let columns = alignments.len() as u32;
+            frame.block = Some(reserve(result, BlockKind::Table, columns, NO_INFO));
+        }
+        Tag::TableHead => {
+            tables.new_row();
+            frame.block = Some(reserve(result, BlockKind::TableHead, 0, NO_INFO));
+        }
+        Tag::TableRow => {
+            tables.new_row();
+            frame.block = Some(reserve(result, BlockKind::TableRow, 0, NO_INFO));
+        }
+        Tag::TableCell => {
+            // The cell's column index and alignment, packed so one `data`
+            // field answers both "which column am I" and "how do I sit in it".
+            let column = tables.column as u32;
+            let alignment = tables.next_cell() as u32;
+            frame.block = Some(reserve(
+                result,
+                BlockKind::TableCell,
+                (column << TABLE_ALIGNMENT_BITS) | alignment,
+                NO_INFO,
+            ));
+        }
         Tag::HtmlBlock => frame.block = Some(reserve(result, BlockKind::HtmlBlock, 0, NO_INFO)),
         Tag::FootnoteDefinition(_) => {
             frame.block = Some(reserve(result, BlockKind::FootnoteDefinition, 0, NO_INFO))

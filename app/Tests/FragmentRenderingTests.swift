@@ -256,4 +256,266 @@ final class FragmentRenderingTests: XCTestCase {
     func testRenderingIsStableForAnEmptyDocument() throws {
         XCTAssertNoThrow(try render(""))
     }
+
+    // MARK: - Checkboxes
+
+    func testACheckedTaskPaintsAFilledCheckbox() throws {
+        // The literal `[x]` is painted clear and a checkbox drawn over it, so
+        // the only colour on the line can be the checkbox's own accent fill.
+        let ticked = try render("- [x] done\n")
+        XCTAssertNotNil(
+            dominantColor(ticked),
+            "a ticked task should paint a filled checkbox, not just its text")
+    }
+
+    func testAnUncheckedTaskDrawsAnOutlineRatherThanAFill() throws {
+        // The contrast with the test above is the point: if both painted the
+        // same, the checkbox would not be reporting state.
+        XCTAssertNil(
+            dominantColor(try render("- [ ] todo\n")),
+            "an empty checkbox should be an outline, with no accent fill")
+    }
+
+    func testACheckboxIsNotClippedByTheFragmentSurface() throws {
+        // A drawn ornament sits slightly proud of the glyphs it covers. If
+        // `renderingSurfaceBounds` is sized to the glyphs alone the box loses
+        // its edges, which reads as a broken checkbox rather than a clipped one.
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 200)
+        view.setMarkdown("- [x] done\n")
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var checked = false
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment,
+                fragment.ornaments.contains(where: {
+                    if case .checkbox = $0 { return true } else { return false }
+                })
+            else { return true }
+            checked = true
+            XCTAssertGreaterThanOrEqual(
+                fragment.renderingSurfaceBounds.height,
+                fragment.layoutFragmentFrame.height,
+                "the surface must be at least as tall as the line it decorates")
+            return false
+        }
+        XCTAssertTrue(checked, "the task line should carry a checkbox ornament")
+    }
+
+    // MARK: - Code panels
+
+    func testCodeTextCarriesNoBackgroundAttribute() {
+        // `.backgroundColor` paints a box exactly as wide as each line's
+        // glyphs. Stacked behind the panel the fragment already draws to the
+        // container's edge, that is a ragged staircase over a clean card.
+        let view = MarkdownTextView.make()
+        view.setMarkdown("```swift\nlet value = 42\n```\n")
+        let range = (view.markdown as NSString).range(of: "let value = 42")
+        XCTAssertNil(
+            view.textStorage?.attribute(.backgroundColor, at: range.location, effectiveRange: nil),
+            "the code panel is drawn by the fragment, not set as a text attribute")
+    }
+
+    func testInlineCodeCarriesNoBackgroundAttribute() {
+        let view = MarkdownTextView.make()
+        view.setMarkdown("Call `render()` first.\n")
+        let range = (view.markdown as NSString).range(of: "render()")
+        XCTAssertNil(
+            view.textStorage?.attribute(.backgroundColor, at: range.location, effectiveRange: nil),
+            "inline code gets a drawn pill, not a square attribute background")
+    }
+
+    func testAFencedBlockOffersAPopOutControlOnlyOnItsFirstLine() throws {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 320)
+        view.setMarkdown("```mermaid\ngraph TD\nA-->B\n```\n")
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var controls = 0
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment,
+                fragment.expandControlRect != nil
+            {
+                controls += 1
+            }
+            return true
+        }
+        XCTAssertEqual(
+            controls, 1,
+            "the panel has one top-right corner however many lines it spans")
+    }
+
+    // MARK: - Tables
+
+    /// The x range a document range occupies on screen.
+    private func segment(of range: NSRange, in view: MarkdownTextView) throws -> CGRect {
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        let start = try XCTUnwrap(
+            manager.location(manager.documentRange.location, offsetBy: range.location))
+        let end = try XCTUnwrap(manager.location(start, offsetBy: range.length))
+        let textRange = try XCTUnwrap(NSTextRange(location: start, end: end))
+
+        var found: CGRect?
+        manager.enumerateTextSegments(in: textRange, type: .standard, options: []) {
+            _, rect, _, _ in
+            found = rect
+            return false
+        }
+        return try XCTUnwrap(found, "no layout segment for \(range)")
+    }
+
+    /// Lays out a table with the caret parked in a trailing paragraph.
+    ///
+    /// A table reveals as a unit, so a caret anywhere inside it puts the whole
+    /// grid into source form on purpose — which is the wrong state to measure
+    /// column layout in.
+    private func table(_ source: String) throws -> MarkdownTextView {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 560, height: 380)
+        view.setMarkdown(source + "\n\nafter\n")
+        view.setSelectedRange(
+            NSRange(location: (view.markdown as NSString).length, length: 0))
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+        return view
+    }
+
+    func testTableColumnsLineUpAcrossRows() throws {
+        // Live preview hides every `|`, so without column layout this renders
+        // as "NameQty / Apple3 / Watermelon12" — the cells run together and
+        // the second column starts at a different x on every row.
+        let source = """
+            | Name | Qty |
+            |---|---|
+            | Apple | 3 |
+            | Watermelon | 12 |
+            """
+        let view = try table(source)
+        let text = source as NSString
+
+        let heading = try segment(of: text.range(of: "Qty"), in: view)
+        let first = try segment(of: text.range(of: "3"), in: view)
+        let second = try segment(of: text.range(of: "12"), in: view)
+
+        XCTAssertEqual(
+            heading.minX, first.minX, accuracy: 1.0,
+            "the second column must start at one x, not wherever its row's first cell ended")
+        XCTAssertEqual(heading.minX, second.minX, accuracy: 1.0)
+        XCTAssertGreaterThan(
+            first.minX, 60,
+            "the second column should clear the widest first-column cell")
+    }
+
+    func testARightAlignedColumnEndsAtOneEdge() throws {
+        let source = """
+            | Item | Cost |
+            |---|---:|
+            | Tea | 4 |
+            | Coffee | 250 |
+            """
+        let view = try table(source)
+        let text = source as NSString
+
+        let short = try segment(of: text.range(of: "4"), in: view)
+        let long = try segment(of: text.range(of: "250"), in: view)
+
+        XCTAssertEqual(
+            short.maxX, long.maxX, accuracy: 1.0,
+            "`---:` should right-align the column, so its cells share a right edge")
+        XCTAssertLessThan(
+            long.minX, short.minX,
+            "the wider value should start further left, being flush right")
+    }
+
+    func testTableLayoutIsIdempotentAcrossRestyles() throws {
+        // Column widths are added as kerning. Measuring a table that already
+        // carries kerning from the last pass would compound it, so every
+        // keystroke inside a table would push its columns further apart.
+        let source = """
+            | Name | Qty |
+            |---|---|
+            | Apple | 3 |
+            """
+        let view = try table(source)
+        let text = source as NSString
+        let before = try segment(of: text.range(of: "Qty"), in: view)
+
+        for _ in 0..<3 {
+            view.theme = .standard
+            view.textLayoutManager?.ensureLayout(
+                for: view.textLayoutManager!.documentRange)
+        }
+        let after = try segment(of: text.range(of: "Qty"), in: view)
+
+        XCTAssertEqual(
+            before.minX, after.minX, accuracy: 0.5,
+            "restyling must not widen a table it has already laid out")
+    }
+
+    func testACaretInOneRowRevealsTheWholeTable() throws {
+        // Revealing row by row would show the caret's row as raw `| … |`
+        // while its neighbours stayed laid out — and the row would jump
+        // sideways out of the grid as the caret arrived, because its own
+        // pipes suddenly take up space.
+        let source = """
+            | Name | Qty |
+            |---|---|
+            | Apple | 3 |
+            | Pear | 9 |
+            """
+        let document = ParsedDocument.parse(source)
+        let inLastRow = (source as NSString).range(of: "Pear").location
+        let hidden = HiddenRanges(
+            document: document, selection: NSRange(location: inLastRow, length: 0))
+
+        for pipe in ["| Name", "| Apple", "| Pear"] {
+            let location = (source as NSString).range(of: pipe).location
+            XCTAssertFalse(
+                hidden.covers(NSRange(location: location, length: 1)),
+                "every row's pipes should be revealed together, not just \(pipe)")
+        }
+    }
+
+    func testATableAwayFromTheCaretHidesEveryPipe() throws {
+        let source = "| Name | Qty |\n|---|---|\n| Apple | 3 |\n\nafter\n"
+        let document = ParsedDocument.parse(source)
+        let hidden = HiddenRanges(
+            document: document,
+            selection: NSRange(location: (source as NSString).range(of: "after").location, length: 0))
+
+        for pipe in ["| Name", "| Apple"] {
+            let location = (source as NSString).range(of: pipe).location
+            XCTAssertTrue(
+                hidden.covers(NSRange(location: location, length: 1)),
+                "\(pipe) should collapse once the caret leaves the table")
+        }
+    }
+
+    func testSourceModeLeavesTableColumnsAlone() throws {
+        // Source mode shows the characters as written. Padding between them
+        // would be the editor editing the reader's view of their own file.
+        let source = """
+            | Name | Qty |
+            |---|---|
+            | Apple | 3 |
+            """
+        let view = try table(source)
+        view.mode = .source
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        let range = (source as NSString).range(of: "Qty")
+        XCTAssertNil(
+            view.textStorage?.attribute(.kern, at: range.location - 1, effectiveRange: nil),
+            "source mode must strip the column padding live preview added")
+    }
+
+    func testATablePaintsAGridBehindItsRows() throws {
+        let plain = try render("Name Qty\nApple 3\n")
+        let gridded = try render("| Name | Qty |\n|---|---|\n| Apple | 3 |\n")
+        XCTAssertGreaterThan(
+            inkedPixels(gridded), inkedPixels(plain),
+            "a table should paint a header fill and a border, not only its words")
+    }
 }

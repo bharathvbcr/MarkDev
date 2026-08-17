@@ -56,6 +56,23 @@ public enum BlockKind: UInt16, Sendable, CaseIterable {
     case definitionListDefinition = 19
 }
 
+/// How a table column's cells sit in their column.
+///
+/// Mirrors `TableAlignment` in `core/src/md/model.rs`, packed into a
+/// `tableCell` block's `data` alongside the column index.
+public enum TableAlignment: UInt32, Sendable, CaseIterable {
+    /// No `:` in the delimiter row. Lays out left, but stays distinct from an
+    /// explicit `:---` so the source can be round-tripped unchanged.
+    case auto = 0
+    case left = 1
+    case center = 2
+    case right = 3
+
+    /// Bits of a cell's `data` given over to alignment.
+    static let bits: UInt32 = 2
+    static let mask: UInt32 = (1 << bits) - 1
+}
+
 /// GFM alert flavour, carried in a callout block's `data`.
 public enum CalloutKind: UInt32, Sendable, CaseIterable {
     case note = 0
@@ -123,5 +140,25 @@ public struct BlockDescriptor: Sendable, Equatable {
     /// The heading level 1–6, for ``BlockKind/heading`` blocks.
     public var headingLevel: Int? {
         kind == .heading ? Int(data) : nil
+    }
+
+    /// The column this cell occupies, for ``BlockKind/tableCell`` blocks.
+    ///
+    /// Rows are squared off by the parser — surplus cells dropped, short rows
+    /// padded — so this indexes the table's columns directly and never runs
+    /// past the header.
+    public var tableColumn: Int? {
+        kind == .tableCell ? Int(data >> TableAlignment.bits) : nil
+    }
+
+    /// How this cell sits in its column, for ``BlockKind/tableCell`` blocks.
+    public var tableAlignment: TableAlignment? {
+        guard kind == .tableCell else { return nil }
+        return TableAlignment(rawValue: data & TableAlignment.mask)
+    }
+
+    /// The number of columns, for ``BlockKind/table`` blocks.
+    public var tableColumnCount: Int? {
+        kind == .table ? Int(data) : nil
     }
 }

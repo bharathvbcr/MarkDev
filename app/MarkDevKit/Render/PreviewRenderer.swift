@@ -31,6 +31,16 @@ public enum PreviewRenderer {
             headingScale: [2.0, 1.6, 1.35, 1.2, 1.1, 1.0]
         )
 
+        /// Typography for the hover peek.
+        ///
+        /// Smaller, and with a flatter heading scale: a popover is a glance,
+        /// and a display-sized H1 in one eats the excerpt it came to show.
+        public static let peek = Theme(
+            bodySize: 12,
+            codeSize: 11,
+            headingScale: [1.3, 1.2, 1.1, 1.05, 1.0, 1.0]
+        )
+
         public init(bodySize: CGFloat, codeSize: CGFloat, headingScale: [CGFloat]) {
             self.bodySize = bodySize
             self.codeSize = codeSize
@@ -68,7 +78,48 @@ public enum PreviewRenderer {
             apply(span: span, to: result, range: mapped, theme: theme)
         }
 
+        substituteDroppedSyntax(parsed, in: result, hidden: hidden, theme: theme)
         return result
+    }
+
+    /// Puts a printable stand-in where syntax that carries meaning was
+    /// stripped.
+    ///
+    /// This path *deletes* hidden runs rather than drawing over them, which is
+    /// what makes it cheap enough for Quick Look. But a `- [x]` and a `---`
+    /// are entirely syntax: delete them and a checklist becomes an unmarked
+    /// list, and a section break becomes a blank line. The editor solves this
+    /// by drawing a checkbox and a rule; with nothing to draw on, the only
+    /// honest answer is a character that says the same thing.
+    ///
+    /// Applied back to front, so each insertion leaves the offsets of the ones
+    /// still to come untouched.
+    private static func substituteDroppedSyntax(
+        _ parsed: ParsedDocument,
+        in string: NSMutableAttributedString,
+        hidden: HiddenRanges,
+        theme: Theme
+    ) {
+        var replacements: [(offset: Int, text: String)] = []
+        for span in parsed.spans where span.kind == .taskMarker {
+            let at = min(hidden.visibleOffset(forSource: span.range.location), string.length)
+            replacements.append((at, span.data != 0 ? "☑\u{00A0}" : "☐\u{00A0}"))
+        }
+        for block in parsed.blocks where block.kind == .rule {
+            let at = min(hidden.visibleOffset(forSource: block.range.location), string.length)
+            replacements.append((at, "───────"))
+        }
+
+        for replacement in replacements.sorted(by: { $0.offset > $1.offset }) {
+            string.insert(
+                NSAttributedString(
+                    string: replacement.text,
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: theme.bodySize),
+                        .foregroundColor: NSColor.secondaryLabelColor,
+                    ]),
+                at: replacement.offset)
+        }
     }
 
     /// Convenience for callers that have not parsed yet.
