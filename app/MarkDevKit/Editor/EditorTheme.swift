@@ -135,6 +135,16 @@ public struct EditorTheme {
         }
     }
 
+    /// Leading between the lines of a code block.
+    ///
+    /// Tighter than prose, and derived rather than stored for the same reason
+    /// the surfaces below are: it is not an independent decision but "prose
+    /// leading, closed up". A listing is read as one object, and giving it
+    /// body leading makes a five-line fence as tall as a paragraph.
+    public var codeLineSpacing: CGFloat {
+        (lineSpacing * 0.4).rounded()
+    }
+
     /// Hairline around a code panel, so it reads as a card rather than a
     /// stretch of tinted paragraph.
     public var codeBorder: NSColor {

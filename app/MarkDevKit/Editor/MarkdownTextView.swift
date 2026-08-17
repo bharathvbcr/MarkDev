@@ -61,7 +61,19 @@ public final class MarkdownTextView: ScrollingTextView {
 
     /// The most recent parse. Read-only to callers; the outline, backlinks
     /// panel, and inspector all read from here rather than reparsing.
-    public private(set) var parsed: ParsedDocument = .empty
+    public private(set) var parsed: ParsedDocument = .empty {
+        didSet { listItems = parsed.blocks.filter { $0.kind == .listItem } }
+    }
+
+    /// The parse's list items, in document order.
+    ///
+    /// Kept because the layout delegate asks "does an item start on this line"
+    /// once per fragment, and TextKit builds a fragment per line: scanning
+    /// every block to answer it is the quadratic this codebase has already
+    /// paid for three times over — see the marker and span indices in
+    /// ``MarkdownStyler``. Blocks arrive in open order, so this is sorted by
+    /// start offset and can be searched.
+    private var listItems: [BlockDescriptor] = []
 
     /// Called after every reparse, for observers such as the outline view.
     public var onParse: ((ParsedDocument) -> Void)?
@@ -522,6 +534,25 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Recomputes the reveal set, restyling only the blocks whose visibility
     /// actually flipped.
     private func updateRevealIfNeeded() {
+        // Never from a parse older than the text. AppKit moves the caret in
+        // the middle of an edit — the storage already holds the new
+        // characters while `parsed` still describes the old ones — and a
+        // restyle here would clear text this parse cannot account for and
+        // then style it from the wrong blocks. Nothing is lost by waiting:
+        // the reparse recomputes the reveal set itself, and folds the blocks
+        // whose syntax appeared or disappeared into its own scope.
+        //
+        // The symptom was a code block that had just swallowed the line after
+        // it: the stale pass reset that line to body text, and the scoped
+        // pass that followed had no reason to visit it again.
+        //
+        // The test is `unparsedChange`, not `hasSettledAfterTextChanges`:
+        // announced typing clears the pending change in `didChangeText` while
+        // the catch-up it scheduled is still on its way, and that catch-up
+        // finds nothing to do. Waiting for it as well would drop this reveal
+        // change on the floor.
+        guard unparsedChange == nil else { return }
+
         let next = RevealPolicy.revealedBlocks(
             in: parsed, selection: selectedRange(), mode: mode)
         guard next != revealedBlocks else { return }
@@ -972,11 +1003,107 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         fragment.decoration = BlockDecoration.decoration(
             for: range, in: parsed, text: textStorage?.string as NSString?)
         resolveRenderedContent(for: fragment)
+        resolveCollapsedSyntax(for: fragment, at: range)
         return fragment
     }
 }
 
 extension MarkdownTextView {
+    /// Works out what has to be drawn in place of the syntax this fragment
+    /// hides — a fence's language, an alert's flavour, a list item's bullet.
+    ///
+    /// Resolved here rather than in ``BlockDecoration``, because it is not a
+    /// question about the parse: it asks what is *collapsed right now*, which
+    /// changes with the caret. While the caret is in the block its ```` ``` ````
+    /// and its `- ` are on screen already, and drawing a stand-in beside them
+    /// would state the same thing twice.
+    func resolveCollapsedSyntax(for fragment: MarkdownLayoutFragment, at range: NSRange) {
+        guard let text = textStorage?.string as NSString? else { return }
+        let opensWithHiddenLine = hiddenRanges.hidesWholeLine(at: range.location, in: text)
+
+        switch fragment.decoration {
+        case .code(let edge, let language):
+            if edge.roundsTop, opensWithHiddenLine, let language, !language.isEmpty {
+                fragment.blockLabel = language.uppercased()
+            }
+        case .callout(let kind, let edge):
+            if edge.roundsTop, opensWithHiddenLine {
+                fragment.blockLabel = kind.title
+            }
+        case .task:
+            // The checkbox is the stand-in; a bullet beside it would be a
+            // second marker for one item.
+            break
+        default:
+            fragment.listMarker = listMarker(forFragmentAt: range, in: text)
+        }
+    }
+
+    /// The bullet or number for a list item opening at this fragment.
+    ///
+    /// `nil` unless the fragment holds the item's *first* line and that line's
+    /// marker is collapsed: a wrapped item's later lines carry no marker, and
+    /// a revealed item is showing its own `- ` already.
+    private func listMarker(forFragmentAt range: NSRange, in text: NSString) -> String? {
+        guard let item = listItem(startingIn: range) else { return nil }
+
+        // The marker as written, so `7.` stays 7 and `*` still nests like `-`.
+        let line = text.lineRange(for: NSRange(location: item.range.location, length: 0))
+        let content = HiddenRanges.contentRange(of: line, in: text)
+        let source = text.substring(with: content)
+        guard let written = Self.writtenListMarker(in: source) else { return nil }
+
+        // Leading indentation is spaces and tabs, so its character count is
+        // also its length in the UTF-16 units storage is indexed by.
+        let indent = source.prefix { $0 == " " || $0 == "\t" }.count
+        let marker = NSRange(
+            location: content.location + indent, length: (written as NSString).length)
+        guard hiddenRanges.covers(marker) else { return nil }
+
+        if written.first?.isNumber == true { return written }
+        // Nesting alternates list, item, so each level of indentation is two
+        // blocks deep. The glyph changes with it, the way a printed list does.
+        return Self.bullets[Int(item.depth) / 2 % Self.bullets.count]
+    }
+
+    /// The first list item beginning inside `range`, found by binary search.
+    ///
+    /// Items nest, so two can begin at the same offset — `- - a` opens an
+    /// outer item and an inner one on one line. The outer one is taken,
+    /// because the marker read off that line is the outer one's.
+    private func listItem(startingIn range: NSRange) -> BlockDescriptor? {
+        var low = 0
+        var high = listItems.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if listItems[mid].range.location < range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        guard low < listItems.count,
+            listItems[low].range.location < NSMaxRange(range)
+        else { return nil }
+        return listItems[low]
+    }
+
+    /// Bullets by nesting level, filled then hollow then square — the
+    /// convention a reader already knows from print and from HTML.
+    private static let bullets = ["•", "◦", "▪"]
+
+    /// The literal marker at the head of a list item's line, if there is one.
+    private static func writtenListMarker(in line: String) -> String? {
+        let body = line.drop { $0 == " " || $0 == "\t" }
+        guard let first = body.first else { return nil }
+        if first == "-" || first == "*" || first == "+" { return String(first) }
+        guard first.isNumber else { return nil }
+        let digits = body.prefix { $0.isNumber }
+        let rest = body.dropFirst(digits.count)
+        guard let delimiter = rest.first, delimiter == "." || delimiter == ")" else { return nil }
+        return String(digits) + String(delimiter)
+    }
+
     /// Renders a fragment's replacement content, if it has any.
     ///
     /// Done here, on the main actor, rather than inside the fragment:

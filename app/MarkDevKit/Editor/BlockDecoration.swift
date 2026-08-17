@@ -23,6 +23,22 @@ public enum BlockEdge: Sendable, Equatable {
     public var roundsBottom: Bool { self == .only || self == .last }
 }
 
+extension CalloutKind {
+    /// The alert's name, drawn where its `[!NOTE]` line was collapsed.
+    ///
+    /// Without it the flavour survives only as a tint, and "is this a warning
+    /// or a caution" becomes a question about two shades of orange-red.
+    public var title: String {
+        switch self {
+        case .note: "NOTE"
+        case .tip: "TIP"
+        case .important: "IMPORTANT"
+        case .warning: "WARNING"
+        case .caution: "CAUTION"
+        }
+    }
+}
+
 /// Content drawn *in place of* a block's source text.
 public struct RenderedBlock: Sendable, Equatable {
     public enum Kind: Sendable, Equatable {

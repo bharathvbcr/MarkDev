@@ -7,6 +7,19 @@
 
 import AppKit
 
+extension NSAttributedString.Key {
+    /// Marks a run of inline code so the layout fragment can draw a pill
+    /// behind it.
+    ///
+    /// A private key rather than `.backgroundColor` because the two are not
+    /// the same shape: AppKit's background fills the line's full height, edge
+    /// to edge, which reads as a slab rather than as a code span — and in a
+    /// heading it collides with the lines around it. Everything the styler
+    /// knows is still expressed as an attribute, so the drawing layer stays a
+    /// pure function of text storage.
+    public static let inlineCodeRun = NSAttributedString.Key("dev.markdev.inlineCode")
+}
+
 /// Turns a ``ParsedDocument`` into text attributes.
 ///
 /// # Why markers shrink instead of disappearing
@@ -56,7 +69,14 @@ public enum MarkdownStyler {
     ) {
         let full = NSRange(location: 0, length: storage.length)
         guard full.length > 0 else { return }
-        let target = clamp(scope ?? full, to: full)
+        // Grown to whole lines. Paragraph attributes are a property of a line
+        // — TextKit lays one out with the style of its first character — so a
+        // scope ending mid-line would leave that line's style decided by
+        // whichever half the edit happened to reach. Line-aligning it here
+        // also means every pass below can treat "touches the scope" and "is
+        // wholly inside it" as the same question about a line.
+        let target = wholeLines(
+            clamp(scope ?? full, to: full), in: storage.string as NSString, limit: full)
         guard target.length > 0 else { return }
 
         storage.beginEditing()
@@ -66,12 +86,15 @@ public enum MarkdownStyler {
         applyBlocks(
             document.blocks, document: document, to: storage, limit: full, scope: target,
             theme: theme)
+        applyBlockSpacing(document.blocks, to: storage, limit: full, scope: target, theme: theme)
         applySpans(document.spans, to: storage, limit: full, scope: target, theme: theme)
         applyLinkTargets(document, to: storage, limit: full, scope: target)
         // Marker styling must win over the span attributes it overlaps, or a
         // heading's `# ` would be re-inflated to heading size.
         applyMarkers(
             document, hidden: hidden, to: storage, limit: full, scope: target, theme: theme)
+        // After the markers, because it asks what they left visible.
+        collapseFullyHiddenLines(hidden: hidden, in: storage, limit: full, scope: target)
         // Truly last. It measures text the other passes have styled, and its
         // padding rides on characters that `applyMarkers` also touches — that
         // pass zeroes kerning on every collapsed marker, which silently wiped
@@ -85,9 +108,14 @@ public enum MarkdownStyler {
     private static func applyBase(
         to storage: NSTextStorage, range: NSRange, theme: EditorTheme
     ) {
+        // No paragraph spacing here: `NSParagraphStyle` ends a paragraph at
+        // every newline, and a Markdown paragraph is routinely hard-wrapped
+        // across several of them. Spacing set here opens a 12pt gap in the
+        // middle of one sentence, so a wrapped README reads as double-spaced.
+        // ``applyBlockSpacing`` puts it back where it belongs — the last line
+        // of each block.
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = theme.lineSpacing
-        paragraph.paragraphSpacing = theme.paragraphSpacing
 
         // Clearing first means a construct that was deleted cannot leave its
         // styling behind on the text that replaced it.
@@ -156,27 +184,64 @@ public enum MarkdownStyler {
         // block or two, and one holding no list items should not pay to walk
         // the document's spans at all.
         var taskMarkers: [NSRange]?
+        let text = storage.string as NSString
 
         for block in blocks {
+            // Paragraph attributes are decided per *line*: TextKit lays a line
+            // out with the style of its first character. A nested list item's
+            // parsed range begins after the spaces that indent it, so applying
+            // its indent to that range alone left the line reading the style
+            // of the item it is nested in — every nested list came out one
+            // level short.
+            //
+            // A block therefore counts as in scope when any of *its lines* is,
+            // not merely when its own range is: an item that begins two spaces
+            // into a line the scope starts at would otherwise sit out the
+            // pass, leaving the enclosing quote's indent on a line the item
+            // owns. Writes are still clipped to the scope, and the scope is
+            // whole lines, so every line inside it ends up styled by exactly
+            // the blocks a full pass would have used, in the same order.
+            let lines = NSIntersectionRange(
+                lineAligned(clamp(block.range, to: limit), in: text, limit: limit), scope)
+            guard lines.length > 0 else { continue }
             let range = NSIntersectionRange(clamp(block.range, to: limit), scope)
-            guard range.length > 0 else { continue }
 
             switch block.kind {
             case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter:
-                storage.addAttributes(
-                    [.font: theme.monoFont, .backgroundColor: theme.codeBackground],
-                    range: range
-                )
+                // No `.backgroundColor`: the panel is drawn by
+                // ``MarkdownLayoutFragment``, which reaches the text
+                // container's edge. A character background stops where each
+                // line's text does, so painting both stacks a second, ragged
+                // tint on top of the panel — one darker box per line, ending
+                // mid-air.
+                let paragraph = NSMutableParagraphStyle()
+                // Code sits tighter than prose: a listing is read as a block,
+                // and body leading between its lines makes a five-line fence
+                // as tall as a paragraph.
+                paragraph.lineSpacing = theme.codeLineSpacing
+                paragraph.firstLineHeadIndent = MarkdownLayoutFragment.Metrics.panelInset
+                paragraph.headIndent = MarkdownLayoutFragment.Metrics.panelInset
+                // Negative: measured in from the trailing margin, so a long
+                // line wraps inside the panel rather than against its edge.
+                paragraph.tailIndent = -MarkdownLayoutFragment.Metrics.panelInset
+                storage.addAttribute(.font, value: theme.monoFont, range: range)
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
+            case .tableRow, .tableHead:
+                // The same inset a code panel gives its text: a row's shading
+                // reaches the container's edge, so without it the first
+                // column's letters sit on the panel's border.
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineSpacing = theme.lineSpacing
+                paragraph.firstLineHeadIndent = MarkdownLayoutFragment.Metrics.panelInset
+                paragraph.headIndent = MarkdownLayoutFragment.Metrics.panelInset
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
             case .blockQuote, .callout:
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.lineSpacing = theme.lineSpacing
-                paragraph.paragraphSpacing = theme.paragraphSpacing
                 paragraph.firstLineHeadIndent = 16
                 paragraph.headIndent = 16
-                storage.addAttributes(
-                    [.foregroundColor: theme.quoteColor, .paragraphStyle: paragraph],
-                    range: range
-                )
+                storage.addAttribute(.foregroundColor, value: theme.quoteColor, range: range)
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
             case .listItem:
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.lineSpacing = theme.lineSpacing
@@ -196,11 +261,178 @@ public enum MarkdownStyler {
                 }
                 paragraph.firstLineHeadIndent = indent
                 paragraph.headIndent = indent
-                storage.addAttribute(.paragraphStyle, value: paragraph, range: range)
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
             default:
                 break
             }
         }
+    }
+
+    /// Puts paragraph spacing on the last line of each top-level block.
+    ///
+    /// Spacing belongs to a *block*, not to a line. Markdown paragraphs are
+    /// routinely hard-wrapped, and `NSParagraphStyle` treats every newline as
+    /// the end of a paragraph — so spacing applied in the base pass opens the
+    /// gap inside a sentence and makes ordinary prose read as double-spaced.
+    ///
+    /// Top-level blocks only: a list item's spacing is the list's business,
+    /// and paying it per item turns a tight list into a spaced one.
+    @MainActor
+    private static func applyBlockSpacing(
+        _ blocks: [BlockDescriptor],
+        to storage: NSTextStorage,
+        limit: NSRange,
+        scope: NSRange,
+        theme: EditorTheme
+    ) {
+        guard theme.paragraphSpacing > 0 else { return }
+        let text = storage.string as NSString
+
+        for block in topLevel(blocks) {
+            // Cheapest test first: a block the scope cannot reach is skipped
+            // before it costs a line lookup. This pass walks every block in
+            // the document, and it runs on the keystroke path.
+            guard NSIntersectionRange(clamp(block.range, to: limit), scope).length > 0
+            else { continue }
+            // A block that paints a panel already carries its own padding,
+            // and spacing on its last line would be drawn *inside* the panel:
+            // the fragment's frame is what the background covers, and the gap
+            // is part of that frame. Its separation is the panel's margins.
+            guard !drawsPanel(block.kind) else { continue }
+            let clamped = clamp(block.range, to: limit)
+            // Nothing to add where the document already leaves a blank line —
+            // that line is real, the reader typed it and can put the caret in
+            // it, and spacing on top of it is the same gap counted twice.
+            guard !isFollowedByBlankLine(clamped, in: text) else { continue }
+            // The block's last line, whole: a line is laid out with the style
+            // of its first character, so spacing written onto the final
+            // character alone would simply not be read.
+            // The block's last line, whole: a line is laid out with the style
+            // of its first character, so spacing written onto the final
+            // character alone would simply not be read. The scope covers whole
+            // lines, so a line it touches at all is a line it holds entirely.
+            let last = clamp(
+                text.lineRange(for: NSRange(location: NSMaxRange(clamped) - 1, length: 0)),
+                to: limit)
+            let range = NSIntersectionRange(last, scope)
+            guard range.length == last.length else { continue }
+
+            // Extends whatever that line already carries — a list's spacing
+            // has to keep the list's indent, or the last item jumps left.
+            let base = storage.attribute(.paragraphStyle, at: range.location, effectiveRange: nil)
+                as? NSParagraphStyle
+            let paragraph = (base?.mutableCopy() as? NSMutableParagraphStyle)
+                ?? NSMutableParagraphStyle()
+            paragraph.paragraphSpacing = theme.paragraphSpacing
+            storage.addAttribute(.paragraphStyle, value: paragraph, range: range)
+        }
+    }
+
+    /// `range` grown outwards to whole lines, plus the line after it.
+    ///
+    /// Used for the pass's scope, where both ends have to move: a line that is
+    /// half in scope is a line whose style depends on where an edit happened
+    /// to stop.
+    ///
+    /// The extra line at each end is not slack — a line's style depends on its
+    /// neighbours in both directions:
+    ///
+    /// - **Forwards.** An edit that inserts a newline pushes the characters
+    ///   after it onto the *following* line, and a line's style is decided by
+    ///   its first character, so that pushed character arrives wearing the
+    ///   style of the line it used to end. It is how a blank line after a
+    ///   fence kept the code block's indent.
+    /// - **Backwards.** A block's spacing is written on its last line and
+    ///   decided by whether a blank line follows it, so typing on a line
+    ///   changes the gap belonging to the line before it.
+    ///
+    /// Two lines is a fixed cost; the alternative is a stale line at whichever
+    /// end of the scope the edit happened to land on.
+    private static func wholeLines(
+        _ range: NSRange, in text: NSString, limit: NSRange
+    ) -> NSRange {
+        guard range.length > 0, NSMaxRange(range) <= text.length else { return range }
+        var start = text.lineRange(for: NSRange(location: range.location, length: 0)).location
+        if start > 0 {
+            start = text.lineRange(for: NSRange(location: start - 1, length: 0)).location
+        }
+        var end = NSMaxRange(
+            text.lineRange(for: NSRange(location: NSMaxRange(range) - 1, length: 0)))
+        if end < text.length {
+            end = NSMaxRange(text.lineRange(for: NSRange(location: end, length: 0)))
+        }
+        return clamp(NSRange(location: start, length: end - start), to: limit)
+    }
+
+    /// `range` grown back to the head of the line it starts on, held inside
+    /// the document.
+    ///
+    /// Only the *start* moves. TextKit reads a line's style from its first
+    /// character, so reaching back to the line's head is what makes the style
+    /// count; reaching forward would hand the block's style to the line that
+    /// follows it, which is another block's — or nobody's.
+    ///
+    /// **Held inside the document, not inside the scope.** This is the second
+    /// deliberate exception to "a scoped pass writes only inside its scope",
+    /// alongside `alignTableColumns`, and it is bounded to the head of one
+    /// line. Clipping it instead leaves that line's *first* character wearing
+    /// the previous parse's style while the rest of the line gets the new one
+    /// — and since the first character is the one TextKit lays the line out
+    /// from, the stale half wins: a list item nested in a quote kept the
+    /// quote's indent. The value written is the current parse's answer for a
+    /// line the block owns, so writing it over the whole line is what a full
+    /// restyle would have done anyway.
+    private static func lineAligned(
+        _ range: NSRange, in text: NSString, limit: NSRange
+    ) -> NSRange {
+        guard range.length > 0, NSMaxRange(range) <= text.length else { return range }
+        let first = text.lineRange(for: NSRange(location: range.location, length: 0))
+        return clamp(
+            NSRange(location: first.location, length: NSMaxRange(range) - first.location),
+            to: limit)
+    }
+
+    /// Whether a block is drawn on a background of its own.
+    private static func drawsPanel(_ kind: BlockKind) -> Bool {
+        switch kind {
+        case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter, .callout, .blockQuote, .table:
+            true
+        default:
+            false
+        }
+    }
+
+    /// Whether the line after `range`'s last line is empty.
+    ///
+    /// A block's parsed range sometimes takes in the blank line that follows
+    /// it and sometimes stops at its own text, so this asks about the line
+    /// after the block's *last* one either way.
+    private static func isFollowedByBlankLine(_ range: NSRange, in text: NSString) -> Bool {
+        guard range.length > 0, NSMaxRange(range) <= text.length else { return false }
+        let last = text.lineRange(for: NSRange(location: NSMaxRange(range) - 1, length: 0))
+        // The block's own last line is already blank when its range swallowed
+        // the separator.
+        if HiddenRanges.contentRange(of: last, in: text).length == 0 { return true }
+        guard NSMaxRange(last) < text.length else { return false }
+        let next = text.lineRange(for: NSRange(location: NSMaxRange(last), length: 0))
+        return HiddenRanges.contentRange(of: next, in: text).length == 0
+    }
+
+    /// The blocks no other block contains, in document order.
+    ///
+    /// A linear sweep rather than a containment test per pair: blocks arrive
+    /// sorted by start offset with parents before their children, so a block
+    /// starting at or after the current top-level block's end is the next
+    /// top-level one.
+    private static func topLevel(_ blocks: [BlockDescriptor]) -> [BlockDescriptor] {
+        var result: [BlockDescriptor] = []
+        var end = Int.min
+        for block in blocks where block.range.length > 0 {
+            guard block.range.location >= end else { continue }
+            result.append(block)
+            end = NSMaxRange(block.range)
+        }
+        return result
     }
 
     @MainActor
@@ -227,11 +459,16 @@ public enum MarkdownStyler {
                 storage.addAttribute(
                     .strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
             case .inlineCode:
+                // Marked, not tinted. `.backgroundColor` paints a rectangle
+                // the full height of the *line*, so a code word in a heading
+                // gets a slab that touches the line above it and the one
+                // below. ``MarkdownLayoutFragment`` draws a pill around the
+                // run instead, sized to the type rather than to the leading.
                 storage.addAttributes(
                     [
                         .font: theme.monoFont,
                         .foregroundColor: theme.codeColor,
-                        .backgroundColor: theme.codeBackground,
+                        .inlineCodeRun: true,
                     ],
                     range: range
                 )
@@ -333,6 +570,75 @@ public enum MarkdownStyler {
                 range: clamped
             )
         }
+    }
+
+    /// Takes the height back off lines that are nothing but hidden syntax.
+    ///
+    /// Collapsing a marker shrinks its *characters*; the line they sat on is
+    /// still a line, and it still carries the newline that ends it at full
+    /// size. A fenced block's ```` ``` ```` lines are exactly that — once
+    /// hidden, each leaves a blank the height of a line of code at the top and
+    /// bottom of the panel, and a GFM alert leaves one where its `[!NOTE]`
+    /// used to be. The characters stay in storage, as every collapsed marker
+    /// does; only their metrics go.
+    ///
+    /// Whole lines only, and only lines that lie entirely inside the scope: a
+    /// half-collapsed line would be a line whose height depended on where an
+    /// edit happened to reach.
+    @MainActor
+    private static func collapseFullyHiddenLines(
+        hidden: HiddenRanges,
+        in storage: NSTextStorage,
+        limit: NSRange,
+        scope: NSRange
+    ) {
+        guard !hidden.ranges.isEmpty else { return }
+        let text = storage.string as NSString
+        let font = NSFont.systemFont(ofSize: EditorTheme.hiddenMarkerFontSize)
+
+        var previousLine = NSRange(location: NSNotFound, length: 0)
+        for range in hidden.ranges {
+            let clamped = NSIntersectionRange(clamp(range, to: limit), scope)
+            guard clamped.length > 0 else { continue }
+
+            // Every line the run touches, not only the one it starts on: a
+            // closing fence's marker begins on the *previous* line's newline,
+            // so keying off its start alone left every closing ``` holding a
+            // line's worth of blank at the foot of the panel.
+            var cursor = clamped.location
+            while cursor < NSMaxRange(clamped) {
+                let line = text.lineRange(for: NSRange(location: cursor, length: 0))
+                cursor = max(NSMaxRange(line), cursor + 1)
+                guard !NSEqualRanges(line, previousLine) else { continue }
+                previousLine = line
+                // Whole lines only — a half-collapsed line would be a line
+                // whose height depended on where an edit happened to reach.
+                // Scope decides *whether* to look, never how much to write.
+                guard NSIntersectionRange(line, scope).length > 0 else { continue }
+
+                // The same question the editor asks before drawing a label in
+                // the line's place, asked in the one place that answers it.
+                guard hidden.hidesWholeLine(at: line.location, in: text) else { continue }
+                collapse(line: line, in: storage, font: font)
+            }
+        }
+    }
+
+    /// Takes the leading off one line, keeping the gap that follows its block.
+    @MainActor
+    private static func collapse(line: NSRange, in storage: NSTextStorage, font: NSFont) {
+        storage.addAttributes(
+            [.font: font, .foregroundColor: NSColor.clear, .kern: 0], range: line)
+
+        // The leading goes; the spacing *after* the block does not. A fenced
+        // block ends on a line that is pure syntax, so dropping everything
+        // here would take the gap between the panel and the paragraph below
+        // it as well.
+        let existing = storage.attribute(
+            .paragraphStyle, at: line.location, effectiveRange: nil) as? NSParagraphStyle
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.paragraphSpacing = existing?.paragraphSpacing ?? 0
+        storage.addAttribute(.paragraphStyle, value: paragraph, range: line)
     }
 
     // MARK: - Helpers

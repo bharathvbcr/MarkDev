@@ -134,6 +134,34 @@ public struct HiddenRanges: Sendable, Equatable {
             && range.location + range.length <= run.location + run.length
     }
 
+    /// Whether the line holding `offset` is nothing but hidden syntax.
+    ///
+    /// The newline that ends the line does not count: it is never part of a
+    /// marker, and a line whose every visible character is collapsed is
+    /// already a line with nothing to show.
+    ///
+    /// Shared by the two halves of one decision — the styler takes the height
+    /// off such a line, and the editor draws a label in its place — so that
+    /// "there is nothing here to see" and "something must stand in for it"
+    /// can never disagree.
+    public func hidesWholeLine(at offset: Int, in text: NSString) -> Bool {
+        guard offset >= 0, offset <= text.length else { return false }
+        let line = text.lineRange(for: NSRange(location: min(offset, max(text.length - 1, 0)), length: 0))
+        let body = HiddenRanges.contentRange(of: line, in: text)
+        return body.length > 0 && covers(body)
+    }
+
+    /// A line's text, without the newline that ends it.
+    static func contentRange(of line: NSRange, in text: NSString) -> NSRange {
+        var end = NSMaxRange(line)
+        while end > line.location {
+            let character = text.character(at: end - 1)
+            guard character == 0x0A || character == 0x0D else { break }
+            end -= 1
+        }
+        return NSRange(location: line.location, length: end - line.location)
+    }
+
     /// Moves `offset` out of any hidden run, in the given direction.
     ///
     /// This is what arrow keys and click-positioning use so a hidden marker
