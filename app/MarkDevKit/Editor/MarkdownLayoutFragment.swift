@@ -20,6 +20,10 @@ struct BlockDecorationPalette: Sendable {
     let quoteColor: CGColor
     let secondaryColor: CGColor
     let labelFont: CTFont
+    /// Font for the explanation shown where content could not be rendered.
+    /// Larger than ``labelFont``: this is a sentence the reader has to read and
+    /// act on, not a word naming a block.
+    let failureFont: CTFont
     /// Font for a drawn list bullet or number. Sized from the body font, so a
     /// bullet keeps its place beside the text at any type size.
     let listMarkerFont: CTFont
@@ -42,6 +46,8 @@ struct BlockDecorationPalette: Sendable {
         secondaryColor = theme.secondaryColor.cgColor
         labelFont = CTFontCreateUIFontForLanguage(.smallSystem, 9, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, 9, nil)
+        failureFont = CTFontCreateUIFontForLanguage(.smallSystem, 11, nil)
+            ?? CTFontCreateWithName("Helvetica" as CFString, 11, nil)
         listMarkerFont = CTFontCreateUIFontForLanguage(
             .system, theme.bodyFont.pointSize * 0.85, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, theme.bodyFont.pointSize * 0.85, nil)
@@ -677,18 +683,50 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         CTLineDraw(line, context)
     }
 
+    /// Top of whatever stands in for the block's text, in the space
+    /// `draw(at:in:)` works in.
+    ///
+    /// Below the (collapsed) source, which is why it is measured from
+    /// `super.layoutFragmentFrame` and not from the override: the override has
+    /// already added the content's own height, and measuring from it would put
+    /// the content below the room reserved for it.
+    private var contentTop: CGFloat {
+        super.layoutFragmentFrame.height + Metrics.blockPadding
+    }
+
+    /// Where the formula, diagram, or picture is drawn, in fragment-local
+    /// coordinates.
+    ///
+    /// Exposed for the same reason ``decorationRect`` and ``inlineCodeRects``
+    /// are: where this lands, and which way up it is, is the whole of two bugs
+    /// this has had — and asserting geometry beats inferring it from a
+    /// screenshot.
+    var renderedContentRect: CGRect? {
+        guard let rendered = renderedContent, rendered.cgImage != nil else { return nil }
+        return CGRect(
+            x: Metrics.blockPadding, y: contentTop,
+            width: rendered.size.width, height: rendered.size.height)
+    }
+
     /// Draws a formula, diagram, or image where the source text would be.
     private func drawRenderedContent(in context: CGContext, at point: CGPoint) {
-        let top = point.y + super.layoutFragmentFrame.height + Metrics.blockPadding
-
-        if let rendered = renderedContent, let image = rendered.cgImage {
-            let rect = CGRect(
-                x: point.x + Metrics.blockPadding, y: top,
-                width: rendered.size.width, height: rendered.size.height)
+        if let rendered = renderedContent, let image = rendered.cgImage,
+            let local = renderedContentRect
+        {
+            let rect = local.offsetBy(dx: point.x, dy: point.y)
             context.saveGState()
             defer { context.restoreGState() }
-            // Flip: the text context has its origin at the top, CGImage does
-            // not, so an unflipped draw renders the diagram upside down.
+            // The text context is flipped — `NSTextView` is a flipped view — and
+            // `CGContext.draw` puts an image's first row at the *bottom* of the
+            // rect in the current space. Reflecting about the rect's own middle
+            // therefore leaves the rect where it is and turns the picture the
+            // right way up.
+            //
+            // Correct for every image because `RenderedContent` normalises them
+            // to one orientation. It did not, and a Mermaid diagram was drawn
+            // bottom-up next to a formula that was not: the flip happened to
+            // suit a bitmap captured from a flipped AppKit view, which is what
+            // the formula came from and nothing else did.
             context.translateBy(x: 0, y: rect.midY)
             context.scaleBy(x: 1, y: -1)
             context.translateBy(x: 0, y: -rect.midY)
@@ -699,11 +737,31 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         // Never a silent blank: an empty space where a diagram should be is
         // indistinguishable from one the app cannot render.
         if let failure = renderFailure {
-            drawFailure(failure.reason, in: context, at: CGPoint(x: point.x, y: top))
+            drawFailure(
+                failure.reason, in: context, at: CGPoint(x: point.x, y: point.y + contentTop))
+        }
+    }
+
+    /// Names the kind of content that failed, so a library's own error message
+    /// arrives attached to something the reader can act on.
+    ///
+    /// A bare `invalidHeader("…")` says nothing about *which* block of a note
+    /// is wrong, and the source it belongs to is collapsed behind this strip —
+    /// putting the caret in the block is what brings it back.
+    private var failureSubject: String? {
+        switch decoration.rendered?.kind {
+        case .math: "Formula"
+        case .diagram: "Diagram"
+        case .image: "Image"
+        case nil: nil
         }
     }
 
     /// Draws an explanation where content could not be rendered.
+    ///
+    /// Clipped to its own panel: a library error can be long, and Core Text
+    /// draws a line wherever it is told to, straight off the edge of the column
+    /// and over the margin.
     private func drawFailure(_ reason: String, in context: CGContext, at point: CGPoint) {
         guard let palette else { return }
         let rect = CGRect(
@@ -713,16 +771,30 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
 
         context.saveGState()
         defer { context.restoreGState() }
-        context.setFillColor(palette.codeBackground)
         context.addPath(
             CGPath(
                 roundedRect: rect, cornerWidth: Metrics.cornerRadius,
                 cornerHeight: Metrics.cornerRadius, transform: nil))
+        context.setFillColor(palette.codeBackground)
         context.fillPath()
 
+        // The same hairline a code panel carries. A block that did not render
+        // is still a block, and a tinted rectangle with no edge reads as a
+        // rendering artefact rather than as part of the document.
+        let inset = rect.insetBy(dx: 0.5, dy: 0.5)
+        context.addPath(
+            CGPath(
+                roundedRect: inset, cornerWidth: Metrics.cornerRadius,
+                cornerHeight: Metrics.cornerRadius, transform: nil))
+        context.setStrokeColor(palette.codeBorder)
+        context.setLineWidth(1)
+        context.strokePath()
+
+        context.clip(to: rect.insetBy(dx: Metrics.blockPadding / 2, dy: 0))
+        let text = failureSubject.map { "\($0): \(reason)" } ?? reason
         drawLabel(
-            reason, font: palette.labelFont, color: palette.secondaryColor,
-            at: CGPoint(x: rect.minX + Metrics.blockPadding, y: rect.midY - 4), in: context)
+            text, font: palette.failureFont, color: palette.secondaryColor,
+            at: CGPoint(x: rect.minX + Metrics.blockPadding, y: rect.midY - 6), in: context)
     }
 
     /// Draws a checkbox where the `- [ ]` used to be.

@@ -99,15 +99,29 @@ final class BlockDecorationTests: XCTestCase {
 
     // MARK: - Rendered blocks
 
+    /// The decoration for `range` with every renderable block collapsed —
+    /// reading mode, where no caret reveals anything.
     private func decoration(_ source: String, at range: NSRange, withText: Bool) -> BlockDecoration {
-        BlockDecoration.decoration(
-            for: range, in: ParsedDocument.parse(source),
-            text: withText ? (source as NSString) : nil)
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(
+            document: parsed, text: withText ? (source as NSString) : nil)
+        let hidden = HiddenRanges(
+            document: parsed, selection: NSRange(location: 0, length: 0), mode: .reading,
+            rendered: rendered)
+        return BlockDecoration.decoration(
+            for: range, in: parsed, rendered: rendered, hidden: hidden)
+    }
+
+    /// The decoration for a block's *first* line, which is the piece that draws
+    /// the content standing in for the whole block.
+    private func headDecoration(_ source: String, withText: Bool = true) -> BlockDecoration {
+        let firstLine = (source as NSString).lineRange(for: NSRange(location: 0, length: 0))
+        return decoration(source, at: firstLine, withText: withText)
     }
 
     func testAMathBlockBecomesRenderedLatex() {
         let source = "$$\nE = mc^2\n$$"
-        let decoration = decoration(source, at: range(of: "$$", in: source), withText: true)
+        let decoration = headDecoration(source)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected rendered math, got \(decoration)")
         }
@@ -117,7 +131,7 @@ final class BlockDecorationTests: XCTestCase {
 
     func testAMermaidFenceBecomesARenderedDiagram() {
         let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
-        let decoration = decoration(source, at: range(of: "```mermaid", in: source), withText: true)
+        let decoration = headDecoration(source)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected a rendered diagram, got \(decoration)")
         }
@@ -126,32 +140,48 @@ final class BlockDecorationTests: XCTestCase {
         XCTAssertFalse(block.source.contains("```"))
     }
 
-    func testOnlyTheLeadingLineOfARenderedBlockCarriesTheContent() {
-        // TextKit lays out one fragment per line, and each fragment holding
-        // rendered content both draws the whole picture and pays its height.
-        // These two tests used to ask about a line in the *middle* of the
-        // fence, which is exactly the case that must now answer `.none` — a
-        // four-line fence was drawing four stacked copies of one diagram.
-        for source in [
-            "```mermaid\ngraph TD;\n  A --> B;\n```",
-            "$$\nE = mc^2\n$$",
-        ] {
-            let text = source as NSString
-            var rendered: [NSRange] = []
-            var start = 0
-            while start < text.length {
-                let line = text.lineRange(for: NSRange(location: start, length: 0))
-                if decoration(source, at: line, withText: true).rendered != nil {
-                    rendered.append(line)
-                }
-                start = line.location + max(line.length, 1)
+    func testOnlyTheFirstLineOfARenderedBlockDrawsIt() {
+        // TextKit lays out one fragment per line. Every line claiming the
+        // block's content stacked one diagram per line down the page.
+        let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
+        for line in ["graph TD;", "  A --> B;"] {
+            let decoration = decoration(source, at: range(of: line, in: source), withText: true)
+            XCTAssertNil(
+                decoration.rendered,
+                "\(line.debugDescription) must not draw a second copy of the diagram")
+        }
+    }
+
+    func testAVisibleSourceIsDrawnAsCodeRatherThanRendered() {
+        // Source mode, or the caret inside the block: the text is on screen, so
+        // drawing the diagram as well would bury the code under it.
+        let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        let hidden = HiddenRanges(
+            document: parsed, selection: NSRange(location: 0, length: 0), mode: .source,
+            rendered: rendered)
+
+        XCTAssertTrue(hidden.ranges.isEmpty, "source mode collapses nothing")
+        for line in ["```mermaid", "graph TD;", "  A --> B;"] {
+            let decoration = BlockDecoration.decoration(
+                for: range(of: line, in: source), in: parsed, rendered: rendered, hidden: hidden)
+            guard case .code(_, let language) = decoration else {
+                return XCTFail("expected the source drawn as code, got \(decoration)")
             }
-            XCTAssertEqual(
-                rendered.count, 1,
-                "exactly one line of \(source.debugDescription) may carry the content, "
-                    + "got \(rendered.count)")
-            XCTAssertEqual(
-                rendered.first?.location, 0, "it must be the block's first line")
+            XCTAssertEqual(language, "mermaid", "the panel is labelled with the fence's language")
+        }
+    }
+
+    func testAVisibleMathBlockIsDrawnAsCode() {
+        let source = "$$\nE = mc^2\n$$"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        let decoration = BlockDecoration.decoration(
+            for: range(of: "E = mc^2", in: source), in: parsed, rendered: rendered,
+            hidden: .none)
+        guard case .code = decoration else {
+            return XCTFail("expected a code panel around the visible source, got \(decoration)")
         }
     }
 
@@ -170,9 +200,7 @@ final class BlockDecorationTests: XCTestCase {
         // covers. A range starting mid-line is not a fragment and now answers
         // `.none`, because only a block's leading line carries its content.
         let source = "![A diagram](pictures/plan.png)"
-        let decoration = decoration(
-            source, at: NSRange(location: 0, length: (source as NSString).length),
-            withText: true)
+        let decoration = headDecoration(source)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected a rendered image, got \(decoration)")
         }
@@ -181,12 +209,28 @@ final class BlockDecorationTests: XCTestCase {
         XCTAssertEqual(alt, "A diagram", "alt text is shown when the file cannot be loaded")
     }
 
+    func testAVisibleImageParagraphIsPlainProse() {
+        // It used to draw the picture *and* keep the `![…](…)` on screen above
+        // it, which is the same source-and-rendering collision as the fences.
+        let source = "![A diagram](pictures/plan.png)"
+        let parsed = ParsedDocument.parse(source)
+        let decoration = BlockDecoration.decoration(
+            for: NSRange(location: 0, length: (source as NSString).length), in: parsed,
+            rendered: RenderedBlocks(document: parsed, text: source as NSString), hidden: .none)
+        XCTAssertEqual(decoration, .none, "visible image source is prose, not a picture")
+    }
+
     func testAnInlineImageStaysInline() {
         // Swapping an image inside a sentence for a block would break the
         // line it belongs to.
         let source = "See ![icon](i.png) here in a sentence."
         let decoration = decoration(source, at: range(of: "icon", in: source), withText: true)
         XCTAssertNil(decoration.rendered, "an image mid-sentence must not become a block")
+    }
+
+    func testAParagraphWithTwoImagesIsNotAPicture() {
+        let source = "![one](a.png) ![two](b.png)"
+        XCTAssertNil(headDecoration(source).rendered)
     }
 
     func testRenderedBlocksPaintNoPanel() {

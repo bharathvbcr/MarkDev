@@ -64,25 +64,6 @@ public enum RevealPolicy {
         return selection.location < blockEnd && selectionEnd > block.location
     }
 
-    /// Ranges whose *entire* text is replaced by rendered content.
-    ///
-    /// Unlike a marker, the whole block goes: a formula's source is replaced
-    /// by the typeset formula, not merely stripped of its `$$`. These hide
-    /// only while the caret is elsewhere — the source has to come back to be
-    /// edited, which is the same bargain live preview makes everywhere else.
-    public static func blocksRenderedAsContent(
-        in document: ParsedDocument,
-        revealed: Set<Int>
-    ) -> [NSRange] {
-        var ranges: [NSRange] = []
-        for (index, block) in document.blocks.enumerated() {
-            guard block.kind == .mathBlock || block.kind == .mermaidBlock else { continue }
-            guard !revealed.contains(index) else { continue }
-            ranges.append(block.range)
-        }
-        return ranges
-    }
-
     /// Ranges that must stay visible because hiding them would destroy
     /// information no drawn stand-in replaces yet.
     ///
@@ -107,11 +88,18 @@ extension HiddenRanges {
     ///   unfocused editor reveals nothing: syntax appears because the caret is
     ///   somewhere, and with no caret in play showing it makes a note look
     ///   like raw source the moment it opens.
+    /// - Parameter rendered: the blocks drawn as content rather than as their
+    ///   own source, which collapse *whole* rather than marker by marker. The
+    ///   default of ``RenderedBlocks/none`` means nothing is drawn in any
+    ///   block's place, so nothing collapses on that account — a caller who
+    ///   omits it gets every source shown, never a block hidden with nothing
+    ///   standing in for it.
     public init(
         document: ParsedDocument,
         selection: NSRange,
         mode: EditorMode = .livePreview,
-        isEditing: Bool = true
+        isEditing: Bool = true,
+        rendered: RenderedBlocks = .none
     ) {
         guard mode != .source else {
             self.init(merging: [])
@@ -132,7 +120,7 @@ extension HiddenRanges {
         }
 
         // Rendered blocks hide entirely, not just their delimiters.
-        let replaced = RevealPolicy.blocksRenderedAsContent(in: document, revealed: revealed)
+        let replaced = rendered.collapsedRanges(revealed: revealed)
 
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }

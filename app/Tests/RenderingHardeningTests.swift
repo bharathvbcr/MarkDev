@@ -18,6 +18,9 @@
 //  4. Anything drawn outside the text is inside the surface the fragment claims.
 //  5. No rect is empty, infinite, or NaN.
 //  6. Styling is idempotent — a second pass changes nothing.
+//  7. A block drawn as content — a diagram, a formula, a picture — is drawn
+//     exactly once, and only while every character of the source it replaces is
+//     collapsed.
 //
 
 import AppKit
@@ -84,6 +87,30 @@ final class RenderingHardeningTests: XCTestCase {
         ("fence immediately after text", "text\n```swift\nlet x = 1\n```\ntext\n"),
         ("nothing but blank lines", "\n\n\n\n"),
         ("whitespace only line in a fence", "```\n   \n\t\n```\n"),
+        // Blocks drawn as content, in every degenerate shape they come in. Each
+        // of these decides whether a source is collapsed, drawn, or both.
+        ("empty mermaid fence", "```mermaid\n```\n"),
+        ("unclosed mermaid fence", "```mermaid\ngraph TD;\nA-->B;\n"),
+        ("mermaid that cannot render", "```mermaid\nnot a diagram of any kind\n```\n"),
+        ("blank mermaid body", "```mermaid\n\n\n```\n"),
+        ("long mermaid", "```mermaid\ngraph TD;\n"
+            + (0..<40).map { "  N\($0) --> N\($0 + 1);" }.joined(separator: "\n") + "\n```\n"),
+        ("mermaid inside a list", "- item\n\n  ```mermaid\n  graph TD;\n  A-->B;\n  ```\n"),
+        ("mermaid inside a quote", "> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n"),
+        ("two diagrams in a row", "```mermaid\ngraph TD;\nA-->B;\n```\n"
+            + "```mermaid\ngraph LR;\nC-->D;\n```\n"),
+        ("empty math", "$$\n$$\n"),
+        ("invalid math", "$$\n\\frac{\n$$\n"),
+        ("math inside a quote", "> $$\n> x^2\n> $$\n"),
+        ("standalone image", "![A plan](plan.png)\n"),
+        ("image with no alt", "![](plan.png)\n"),
+        ("image with no target", "![alt]()\n"),
+        ("two images in one paragraph", "![one](a.png) ![two](b.png)\n"),
+        ("image in a sentence", "See ![icon](i.png) here.\n"),
+        ("image in a list item", "- ![p](p.png)\n"),
+        ("remote image", "![web](https://example.com/x.png)\n"),
+        ("everything rendered at once", "![p](p.png)\n\n$$\nx^2\n$$\n\n"
+            + "```mermaid\ngraph TD;\nA-->B;\n```\n\ntext\n"),
     ]
 
     // MARK: - The invariants
@@ -110,6 +137,7 @@ final class RenderingHardeningTests: XCTestCase {
         assertNoCharacterTintInCode(view, name: name, file: file, line: line)
         assertCollapsedLinesHaveNoHeight(view, name: name, file: file, line: line)
         assertFragmentGeometry(view, name: name, file: file, line: line)
+        assertRenderedContentStandsInForCollapsedSource(view, name: name, file: file, line: line)
         assertStylingIsIdempotent(view, name: name, file: file, line: line)
 
         // Drawing is where a degenerate rect finally matters.
@@ -150,9 +178,11 @@ final class RenderingHardeningTests: XCTestCase {
     ) {
         guard let storage = view.textStorage else { return }
         let text = storage.string as NSString
-        let hidden = HiddenRanges(
-            document: view.parsed, selection: view.selectedRange(), mode: view.mode,
-            isEditing: view.window == nil)
+        // The view's own answer, not a second computation of it. Recomputing it
+        // here needs every input the view used — the reveal set, the focus, and
+        // now the blocks drawn as content — and a copy that drifts turns this
+        // into a test of the copy.
+        let hidden = view.hiddenRanges
 
         var offset = 0
         while offset < text.length {
@@ -230,6 +260,72 @@ final class RenderingHardeningTests: XCTestCase {
         }
     }
 
+    /// 7. Content is drawn once, and only where the source it replaces has gone.
+    ///
+    /// Both directions have shipped broken, so both are asserted. Every fragment
+    /// of a collapsed fence drew the whole block's diagram, which stacked one
+    /// copy per line; and an image paragraph drew its picture without ever
+    /// collapsing, so the reader saw the `![…](…)` *and* the image.
+    private func assertRenderedContentStandsInForCollapsedSource(
+        _ view: MarkdownTextView, name: String, file: StaticString, line: UInt
+    ) {
+        guard let manager = view.textLayoutManager else { return }
+        let hidden = view.hiddenRanges
+        let rendered = view.renderedBlocks
+
+        var drawn: [Int: Int] = [:]
+
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment,
+                let element = fragment.rangeInElement as NSTextRange?
+            else { return true }
+            let start = manager.offset(from: manager.documentRange.location, to: element.location)
+            let end = manager.offset(from: manager.documentRange.location, to: element.endLocation)
+            guard start >= 0, end >= start else { return true }
+            let range = NSRange(location: start, length: end - start)
+            guard let entry = rendered.entry(overlapping: range) else {
+                XCTAssertNil(
+                    fragment.decoration.rendered,
+                    "\(name): a fragment at \(range) draws content belonging to no block",
+                    file: file, line: line)
+                return true
+            }
+
+            guard let content = fragment.decoration.rendered else { return true }
+            XCTAssertEqual(
+                content, entry.content,
+                "\(name): the fragment at \(range) draws content from another block",
+                file: file, line: line)
+            XCTAssertTrue(
+                hidden.covers(entry.range),
+                "\(name): content is drawn for \(entry.range) while its source is on screen — "
+                    + "the reader sees the block written out *and* rendered over it",
+                file: file, line: line)
+            drawn[entry.block, default: 0] += 1
+            return true
+        }
+
+        for (block, count) in drawn {
+            XCTAssertEqual(
+                count, 1,
+                "\(name): block \(block) drew its content \(count) times; TextKit makes one "
+                    + "fragment per line and only the first piece may draw",
+                file: file, line: line)
+        }
+
+        // The height a block ends up occupying is asserted in
+        // `RenderedBlockTests`, not here, and deliberately. It is the *symptom*
+        // of drawing more than once, and stating it over arbitrary documents
+        // means budgeting three costs that have nothing to do with this
+        // invariant: a failure strip where nothing could render, the paragraph
+        // spacing a collapsed last line deliberately keeps, and TextKit's extra
+        // end-of-document line, which inside a list carries that list's indent.
+        // `drawn == 1` is the cause, exactly, and it holds here over every
+        // document, caret, width, and mode the sweeps below cover.
+    }
+
     /// 6. Styling twice is styling once.
     ///
     /// On its own storage rather than the view's, because the view layers
@@ -249,8 +345,12 @@ final class RenderingHardeningTests: XCTestCase {
 
         let storage = NSTextStorage(attributedString: NSAttributedString(string: source))
         let parsed = ParsedDocument.parse(source)
+        // With the rendered blocks, so the pass under test collapses whole
+        // blocks as well as markers — the two shapes of hidden run behave
+        // differently in the collapse pass, and only one of them was covered.
         let hidden = HiddenRanges(
-            document: parsed, selection: view.selectedRange(), mode: view.mode)
+            document: parsed, selection: view.selectedRange(), mode: view.mode,
+            rendered: RenderedBlocks(document: parsed, text: source as NSString))
 
         MarkdownStyler.apply(document: parsed, hidden: hidden, to: storage)
         let once = NSAttributedString(attributedString: storage)
@@ -302,6 +402,10 @@ final class RenderingHardeningTests: XCTestCase {
         "```swift\nlet x = 1\n```\n", "```\nplain fence\n```\n", "~~~\ntilde\n~~~\n",
         "| a | b |\n|---|---|\n| 1 | 2 |\n", "---\n", "\n", "    indented code\n",
         "$$\nx^2\n$$\n", "text with a [[wikilink]] and #tag\n", "```unclosed\nbody\n",
+        // Rendered blocks in the shuffle, so the random sweeps exercise the
+        // collapse-whole-block path as well as the collapse-a-marker one.
+        "```mermaid\ngraph TD;\nA-->B;\n```\n", "```mermaid\nnope\n```\n", "```mermaid\n```\n",
+        "![p](p.png)\n", "$$\n$$\n", "$$\n\\frac{a}{b}\n$$\n",
     ]
 
     private func randomDocument(seed: UInt64, blocks: Int) -> String {
@@ -319,7 +423,7 @@ final class RenderingHardeningTests: XCTestCase {
     }
 
     func testRandomDocumentsHoldUpUnderRandomCarets() {
-        for seed in (100...140) as ClosedRange<UInt64> {
+        for seed in (100...180) as ClosedRange<UInt64> {
             var rng = SeededGenerator(seed: seed)
             let source = randomDocument(seed: seed, blocks: 12)
             let length = (source as NSString).length
@@ -341,13 +445,12 @@ final class RenderingHardeningTests: XCTestCase {
         // container — which is what shook out the stale-parse restyle on the
         // caret path.
         //
-        // The count is not arbitrary. At sixty this loop was clean while seed
-        // 209 went on losing a fence's colours at step 62 — the splicing had
-        // not yet produced a fence butted up against a restyle scope, which is
-        // the shape that shows it. See
-        // ``testCodeKeepsItsColoursWhenOnlyTheGrownScopeReachesIt``, which is
-        // that shape written down.
-        for seed in (200...215) as ClosedRange<UInt64> {
+        // Widened to 48 seeds because it earned it: with diagrams, formulas,
+        // and images in the corpus it caught a code fence losing its token
+        // colours to an edit on the line below it — a scope one line narrower
+        // than the range that had just been cleared. Seed 211 is the one that
+        // found it; `SyntaxHighlightingTests` now pins that case directly.
+        for seed in (200...247) as ClosedRange<UInt64> {
             var rng = SeededGenerator(seed: seed)
             let source = randomDocument(seed: seed, blocks: 10)
             let view = MarkdownTextView.make()
