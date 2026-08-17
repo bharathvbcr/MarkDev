@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-checks:
+    name: Rust Core (fmt, clippy, tests)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Format Check
+        run: cd core && cargo fmt --check
+
+      - name: Clippy Linter
+        run: cd core && cargo clippy --all-targets -- -D warnings
+
+      - name: Run Core Tests
+        run: cd core && cargo test
+
+      - name: Performance Release Benchmark
+        run: cd core && cargo test --release --test performance
+
+  macos-app:
+    name: macOS App (Swift + MarkDevKit)
+    runs-on: macos-14
+    needs: rust-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tools
+        run: brew install just xcodegen
+
+      - name: Build Rust Core
+        run: just build-core-debug
+
+      - name: Generate Xcode Project
+        run: just generate
+
+      - name: Build and Test AppKit Targets
+        run: |
+          xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug test
