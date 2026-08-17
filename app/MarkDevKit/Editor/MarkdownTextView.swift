@@ -55,6 +55,10 @@ public final class MarkdownTextView: ScrollingTextView {
             // plain click follow a wikilink: an editable text view treats a
             // click on a link as "put the caret here" instead.
             isEditable = mode != .reading
+            // The cache belongs to the mode that was just left; carrying it
+            // into the new one would have the next caret move compare against
+            // a set answering a different question.
+            refreshRevealedBlocks()
             restyle()
         }
     }
@@ -143,9 +147,14 @@ public final class MarkdownTextView: ScrollingTextView {
     /// of the one question the editor and the renderer must agree on.
     private(set) var hiddenRanges: HiddenRanges = .none
 
-    /// Which blocks are revealed, cached so caret movement only restyles when
-    /// the answer actually changes. Without this, every arrow key would
-    /// restyle the whole document.
+    /// Which blocks are revealed *because the caret is in them*, cached so
+    /// caret movement only restyles when the answer actually changes. Without
+    /// this, every arrow key would restyle the whole document.
+    ///
+    /// Empty in the modes where reveal does not follow the caret — source
+    /// reveals every block, reading none — because there the answer is a
+    /// constant of the mode and there is nothing for a cache to notice
+    /// changing. See ``RevealPolicy/revealFollowsCaret(_:)``.
     private var revealedBlocks: Set<Int> = []
 
     /// Guards against reentrant styling.
@@ -266,8 +275,7 @@ public final class MarkdownTextView: ScrollingTextView {
         }
         document.rebuild(from: markdown)
         parsed = document.parsed
-        revealedBlocks = RevealPolicy.revealedBlocks(
-            in: parsed, selection: selectedRange(), mode: mode)
+        refreshRevealedBlocks()
         restyle()
         onParse?(parsed)
     }
@@ -301,53 +309,84 @@ public final class MarkdownTextView: ScrollingTextView {
         }
         parsed = document.parsed
 
+        var scope = incrementalScope(
+            from: previous, to: parsed, edited: editedRange, delta: delta,
+            onlyOffsetsMoved: onlyOffsetsMoved)
+
         // The blocks whose syntax appeared or disappeared join the scope. An
         // edit that moves the caret into another block changes how that block
         // is drawn without changing a single thing about the parse, so no
         // amount of comparing the two parses would find it.
-        let revealedBefore = revealedRanges(of: revealedBlocks, in: previous)
-            .map { shift($0, by: delta, at: editedRange) }
-        revealedBlocks = RevealPolicy.revealedBlocks(
-            in: parsed, selection: selectedRange(), mode: mode)
-        let revealedAfter = revealedRanges(of: revealedBlocks, in: parsed)
-
-        var scope = incrementalScope(
-            from: previous, to: parsed, edited: editedRange, delta: delta,
-            onlyOffsetsMoved: onlyOffsetsMoved)
-        if scope != nil, revealedBefore != revealedAfter {
-            for range in revealedBefore + revealedAfter {
-                scope = scope.map { NSUnionRange($0, range) }
+        //
+        // Only where reveal follows the caret. Source shows every block's
+        // syntax and reading hides all of it, so there is nothing here for an
+        // edit to change — and asking anyway is not free. The comparison is
+        // between *ranges*, and a set holding every block hands it every block
+        // range in the document: the pre-edit ranges are shifted to where
+        // their text now sits, which disagrees with the new parse wherever the
+        // edit lands on a block boundary, so typing at the head of a file made
+        // the two arrays differ and unioned all of them into the scope. That
+        // restyles the whole buffer and, worse, invalidates every layout
+        // fragment in it. Measured on 10,000 lines of prose in source mode:
+        // 14.5s for one keystroke, against 80ms for the same keystroke in live
+        // preview, of which the styling was only ~200ms and the rest was
+        // TextKit laying the file out again.
+        if RevealPolicy.revealFollowsCaret(mode) {
+            let revealedBefore = revealedRanges(of: revealedBlocks, in: previous)
+                .map { shift($0, by: delta, at: editedRange) }
+            refreshRevealedBlocks()
+            let revealedAfter = revealedRanges(of: revealedBlocks, in: parsed)
+            if scope != nil, revealedBefore != revealedAfter {
+                for range in revealedBefore + revealedAfter {
+                    scope = scope.map { NSUnionRange($0, range) }
+                }
             }
         }
 
-        // Tables join the scope whole, from both parses.
+        // Whatever *was* a table joins the scope whole, taken from the old
+        // parse and shifted to where its text now sits.
         //
         // `alignTableColumns` is the one layer that writes outside the scope:
         // a cell's width can decide a column far away, so a scoped restyle
-        // still re-kerns every table in the file. Nothing clears that padding
-        // except a scope that reaches it, so text which *stopped* being a
-        // table kept an 18pt gap — one turned up in the middle of a code
-        // block, hundreds of characters from an edit. Taking the old parse's
-        // tables (shifted to where their text now sits) and the new parse's
-        // together means the padding is always cleared and recomputed
-        // wherever a table was or is. It also makes the pass idempotent: the
-        // kern rides on a cell's last character and the measurement includes
-        // that character, so re-measuring a half-cleared table drifts wider
-        // every time.
+        // re-kerns every table in the file however small the scope was. That
+        // pass clears and recomputes the padding of every table the *current*
+        // parse has, so the scope owes those nothing — but nothing at all
+        // clears the padding left on text that has **stopped** being a table.
+        // Only the styler's base pass does, and only inside the scope. Before
+        // the scope reached them, an 18pt gap turned up in the middle of a
+        // code block, hundreds of characters from the edit that caused it.
+        //
+        // The new parse's tables were unioned in here as well until it was
+        // measured: over the random editing corpus — 2,032 scoped reparses —
+        // adding them never once changed the resulting scope. Nor can they,
+        // given what divergence promises. A table the new parse holds either
+        // agrees with the old parse, in which case it is already here as its
+        // shifted self, or disagrees, in which case it lies inside the
+        // divergence this scope is built from.
+        //
+        // That is a simplification and not a saving: a table-heavy document's
+        // old tables span it from end to end by themselves, so it still
+        // restyles whole on every keystroke.
         //
         // Costs nothing for a document with no tables, which is most of them.
         let tablesBefore = previous.blocks
             .filter { $0.kind == .table }
             .map { shift($0.range, by: delta, at: editedRange) }
-        let tablesAfter = parsed.blocks.filter { $0.kind == .table }.map(\.range)
-        if scope != nil, !tablesBefore.isEmpty || !tablesAfter.isEmpty {
-            for range in tablesBefore + tablesAfter {
-                scope = scope.map { NSUnionRange($0, range) }
-            }
+        for range in tablesBefore {
+            scope = scope.map { NSUnionRange($0, range) }
         }
 
         restyle(scope: scope)
         onParse?(parsed)
+    }
+
+    /// Recomputes the cached reveal set for the current parse and selection,
+    /// or empties it where reveal does not follow the caret.
+    private func refreshRevealedBlocks() {
+        revealedBlocks =
+            RevealPolicy.revealFollowsCaret(mode)
+            ? RevealPolicy.revealedBlocks(in: parsed, selection: selectedRange(), mode: mode)
+            : []
     }
 
     /// The ranges of the blocks at `indices`, in document order.
@@ -409,11 +448,20 @@ public final class MarkdownTextView: ScrollingTextView {
         )
     }
 
+    /// What the last restyle covered, or `nil` where it covered everything.
+    ///
+    /// Internal, for tests. "A keystroke restyles a block, not the file" is
+    /// what every performance gate in this target is really asserting, and
+    /// asking the editor directly answers it deterministically — a timing
+    /// budget can only infer it, and infers it worst on a busy machine.
+    private(set) var lastRestyleScope: NSRange?
+
     /// Reapplies attributes for the current parse and selection.
     private func restyle(scope: NSRange? = nil) {
         guard !isStyling, let storage = textStorage else { return }
         isStyling = true
         defer { isStyling = false }
+        lastRestyleScope = scope
 
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus,
@@ -593,6 +641,9 @@ public final class MarkdownTextView: ScrollingTextView {
         // finds nothing to do. Waiting for it as well would drop this reveal
         // change on the floor.
         guard unparsedChange == nil else { return }
+        // Nothing a caret move can change in source or reading mode: what is
+        // revealed there is decided by the mode, not by where the caret is.
+        guard RevealPolicy.revealFollowsCaret(mode) else { return }
 
         let next = RevealPolicy.revealedBlocks(
             in: parsed, selection: selectedRange(), mode: mode)

@@ -52,6 +52,23 @@ public enum RevealPolicy {
         }
     }
 
+    /// Whether what is revealed depends on where the caret is.
+    ///
+    /// Only live preview answers per position. Source reveals every block and
+    /// reading reveals none, so in both the set is decided by the mode alone:
+    /// no caret movement and no edit can change it, and the difference between
+    /// two of them is always empty.
+    ///
+    /// The editor caches the reveal set to work out which blocks have to be
+    /// restyled when it changes. Asking a mode that cannot change it is not
+    /// merely wasted work — see ``MarkdownTextView/reparse(edit:)``, where the
+    /// two answers are compared as *ranges*, and a set covering every block
+    /// produces two arrays that disagree wherever an edit lands on a block
+    /// boundary. The union of both then reaches the whole document.
+    public static func revealFollowsCaret(_ mode: EditorMode) -> Bool {
+        mode == .livePreview
+    }
+
     /// A caret sitting exactly on a block boundary counts as inside it, so
     /// typing at the end of a heading keeps its `# ` visible instead of
     /// having the prefix vanish on the last character.

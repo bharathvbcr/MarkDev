@@ -474,4 +474,87 @@ final class TaskAndTableTests: XCTestCase {
     func testATableWithoutBodyRowsIsLeftAlone() {
         XCTAssertNoThrow(makeView("| a |\n|---|\n"))
     }
+
+    /// The padding kerned onto each of a table's cells, in document order.
+    ///
+    /// - Parameter index: which table in the document, in document order.
+    private func paddings(ofTable index: Int, in view: MarkdownTextView) throws -> [CGFloat] {
+        let storage = try XCTUnwrap(view.textStorage)
+        let blocks = view.parsed.blocks
+        let tables = blocks.filter { $0.kind == .table }
+            .sorted { $0.range.location < $1.range.location }
+        let table = try XCTUnwrap(tables.indices.contains(index) ? tables[index] : nil)
+
+        return
+            blocks
+            .filter {
+                $0.kind == .tableCell
+                    && NSIntersectionRange($0.range, table.range).length > 0
+            }
+            .sorted { $0.range.location < $1.range.location }
+            .map { cell in
+                let last = cell.range.location + cell.range.length - 1
+                return storage.attribute(.kern, at: last, effectiveRange: nil) as? CGFloat ?? 0
+            }
+    }
+
+    func testATableIsAlignedAgainstItsOwnRowsAndNoOthers() throws {
+        // A table's columns are decided by its own rows, and by nothing else
+        // in the document. That is what the grouping in ``MarkdownStyler`` has
+        // to get right: it stopped filtering every block in the document per
+        // table and again per row — O(tables × blocks), 8.2 seconds of one
+        // keystroke in a document of 1,400 tables — in favour of a single
+        // sweep that hands each table the rows that follow it. A sweep that
+        // ran a table's rows together with its neighbour's would pad this
+        // narrow table out to the wide one's columns.
+        //
+        // Asserted by comparing against the same table on its own, so the
+        // test needs no arithmetic of its own: measuring a cell includes the
+        // kern already sitting on its last character, which is the trap
+        // ``alignTableColumns`` clears the padding to avoid.
+        let narrow = """
+            | a | b |
+            |---|---|
+            | 1 | 2 |
+            """
+        let alone = try paddings(ofTable: 0, in: makeView(narrow + "\n"))
+        XCTAssertFalse(alone.isEmpty, "the fixture should have padded cells")
+
+        let crowded = makeView(
+            """
+            \(narrow)
+
+            Prose between them.
+
+            | a much wider heading | and another one |
+            |---|---|
+            | 1 | 2 |
+            | a considerably longer cell | x |
+
+            > | quoted | table |
+            > |---|---|
+            > | 1 | 2 |
+
+            """)
+        let together = try paddings(ofTable: 0, in: crowded)
+
+        XCTAssertEqual(
+            together.count, alone.count,
+            "the same table should have the same cells whatever surrounds it")
+        for (index, padding) in together.enumerated() where index < alone.count {
+            XCTAssertEqual(
+                padding, alone[index], accuracy: 0.5,
+                "cell \(index) of the first table was padded differently once other "
+                    + "tables shared the document — its rows have been grouped with theirs")
+        }
+
+        // And the neighbours are aligned at all, so the comparison above is
+        // not two tables that were both left alone.
+        let wide = try paddings(ofTable: 1, in: crowded)
+        let quoted = try paddings(ofTable: 2, in: crowded)
+        XCTAssertGreaterThan(
+            wide.max() ?? 0, together.max() ?? 0,
+            "the wider table needs more padding than the narrow one")
+        XCTAssertFalse(quoted.isEmpty, "a table inside a quote is still a table")
+    }
 }

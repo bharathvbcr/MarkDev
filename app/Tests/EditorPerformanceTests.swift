@@ -340,6 +340,117 @@ final class EditorPerformanceTests: XCTestCase {
             "a prose keystroke has regressed; check for work proportional to document size")
     }
 
+    /// A document dominated by GFM tables — the shape that makes
+    /// ``MarkdownStyler/alignTableColumns(_:to:limit:theme:)`` the most
+    /// expensive layer in a restyle, and the one where a per-table scan of
+    /// every block turns into a genuine quadratic.
+    private static func tableDocument(lines: Int) -> String {
+        var out: [String] = []
+        out.reserveCapacity(lines)
+        var i = 0
+        while out.count < lines {
+            out.append("## Table \(i)")
+            out.append("")
+            out.append("| Name | Age | City |")
+            out.append("| --- | --- | --- |")
+            out.append("| Alice \(i) | 30 | Berlin |")
+            out.append("| Bob \(i) | 41 | Lisbon |")
+            out.append("| Carol \(i) | 25 | Oslo |")
+            out.append("")
+            i += 1
+        }
+        return out.prefix(lines).joined(separator: "\n")
+    }
+
+    func testTypingInSourceModeIsLinearInTheSizeOfTheDocument() {
+        // Source mode used to cost a keystroke that grew with the square of
+        // the document: 1.1s at 2,500 lines, 4.3s at 5,000, 18.5s at 10,000.
+        //
+        // Measured on the table-heavy fixture because that is where it was
+        // worst, and because it holds both of the causes. One belongs to
+        // source mode: it reveals every block, and comparing the revealed
+        // *ranges* before and after an edit made two arrays that disagree at
+        // the head of the document, which unioned every block into the
+        // restyle scope. The other belongs to every mode: aligning table
+        // columns filtered all of the document's blocks once per table and
+        // again per row, which is O(tables × blocks) — 8.2 seconds of a
+        // single keystroke here, and the reason four times the text cost
+        // twelve times as much.
+        //
+        // Four times the document, not twice, for the reason
+        // `testOpeningADocumentStylesItInLinearTime` gives: linear work then
+        // costs about 4x and quadratic work about 16x, so a threshold between
+        // them cannot be reached by a modest inefficiency or a busy machine.
+        let sizes = [2_500, 10_000]
+        var costs: [TimeInterval] = []
+
+        for lines in sizes {
+            let source = Self.tableDocument(lines: lines)
+            let view = MarkdownTextView.make()
+            view.mode = .source
+            view.setMarkdown(source)
+            view.setSelectedRange(NSRange(location: 0, length: 0))
+
+            // Both terms best-of-N so the subtraction stays like-for-like,
+            // exactly as in the keystroke gate above. The debug parse is
+            // subtracted because it is Rust's cost, not this target's, and it
+            // is gated in release by core/tests/performance.rs.
+            let parse = measureBest { _ = ParsedDocument.parse(source) }
+            let cycle = measureBest {
+                view.insertText("x", replacementRange: view.selectedRange())
+            }
+            costs.append(max(0, cycle.best - parse.best))
+
+            print(
+                "[perf] source-mode keystroke on \(lines) lines of tables: "
+                    + "\(cycle.description) total, "
+                    + "\(String(format: "%.2f", parse.best * 1000))ms debug parse, "
+                    + "\(String(format: "%.2f", costs[costs.count - 1] * 1000))ms editor")
+        }
+
+        let ratio = costs[1] / costs[0]
+        print(
+            "[perf] source-mode keystroke ratio: "
+                + "\(String(format: "%.2f", ratio))x for 4x the text")
+
+        XCTAssertLessThan(
+            ratio, 8.0,
+            "a source-mode keystroke is scaling superlinearly with the size of the document")
+    }
+
+    func testASourceModeKeystrokeRestylesABlockRatherThanTheFile() throws {
+        // The deterministic half of the gate above, and the one that names
+        // what actually went wrong. A timing budget can only infer "this
+        // keystroke touched all 10,000 lines"; the scope says so.
+        //
+        // Source mode reveals every block by definition, so no edit and no
+        // caret movement can change what is revealed. Asking anyway was not
+        // merely wasted work: the answers are compared as ranges, the
+        // pre-edit ones shifted to where their text now sits, and typing at
+        // the head of the document makes that shift disagree with the new
+        // parse. The two arrays then differ, and every block range in the
+        // file is unioned into the scope — which also discards every cached
+        // layout fragment. Measured with the whole document laid out: 14.5s
+        // for one keystroke against 80ms for the same keystroke in live
+        // preview.
+        let view = MarkdownTextView.make()
+        view.mode = .source
+        view.setMarkdown(Self.largeDocument(lines: 10_000))
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        let length = (view.markdown as NSString).length
+
+        view.insertText("x", replacementRange: view.selectedRange())
+
+        let scope = try XCTUnwrap(
+            view.lastRestyleScope,
+            "a keystroke must scope its restyle; nil restyles the whole document")
+        XCTAssertLessThan(
+            scope.length, length / 100,
+            "typing one character in source mode restyled \(scope.length) of \(length) "
+                + "characters — the reveal set must not widen the scope in a mode "
+                + "where nothing about it can change")
+    }
+
     func testCaretMovementWithinABlockDoesNotRestyle() {
         // Moving the caret inside one block leaves the reveal set unchanged,
         // so it must not trigger a full restyle. This is the optimisation
