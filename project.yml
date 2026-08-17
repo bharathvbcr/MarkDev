@@ -27,7 +27,23 @@ settings:
     # assets change.
     CURRENT_PROJECT_VERSION: "5"
     ONLY_ACTIVE_ARCH: true
-    ENABLE_HARDENED_RUNTIME: true
+    # Off for as long as the identity below is ad-hoc, and flipped back on in
+    # the same change that introduces a real one — the two are one decision,
+    # not two settings.
+    #
+    # A hardened-runtime process will not load an ad-hoc signed library: dyld
+    # reports "mapping process and mapped file (non-platform) have different
+    # Team IDs" and the app dies before `main`. Xcode hides this in Debug,
+    # where it quietly disables hardened runtime for ad-hoc builds and prints
+    # a note; it does not do the same for Release. So Release built, signed,
+    # and passed `codesign --verify --deep --strict`, and every one of those
+    # said yes about a bundle that could not start — `just run` builds Debug,
+    # so nothing exercised it.
+    #
+    # Hardened runtime is a requirement for notarised distribution, and a
+    # notarised build needs a Developer ID anyway. Turning it on without one
+    # buys no protection; it only produces an app that cannot launch.
+    ENABLE_HARDENED_RUNTIME: false
     # Signed to run locally; a distribution identity replaces this at release.
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: true
