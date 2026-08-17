@@ -294,25 +294,6 @@ final class TerminalSessionsTests: XCTestCase {
     }
 }
 
-/// A deterministic generator, so a failing storm can be replayed exactly.
-///
-/// `SystemRandomNumberGenerator` would make every run a different test, and a
-/// randomised failure nobody can reproduce is worse than no test at all.
-struct SeededGenerator: RandomNumberGenerator {
-    private var state: UInt64
-
-    init(seed: UInt64) { state = seed == 0 ? 0x9E37_79B9_7F4A_7C15 : seed }
-
-    mutating func next() -> UInt64 {
-        // splitmix64.
-        state &+= 0x9E37_79B9_7F4A_7C15
-        var z = state
-        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
-        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
-        return z ^ (z >> 31)
-    }
-}
-
 @MainActor
 final class NavigatorTerminalTargetTests: XCTestCase {
     private func node(_ path: String, isDirectory: Bool) -> FileNode {

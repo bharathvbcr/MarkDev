@@ -364,6 +364,27 @@ extension MarkdownStyler {
                     .sorted { $0.range.location < $1.range.location }
             }
 
+            // Clear the padding this pass is about to recompute, before
+            // anything is measured.
+            //
+            // The kern rides on the cell's final character and `measure`
+            // measures the cell *including* that character — so without this
+            // the function reads back its own previous padding and adds to
+            // it. A full restyle got away with it because `applyMarkers`
+            // zeroes kerning on every collapsed marker first, and the pipes
+            // are collapsed markers. A *scoped* restyle only zeroes the ones
+            // inside its scope, so the columns of a table reached from
+            // outside that scope drifted a little wider on every keystroke.
+            // Zeroing rather than removing matches what `applyMarkers` leaves
+            // behind, so an incrementally styled document and a freshly
+            // parsed one carry the same attributes.
+            for cells in cellsByRow {
+                for cell in cells {
+                    guard let last = lastCharacter(of: cell.range, in: limit) else { continue }
+                    storage.addAttribute(.kern, value: 0, range: last)
+                }
+            }
+
             // Widest cell per column decides that column's width.
             var columnWidths: [CGFloat] = []
             for cells in cellsByRow {

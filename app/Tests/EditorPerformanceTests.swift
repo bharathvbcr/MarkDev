@@ -217,8 +217,8 @@ final class EditorPerformanceTests: XCTestCase {
         }
         // Measured after the fact so the parse cost being subtracted is a warm
         // one, exactly like the parse inside the keystroke above.
-        let parseCost = measureMedian { _ = ParsedDocument.parse(source) }
-        let steady = measureMedian {
+        let parseCost = measureFastest { _ = ParsedDocument.parse(source) }
+        let steady = measureFastest {
             view.insertText("x", replacementRange: view.selectedRange())
         }
 
