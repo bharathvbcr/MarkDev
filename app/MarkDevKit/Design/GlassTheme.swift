@@ -42,11 +42,11 @@ public enum GlassTheme {
     public static let dividerLineWidth: CGFloat = 1
 
     /// Width rules for the navigator, on the leading edge.
-    public static let sidebar = PanelWidthRange(preferred: 260, minimum: 180, maximum: 420)
+    public static let sidebar = PanelSizeRange(preferred: 260, minimum: 180, maximum: 420)
     /// Width rules for the inspector, on the trailing edge. Wider than the
     /// navigator because backlink context is prose, and prose in a 180pt
     /// column wraps into an unreadable ribbon.
-    public static let inspector = PanelWidthRange(preferred: 300, minimum: 220, maximum: 460)
+    public static let inspector = PanelSizeRange(preferred: 300, minimum: 220, maximum: 460)
 
     /// The narrowest editor column that still reads like prose rather than a
     /// vertical ribbon. The window minimum is sized for the common two-pane
@@ -57,6 +57,13 @@ public enum GlassTheme {
         sidebar.preferred + inspector.preferred
         + (dividerHitWidth * 3)
         + (minimumEditorPaneWidth * 2)
+
+    /// Height rules for the terminal drawer, along the bottom edge.
+    ///
+    /// The minimum is deliberately generous: a shell shorter than about ten
+    /// rows cannot show a compiler error or a CLI's progress output without
+    /// scrolling it away, which makes the drawer worse than no drawer.
+    public static let terminal = PanelSizeRange(preferred: 260, minimum: 160, maximum: 720)
 
     /// Height of the status readout under each pane.
     public static let statusBarHeight: CGFloat = 26
@@ -78,13 +85,17 @@ public enum GlassTheme {
     }
 }
 
-/// The widths a side panel may take, and the width it returns to.
+/// The sizes a panel may take along its resizable axis, and the size it
+/// returns to.
+///
+/// Named for size rather than width because the same rules govern the terminal
+/// drawer's *height*: the axis is the caller's business, the clamping is not.
 ///
 /// A pure value for the same reason ``SplitLayout`` is one: "a panel can never
 /// be dragged shut" is then a tested property of the model rather than a clamp
 /// copied into every view that draws a drag handle.
-public struct PanelWidthRange: Sendable, Equatable {
-    /// The width a fresh window opens at, and that a double-click restores.
+public struct PanelSizeRange: Sendable, Equatable {
+    /// The size a fresh window opens at, and that a double-click restores.
     public let preferred: CGFloat
     public let minimum: CGFloat
     public let maximum: CGFloat
@@ -92,21 +103,21 @@ public struct PanelWidthRange: Sendable, Equatable {
     public init(preferred: CGFloat, minimum: CGFloat, maximum: CGFloat) {
         precondition(
             minimum <= preferred && preferred <= maximum,
-            "A panel's preferred width must lie inside its own range.")
+            "A panel's preferred size must lie inside its own range.")
         self.preferred = preferred
         self.minimum = minimum
         self.maximum = maximum
     }
 
-    /// `width` brought inside the range.
+    /// `size` brought inside the range.
     ///
-    /// A non-finite width falls back to ``preferred``. Drag arithmetic divides
+    /// A non-finite size falls back to ``preferred``. Drag arithmetic divides
     /// by container sizes that are momentarily zero during window setup, and a
     /// NaN reaching `frame(width:)` corrupts the whole layout pass rather than
     /// failing where it was produced.
-    public func clamping(_ width: CGFloat) -> CGFloat {
-        guard width.isFinite else { return preferred }
-        return min(max(width, minimum), maximum)
+    public func clamping(_ size: CGFloat) -> CGFloat {
+        guard size.isFinite else { return preferred }
+        return min(max(size, minimum), maximum)
     }
 }
 

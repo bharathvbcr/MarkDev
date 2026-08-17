@@ -208,6 +208,44 @@ public final class VaultIndex {
         #endif
     }
 
+    /// The link graph, laid out and ready to draw.
+    ///
+    /// One call rather than nodes-then-edges-then-positions: the layout is a
+    /// property of the whole graph, and fetching it in pieces would let a view
+    /// draw edges against coordinates from a different build.
+    ///
+    /// - Parameters:
+    ///   - focus: limits the graph to notes within `depth` hops of this one.
+    ///     Accepts either a vault-relative path or a wikilink-style name.
+    ///   - tag: keeps only notes carrying this tag; the leading `#` is optional.
+    ///   - folder: keeps only notes under this vault-relative folder.
+    public func graph(
+        focus: String? = nil,
+        depth: Int = 2,
+        tag: String? = nil,
+        folder: String? = nil
+    ) -> VaultGraph {
+        #if canImport(CMarkDev)
+            guard let handle else { return .empty }
+            let bounded = UInt32(max(0, min(depth, 16)))
+            // Nested `withCString` rather than a helper: the pointers must all
+            // stay alive across the single call, and a helper returning them
+            // would hand back memory already freed.
+            return withOptionalCString(focus) { focusPointer in
+                withOptionalCString(tag) { tagPointer in
+                    withOptionalCString(folder) { folderPointer in
+                        decode(
+                            md_vault_graph(
+                                handle, focusPointer, bounded, tagPointer, folderPointer))
+                            ?? .empty
+                    }
+                }
+            }
+        #else
+            return .empty
+        #endif
+    }
+
     /// Every note path, for the palette and link autocomplete.
     public func notePaths() -> [String] {
         #if canImport(CMarkDev)
@@ -227,6 +265,21 @@ public final class VaultIndex {
         ) -> [T] {
             guard let handle else { return [] }
             return path.withCString { decode(call(handle, $0)) } ?? []
+        }
+
+        /// Runs `body` with a C string for `value`, or with null when it is
+        /// absent or empty.
+        ///
+        /// The pointer is only valid for the duration of `body` — returning it
+        /// would hand back memory that has already been freed, which is why
+        /// the graph query nests three of these rather than calling a helper
+        /// that returns pointers.
+        private func withOptionalCString<Result>(
+            _ value: String?,
+            _ body: (UnsafePointer<CChar>?) -> Result
+        ) -> Result {
+            guard let value, !value.isEmpty else { return body(nil) }
+            return value.withCString { body($0) }
         }
 
         /// Decodes a borrowed C string.

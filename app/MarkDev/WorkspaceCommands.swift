@@ -73,6 +73,9 @@ struct WorkspaceCommands: Commands {
             actionButton(
                 "Toggle Inspector", action: .toggleInspector, key: "i",
                 modifiers: [.command, .option])
+            actionButton("Toggle Terminal", action: .toggleTerminal, key: "j")
+            actionButton(
+                "Graph View", action: .toggleGraph, key: "g", modifiers: [.command, .shift])
             Divider()
             actionButton("Split Right", action: .splitRight)
             actionButton("Split Down", action: .splitDown)

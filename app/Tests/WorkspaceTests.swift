@@ -237,6 +237,79 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(workspace.focusedPane, second, "focus follows the new pane")
     }
 
+    func testOpeningAFileBesideAPaneCreatesATrailingSplit() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = root.appendingPathComponent("Original.md")
+        let dropped = root.appendingPathComponent("Dropped.md")
+        try write("# Original", to: original)
+        try write("# Dropped", to: dropped)
+
+        let workspace = Workspace()
+        let first = workspace.focusedPane
+        try workspace.open(original, in: first)
+
+        let second = try workspace.open(dropped, beside: first, edge: .trailing)
+
+        XCTAssertEqual(workspace.layout.paneCount, 2)
+        XCTAssertEqual(workspace.layout.panes, [first, second])
+        XCTAssertEqual(workspace.document(in: first)?.url, original)
+        XCTAssertEqual(workspace.document(in: second)?.url, dropped)
+        XCTAssertEqual(workspace.document(in: second)?.text, "# Dropped")
+        XCTAssertEqual(workspace.focusedPane, second)
+    }
+
+    func testOpeningAMissingFileBesideAPaneDoesNotLeaveASplit() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = root.appendingPathComponent("Original.md")
+        let missing = root.appendingPathComponent("Missing.md")
+        try write("# Original", to: original)
+
+        let workspace = Workspace()
+        let first = workspace.focusedPane
+        try workspace.open(original, in: first)
+        let layoutBefore = workspace.layout
+        let panesBefore = workspace.panes
+
+        XCTAssertThrowsError(
+            try workspace.open(missing, beside: first, edge: .trailing))
+        XCTAssertEqual(workspace.layout, layoutBefore)
+        XCTAssertEqual(workspace.panes, panesBefore)
+        XCTAssertEqual(workspace.focusedPane, first)
+    }
+
+    func testMarkdownDropPolicyMatchesDeclaredExtensionsAndRejectsDirectories() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let markdownDirectory = root.appendingPathComponent("Archive.md", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: markdownDirectory, withIntermediateDirectories: false)
+
+        for name in ["Note.md", "Note.MARKDOWN", "Note.mdown", "Note.mdx", "Note.mkd"] {
+            XCTAssertTrue(MarkdownDropPolicy.accepts(root.appendingPathComponent(name)), name)
+        }
+        XCTAssertFalse(MarkdownDropPolicy.accepts(root.appendingPathComponent("Image.png")))
+        XCTAssertFalse(MarkdownDropPolicy.accepts(root.appendingPathComponent("README")))
+        XCTAssertFalse(MarkdownDropPolicy.accepts(markdownDirectory))
+    }
+
+    func testDroppingAnAlreadyOpenFileSharesItsDocumentIdentity() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Shared.md")
+        try write("original", to: file)
+
+        let workspace = Workspace()
+        let first = workspace.focusedPane
+        try workspace.open(file, in: first)
+        let second = try workspace.open(file, beside: first)
+
+        XCTAssertEqual(workspace.document(in: first)?.id, workspace.document(in: second)?.id)
+        workspace.updateText("edited in split", in: second)
+        XCTAssertEqual(workspace.document(in: first)?.text, "edited in split")
+    }
+
     func testSplitSharesOneDocumentIdentityAndPropagatesEdits() throws {
         let root = try makeVault()
         defer { try? FileManager.default.removeItem(at: root) }

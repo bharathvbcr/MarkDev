@@ -616,6 +616,41 @@ pub unsafe extern "C" fn md_vault_note_paths(handle: *mut VaultHandle) -> *const
     handle.scratch.as_ref().map_or(ptr::null(), |s| s.as_ptr())
 }
 
+/// JSON graph of the vault's links, laid out and ready to draw.
+///
+/// One call rather than "give me the nodes, now the edges, now the positions":
+/// the layout is a property of the whole graph, so splitting it would let a
+/// caller draw edges against coordinates from a different build.
+///
+/// `focus` limits the graph to notes within `depth` hops of that note; pass
+/// null for the whole vault. `tag` and `folder` filter it further; both may be
+/// null.
+///
+/// # Safety
+///
+/// `handle` must be live. `focus`, `tag`, and `folder` may be null, and must
+/// otherwise be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_graph(
+    handle: *mut VaultHandle,
+    focus: *const c_char,
+    depth: u32,
+    tag: *const c_char,
+    folder: *const c_char,
+) -> *const c_char {
+    let Some(handle) = handle.as_mut() else {
+        return ptr::null();
+    };
+    let query = crate::vault::GraphQuery {
+        focus: read_str(focus),
+        depth,
+        tag: read_str(tag),
+        folder: read_str(folder),
+    };
+    let graph = crate::vault::Graph::build(&handle.vault, &query);
+    handle.serve(&graph)
+}
+
 // ---------------------------------------------------------------------------
 // Syntax highlighting
 // ---------------------------------------------------------------------------

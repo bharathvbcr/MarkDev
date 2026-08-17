@@ -16,6 +16,11 @@ public struct MarkdownEditorView: NSViewRepresentable {
     @Binding public var text: String
     public var mode: EditorMode
     public var theme: EditorTheme
+    /// The folder the document was loaded from, for resolving relative image
+    /// paths. An unsaved document has none, and its images cannot resolve —
+    /// which is correct: there is nothing yet for `./shot.png` to be relative
+    /// *to*.
+    public var documentDirectory: URL?
     /// Called after each reparse — the outline and backlinks panels observe
     /// this rather than parsing the document a second time.
     public var onParse: ((ParsedDocument) -> Void)?
@@ -28,6 +33,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         text: Binding<String>,
         mode: EditorMode = .livePreview,
         theme: EditorTheme = .standard,
+        documentDirectory: URL? = nil,
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
         onFollowWikiLink: ((String) -> Void)? = nil
@@ -35,6 +41,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self._text = text
         self.mode = mode
         self.theme = theme
+        self.documentDirectory = documentDirectory
         self.reveal = reveal
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
@@ -45,6 +52,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
         // Assigning `mode` also sets editability, so this must come before
         // any content is loaded.
         textView.mode = mode
+        // Before `setMarkdown`, so the first layout pass can already resolve
+        // embedded images instead of drawing a failure and correcting itself.
+        textView.documentDirectory = documentDirectory
         textView.delegate = context.coordinator
         // Deferred: the first parse happens inside `setMarkdown` below, which
         // runs during SwiftUI's view-update pass. Touching @State there is
@@ -74,6 +84,10 @@ public struct MarkdownEditorView: NSViewRepresentable {
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
         if textView.mode != mode { textView.mode = mode }
+        // Assigning re-renders only on a genuine change; the property guards
+        // itself, so a document switching folders repaints its images and one
+        // that did not costs nothing.
+        textView.documentDirectory = documentDirectory
 
         // Only push text in when it genuinely differs, or every keystroke
         // would reset the document and collapse the selection.

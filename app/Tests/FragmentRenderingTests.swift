@@ -253,6 +253,138 @@ final class FragmentRenderingTests: XCTestCase {
                 + "each line's text width (edges: \(Set(edges).sorted().suffix(8)))")
     }
 
+    // MARK: - Rendered content
+
+    func testAMathBlockPaintsATypesetFormulaInPlaceOfItsSource() throws {
+        // The source collapses and the formula is drawn in its place, so the
+        // rendered version must cover far more of the surface than the raw
+        // `$$…$$` ever would.
+        let plain = try render("E = mc squared\n")
+        let math = try render("$$\nE = mc^2\n$$\n")
+
+        XCTAssertGreaterThan(
+            inkedPixels(math), inkedPixels(plain),
+            "a typeset formula should paint more than its plain-text equivalent")
+    }
+
+    func testAMathFragmentGrowsToFitTheFormula() throws {
+        // Without the frame growing, the following paragraph lays out on top
+        // of the formula.
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+        view.setMarkdown("$$\nE = mc^2\n$$\n")
+
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var rendered: [MarkdownLayoutFragment] = []
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment,
+                fragment.decoration.rendered != nil
+            {
+                rendered.append(fragment)
+            }
+            return true
+        }
+
+        XCTAssertFalse(rendered.isEmpty, "the math block should produce rendered fragments")
+        let withContent = rendered.filter { $0.renderedContent != nil }
+        XCTAssertFalse(withContent.isEmpty, "the formula should have typeset")
+        for fragment in withContent {
+            XCTAssertGreaterThan(
+                fragment.layoutFragmentFrame.height, 20,
+                "the fragment must grow to fit the formula it draws")
+        }
+    }
+
+    func testAMermaidFenceRendersADiagramRatherThanCode() throws {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 500)
+        view.setMarkdown("```mermaid\ngraph TD;\n  A --> B;\n```\n")
+
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var diagrams = 0
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment,
+                case .diagram = fragment.decoration.rendered?.kind,
+                fragment.renderedContent != nil
+            {
+                diagrams += 1
+            }
+            return true
+        }
+        XCTAssertGreaterThan(diagrams, 0, "a mermaid fence should render as a diagram")
+    }
+
+    func testAMissingImageShowsAnExplanationNotABlank() throws {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 300)
+        view.documentDirectory = URL(fileURLWithPath: "/tmp")
+        view.setMarkdown("![A plan](nope-\(UUID().uuidString).png)\n")
+
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var explained = false
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment,
+                let failure = fragment.renderFailure
+            {
+                // The author's own alt text is more use than a bare filename.
+                XCTAssertTrue(failure.reason.contains("A plan"))
+                explained = true
+            }
+            return true
+        }
+        XCTAssertTrue(explained, "a missing image must explain itself, not render blank")
+    }
+
+    // MARK: - Checkboxes and tables
+
+    func testACheckedTaskPaintsAFilledBox() throws {
+        // The `[x]` is collapsed, so if the box were not drawn the line would
+        // simply lose its state.
+        let checked = try render("- [x] done\n")
+        let colour = try XCTUnwrap(
+            dominantColor(checked), "a ticked box should paint the accent colour")
+
+        // The accent fill is a saturated colour; an empty outline is not.
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0
+        var brightness: CGFloat = 0
+        var alpha: CGFloat = 0
+        colour.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+        XCTAssertGreaterThan(saturation, 0.2)
+    }
+
+    func testAnUncheckedTaskPaintsLessThanACheckedOne() throws {
+        // An outline is strokes; a tick is a filled box. If both drew the
+        // same, the two states would be indistinguishable.
+        let unchecked = try render("- [ ] todo\n")
+        let checked = try render("- [x] todo\n")
+
+        XCTAssertGreaterThan(
+            inkedPixels(checked), inkedPixels(unchecked),
+            "a ticked box should cover more than an empty one")
+    }
+
+    func testATableHeaderIsShaded() throws {
+        let table = try render("| a | b |\n|---|---|\n| 1 | 2 |\n")
+        let plain = try render("a b\n1 2\n")
+
+        XCTAssertGreaterThan(
+            inkedPixels(table), inkedPixels(plain),
+            "a table should paint header shading and row rules")
+    }
+
     func testRenderingIsStableForAnEmptyDocument() throws {
         XCTAssertNoThrow(try render(""))
     }

@@ -11,38 +11,35 @@ import QuickLookUI
 
 /// Renders a Markdown file into Quick Look's preview panel.
 ///
-/// Quick Look extensions are memory-capped and are judged on how fast they
-/// paint, so this path shares `MarkDevKit`'s read-only renderer and never
-/// touches the editing machinery.
+/// The whole controller is a host for ``MarkDevPreviewController``: the
+/// preview is the editor in reading mode, so what Finder shows on Space is
+/// what the app shows when the note is opened. Nothing about the rendering
+/// lives here.
 final class PreviewViewController: NSViewController, QLPreviewingController {
-    private let textView = NSTextView()
-    private let scrollView = NSScrollView()
+    private let preview = MarkdownPreviewController()
 
     override func loadView() {
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.textContainerInset = NSSize(width: 24, height: 24)
-
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.documentView = textView
-
-        view = scrollView
+        view = preview.view
     }
 
     func preparePreviewOfFile(at url: URL) async throws {
-        // Read off the main actor: Quick Look calls this on a file that may
-        // live on a slow or network volume.
-        let source = try await Task.detached(priority: .userInitiated) {
-            try String(contentsOf: url, encoding: .utf8)
+        // Read off the main actor: Quick Look calls this for files that may
+        // live on a slow or network volume, and blocking the main thread of a
+        // preview extension is what makes Space feel broken.
+        let data = try await Task.detached(priority: .userInitiated) {
+            try Data(contentsOf: url)
         }.value
 
-        let parsed = ParsedDocument.parse(source)
-        let rendered = PreviewRenderer.attributedString(for: source, parsed: parsed)
+        // Latin-1 as a fallback rather than a thrown error: a note saved by an
+        // older tool is still worth previewing, and Quick Look's alternative
+        // is a blank panel that explains nothing.
+        let markdown =
+            String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1)
+            ?? ""
 
         await MainActor.run {
-            textView.textStorage?.setAttributedString(rendered)
+            preview.show(markdown, directory: url.deletingLastPathComponent())
         }
     }
 }

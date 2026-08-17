@@ -97,6 +97,70 @@ final class BlockDecorationTests: XCTestCase {
         XCTAssertTrue(BlockDecoration.code(edge: .only, language: nil).hasBackground)
     }
 
+    // MARK: - Rendered blocks
+
+    private func decoration(_ source: String, at range: NSRange, withText: Bool) -> BlockDecoration {
+        BlockDecoration.decoration(
+            for: range, in: ParsedDocument.parse(source),
+            text: withText ? (source as NSString) : nil)
+    }
+
+    func testAMathBlockBecomesRenderedLatex() {
+        let source = "$$\nE = mc^2\n$$"
+        let decoration = decoration(source, at: range(of: "E = mc^2", in: source), withText: true)
+        guard case .rendered(let block) = decoration else {
+            return XCTFail("expected rendered math, got \(decoration)")
+        }
+        XCTAssertEqual(block.kind, .math)
+        XCTAssertEqual(block.source, "E = mc^2", "the `$$` delimiters are not part of the formula")
+    }
+
+    func testAMermaidFenceBecomesARenderedDiagram() {
+        let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
+        let decoration = decoration(source, at: range(of: "graph TD", in: source), withText: true)
+        guard case .rendered(let block) = decoration else {
+            return XCTFail("expected a rendered diagram, got \(decoration)")
+        }
+        XCTAssertEqual(block.kind, .diagram)
+        XCTAssertTrue(block.source.hasPrefix("graph TD"), "fence lines are not part of the source")
+        XCTAssertFalse(block.source.contains("```"))
+    }
+
+    func testWithoutTextMathFallsBackToCode() {
+        // The source cannot be read without the document text, and drawing it
+        // as code beats drawing nothing.
+        let source = "$$\nE = mc^2\n$$"
+        let decoration = decoration(source, at: range(of: "E = mc^2", in: source), withText: false)
+        guard case .code = decoration else {
+            return XCTFail("expected a code fallback, got \(decoration)")
+        }
+    }
+
+    func testAStandaloneImageBecomesARenderedImage() {
+        let source = "![A diagram](pictures/plan.png)"
+        let decoration = decoration(source, at: NSRange(location: 2, length: 3), withText: true)
+        guard case .rendered(let block) = decoration else {
+            return XCTFail("expected a rendered image, got \(decoration)")
+        }
+        XCTAssertEqual(block.source, "pictures/plan.png")
+        guard case .image(let alt) = block.kind else { return XCTFail("expected image kind") }
+        XCTAssertEqual(alt, "A diagram", "alt text is shown when the file cannot be loaded")
+    }
+
+    func testAnInlineImageStaysInline() {
+        // Swapping an image inside a sentence for a block would break the
+        // line it belongs to.
+        let source = "See ![icon](i.png) here in a sentence."
+        let decoration = decoration(source, at: range(of: "icon", in: source), withText: true)
+        XCTAssertNil(decoration.rendered, "an image mid-sentence must not become a block")
+    }
+
+    func testRenderedBlocksPaintNoPanel() {
+        let math = BlockDecoration.rendered(RenderedBlock(kind: .math, source: "x"))
+        XCTAssertFalse(math.hasBackground)
+        XCTAssertNotNil(math.rendered)
+    }
+
     func testEmptyDocumentIsHandled() {
         XCTAssertEqual(
             BlockDecoration.decoration(for: NSRange(location: 0, length: 0), in: .empty), .none)
@@ -151,5 +215,185 @@ final class SyntaxHighlighterTests: XCTestCase {
         let first = highlighter.spans(language: "rust", code: code)
         let second = highlighter.spans(language: "rust", code: code)
         XCTAssertEqual(first, second)
+    }
+}
+
+@MainActor
+final class TaskAndTableTests: XCTestCase {
+    private func makeView(_ markdown: String) -> MarkdownTextView {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+        view.setMarkdown(markdown)
+        return view
+    }
+
+    // MARK: - Checkboxes
+
+    func testTogglingATaskEditsTheDocument() {
+        // Ticking a box is a document change, not view state: `[ ]` and `[x]`
+        // are the text, so undo, save, and the index all see it.
+        let view = makeView("- [ ] write tests\n")
+        let marker = view.parsed.spans.first { $0.kind == .taskMarker }
+        XCTAssertNotNil(marker)
+
+        XCTAssertTrue(view.toggleTask(at: marker!.range.location))
+        XCTAssertTrue(view.markdown.contains("[x]"))
+        XCTAssertFalse(view.markdown.contains("[ ]"))
+    }
+
+    func testTogglingIsReversible() {
+        let view = makeView("- [x] done\n")
+        let marker = view.parsed.spans.first { $0.kind == .taskMarker }
+        view.toggleTask(at: marker!.range.location)
+        XCTAssertTrue(view.markdown.contains("[ ]"))
+
+        let again = view.parsed.spans.first { $0.kind == .taskMarker }
+        view.toggleTask(at: again!.range.location)
+        XCTAssertTrue(view.markdown.contains("[x]"))
+    }
+
+    func testTogglingIsUndoable() throws {
+        // Undo needs a real responder chain: a detached view has no undo
+        // manager, so putting it in a window is what makes this test the
+        // thing it claims to be.
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        let view = makeView("- [ ] reversible\n")
+        window.contentView = view
+        window.makeFirstResponder(view)
+
+        let marker = try XCTUnwrap(view.parsed.spans.first { $0.kind == .taskMarker })
+        view.toggleTask(at: marker.range.location)
+        XCTAssertTrue(view.markdown.contains("[x]"))
+
+        let undo = try XCTUnwrap(view.undoManager, "an editable text view in a window has undo")
+        undo.undo()
+        XCTAssertTrue(view.markdown.contains("[ ]"), "toggling must be undoable")
+    }
+
+    func testTogglingElsewhereDoesNothing() {
+        let view = makeView("Just prose, no tasks here.\n")
+        XCTAssertFalse(view.toggleTask(at: 3))
+        XCTAssertEqual(view.markdown, "Just prose, no tasks here.\n")
+    }
+
+    func testTaskMarkersCollapseSoTheCheckboxStandsAlone() {
+        let view = makeView("# T\n\n- [x] done\n")
+        // Caret in the heading, so the task's own block is not revealed.
+        view.setSelectedRange(NSRange(location: 2, length: 0))
+
+        let range = (view.markdown as NSString).range(of: "[x]")
+        let font = view.textStorage?.attribute(.font, at: range.location, effectiveRange: nil)
+            as? NSFont
+        XCTAssertEqual(
+            font?.pointSize, EditorTheme.hiddenMarkerFontSize,
+            "the raw `[x]` should collapse behind the drawn checkbox")
+    }
+
+    func testTaskItemsReserveAGutterForTheirCheckbox() {
+        // Without the indent the checkbox would be drawn over the item's text.
+        let view = makeView("- [ ] task\n")
+        let range = (view.markdown as NSString).range(of: "task")
+        let style = view.textStorage?.attribute(
+            .paragraphStyle, at: range.location, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertGreaterThan(
+            style?.headIndent ?? 0, MarkdownLayoutFragment.Metrics.checkboxGutter,
+            "a task item needs room for its checkbox")
+    }
+
+    func testClickingTheGutterTogglesTheCheckbox() throws {
+        // Exercised through `toggleTask` rather than a synthesised click: a
+        // `mouseDown` that misses the gutter falls through to `NSTextView`,
+        // which starts a drag-tracking loop and waits for a mouse-up a test
+        // never sends — so a failure here would hang rather than fail.
+        let view = makeView("- [ ] task\n")
+        let marker = try XCTUnwrap(view.parsed.spans.first { $0.kind == .taskMarker })
+
+        XCTAssertTrue(view.toggleTask(at: marker.range.location))
+        XCTAssertTrue(view.markdown.contains("[x]"))
+    }
+
+    // MARK: - Tables
+
+    private func table() -> String {
+        """
+        | Language | Grammar |
+        |---|---|
+        | Rust | yes |
+        | A much longer language name | no |
+        """
+    }
+
+    func testTableRowsResolveHeaderAndBody() {
+        let source = table()
+        let document = ParsedDocument.parse(source)
+        let header = (source as NSString).range(of: "Language")
+        let body = (source as NSString).range(of: "Rust")
+
+        guard case .tableRow(let headerIsHeader, _) = BlockDecoration.decoration(
+            for: header, in: document)
+        else { return XCTFail("expected a table row for the header") }
+        XCTAssertTrue(headerIsHeader)
+
+        guard case .tableRow(let bodyIsHeader, _) = BlockDecoration.decoration(
+            for: body, in: document)
+        else { return XCTFail("expected a table row for the body") }
+        XCTAssertFalse(bodyIsHeader)
+    }
+
+    func testColumnsAreAlignedByKerningTheSeparators() {
+        // The text is never rewritten, so alignment rides on the collapsed
+        // `|` separators the document already has.
+        let view = makeView(table())
+        guard let storage = view.textStorage else { return XCTFail("no storage") }
+
+        var kerned = 0
+        storage.enumerateAttribute(
+            .kern, in: NSRange(location: 0, length: storage.length)
+        ) { value, _, _ in
+            if let kern = value as? CGFloat, kern > 0 { kerned += 1 }
+        }
+        XCTAssertGreaterThan(kerned, 0, "table cells should be padded to their columns")
+    }
+
+    func testAShorterCellIsPaddedMoreThanALongerOneInTheSameColumn() throws {
+        // The property that makes columns line up: within a column, padding
+        // makes up the difference, so the shorter cell gets more of it.
+        let view = makeView(table())
+        let storage = try XCTUnwrap(view.textStorage)
+
+        // First-column cells, in row order.
+        let rows = view.parsed.blocks.filter { $0.kind == .tableRow || $0.kind == .tableHead }
+            .sorted { $0.range.location < $1.range.location }
+        let firstColumn: [BlockDescriptor] = rows.compactMap { row in
+            view.parsed.blocks
+                .filter {
+                    $0.kind == .tableCell
+                        && NSIntersectionRange($0.range, row.range).length > 0
+                }
+                .min { $0.range.location < $1.range.location }
+        }
+        XCTAssertGreaterThanOrEqual(firstColumn.count, 3)
+
+        /// Padding applied to a cell, read from its final character.
+        func padding(_ cell: BlockDescriptor) -> CGFloat {
+            let last = cell.range.location + cell.range.length - 1
+            return storage.attribute(.kern, at: last, effectiveRange: nil) as? CGFloat ?? 0
+        }
+
+        let text = view.markdown as NSString
+        let widest = firstColumn.max { text.substring(with: $0.range).count < text.substring(with: $1.range).count }
+        let narrowest = firstColumn.min { text.substring(with: $0.range).count < text.substring(with: $1.range).count }
+        let wide = try XCTUnwrap(widest)
+        let narrow = try XCTUnwrap(narrowest)
+
+        XCTAssertGreaterThan(
+            padding(narrow), padding(wide),
+            "the shorter cell needs more padding to reach the same column edge")
+    }
+
+    func testATableWithoutBodyRowsIsLeftAlone() {
+        XCTAssertNoThrow(makeView("| a |\n|---|\n"))
     }
 }

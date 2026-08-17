@@ -109,8 +109,24 @@ preview FILE: build
     qlmanage -p {{FILE}}
 
 # What macOS thinks will handle Markdown previews right now.
+#
+# `qlmanage -m plugins` lists only the *legacy* .qlgenerator plugins and never
+# mentions a modern .appex, so it reported "nothing registered" even for the
+# extension that was in fact serving previews. pluginkit is the register that
+# actually decides.
 preview-status:
-    qlmanage -m plugins 2>/dev/null | grep -i markdown || echo "no markdown Quick Look plugin registered"
+    #!/usr/bin/env zsh
+    echo "Quick Look preview extensions claiming Markdown:"
+    pluginkit -mAD -p com.apple.quicklook.preview -v 2>/dev/null \
+        | grep -iE "markdev|markdown" || echo "  (none)"
+    echo
+    echo "Type resolution:"
+    for ext in md markdown mdx mkd; do
+        probe=$(mktemp -d)/probe.$ext
+        touch $probe
+        printf "  .%-9s %s\n" $ext "$(mdls -name kMDItemContentType -raw $probe)"
+        rm -rf $(dirname $probe)
+    done
 
 # --- Housekeeping ----------------------------------------------------------
 

@@ -64,26 +64,37 @@ public enum RevealPolicy {
         return selection.location < blockEnd && selectionEnd > block.location
     }
 
-    /// Ranges that must stay visible because hiding them would destroy
-    /// information no drawn stand-in replaces yet.
+    /// Ranges whose *entire* text is replaced by rendered content.
     ///
-    /// A `- [x]` checkbox and a `---` rule are *entirely* syntax: unlike
-    /// `**`, there is no content left behind once they are hidden. They only
-    /// become hideable once the editor draws a checkbox and a horizontal
-    /// line in their place, which is fragment work. Until then they stay
-    /// visible — a blank line where a rule used to be would read as data
-    /// loss.
-    public static func markersRequiringReplacement(in document: ParsedDocument) -> [NSRange] {
+    /// Unlike a marker, the whole block goes: a formula's source is replaced
+    /// by the typeset formula, not merely stripped of its `$$`. These hide
+    /// only while the caret is elsewhere — the source has to come back to be
+    /// edited, which is the same bargain live preview makes everywhere else.
+    public static func blocksRenderedAsContent(
+        in document: ParsedDocument,
+        revealed: Set<Int>
+    ) -> [NSRange] {
         var ranges: [NSRange] = []
-        ranges.reserveCapacity(8)
-
-        for span in document.spans where span.kind == .taskMarker {
-            ranges.append(span.range)
-        }
-        for block in document.blocks where block.kind == .rule {
+        for (index, block) in document.blocks.enumerated() {
+            guard block.kind == .mathBlock || block.kind == .mermaidBlock else { continue }
+            guard !revealed.contains(index) else { continue }
             ranges.append(block.range)
         }
         return ranges
+    }
+
+    /// Ranges that must stay visible because hiding them would destroy
+    /// information no drawn stand-in replaces yet.
+    ///
+    /// Both `- [x]` and `---` are *entirely* syntax: unlike `**`, nothing is
+    /// left behind once they are hidden. They may only be hidden because the
+    /// layout fragment now draws a checkbox and a horizontal line in their
+    /// place — hiding them with nothing drawn would read as data loss.
+    ///
+    /// Kept as a hook rather than deleted: any future construct that is all
+    /// syntax has to earn its drawn replacement the same way.
+    public static func markersRequiringReplacement(in document: ParsedDocument) -> [NSRange] {
+        []
     }
 }
 
@@ -120,6 +131,9 @@ extension HiddenRanges {
             protected.insert(integersIn: range.location..<(range.location + range.length))
         }
 
+        // Rendered blocks hide entirely, not just their delimiters.
+        let replaced = RevealPolicy.blocksRenderedAsContent(in: document, revealed: revealed)
+
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }
             .map(\.range)
@@ -129,6 +143,6 @@ extension HiddenRanges {
                         integersIn: candidate.location..<(candidate.location + candidate.length))
             }
 
-        self.init(merging: Array(hideable))
+        self.init(merging: Array(hideable) + replaced)
     }
 }

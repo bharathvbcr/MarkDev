@@ -18,21 +18,35 @@ public struct NavigatorView: View {
     /// a workspace-level decision, and the sidebar is only one of the places
     /// it can be made.
     public var onChooseVault: (() -> Void)?
+    /// Called with the highlighted file while Space is held, and with `nil`
+    /// when it is released. The navigator does not present the peek itself:
+    /// the panel floats over the whole workspace, which the sidebar is only a
+    /// corner of.
+    public var onPeek: ((URL?) -> Void)?
+    /// Called with a *directory* to open a shell in. A file resolves to the
+    /// folder holding it, since that is what a shell can be started in and
+    /// what someone means by "a terminal here" while pointing at a note.
+    public var onOpenTerminal: ((URL) -> Void)?
 
     @State private var nodes: [FileNode] = []
     @State private var expanded: Set<URL> = []
     @State private var filter = ""
     @State private var selection: URL?
+    @FocusState private var listFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
         root: URL?,
         onOpen: @escaping (URL) -> Void,
-        onChooseVault: (() -> Void)? = nil
+        onChooseVault: (() -> Void)? = nil,
+        onPeek: ((URL?) -> Void)? = nil,
+        onOpenTerminal: ((URL) -> Void)? = nil
     ) {
         self.root = root
         self.onOpen = onOpen
         self.onChooseVault = onChooseVault
+        self.onPeek = onPeek
+        self.onOpenTerminal = onOpenTerminal
     }
 
     public var body: some View {
@@ -64,8 +78,25 @@ public struct NavigatorView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 0)
+            if let onOpenTerminal {
+                // A button, not only a menu item: opening a shell at the vault
+                // root is the common case, and burying the common case one
+                // click deeper than "Reveal in Finder" makes the terminal feel
+                // like a thing the app has rather than a thing it offers.
+                Button { onOpenTerminal(root) } label: {
+                    Image(systemName: "apple.terminal")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Open a terminal in \(root.lastPathComponent)")
+                .accessibilityLabel("Open a terminal in the vault")
+            }
             Menu {
                 Button("Change Vault…") { onChooseVault?() }
+                if let onOpenTerminal {
+                    Button("Open Terminal Here") { onOpenTerminal(root) }
+                }
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([root])
                 }
@@ -155,35 +186,127 @@ public struct NavigatorView: View {
             }
             .frame(maxWidth: .infinity)
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(rows, id: \.node.id) { row in
-                        NavigatorRow(
-                            node: row.node,
-                            depth: row.depth,
-                            subtitle: row.subtitle,
-                            isExpanded: expanded.contains(row.node.url),
-                            isSelected: selection == row.node.url,
-                            reduceMotion: reduceMotion
-                        ) {
-                            activate(row.node)
-                        }
-                        .contextMenu {
-                            Button("Reveal in Finder") {
-                                NSWorkspace.shared.activateFileViewerSelecting([row.node.url])
+            ScrollViewReader { scroller in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1) {
+                        ForEach(rows, id: \.node.id) { row in
+                            NavigatorRow(
+                                node: row.node,
+                                depth: row.depth,
+                                subtitle: row.subtitle,
+                                isExpanded: expanded.contains(row.node.url),
+                                isSelected: selection == row.node.url,
+                                reduceMotion: reduceMotion
+                            ) {
+                                listFocused = true
+                                activate(row.node)
                             }
-                            Button("Copy Path") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(
-                                    row.node.url.path, forType: .string)
+                            .id(row.node.url)
+                            .contextMenu {
+                                if let onOpenTerminal {
+                                    Button("Open Terminal Here") {
+                                        onOpenTerminal(
+                                            NavigatorTerminalTarget.directory(for: row.node))
+                                    }
+                                    Divider()
+                                }
+                                Button("Reveal in Finder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([row.node.url])
+                                }
+                                Button("Copy Path") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(
+                                        row.node.url.path, forType: .string)
+                                }
                             }
                         }
                     }
+                    .padding(.vertical, GlassTheme.Spacing.tight)
                 }
-                .padding(.vertical, GlassTheme.Spacing.tight)
+                .scrollContentBackground(.hidden)
+                .onChange(of: selection) { _, new in
+                    guard let new else { return }
+                    scroller.scrollTo(new, anchor: .center)
+                }
             }
-            .scrollContentBackground(.hidden)
+            .focusable()
+            .focused($listFocused)
+            .focusEffectDisabled()
+            .onKeyPress(.downArrow) { moveSelection(by: 1, in: rows) }
+            .onKeyPress(.upArrow) { moveSelection(by: -1, in: rows) }
+            .onKeyPress(.rightArrow) { setExpansion(true) }
+            .onKeyPress(.leftArrow) { setExpansion(false) }
+            .onKeyPress(.return) { openSelection() }
+            // Hold Space to peek, release to dismiss — the Finder gesture.
+            // Both phases are requested and key repeat is not, so holding the
+            // key down does not fire a stream of open-and-close requests.
+            .onKeyPress(.space, phases: [.down, .up]) { press in
+                onPeek?(press.phase == .down ? peekTarget : nil)
+                return .handled
+            }
+            // Releasing Space after focus has moved elsewhere would otherwise
+            // leave the panel stuck open with no key to dismiss it.
+            .onChange(of: listFocused) { _, focused in
+                if !focused { onPeek?(nil) }
+            }
         }
+    }
+
+    // MARK: - Keyboard
+
+    /// The file the peek panel should show: directories have nothing to
+    /// preview, so Space over one is a no-op rather than an empty panel.
+    private var peekTarget: URL? {
+        guard let selection,
+            let node = visibleRows.first(where: { $0.node.url == selection })?.node,
+            !node.isDirectory
+        else { return nil }
+        return selection
+    }
+
+    private func moveSelection(by offset: Int, in rows: [Row]) -> KeyPress.Result {
+        let urls = rows.map(\.node.url)
+        guard let next = NavigatorKeyboard.move(selection, by: offset, in: urls) else {
+            return .ignored
+        }
+        selection = next
+        return .handled
+    }
+
+    /// Expands or collapses the selected directory.
+    ///
+    /// Collapsing an already-collapsed row steps to its parent, which is what
+    /// makes left-arrow feel like "out" rather than dead.
+    private func setExpansion(_ expand: Bool) -> KeyPress.Result {
+        guard let selection,
+            let node = visibleRows.first(where: { $0.node.url == selection })?.node
+        else { return .ignored }
+
+        if expand {
+            guard node.isDirectory, !expanded.contains(node.url) else { return .ignored }
+            expanded.insert(node.url)
+            loadChildren(of: node.url)
+            return .handled
+        }
+
+        if node.isDirectory, expanded.contains(node.url) {
+            expanded.remove(node.url)
+            return .handled
+        }
+        let parent = node.url.deletingLastPathComponent()
+        guard parent != root, visibleRows.contains(where: { $0.node.url == parent }) else {
+            return .ignored
+        }
+        self.selection = parent
+        return .handled
+    }
+
+    private func openSelection() -> KeyPress.Result {
+        guard let selection,
+            let node = visibleRows.first(where: { $0.node.url == selection })?.node
+        else { return .ignored }
+        activate(node)
+        return .handled
     }
 
     // MARK: - Rows
@@ -297,6 +420,43 @@ public struct NavigatorView: View {
             return false
         }
         _ = fill(&nodes)
+    }
+}
+
+/// Which directory a sidebar row means when asked for a terminal.
+///
+/// Pure, and separate from the view, because the rule is the whole feature: a
+/// shell cannot start "in" a note. Pointing at `Notes/Index.md` and asking for
+/// a terminal means `Notes/`, and getting that wrong is the difference between
+/// a working command and a shell that starts at home for no visible reason.
+enum NavigatorTerminalTarget {
+    static func directory(for node: FileNode) -> URL {
+        node.isDirectory ? node.url : node.url.deletingLastPathComponent()
+    }
+}
+
+/// Where the arrow keys move the navigator's selection.
+///
+/// A pure function over the flattened row list, for the same reason
+/// ``SplitLayout`` is a value type: "arrowing past the end stays put" and
+/// "the first press with nothing selected lands on an end" are then tested
+/// properties of the model, rather than behaviour that needs a window, a
+/// focused view, and a synthesised key event to observe.
+enum NavigatorKeyboard {
+    /// The row `offset` steps from `selection`, or `nil` if nothing moves.
+    ///
+    /// Returning `nil` rather than the unchanged selection is what lets the
+    /// view report the key as unhandled, so a press at the end of the list
+    /// falls through to AppKit instead of being swallowed.
+    static func move(_ selection: URL?, by offset: Int, in rows: [URL]) -> URL? {
+        guard !rows.isEmpty else { return nil }
+        guard let selection, let current = rows.firstIndex(of: selection) else {
+            // Nothing selected yet: step in from whichever end the key implies.
+            return offset >= 0 ? rows.first : rows.last
+        }
+        let next = current + offset
+        guard rows.indices.contains(next), next != current else { return nil }
+        return rows[next]
     }
 }
 

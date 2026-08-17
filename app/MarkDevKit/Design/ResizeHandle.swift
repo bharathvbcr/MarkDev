@@ -20,7 +20,7 @@ import SwiftUI
 ///
 /// The handle reports *incremental* translation and owns no geometry. Whoever
 /// draws it decides what a point of drag means and clamps the result — see
-/// ``SplitLayout`` and ``PanelWidthRange``.
+/// ``SplitLayout`` and ``PanelSizeRange``.
 public struct ResizeHandle: View {
     /// The axis the two regions are laid out along, not the axis of the line:
     /// a `.horizontal` arrangement gets a vertical divider dragged sideways.

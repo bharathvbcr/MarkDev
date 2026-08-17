@@ -25,13 +25,32 @@ settings:
     # per build: changing the icon without bumping this leaves Finder showing
     # the old icon indefinitely. Bump when the type declarations or the icon
     # assets change.
-    CURRENT_PROJECT_VERSION: "4"
+    CURRENT_PROJECT_VERSION: "5"
     ONLY_ACTIVE_ARCH: true
     ENABLE_HARDENED_RUNTIME: true
     # Signed to run locally; a distribution identity replaces this at release.
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: true
     CODE_SIGNING_ALLOWED: true
+
+packages:
+  # LaTeX typesetting in pure Swift (a port of iosMath). Core Text only —
+  # no WebView, which is the whole point of MarkDev's rendering.
+  SwiftMath:
+    url: https://github.com/mgriebling/SwiftMath
+    from: 1.7.3
+  # Native Mermaid rendering, laid out by a Swift port of the Eclipse Layout
+  # Kernel. Covers flowchart, sequence, class, state, ER, and XY charts;
+  # anything else is surfaced as unsupported rather than rendered wrongly.
+  BeautifulMermaid:
+    url: https://github.com/lukilabs/beautiful-mermaid-swift
+    from: 1.0.4
+  # The terminal drawer. A real VT100/xterm emulator in Swift — the point of
+  # MarkDev's terminal is running coding CLIs, which need a working pty and
+  # escape-sequence handling, not a text view that shells out.
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: 1.18.0
 
 targets:
   # ---------------------------------------------------------------------
@@ -44,6 +63,13 @@ targets:
     platform: macOS
     sources:
       - path: app/MarkDevKit
+    dependencies:
+      - package: SwiftMath
+        product: SwiftMath
+      - package: BeautifulMermaid
+        product: BeautifulMermaid
+      - package: SwiftTerm
+        product: SwiftTerm
     # A macOS framework without Versions/A/Resources/Info.plist is not a
     # valid bundle, and codesign rejects it with an opaque "bundle format
     # unrecognized" rather than naming the missing file.
@@ -116,20 +142,26 @@ targets:
             CFBundleTypeIconFile: DocumentIcon
             LSItemContentTypes:
               - net.daringfireball.markdown
+              - dev.markdev.markdown-extended
           - CFBundleTypeName: Plain Text
             CFBundleTypeRole: Editor
             LSHandlerRank: Alternate
             LSItemContentTypes:
               - public.plain-text
-        # Claims .mdx and .mkd, which the system's own declaration omits.
-        #
-        # **Imported, not exported — and the document icon cannot go here.**
+        # **Imported, not exported — and it cannot add file extensions.**
         # macOS ships its own declaration of `net.daringfireball.markdown` in
-        # CoreTypes. Exporting it from this app to attach `UTTypeIcons` looks
-        # right and does nothing: Launch Services registers the duplicate
-        # declaration as *inactive* (visible in `lsregister -dump`) and never
-        # reads its icons. `CFBundleTypeIconFile` on the document-type claim
-        # above is what actually reaches Finder.
+        # CoreTypes, and that one is `active exported core`. Every other
+        # declaration of the same identifier — this app's, Xcode's, QLMarkdown's
+        # — registers `inactive imported` and is never read. Confirm with:
+        #
+        #   lsregister -dump | awk '/^type id: *net.daringfireball.markdown/,/^---/'
+        #
+        # So this block declares only what CoreTypes already maps (.md and
+        # .markdown). Listing .mdx here looked like it claimed the extension
+        # and provably did not: an .mdx file still resolved to a dynamic UTI.
+        # Extensions CoreTypes does not own need their own *exported* type,
+        # below. The same rule is why the document icon has to hang off
+        # `CFBundleTypeIconFile` rather than `UTTypeIcons`.
         UTImportedTypeDeclarations:
           - UTTypeIdentifier: net.daringfireball.markdown
             UTTypeDescription: Markdown Document
@@ -139,9 +171,23 @@ targets:
               public.filename-extension:
                 - md
                 - markdown
+        # The extensions CoreTypes leaves as dynamic types.
+        #
+        # A new identifier, so this declaration is genuinely `exported` and
+        # active. Conforming to `net.daringfireball.markdown` means anything
+        # that already handles Markdown — including MarkDev's own Quick Look
+        # extension — handles these too, without CoreTypes' claim being touched.
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: dev.markdev.markdown-extended
+            UTTypeDescription: Markdown Document
+            UTTypeConformsTo:
+              - net.daringfireball.markdown
+            UTTypeTagSpecification:
+              public.filename-extension:
                 - mdown
                 - mdx
                 - mkd
+                - markdn
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDev
@@ -176,6 +222,7 @@ targets:
             # "extension not working" with nothing to point at.
             QLSupportedContentTypes:
               - net.daringfireball.markdown
+              - dev.markdev.markdown-extended
             # MarkDev renders its own preview surface rather than handing
             # Quick Look a thumbnail.
             QLSupportsSearchableItems: false
@@ -194,6 +241,19 @@ targets:
       - path: app/Tests
     dependencies:
       - target: MarkDevKit
+      # SwiftMath ships its math fonts in an SPM resource bundle, which
+      # `Bundle.module` resolves against the *loading* bundle. Without the
+      # package listed here the bundle is absent from the test runner and
+      # typesetting traps at the first formula.
+      - package: SwiftMath
+        product: SwiftMath
+      - package: BeautifulMermaid
+        product: BeautifulMermaid
+      # The terminal test launches a real process through SwiftTerm's pty,
+      # which needs the module visible to the test target and not only to the
+      # framework it links.
+      - package: SwiftTerm
+        product: SwiftTerm
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDevKitTests

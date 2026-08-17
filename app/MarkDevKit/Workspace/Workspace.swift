@@ -36,6 +36,7 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
 /// Recoverable document-lifecycle failures surfaced by ``Workspace``.
 public enum WorkspaceError: Error, Equatable, LocalizedError {
     case noDocument
+    case paneUnavailable
     case needsSaveDestination
     case destinationAlreadyOpen(URL)
     case destinationExists(URL)
@@ -45,6 +46,8 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
         switch self {
         case .noDocument:
             "There is no document to save."
+        case .paneUnavailable:
+            "The target editor is no longer open."
         case .needsSaveDestination:
             "Choose a name and location before saving this document."
         case .destinationAlreadyOpen(let url):
@@ -54,6 +57,20 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
         case .documentChangedOnDisk(let url):
             "\(url.lastPathComponent) changed on disk. Reload it or use Save As to preserve both versions."
         }
+    }
+}
+
+/// The file boundary for editor-targeted drops.
+public enum MarkdownDropPolicy {
+    /// Whether `url` is a Markdown file type declared by MarkDev.
+    ///
+    /// A directory named `Archive.md` is still a directory and must remain a
+    /// vault drop rather than being sent through the document reader.
+    public static func accepts(_ url: URL) -> Bool {
+        guard FileTree.isMarkdown(url), !url.hasDirectoryPath else {
+            return false
+        }
+        return (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true
     }
 }
 
@@ -154,28 +171,12 @@ public final class Workspace {
     public func open(_ url: URL, in pane: PaneID) throws {
         guard var state = panes[pane] else { return }
 
-        let url = url.standardizedFileURL
-
-        if let existing = state.documents.first(where: { $0.url == url }) {
+        let document = try resolvedDocument(for: url)
+        if let existing = state.documents.first(where: { $0.id == document.id }) {
             state.selection = existing.id
             panes[pane] = state
             return
         }
-
-        // A document has one identity even when it is visible in several
-        // panes. Reuse that identity so edits and saves cannot diverge into
-        // competing in-memory copies of the same file.
-        if let existing = allDocuments.first(where: { $0.url == url }) {
-            state.documents.append(existing)
-            state.selection = existing.id
-            panes[pane] = state
-            return
-        }
-
-        // Read before mutating pane state. A missing, unreadable, or non-UTF-8
-        // file must not masquerade as a successfully opened empty document.
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let document = OpenDocument(url: url, text: text)
         if state.documents.count == 1, state.documents[0].isPristineUntitled {
             state.documents[0] = document
         } else {
@@ -183,6 +184,33 @@ public final class Workspace {
         }
         state.selection = document.id
         panes[pane] = state
+    }
+
+    /// Opens `url` in a new pane beside `pane`.
+    ///
+    /// File resolution happens before layout mutation. A missing, unreadable,
+    /// or non-UTF-8 drop therefore cannot leave an empty split behind. If the
+    /// document is already open, the new pane shares its canonical identity so
+    /// edits continue to propagate between views.
+    @discardableResult
+    public func open(
+        _ url: URL,
+        beside pane: PaneID,
+        edge: SplitEdge = .trailing
+    ) throws -> PaneID {
+        guard panes[pane] != nil, layout.panes.contains(pane) else {
+            throw WorkspaceError.paneUnavailable
+        }
+        let document = try resolvedDocument(for: url)
+
+        let new = PaneID()
+        layout.split(pane, edge: edge, with: new)
+        guard layout.panes.contains(new) else {
+            throw WorkspaceError.paneUnavailable
+        }
+        panes[new] = PaneState(documents: [document], selection: document.id)
+        focusedPane = new
+        return new
     }
 
     /// Updates the text of the document shown in `pane`.
@@ -320,6 +348,19 @@ public final class Workspace {
         return layout.panes.compactMap { panes[$0] }
             .flatMap(\.documents)
             .filter { seen.insert($0.id).inserted }
+    }
+
+    /// Returns the one in-memory identity for `url`, loading it when needed.
+    ///
+    /// This is the canonical read boundary for both ordinary opens and drops.
+    /// Keeping it ahead of any pane mutation is what makes open failure atomic.
+    private func resolvedDocument(for requestedURL: URL) throws -> OpenDocument {
+        let url = requestedURL.standardizedFileURL
+        if let existing = allDocuments.first(where: { $0.url == url }) {
+            return existing
+        }
+        let text = try String(contentsOf: url, encoding: .utf8)
+        return OpenDocument(url: url, text: text)
     }
 
     /// Replaces every view of `document` so split panes can never drift.

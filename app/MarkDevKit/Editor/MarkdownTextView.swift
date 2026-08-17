@@ -46,6 +46,16 @@ public final class MarkdownTextView: NSTextView {
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
 
+    /// Directory the document lives in, for resolving relative image paths.
+    ///
+    /// Setting it re-renders, since every embedded image resolves against it.
+    public var documentDirectory: URL? {
+        didSet {
+            guard documentDirectory != oldValue else { return }
+            textLayoutManager?.invalidateLayout(for: textLayoutManager!.documentRange)
+        }
+    }
+
     /// Currently collapsed ranges.
     private var hiddenRanges: HiddenRanges = .none
 
@@ -214,6 +224,7 @@ public final class MarkdownTextView: NSTextView {
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: scope)
+        invalidateFragments(scope: scope)
         repairTypingAttributes()
     }
 
@@ -267,6 +278,35 @@ public final class MarkdownTextView: NSTextView {
         }
         guard end > start else { return nil }
         return NSRange(location: start, length: end - start)
+    }
+
+    /// Rebuilds layout fragments so their decoration matches the new parse.
+    ///
+    /// Attributes alone do not do it: block decoration lives on the fragment,
+    /// which TextKit caches and happily reuses across a document change. The
+    /// result is a fence still painted as prose, or a formula still showing
+    /// its source, until something else forces a relayout.
+    ///
+    /// Scoped where possible — a structural edit passes `nil` and rebuilds
+    /// everything, since that is exactly when distant blocks change meaning.
+    private func invalidateFragments(scope: NSRange?) {
+        guard let manager = textLayoutManager else { return }
+        guard let scope, let range = textRange(for: scope) else {
+            manager.invalidateLayout(for: manager.documentRange)
+            return
+        }
+        manager.invalidateLayout(for: range)
+    }
+
+    /// Converts a character range into a `NSTextRange`.
+    private func textRange(for range: NSRange) -> NSTextRange? {
+        guard let manager = textLayoutManager,
+            let content = manager.textContentManager,
+            let start = content.location(
+                manager.documentRange.location, offsetBy: range.location),
+            let end = content.location(start, offsetBy: range.length)
+        else { return nil }
+        return NSTextRange(location: start, end: end)
     }
 
     /// Whether this view holds keyboard focus.
@@ -328,6 +368,59 @@ public final class MarkdownTextView: NSTextView {
         scrollRangeToVisible(NSRange(location: clamped, length: 0))
     }
 
+    /// Toggles the task checkbox at a character offset, if there is one.
+    ///
+    /// Edits the text rather than any view state: `[ ]` and `[x]` are the
+    /// document, so ticking a box is a document change that undo, save, and
+    /// the vault index all see like any other edit.
+    @discardableResult
+    public func toggleTask(at offset: Int) -> Bool {
+        guard let storage = textStorage else { return false }
+        guard let marker = parsed.spans.first(where: { span in
+            span.kind == .taskMarker && NSLocationInRange(offset, span.range)
+        }) else { return false }
+
+        let text = storage.string as NSString
+        guard marker.range.location + marker.range.length <= text.length else { return false }
+
+        // The state character sits between the brackets: `[ ]` / `[x]`.
+        let current = text.substring(with: marker.range)
+        let replacement = current.contains("x") || current.contains("X") ? "[ ]" : "[x]"
+        guard current != replacement else { return false }
+
+        // `insertText` rather than editing the storage directly: it is the
+        // ordinary input path, so undo, the change notification, and the
+        // document binding all behave exactly as they do for typing.
+        insertText(replacement, replacementRange: marker.range)
+        return true
+    }
+
+
+    /// The task marker whose drawn checkbox covers `point`, if any.
+    private func taskMarker(atCheckbox point: CGPoint) -> StyleSpan? {
+        let offset = characterIndexForInsertion(at: point)
+        guard let marker = parsed.spans.first(where: { span in
+            span.kind == .taskMarker
+                && NSLocationInRange(min(offset, max(span.range.location, 0)), span.range)
+        }) ?? parsed.spans.first(where: { span in
+            // The checkbox is drawn in the gutter, left of the text, so a
+            // click on it resolves to the first character of the line rather
+            // than to the marker itself.
+            span.kind == .taskMarker && lineRange(containing: offset).map {
+                NSIntersectionRange($0, span.range).length > 0
+            } ?? false
+        }) else { return nil }
+        return marker
+    }
+
+    /// The line containing an offset.
+    private func lineRange(containing offset: Int) -> NSRange? {
+        guard let storage = textStorage else { return nil }
+        let text = storage.string as NSString
+        guard offset >= 0, offset <= text.length else { return nil }
+        return text.lineRange(for: NSRange(location: min(offset, max(text.length - 1, 0)), length: 0))
+    }
+
     // MARK: - Overrides
 
     /// Follows a wikilink click.
@@ -345,6 +438,39 @@ public final class MarkdownTextView: NSTextView {
         let target = (url.host(percentEncoded: false) ?? url.absoluteString)
             .replacingOccurrences(of: "\(MarkdownStyler.wikiLinkScheme)://", with: "")
         onFollowWikiLink?(target.removingPercentEncoding ?? target)
+    }
+
+    /// Ticks a checkbox when one is clicked, before the caret moves.
+    public override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Only the gutter counts: clicking the item's text should place the
+        // caret, not toggle the task.
+        if isInCheckboxGutter(point), let marker = taskMarker(atCheckbox: point) {
+            toggleTask(at: marker.range.location)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    /// Whether `point` lands in the gutter the checkbox is drawn into.
+    ///
+    /// Measured from the clicked line's own indent — the same value the
+    /// fragment positions the box from — rather than as a fixed band at the
+    /// view's left edge. A fixed band was only ever right for a first-level
+    /// item at the margin: indent a task list and the box moves with its text
+    /// while the target stays behind, so clicking a checkbox does nothing.
+    func isInCheckboxGutter(_ point: CGPoint) -> Bool {
+        guard let storage = textStorage, storage.length > 0 else { return false }
+        let offset = characterIndexForInsertion(at: point)
+        let index = min(max(offset, 0), storage.length - 1)
+        let indent =
+            (storage.attribute(.paragraphStyle, at: index, effectiveRange: nil)
+            as? NSParagraphStyle)?.firstLineHeadIndent ?? 0
+
+        let textStart =
+            textContainerInset.width + (textContainer?.lineFragmentPadding ?? 0) + indent
+        return point.x < textStart
+            && point.x >= textStart - MarkdownLayoutFragment.Metrics.checkboxGutter
     }
 
     public override func becomeFirstResponder() -> Bool {
@@ -450,8 +576,52 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         let end = textLayoutManager.offset(from: documentStart, to: elementRange.endLocation)
         guard start >= 0, end >= start else { return fragment }
 
+        let range = NSRange(location: start, length: end - start)
         fragment.decoration = BlockDecoration.decoration(
-            for: NSRange(location: start, length: end - start), in: parsed)
+            for: range, in: parsed, text: textStorage?.string as NSString?)
+        resolveRenderedContent(for: fragment)
         return fragment
+    }
+}
+
+extension MarkdownTextView {
+    /// Renders a fragment's replacement content, if it has any.
+    ///
+    /// Done here, on the main actor, rather than inside the fragment:
+    /// typesetting a formula, laying out a graph, and reading an image file
+    /// all need main-actor state, while TextKit may ask a fragment for its
+    /// metrics from anywhere.
+    func resolveRenderedContent(for fragment: MarkdownLayoutFragment) {
+        guard let block = fragment.decoration.rendered else { return }
+        // The column the content has to fit, minus the panel's own padding.
+        let width = max(bounds.width - theme.insets.width * 2 - 32, 120)
+
+        let result: Result<RenderedContent, RenderFailure>
+        switch block.kind {
+        case .math:
+            result = RichContentRenderer.shared.math(
+                block.source,
+                fontSize: theme.bodyFont.pointSize * 1.25,
+                color: theme.textColor,
+                display: true)
+        case .diagram:
+            let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            result = RichContentRenderer.shared.diagram(
+                block.source, maxWidth: width, dark: dark)
+        case .image(let alt):
+            result = RichContentRenderer.shared.image(
+                at: block.source, relativeTo: documentDirectory, maxWidth: width
+            )
+            .mapError { failure in
+                // Alt text is the author's own description; showing it beats
+                // a bare file name the reader cannot place.
+                alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")
+            }
+        }
+
+        switch result {
+        case .success(let content): fragment.renderedContent = content
+        case .failure(let failure): fragment.renderFailure = failure
+        }
     }
 }

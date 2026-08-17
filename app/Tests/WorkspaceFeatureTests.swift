@@ -29,7 +29,7 @@ final class WorkspaceFeatureTests: XCTestCase {
     }
 
     func testPanelWidthsClampBoundariesAndNonFiniteValues() {
-        let range = PanelWidthRange(preferred: 260, minimum: 180, maximum: 420)
+        let range = PanelSizeRange(preferred: 260, minimum: 180, maximum: 420)
         XCTAssertEqual(range.clamping(100), 180)
         XCTAssertEqual(range.clamping(500), 420)
         XCTAssertEqual(range.clamping(.nan), 260)

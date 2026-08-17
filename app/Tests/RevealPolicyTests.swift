@@ -48,30 +48,46 @@ final class RevealPolicyTests: XCTestCase {
         XCTAssertTrue(hidden.ranges.isEmpty, "caret at end of block keeps it revealed")
     }
 
-    func testTaskMarkersAreNeverHidden() {
-        // Hiding `- [x]` with nothing drawn in its place would read as the
-        // checkbox having been deleted.
+    func testTaskMarkersHideNowThatACheckboxIsDrawn() {
+        // Hiding `- [x]` is only safe because the layout fragment draws a
+        // checkbox in its place — the decoration below is what earns it.
         let doc = ParsedDocument.parse("- [x] done\n- [ ] todo")
         let hidden = HiddenRanges(
             document: doc, selection: NSRange(location: 0, length: 0), mode: .reading)
         guard let task = doc.spans.first(where: { $0.kind == .taskMarker }) else {
             return XCTFail("expected a task marker span")
         }
-        XCTAssertFalse(
+        XCTAssertTrue(
             hidden.ranges.contains { NSIntersectionRange($0, task.range).length > 0 },
-            "task markers must stay visible until a checkbox is drawn for them")
+            "the `[x]` should collapse behind its drawn checkbox")
+
+        let decoration = BlockDecoration.decoration(for: task.range, in: doc)
+        XCTAssertEqual(
+            decoration.taskChecked, true,
+            "a checked item must resolve to a ticked checkbox, or hiding loses it")
     }
 
-    func testHorizontalRulesAreNeverHidden() {
+    func testAnUncheckedTaskResolvesToAnEmptyBox() {
+        let doc = ParsedDocument.parse("- [ ] todo")
+        guard let task = doc.spans.first(where: { $0.kind == .taskMarker }) else {
+            return XCTFail("expected a task marker span")
+        }
+        XCTAssertEqual(BlockDecoration.decoration(for: task.range, in: doc).taskChecked, false)
+    }
+
+    func testHorizontalRulesHideBehindTheirDrawnLine() {
         let doc = ParsedDocument.parse("a\n\n---\n\nb")
         let hidden = HiddenRanges(
             document: doc, selection: NSRange(location: 0, length: 0), mode: .reading)
         guard let rule = doc.blocks.first(where: { $0.kind == .rule }) else {
             return XCTFail("expected a rule block")
         }
-        XCTAssertFalse(
+        XCTAssertTrue(
             hidden.ranges.contains { NSIntersectionRange($0, rule.range).length > 0 },
-            "a hidden rule would leave a blank line that reads as data loss")
+            "the `---` should collapse behind the line drawn for it")
+        XCTAssertEqual(
+            BlockDecoration.decoration(for: rule.range, in: doc), .rule,
+            "and that line must actually be drawn")
     }
 
     func testSelectionSpanningBlocksRevealsAllOfThem() {

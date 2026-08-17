@@ -7,6 +7,7 @@
 //
 
 import AppKit
+import MarkDevKit
 import SwiftUI
 
 @MainActor
@@ -152,4 +153,19 @@ final class MarkDevApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         WindowCloseRegistry.shared.reviewForTermination() ? .terminateNow : .terminateCancel
     }
+
+    /// Receives files opened from Finder, the Dock, or `open`.
+    ///
+    /// This is the hook, not SwiftUI's `onOpenURL`: that covers URL schemes,
+    /// while Launch Services delivers *file* opens here. Without it MarkDev
+    /// was ranked `Owner` of every Markdown document on the machine and
+    /// answered a double-click by showing an empty untitled window — the one
+    /// thing a default Markdown app must not do.
+    ///
+    /// The request usually arrives before any window exists, so it is queued
+    /// rather than acted on; see ``DocumentInbox``.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        DocumentInbox.shared.receive(urls)
+    }
+
 }

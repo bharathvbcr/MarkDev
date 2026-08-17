@@ -17,6 +17,8 @@ public enum CommandAction: Sendable, Equatable {
     case saveAs
     case toggleSidebar
     case toggleInspector
+    case toggleTerminal
+    case toggleGraph
     case splitRight
     case splitDown
     case livePreview

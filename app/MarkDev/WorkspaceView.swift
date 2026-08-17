@@ -12,6 +12,7 @@ import SwiftUI
 struct WorkspaceView: View {
     @State private var workspace = Workspace()
     @State private var showPalette = false
+    @State private var dropTargetPane: PaneID?
 
     // Shell preferences outlive the window. Resizing the navigator or picking
     // a writing mode is a decision about how someone works, not about the
@@ -24,6 +25,13 @@ struct WorkspaceView: View {
         Double(GlassTheme.sidebar.preferred)
     @AppStorage("shell.inspectorWidth") private var storedInspectorWidth =
         Double(GlassTheme.inspector.preferred)
+    @AppStorage("shell.showTerminal") private var showTerminal = false
+    @AppStorage("shell.terminalHeight") private var storedTerminalHeight =
+        Double(GlassTheme.terminal.preferred)
+
+    private var terminalHeight: CGFloat {
+        GlassTheme.terminal.clamping(CGFloat(storedTerminalHeight))
+    }
 
     /// Panel widths, clamped on the way out as well as on the way in: the
     /// stored value survives a build whose limits have changed, and a hand-
@@ -55,11 +63,62 @@ struct WorkspaceView: View {
     /// Pending scroll-to-offset per pane, from the outline and from links.
     @State private var reveals: [PaneID: RevealRequest] = [:]
 
+    /// The note under the held Space bar, if any.
+    @State private var peek: URL?
+
+    /// Whether the link graph is up.
+    @State private var showGraph = false
+
+    /// Every open shell. Owned here, not by the drawer, so hiding the drawer
+    /// does not kill a running build — see ``TerminalSessions``.
+    @State private var terminals = TerminalSessions()
+    /// Whether the drawer has ever been opened in this window.
+    ///
+    /// Once it has, it stays mounted — collapsed to nothing when hidden — so
+    /// the shells inside it survive ⌘J. Until then it is not built at all, so
+    /// an app whose terminal is never opened never forks one.
+    @State private var terminalMounted = false
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Namespace private var glass
 
     /// Vertical space the floating toolbar occupies, so content can clear it.
     private static let toolbarHeight: CGFloat = 52
+
+    /// Coordinate space shared by the floating chrome and the panels beneath
+    /// it, so one can be measured against the other.
+    private static let workspaceSpace = "workspace"
+
+    /// Bottom edge of the sidebar's header row, in `workspaceSpace`.
+    ///
+    /// `nil` until the first layout pass reports one.
+    @State private var sidebarHeaderBottom: CGFloat?
+
+    /// Carries that edge from the toolbar, which draws the header, to the
+    /// sidebar panel, which draws the rule under it.
+    ///
+    /// The two are siblings in the `ZStack`, so the panel cannot simply ask
+    /// how tall the header came out — and the header's height is the headline
+    /// font's, which moves with the system text size. A constant would be
+    /// right at one text size and wrong at every other.
+    private struct SidebarHeaderBottomKey: PreferenceKey {
+        static let defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    /// Distance from the panel's top edge down to the rule.
+    ///
+    /// The panel insets itself by `snug`, so subtracting that converts the
+    /// header's measured bottom into the panel's own coordinates. Landing the
+    /// rule exactly on the header's bottom edge is what balances the header:
+    /// the chip's own padding then reads as equal space above and below the
+    /// title. Falls back to the toolbar's nominal height until measured.
+    private var sidebarHeaderInset: CGFloat {
+        guard let bottom = sidebarHeaderBottom else { return Self.toolbarHeight }
+        return max(0, bottom - GlassTheme.Spacing.snug)
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -80,17 +139,51 @@ struct WorkspaceView: View {
                         })
                 }
 
-                SplitTreeView(layout: workspace.layoutBinding) { pane in
-                    paneView(pane)
+                VStack(spacing: 0) {
+                    SplitTreeView(layout: workspace.layoutBinding) { pane in
+                        paneView(pane)
+                    }
+                    // Cleared from the floating toolbar once, at the container,
+                    // rather than per pane: padding each pane individually
+                    // pushes every pane in a vertical split down, and leaves
+                    // the tab bars colliding with the toolbar the moment a
+                    // split appears.
+                    .padding(.top, Self.toolbarHeight)
+                    // Content still runs under the chrome's edges, giving the
+                    // glass something to refract instead of a flat panel.
+                    .backgroundExtensionEffect()
+
+                    if showTerminal {
+                        ResizeHandle(
+                            axis: .vertical,
+                            label: "Terminal divider",
+                            onDrag: {
+                                storedTerminalHeight = Double(
+                                    GlassTheme.terminal.clamping(terminalHeight - $0))
+                            },
+                            onReset: {
+                                storedTerminalHeight = Double(GlassTheme.terminal.preferred)
+                            })
+                    }
+                    if terminalMounted {
+                        // Collapsed rather than removed. Removing the drawer
+                        // tears down its host views, and tearing down a host
+                        // ends its shell — so ⌘J would throw away whatever was
+                        // running. Height zero keeps the ptys alive.
+                        TerminalDrawer(
+                            sessions: terminals,
+                            document: workspace.document(in: workspace.focusedPane)?.url,
+                            vault: workspace.vaultRoot,
+                            onClose: { showTerminal = false },
+                            onError: { errorMessage = $0 }
+                        )
+                        .frame(height: showTerminal ? terminalHeight : 0)
+                        .clipped()
+                        .opacity(showTerminal ? 1 : 0)
+                        .allowsHitTesting(showTerminal)
+                        .accessibilityHidden(!showTerminal)
+                    }
                 }
-                // Cleared from the floating toolbar once, at the container,
-                // rather than per pane: padding each pane individually pushes
-                // every pane in a vertical split down, and leaves the tab bars
-                // colliding with the toolbar the moment a split appears.
-                .padding(.top, Self.toolbarHeight)
-                // Content still runs under the chrome's edges, giving the
-                // glass something to refract instead of a flat panel.
-                .backgroundExtensionEffect()
 
                 if showInspector {
                     ResizeHandle(
@@ -148,14 +241,103 @@ struct WorkspaceView: View {
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
             value: showPalette
         )
+        // Above the palette's overlay so the two can never fight for the same
+        // space; in practice only one is ever up, since peeking needs the
+        // sidebar to hold focus.
+        .overlay {
+            if let peek {
+                PeekPanel(
+                    url: peek,
+                    onOpen: {
+                        let target = peek
+                        self.peek = nil
+                        openFile(target)
+                    },
+                    onDismiss: { self.peek = nil }
+                )
+                .transition(
+                    reduceMotion
+                        ? .opacity
+                        : .scale(scale: 0.97).combined(with: .opacity))
+            }
+        }
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: peek)
+        .overlay {
+            if showGraph {
+                GraphPanel(
+                    vault: vault,
+                    current: workspace.document(in: workspace.focusedPane)?.url
+                        .flatMap { vault.relativePath(for: $0) },
+                    onOpen: { path in
+                        guard let url = vault.url(for: path) else { return }
+                        showGraph = false
+                        openFile(url)
+                    },
+                    onDismiss: { showGraph = false }
+                )
+                .transition(
+                    reduceMotion
+                        ? .opacity
+                        : .scale(scale: 0.97).combined(with: .opacity))
+            }
+        }
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: showGraph)
+        .coordinateSpace(.named(Self.workspaceSpace))
+        // Keeps the last real measurement rather than clearing it. Collapsing
+        // removes the header, which publishes zero; resetting on that would
+        // send the rule back to its fallback and make it visibly slide into
+        // place on every re-open. Only the first open ever uses the fallback.
+        .onPreferenceChange(SidebarHeaderBottomKey.self) { bottom in
+            if bottom > 0 { sidebarHeaderBottom = bottom }
+        }
         .onChange(of: workspace.layout) { _, _ in pruneOrphanedState() }
         .onChange(of: workspace.focusedPane) { _, _ in refreshVault() }
         .onOpenURL(perform: openFile)
+        // Files from Finder, the Dock, or `open`. Drained on appear as well as
+        // on change, because a double-click that launches the app delivers its
+        // request before this view exists.
+        .onAppear {
+            DocumentInbox.shared.setHandler { openFromInbox($0) }
+        }
         .animation(
             GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
             value: showInspector)
+        .animation(
+            GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
+            value: showTerminal)
         .onDisappear {
             for task in statsTasks.values { task.cancel() }
+        }
+    }
+
+    // MARK: - Terminal
+
+    /// Shows or hides the drawer, mounting it the first time.
+    private func setTerminal(visible: Bool) {
+        if visible { terminalMounted = true }
+        showTerminal = visible
+    }
+
+    /// Opens a shell rooted at `directory`, from the sidebar.
+    ///
+    /// Reveals rather than opens: clicking a folder twice should bring its
+    /// shell forward, not fork a second one beside the first.
+    private func openTerminal(in directory: URL) {
+        // The session first, then the drawer. The drawer opens a default shell
+        // when it appears to nothing, so mounting it first would fork one at
+        // the vault root and *then* add the requested folder beside it.
+        let config = TerminalSession.resolve(document: nil, vault: directory)
+        do {
+            try terminals.reveal(config)
+            setTerminal(visible: true)
+        } catch let failure as TerminalOpenFailure {
+            errorMessage = failure.reason
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -166,22 +348,49 @@ struct WorkspaceView: View {
     ///
     /// The brand and sidebar toggle belong to the **sidebar column** and are
     /// held to its exact width; search and the mode picker belong to the
-    /// **content column**. Laying the toolbar out as one continuous row
-    /// instead lets its items drift out of step with the panels below — adding
-    /// the brand chip pushed the search capsule across the sidebar's edge, so
-    /// the chrome no longer agreed with the layout it sat on.
+    /// **content column**. The brand chip therefore comes and goes with the
+    /// sidebar: pinning it above a panel that is no longer there leaves it
+    /// reading as a header for nothing.
+    ///
+    /// Laying the toolbar out as one continuous row instead lets its items
+    /// drift out of step with the panels below — adding the brand chip pushed
+    /// the search capsule across the sidebar's edge, so the chrome no longer
+    /// agreed with the layout it sat on.
     private var toolbar: some View {
         GlassEffectContainer(spacing: GlassTheme.Spacing.snug) {
             HStack(spacing: 0) {
                 HStack(spacing: GlassTheme.Spacing.snug) {
-                    brandChip
+                    if showSidebar {
+                        brandChip
+                            .transition(.move(edge: .leading).combined(with: .opacity))
+                        Spacer(minLength: GlassTheme.Spacing.snug)
+                    }
                     sidebarToggle
-                    Spacer(minLength: 0)
                 }
-                // Matches the sidebar panel's own inset, so the brand's left
-                // edge sits exactly above the panel's.
+                // The panel below insets itself by `snug` on every side, so
+                // the same inset here puts the brand exactly on its top-left
+                // corner and the toggle exactly on its top-right. The spacer
+                // between them is what holds the two to the corners instead
+                // of letting the toggle float mid-column.
+                //
+                // Collapsed, both the spacer and the trailing inset go with
+                // the panel, and the toggle falls back to the leading edge.
                 .padding(.leading, GlassTheme.Spacing.snug)
+                .padding(.trailing, showSidebar ? GlassTheme.Spacing.snug : 0)
                 .frame(width: showSidebar ? sidebarWidth : nil, alignment: .leading)
+                // Publishes where this row ends so the panel below can put its
+                // rule there. Only while the sidebar is open: collapsed, the
+                // row is a lone floating toggle over the canvas and there is
+                // no panel to underline.
+                .background {
+                    if showSidebar {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: SidebarHeaderBottomKey.self,
+                                value: proxy.frame(in: .named(Self.workspaceSpace)).maxY)
+                        }
+                    }
+                }
 
                 HStack(spacing: GlassTheme.Spacing.snug) {
                     searchButton
@@ -201,6 +410,13 @@ struct WorkspaceView: View {
 
     /// The mark is drawn from the same geometry the app icon is rendered
     /// from, so the chrome and the Dock never disagree.
+    ///
+    /// Deliberately **not** glass. It only exists while the sidebar is open,
+    /// which is exactly when it is sitting on the navigator's own glass panel
+    /// — a capsule there is a surface floating on a surface, and the point of
+    /// glass is to separate the navigation layer from content, not to outline
+    /// every label within it. The padding stays: it lands the logo on the
+    /// panel's inner content edge, in line with the filter field below.
     private var brandChip: some View {
         HStack(spacing: GlassTheme.Spacing.tight) {
             MarkDevLogoView()
@@ -212,13 +428,36 @@ struct WorkspaceView: View {
                 .font(.headline)
                 .fixedSize()
         }
-        .padding(.horizontal, GlassTheme.Spacing.snug)
-        .padding(.vertical, GlassTheme.Spacing.tight)
-        .glassEffect(.regular, in: .capsule)
-        .glassEffectID("brand", in: glass)
+        // `snug` on every side, matching the toggle beside it and the inset
+        // the panel itself sits at. The header then reads as one rhythm: the
+        // panel is 10pt inside the window, and its title is 10pt inside the
+        // panel. `tight` here left the title 6pt from the top edge while the
+        // toggle sat at 10pt, so the two were subtly out of line with each
+        // other and with everything below them.
+        .padding(GlassTheme.Spacing.snug)
     }
 
+    /// Glass only when it is floating over the writing surface.
+    ///
+    /// Open, the toggle rides the navigator's panel and needs no capsule of
+    /// its own. Collapsed, there is nothing behind it but the text canvas, so
+    /// it has to carry its own surface or it reads as a bare glyph dropped on
+    /// the document rather than a control.
+    ///
+    /// `glassEffect` has no `isEnabled:` parameter — the SDK signature is
+    /// `glassEffect(_:in:)` — so this is a branch rather than a flag.
+    @ViewBuilder
     private var sidebarToggle: some View {
+        if showSidebar {
+            sidebarToggleControl
+        } else {
+            sidebarToggleControl
+                .glassEffect(.regular.interactive(), in: .circle)
+                .glassEffectID("sidebar", in: glass)
+        }
+    }
+
+    private var sidebarToggleControl: some View {
         Button {
             showSidebar.toggle()
         } label: {
@@ -226,8 +465,6 @@ struct WorkspaceView: View {
         }
         .buttonStyle(.plain)
         .padding(GlassTheme.Spacing.snug)
-        .glassEffect(.regular.interactive(), in: .circle)
-        .glassEffectID("sidebar", in: glass)
         .help("Toggle sidebar")
     }
 
@@ -290,12 +527,24 @@ struct WorkspaceView: View {
     }
 
     private var sidebar: some View {
-        NavigatorView(
-            root: workspace.vaultRoot,
-            onOpen: { openFile($0) },
-            onChooseVault: { openVault() }
-        )
-        .padding(.top, Self.toolbarHeight)
+        VStack(spacing: 0) {
+            // Closes off the strip the toolbar floats over, so the brand and
+            // the toggle read as this panel's header rather than as two items
+            // hovering above the tree. Inset to the same edges as the filter
+            // field below it, and only ever drawn with the sidebar open —
+            // collapsed, there is no header for it to underline.
+            Divider()
+                .padding(.top, sidebarHeaderInset)
+                .padding(.horizontal, GlassTheme.Spacing.snug)
+
+            NavigatorView(
+                root: workspace.vaultRoot,
+                onOpen: { openFile($0) },
+                onChooseVault: { openVault() },
+                onPeek: { peek = $0 },
+                onOpenTerminal: { openTerminal(in: $0) }
+            )
+        }
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
         .padding(GlassTheme.Spacing.snug)
     }
@@ -330,6 +579,8 @@ struct WorkspaceView: View {
                     }
                 ),
                 mode: mode,
+                documentDirectory: workspace.document(in: pane)?.url?
+                    .deletingLastPathComponent(),
                 reveal: reveals[pane],
                 onParse: { parsed in
                     guard let current = workspace.document(in: pane) else { return }
@@ -346,6 +597,36 @@ struct WorkspaceView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { workspace.focusedPane = pane }
+        .overlay {
+            if dropTargetPane == pane {
+                ZStack {
+                    RoundedRectangle(cornerRadius: GlassTheme.Radius.medium)
+                        .fill(Color.accentColor.opacity(0.10))
+                    RoundedRectangle(cornerRadius: GlassTheme.Radius.medium)
+                        .strokeBorder(
+                            Color.accentColor,
+                            style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                    Label("Open in Split", systemImage: "rectangle.split.2x1")
+                        .font(.headline)
+                        .padding(.horizontal, GlassTheme.Spacing.loose)
+                        .padding(.vertical, GlassTheme.Spacing.regular)
+                        .glassEffect(.regular, in: .capsule)
+                }
+                .padding(GlassTheme.Spacing.snug)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
+        }
+        .dropDestination(
+            for: URL.self,
+            action: { urls, _ in openDroppedMarkdown(urls, beside: pane) },
+            isTargeted: { targeted in
+                if targeted {
+                    dropTargetPane = pane
+                } else if dropTargetPane == pane {
+                    dropTargetPane = nil
+                }
+            })
     }
 
     private var inspector: some View {
@@ -387,6 +668,21 @@ struct WorkspaceView: View {
     /// one of them reads as the app refusing a drag it plainly understood.
     /// Whatever could not be opened still surfaces through the usual alert.
     @discardableResult
+    /// Opens whatever Launch Services handed the app.
+    ///
+    /// Routed through the same rules as a drag onto the window — a folder is a
+    /// vault, a file is a document — rather than a second interpretation of
+    /// what an incoming URL means.
+    private func openFromInbox(_ request: DocumentOpenRequest) {
+        guard !request.isEmpty else { return }
+
+        let truncation = request.truncationMessage
+        _ = open(dropped: request.urls)
+        // After opening, so a genuine open failure wins the alert: that names
+        // one file the reader can act on, while truncation is only a count.
+        if errorMessage == nil, let truncation { errorMessage = truncation }
+    }
+
     private func open(dropped urls: [URL]) -> Bool {
         var openedAnything = false
         for url in urls {
@@ -401,6 +697,34 @@ struct WorkspaceView: View {
             }
         }
         return openedAnything
+    }
+
+    /// Opens Markdown dropped directly on an editor in one new trailing pane.
+    /// Additional Markdown files from the same drag become tabs in that pane.
+    /// Unsupported items are not claimed by this pane target.
+    @discardableResult
+    private func openDroppedMarkdown(_ urls: [URL], beside pane: PaneID) -> Bool {
+        let markdown = urls.filter(MarkdownDropPolicy.accepts)
+        guard !markdown.isEmpty else { return false }
+
+        var destination: PaneID?
+        for url in markdown {
+            do {
+                if let destination {
+                    try workspace.open(url, in: destination)
+                } else {
+                    destination = try workspace.open(url, beside: pane, edge: .trailing)
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+
+        dropTargetPane = nil
+        guard let destination else { return false }
+        workspace.focusedPane = destination
+        refreshVault()
+        return true
     }
 
     private func openVaultRoot(_ url: URL) {
@@ -536,6 +860,13 @@ struct WorkspaceView: View {
                 title: showInspector ? "Hide Inspector" : "Show Inspector",
                 symbol: "sidebar.trailing", kind: .action(.toggleInspector), shortcut: "⌥⌘I"),
             Command(
+                title: showTerminal ? "Hide Terminal" : "Show Terminal",
+                symbol: "apple.terminal", kind: .action(.toggleTerminal), shortcut: "⌘J"),
+            Command(
+                title: showGraph ? "Hide Graph" : "Graph View",
+                symbol: "point.3.filled.connected.trianglepath.dotted",
+                kind: .action(.toggleGraph), shortcut: "⇧⌘G"),
+            Command(
                 title: "Split Right", symbol: "rectangle.split.2x1",
                 kind: .action(.splitRight)),
             Command(
@@ -595,6 +926,8 @@ struct WorkspaceView: View {
         case .saveAs: _ = saveDocumentAs()
         case .toggleSidebar: showSidebar.toggle()
         case .toggleInspector: showInspector.toggle()
+        case .toggleTerminal: setTerminal(visible: !showTerminal)
+        case .toggleGraph: showGraph.toggle()
         case .splitRight: workspace.split(workspace.focusedPane, edge: .trailing)
         case .splitDown: workspace.split(workspace.focusedPane, edge: .bottom)
         case .livePreview: mode = .livePreview
