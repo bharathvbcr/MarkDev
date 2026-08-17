@@ -331,6 +331,23 @@ public final class Workspace {
         }
     }
 
+    /// Moves focus `offset` panes along, in visual order, wrapping at both
+    /// ends.
+    ///
+    /// Splitting is the only way focus moved between panes before this, which
+    /// left clicking as the sole way back — a keyboard user could open a split
+    /// and then not reach one half of it. Wrapping matters for the same reason
+    /// it does in the palette: a held key should never dead-end.
+    public func focusPane(offset: Int) {
+        let order = layout.panes
+        guard order.count > 1 else { return }
+        // An unknown focused pane (mid-close, before pruning) starts from the
+        // first, so the shortcut still moves rather than doing nothing.
+        let current = order.firstIndex(of: focusedPane) ?? 0
+        let next = ((current + offset) % order.count + order.count) % order.count
+        focusedPane = order[next]
+    }
+
     /// Discards state for panes no longer in the layout.
     ///
     /// Without this the dictionary grows for the lifetime of the window,

@@ -104,6 +104,7 @@ public struct NavigatorView: View {
                 Image(systemName: "ellipsis")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -128,11 +129,16 @@ public struct NavigatorView: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
+                .transition(.scale.combined(with: .opacity))
                 .accessibilityLabel("Clear filter")
             }
         }
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: filter.isEmpty)
         .glassPanel(
             radius: GlassTheme.Radius.small,
             padding: EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))
@@ -220,6 +226,13 @@ public struct NavigatorView: View {
                                 }
                             }
                         }
+                        // Children slide out from under their folder rather
+                        // than appearing already in place, which is what
+                        // shows they belong to the row that was clicked.
+                        .transition(
+                            reduceMotion
+                                ? .opacity
+                                : .move(edge: .top).combined(with: .opacity))
                     }
                     .padding(.vertical, GlassTheme.Spacing.tight)
                 }
@@ -249,6 +262,10 @@ public struct NavigatorView: View {
             .onChange(of: listFocused) { _, focused in
                 if !focused { onPeek?(nil) }
             }
+            .scrollContentBackground(.hidden)
+            .animation(
+                GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+                value: expanded)
         }
     }
 
@@ -481,11 +498,21 @@ private struct NavigatorRow: View {
                         .foregroundStyle(.secondary)
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 10)
+                    // A folder glyph as well as the chevron: the chevron says
+                    // "this opens", the folder says what it is, and with only
+                    // the chevron an unexpanded folder and a file differ by
+                    // ten points of indent.
+                    Image(systemName: isExpanded ? "folder.fill" : "folder")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12)
+                        .contentTransition(.symbolEffect(.replace))
                 } else {
                     Image(systemName: "doc.text")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
-                        .frame(width: 10)
+                        .frame(width: 12)
+                        .padding(.leading, 10 + GlassTheme.Spacing.tight)
                 }
 
                 Text(node.displayName)
@@ -519,6 +546,12 @@ private struct NavigatorRow: View {
         .animation(
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
             value: isExpanded)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isHovering)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isSelected)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 

@@ -390,6 +390,53 @@ final class WorkspaceTests: XCTestCase {
         workspace.closePane(only)
         XCTAssertEqual(workspace.layout.paneCount, 1)
     }
+
+    // MARK: - Moving between panes
+
+    func testFocusMovesThroughPanesInVisualOrderAndWraps() {
+        let workspace = Workspace()
+        let first = workspace.focusedPane
+        let second = workspace.split(first, edge: .trailing)
+        let third = workspace.split(second, edge: .trailing)
+        XCTAssertEqual(workspace.layout.panes, [first, second, third])
+
+        workspace.focusedPane = first
+        workspace.focusPane(offset: 1)
+        XCTAssertEqual(workspace.focusedPane, second)
+
+        workspace.focusPane(offset: 1)
+        XCTAssertEqual(workspace.focusedPane, third)
+
+        workspace.focusPane(offset: 1)
+        XCTAssertEqual(workspace.focusedPane, first, "focus must wrap forwards")
+
+        workspace.focusPane(offset: -1)
+        XCTAssertEqual(workspace.focusedPane, third, "focus must wrap backwards")
+    }
+
+    func testFocusingAnotherPaneDoesNothingWithOnlyOne() {
+        let workspace = Workspace()
+        let only = workspace.focusedPane
+        workspace.focusPane(offset: 1)
+        XCTAssertEqual(workspace.focusedPane, only)
+    }
+
+    func testFocusMovesEvenWhenTheFocusedPaneIsNoLongerInTheLayout() {
+        // Closing a pane can leave focus pointing at it until the layout
+        // change is observed. The shortcut must still move rather than
+        // silently doing nothing.
+        let workspace = Workspace()
+        let first = workspace.focusedPane
+        let second = workspace.split(first, edge: .bottom)
+        let third = workspace.split(second, edge: .bottom)
+        workspace.closePane(third)
+        workspace.focusedPane = third
+
+        workspace.focusPane(offset: 1)
+        XCTAssertTrue(
+            workspace.layout.panes.contains(workspace.focusedPane),
+            "focus must land somewhere that exists")
+    }
 }
 
 final class FileTreeTests: XCTestCase {

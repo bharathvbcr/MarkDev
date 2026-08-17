@@ -21,9 +21,14 @@ public enum CommandAction: Sendable, Equatable {
     case toggleGraph
     case splitRight
     case splitDown
-    case livePreview
-    case sourceMode
-    case readingMode
+    case closePane
+    case focusNextPane
+    case focusPreviousPane
+    /// One case for every writing mode, rather than one case per mode.
+    /// ``EditorMode`` already enumerates them, and a fourth mode should not
+    /// need a matching action, a matching menu item, and a matching palette
+    /// row hand-written beside it.
+    case setMode(EditorMode)
     /// Open the inline writing panel on the selection.
     case writingTools
     /// Proofread the whole document and underline what it finds.
@@ -149,9 +154,13 @@ public struct CommandPalette: View {
             Button {
                 isPresented = false
             } label: {
-                Text("esc").font(.caption2).foregroundStyle(.secondary)
+                Text("esc")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .controlTarget(Capsule(), padding: GlassTheme.Spacing.tight)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Close palette")
         }
         .padding(.horizontal, GlassTheme.Spacing.loose)
         .padding(.vertical, GlassTheme.Spacing.regular)
@@ -217,6 +226,8 @@ private struct CommandRow: View {
     let command: Command
     let isHighlighted: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         HStack(spacing: GlassTheme.Spacing.snug) {
             Image(systemName: command.symbol)
@@ -251,6 +262,12 @@ private struct CommandRow: View {
                 .fill(isHighlighted ? Color.accentColor.opacity(0.20) : .clear)
         )
         .contentShape(Rectangle())
+        // Held keys walk the list faster than a spring settles, so the
+        // highlight cross-fades rather than following a curve it would never
+        // finish.
+        .animation(
+            GlassTheme.motion(.easeOut(duration: 0.12), reduceMotion: reduceMotion),
+            value: isHighlighted)
         .accessibilityAddTraits(isHighlighted ? [.isSelected] : [])
     }
 }

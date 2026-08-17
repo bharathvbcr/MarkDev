@@ -36,6 +36,49 @@ final class SplitLayoutTests: XCTestCase {
         check(layout.root)
     }
 
+    /// Every node in the tree, depth first.
+    private func allNodes(_ node: SplitNode) -> [SplitNode] {
+        guard case .split(let group) = node else { return [node] }
+        return [node] + group.children.flatMap(allNodes)
+    }
+
+    // MARK: - Node identity
+
+    // The renderer keys its children on `SplitNode.id`. If two nodes could
+    // share one, SwiftUI would hand one pane's editor to another; if a pane's
+    // id changed when a *sibling* closed, every pane after the closed one
+    // would be rebuilt, losing its scroll position and undo history.
+
+    func testNodeIdentityIsUniqueAcrossTheTree() {
+        let panes = makePanes(4)
+        var layout = SplitLayout(pane: panes[0])
+        layout.split(panes[0], edge: .trailing, with: panes[1])
+        layout.split(panes[1], edge: .bottom, with: panes[2])
+        layout.split(panes[2], edge: .trailing, with: panes[3])
+
+        let ids = allNodes(layout.root).map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "no two nodes may share an identity")
+    }
+
+    func testALeafIdentifiesItselfByItsPane() {
+        let pane = PaneID()
+        XCTAssertEqual(SplitNode.leaf(pane).id, pane.id)
+    }
+
+    func testAPanesIdentitySurvivesAnEarlierSiblingClosing() {
+        let panes = makePanes(3)
+        var layout = SplitLayout(pane: panes[0])
+        layout.split(panes[0], edge: .trailing, with: panes[1])
+        layout.split(panes[1], edge: .trailing, with: panes[2])
+
+        let before = allNodes(layout.root).first { $0 == .leaf(panes[2]) }?.id
+        layout.close(panes[0])
+        let after = allNodes(layout.root).first { $0 == .leaf(panes[2]) }?.id
+
+        XCTAssertNotNil(after)
+        XCTAssertEqual(before, after, "closing a sibling must not re-identify a pane")
+    }
+
     // MARK: - Splitting
 
     func testSinglePaneHasNoSplits() {

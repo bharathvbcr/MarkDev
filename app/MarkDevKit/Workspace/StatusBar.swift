@@ -30,6 +30,8 @@ public struct StatusBar: View {
     public let hasUnsavedChanges: Bool
     public let stats: DocumentStats
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     public init(location: String?, hasUnsavedChanges: Bool, stats: DocumentStats) {
         self.location = location
         self.hasUnsavedChanges = hasUnsavedChanges
@@ -55,6 +57,7 @@ public struct StatusBar: View {
                     .padding(.vertical, 1)
                     .background(
                         Capsule().fill(Color.primary.opacity(0.07)))
+                    .transition(.scale(scale: 0.7).combined(with: .opacity))
             }
 
             Spacer(minLength: GlassTheme.Spacing.snug)
@@ -70,9 +73,19 @@ public struct StatusBar: View {
             }
             .foregroundStyle(.tertiary)
             .monospacedDigit()
+            // Counts arrive on a debounce, in jumps. Rolling the digits shows
+            // that the number moved rather than swapping one still frame for
+            // another at the corner of the eye.
+            .contentTransition(.numericText())
             .fixedSize()
         }
         .font(.caption)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: stats.words)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: hasUnsavedChanges)
         .padding(.horizontal, GlassTheme.Spacing.snug)
         .frame(height: GlassTheme.statusBarHeight)
         .overlay(alignment: .top) {
