@@ -49,8 +49,9 @@ final class RevealPolicyTests: XCTestCase {
     }
 
     func testTaskMarkersAreNeverHidden() {
-        // Hiding `- [x]` with nothing drawn in its place would read as the
-        // checkbox having been deleted.
+        // Collapsing `- [x]` to 0.01pt would leave the drawn checkbox nowhere
+        // to sit; the characters keep their size and the styler paints them
+        // clear instead.
         let doc = ParsedDocument.parse("- [x] done\n- [ ] todo")
         let hidden = HiddenRanges(
             document: doc, selection: NSRange(location: 0, length: 0), mode: .reading)
@@ -59,7 +60,29 @@ final class RevealPolicyTests: XCTestCase {
         }
         XCTAssertFalse(
             hidden.ranges.contains { NSIntersectionRange($0, task.range).length > 0 },
-            "task markers must stay visible until a checkbox is drawn for them")
+            "task markers must keep their size for the checkbox to sit in")
+    }
+
+    func testTheGapAfterATaskMarkerSurvives() {
+        // The space after `[ ]` is its own marker. Hiding it closes the gap
+        // between the drawn checkbox and the text, so `- [ ] first` renders as
+        // `☐first`.
+        //
+        // The caret sits in the trailing paragraph: inside the list item it
+        // would reveal the whole construct, which is not the state under test.
+        let source = "- [ ] first\n\nafter\n"
+        let hidden = HiddenRanges(
+            document: ParsedDocument.parse(source),
+            selection: NSRange(
+                location: (source as NSString).range(of: "after").location, length: 0))
+
+        let marker = (source as NSString).range(of: "[ ]")
+        XCTAssertFalse(
+            hidden.covers(marker), "the marker must keep its size for the checkbox to sit in")
+
+        let gap = NSRange(location: marker.location + marker.length, length: 1)
+        XCTAssertFalse(
+            hidden.covers(gap), "the space between the checkbox and the text must survive")
     }
 
     func testHorizontalRulesAreNeverHidden() {

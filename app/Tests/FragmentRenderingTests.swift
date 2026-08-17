@@ -256,4 +256,142 @@ final class FragmentRenderingTests: XCTestCase {
     func testRenderingIsStableForAnEmptyDocument() throws {
         XCTAssertNoThrow(try render(""))
     }
+
+    // MARK: - Checkboxes
+
+    /// The fragment holding the first checkbox ornament in `markdown`, laid out.
+    private func taskFragment(_ markdown: String) throws -> (
+        view: MarkdownTextView, fragment: MarkdownLayoutFragment
+    ) {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 200)
+        view.setMarkdown(markdown)
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var found: MarkdownLayoutFragment?
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment,
+                fragment.ornaments.contains(where: {
+                    if case .checkbox = $0 { return true } else { return false }
+                })
+            else { return true }
+            found = fragment
+            return false
+        }
+        return (view, try XCTUnwrap(found, "the task line should carry a checkbox ornament"))
+    }
+
+    func testACheckedTaskPaintsAFilledCheckbox() throws {
+        // The literal `[x]` is painted clear and a checkbox drawn over it, so
+        // the only colour on the line can be the checkbox's own accent fill.
+        XCTAssertNotNil(
+            dominantColor(try render("- [x] done\n")),
+            "a ticked task should paint a filled checkbox, not just its text")
+    }
+
+    func testAnUncheckedTaskDrawsAnOutlineRatherThanAFill() throws {
+        // The contrast with the test above is the point: if both painted the
+        // same, the checkbox would not be reporting state.
+        XCTAssertNil(
+            dominantColor(try render("- [ ] todo\n")),
+            "an empty checkbox should be an outline, with no accent fill")
+    }
+
+    /// The defect that sent the first attempt at this feature back: the box
+    /// was positioned from the fragment's origin plus an inset, and painted
+    /// over the first letter of the item.
+    ///
+    /// Asserted in *fragment-local* coordinates, which is what makes this
+    /// test meaningful where the earlier pixel tests were not. The origin
+    /// handed to `draw(at:in:)` differs between a detached view rendered with
+    /// `cacheDisplay` and the running app, so any assertion downstream of it
+    /// can pass in the test harness and still be wrong on screen. These rects
+    /// are computed before any origin is applied, so the property holds in
+    /// both environments or in neither.
+    func testTheCheckboxDoesNotOverlapTheItemText() throws {
+        let (view, fragment) = try taskFragment("- [x] done\n")
+
+        let marker = try XCTUnwrap(
+            view.parsed.spans.first { $0.kind == .taskMarker }?.range,
+            "the parser should report a task marker")
+        let text = (view.markdown as NSString).range(of: "done")
+        XCTAssertNotEqual(text.location, NSNotFound)
+
+        let markerRect = try XCTUnwrap(fragment.rects(for: marker).first)
+        let textRect = try XCTUnwrap(fragment.rects(for: text).first)
+        let box = MarkdownLayoutFragment.checkboxRect(in: markerRect)
+
+        XCTAssertFalse(
+            box.intersects(textRect),
+            "the checkbox must not paint over the item's text "
+                + "(box \(box), text \(textRect))")
+        XCTAssertLessThanOrEqual(
+            box.maxX, textRect.minX,
+            "the checkbox belongs left of the text it marks")
+    }
+
+    func testTheCheckboxIsContainedByTheMarkerItReplaces() {
+        // The containment is what makes the test above hold for *any* font
+        // size, including one whose marker is narrower than the nominal box.
+        for marker in [
+            CGRect(x: 40, y: 0, width: 34, height: 18),
+            CGRect(x: 0, y: 5, width: 9, height: 18),
+            CGRect(x: 12, y: 2, width: 34, height: 6),
+        ] {
+            let box = MarkdownLayoutFragment.checkboxRect(in: marker)
+            XCTAssertTrue(
+                marker.contains(box),
+                "a checkbox must never reach outside the marker it stands in for "
+                    + "(marker \(marker), box \(box))")
+        }
+    }
+
+    func testACheckboxIsNotClippedByTheFragmentSurface() throws {
+        // A drawn ornament sits slightly proud of the glyphs it covers. If
+        // `renderingSurfaceBounds` is sized to the glyphs alone the box loses
+        // its edges, which reads as a broken checkbox rather than a clipped one.
+        let (_, fragment) = try taskFragment("- [x] done\n")
+        XCTAssertGreaterThanOrEqual(
+            fragment.renderingSurfaceBounds.height,
+            fragment.layoutFragmentFrame.height,
+            "the surface must be at least as tall as the line it decorates")
+    }
+
+    func testSourceModeDrawsNoCheckboxOverTheCharacters() throws {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 200)
+        view.mode = .source
+        view.setMarkdown("- [x] done\n")
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var ornamented = false
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, !fragment.ornaments.isEmpty {
+                ornamented = true
+            }
+            return true
+        }
+        XCTAssertFalse(
+            ornamented,
+            "source mode shows the characters as written, so nothing may be drawn over them")
+    }
+
+    func testSourceModeLeavesTheMarkerCharactersVisible() throws {
+        // The other half of source mode: the styler must not paint the marker
+        // clear either, or `- [x]` would be blank rather than shown as written.
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 200)
+        view.mode = .source
+        view.setMarkdown("- [x] done\n")
+
+        let storage = try XCTUnwrap(view.textStorage)
+        let marker = try XCTUnwrap(view.parsed.spans.first { $0.kind == .taskMarker }?.range)
+        let colour = storage.attribute(
+            .foregroundColor, at: marker.location, effectiveRange: nil) as? NSColor
+        XCTAssertNotEqual(
+            colour?.alphaComponent, 0,
+            "source mode must leave the task marker's characters visible")
+    }
 }

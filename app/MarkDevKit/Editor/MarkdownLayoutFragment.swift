@@ -21,6 +21,9 @@ struct BlockDecorationPalette: Sendable {
     let important: CGColor
     let warning: CGColor
     let caution: CGColor
+    let accent: CGColor
+    /// Contrasts with `accent`, for the tick inside a filled checkbox.
+    let checkmark: CGColor
 
     @MainActor
     init(theme: EditorTheme) {
@@ -34,6 +37,8 @@ struct BlockDecorationPalette: Sendable {
         important = theme.calloutAccent(.important).cgColor
         warning = theme.calloutAccent(.warning).cgColor
         caution = theme.calloutAccent(.caution).cgColor
+        accent = theme.accentColor.cgColor
+        checkmark = theme.checkmarkColor.cgColor
     }
 
     func calloutAccent(_ kind: CalloutKind) -> CGColor {
@@ -60,6 +65,11 @@ struct BlockDecorationPalette: Sendable {
 final class MarkdownLayoutFragment: NSTextLayoutFragment {
     var decoration: BlockDecoration = .none
     var palette: BlockDecorationPalette?
+    /// Ornaments drawn over inline runs of this fragment's own text.
+    var ornaments: [InlineOrnament] = []
+    /// This fragment's range in document coordinates, so ornament ranges can
+    /// be made local without asking the layout manager mid-draw.
+    var documentRange = NSRange(location: 0, length: 0)
 
     // MARK: - Metrics
 
@@ -86,10 +96,21 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// The area the fragment actually paints.
     ///
     /// Without widening this, the background is clipped to the text's own
-    /// bounds and the padding drawn around it is simply not shown.
+    /// bounds and the padding drawn around it is simply not shown. Ornaments
+    /// are unioned in too: a checkbox bleeds a point or two past the glyphs it
+    /// covers, and a surface sized to the glyphs alone shaves its edges off.
     override var renderingSurfaceBounds: CGRect {
-        guard decoration != .none else { return super.renderingSurfaceBounds }
-        return super.renderingSurfaceBounds.union(decorationRect)
+        var bounds = super.renderingSurfaceBounds
+        if decoration != .none {
+            bounds = bounds.union(decorationRect)
+        }
+        for ornament in ornaments {
+            for rect in rects(for: ornament.range) {
+                bounds = bounds.union(
+                    rect.insetBy(dx: -Metrics.ornamentBleed, dy: -Metrics.ornamentBleed))
+            }
+        }
+        return bounds
     }
 
     /// The rect the decoration covers.
@@ -145,6 +166,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             drawRule(in: context, at: point)
         }
 
+        drawOrnaments(in: context, at: point)
         super.draw(at: point, in: context)
     }
 
@@ -258,11 +280,137 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         context.strokePath()
     }
 
+    // MARK: - Ornaments
+
+    private func drawOrnaments(in context: CGContext, at point: CGPoint) {
+        guard let palette, !ornaments.isEmpty else { return }
+        for ornament in ornaments {
+            for local in rects(for: ornament.range) {
+                let rect = local.offsetBy(dx: point.x, dy: point.y)
+                switch ornament {
+                case .checkbox(_, let checked):
+                    drawCheckbox(in: rect, checked: checked, palette: palette, context: context)
+                }
+            }
+        }
+    }
+
+    /// Draws a checkbox centred on the `- [ ]` it stands in for.
+    ///
+    /// The literal characters stay in the buffer — that is what keeps ⌘C
+    /// copying real Markdown — but the styler paints them clear, so this is
+    /// what the reader actually sees. Sizing and centring it within the
+    /// marker's *own* rect is what keeps it on the baseline at any body font
+    /// size, and what keeps it off the first letter of the item: the box can
+    /// only ever occupy space the marker already reserved.
+    private func drawCheckbox(
+        in rect: CGRect,
+        checked: Bool,
+        palette: BlockDecorationPalette,
+        context: CGContext
+    ) {
+        let box = Self.checkboxRect(in: rect)
+        let side = box.width
+
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        let path = CGPath(
+            roundedRect: box.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: Metrics.checkboxRadius,
+            cornerHeight: Metrics.checkboxRadius,
+            transform: nil)
+
+        if checked {
+            context.addPath(path)
+            context.setFillColor(palette.accent)
+            context.fillPath()
+
+            // A tick, drawn rather than set in a font: a glyph would depend on
+            // which symbol font happens to be installed.
+            context.setStrokeColor(palette.checkmark)
+            context.setLineWidth(1.6)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            context.move(to: CGPoint(x: box.minX + side * 0.26, y: box.minY + side * 0.52))
+            context.addLine(to: CGPoint(x: box.minX + side * 0.44, y: box.minY + side * 0.71))
+            context.addLine(to: CGPoint(x: box.minX + side * 0.76, y: box.minY + side * 0.31))
+            context.strokePath()
+        } else {
+            context.addPath(path)
+            context.setStrokeColor(
+                palette.secondaryColor.copy(alpha: 0.55) ?? palette.secondaryColor)
+            context.setLineWidth(1)
+            context.strokePath()
+        }
+    }
+
+    // MARK: - Geometry
+
+    /// The box drawn for a checkbox standing in for the marker at `rect`.
+    ///
+    /// A pure function of the marker's own rect, and the reason the checkbox
+    /// cannot land on the item's text: the side is clamped to the marker's
+    /// width as well as its height, so the result is always *contained* by the
+    /// characters it replaces. Overlap is not avoided by choosing a good
+    /// inset — it is unrepresentable.
+    ///
+    /// Kept separate from the drawing so the containment property can be
+    /// asserted without a graphics context or a laid-out view.
+    static func checkboxRect(in rect: CGRect) -> CGRect {
+        let side = min(Metrics.checkboxSide, rect.height, rect.width)
+        return CGRect(
+            x: rect.minX + (rect.width - side) / 2,
+            y: rect.midY - side / 2,
+            width: side,
+            height: side)
+    }
+
+    /// The rects a document range occupies, in fragment-local coordinates.
+    ///
+    /// Read off this fragment's own line fragments rather than by asking the
+    /// layout manager to enumerate text segments: that call can re-enter
+    /// layout, and this runs inside `draw`. A wrapped paragraph yields one
+    /// rect per line the range crosses.
+    func rects(for range: NSRange) -> [CGRect] {
+        guard documentRange.length > 0, range.length > 0 else { return [] }
+        let start = range.location - documentRange.location
+        let end = start + range.length
+        guard end > 0, start < documentRange.length else { return [] }
+
+        var out: [CGRect] = []
+        for line in textLineFragments {
+            let lineRange = line.characterRange
+            let lineStart = lineRange.location
+            let lineEnd = lineRange.location + lineRange.length
+            let from = max(start, lineStart)
+            let to = min(end, lineEnd)
+            guard to > from else { continue }
+
+            let bounds = line.typographicBounds
+            let x0 = line.locationForCharacter(at: from - lineStart).x
+            let x1 = line.locationForCharacter(at: to - lineStart).x
+            guard x1 > x0 else { continue }
+            out.append(
+                CGRect(
+                    x: bounds.minX + x0,
+                    y: bounds.minY,
+                    width: x1 - x0,
+                    height: bounds.height))
+        }
+        return out
+    }
+
     enum Metrics {
         static let blockPadding: CGFloat = 8
         static let cornerRadius: CGFloat = 6
         static let barWidth: CGFloat = 3
         static let rulePadding: CGFloat = 6
+        static let checkboxSide: CGFloat = 14
+        static let checkboxRadius: CGFloat = 4
+        /// How far an ornament may reach past the glyphs it covers, so the
+        /// rendering surface is widened enough not to clip it.
+        static let ornamentBleed: CGFloat = 6
     }
 }
 

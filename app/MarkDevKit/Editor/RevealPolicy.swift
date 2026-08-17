@@ -68,17 +68,21 @@ public enum RevealPolicy {
     /// information no drawn stand-in replaces yet.
     ///
     /// A `- [x]` checkbox and a `---` rule are *entirely* syntax: unlike
-    /// `**`, there is no content left behind once they are hidden. They only
-    /// become hideable once the editor draws a checkbox and a horizontal
-    /// line in their place, which is fragment work. Until then they stay
-    /// visible — a blank line where a rule used to be would read as data
-    /// loss.
+    /// `**`, there is no content left behind once they are hidden. Both need
+    /// somewhere for their drawn stand-in to go, so the characters keep their
+    /// size and the styler merely paints them clear — a rule with no line and
+    /// a bullet with no box both read as data loss.
+    ///
+    /// The task marker is protected one character wider than it is. The space
+    /// after `[ ]` is its own marker, and hiding it closes the gap between the
+    /// checkbox and the text, which renders `- [ ] first` as `☐first`.
     public static func markersRequiringReplacement(in document: ParsedDocument) -> [NSRange] {
         var ranges: [NSRange] = []
         ranges.reserveCapacity(8)
 
         for span in document.spans where span.kind == .taskMarker {
-            ranges.append(span.range)
+            ranges.append(
+                NSRange(location: span.range.location, length: span.range.length + 1))
         }
         for block in document.blocks where block.kind == .rule {
             ranges.append(block.range)

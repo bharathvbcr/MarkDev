@@ -43,6 +43,89 @@ public enum BlockDecoration: Sendable, Equatable {
     }
 }
 
+/// Something drawn *over* a run of a fragment's own text, rather than behind
+/// the whole block.
+///
+/// # Why this is not a `BlockDecoration`
+///
+/// A block decoration is positioned from the fragment's origin and the text
+/// container's width — it does not need to know where any particular glyph
+/// is. A checkbox does: it stands in for four specific characters, and the
+/// only position that is right for it is the one those characters occupy.
+///
+/// Deriving it instead from an indent — collapsing the `- [ ]` and drawing the
+/// box in the gutter the indent opens up — makes the box's position depend on
+/// the origin passed to `draw(at:in:)`, and that origin does not mean the same
+/// thing in a detached view rendered with `cacheDisplay` as it does in the
+/// running app. An ornament sidesteps that: its rect comes from the glyphs, so
+/// it is correct in fragment-local coordinates before any origin is applied.
+public enum InlineOrnament: Sendable, Equatable {
+    /// A `- [ ]` task marker, drawn as a real checkbox over the literal text.
+    case checkbox(range: NSRange, checked: Bool)
+
+    public var range: NSRange {
+        switch self {
+        case .checkbox(let range, _): range
+        }
+    }
+}
+
+/// Every ornament in one parse, ordered for lookup by fragment.
+///
+/// # Why this is an index rather than a scan
+///
+/// ``BlockDecoration/decoration(for:in:)`` scans the block list on every
+/// fragment, which is affordable because blocks are few. Spans are not: a long
+/// note has tens of thousands, and TextKit asks for a fragment per *line*, so
+/// the same scan would be O(lines × spans) and would show up in the editor's
+/// per-keystroke budget. Building the list once per parse and binary-searching
+/// it keeps the lookup logarithmic.
+public struct InlineOrnaments: Sendable, Equatable {
+    /// Ascending by location; ornaments never overlap each other.
+    private let ornaments: [InlineOrnament]
+
+    public static let empty = InlineOrnaments(ornaments: [])
+
+    private init(ornaments: [InlineOrnament]) {
+        self.ornaments = ornaments
+    }
+
+    public init(document: ParsedDocument) {
+        // Spans arrive in document order, so the checkbox list is already
+        // sorted and the search below needs no sort of its own.
+        ornaments = document.spans
+            .filter { $0.kind == .taskMarker && $0.range.length > 0 }
+            .map { .checkbox(range: $0.range, checked: $0.data == 1) }
+    }
+
+    /// Every ornament overlapping `range`, in document order.
+    public func ornaments(in range: NSRange) -> [InlineOrnament] {
+        guard !ornaments.isEmpty, range.length > 0 else { return [] }
+        let end = range.location + range.length
+
+        // First ornament that could reach into `range`.
+        var low = 0
+        var high = ornaments.count
+        while low < high {
+            let mid = (low + high) / 2
+            let candidate = ornaments[mid].range
+            if candidate.location + candidate.length <= range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        var out: [InlineOrnament] = []
+        var index = low
+        while index < ornaments.count, ornaments[index].range.location < end {
+            out.append(ornaments[index])
+            index += 1
+        }
+        return out
+    }
+}
+
 extension BlockDecoration {
     /// The decoration for the fragment covering `range`.
     ///

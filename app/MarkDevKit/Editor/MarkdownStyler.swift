@@ -37,13 +37,19 @@ public enum MarkdownStyler {
     ///
     /// Runs inside one `beginEditing`/`endEditing` pair so TextKit relayouts
     /// once rather than once per attribute run.
+    ///
+    /// - Parameter drawsReplacements: whether a fragment will draw stand-ins
+    ///   for markers that are entirely syntax. Source mode passes `false`: it
+    ///   promises the characters as written, so nothing may be painted over
+    ///   them and nothing may be painted *out* of them either.
     @MainActor
     public static func apply(
         document: ParsedDocument,
         hidden: HiddenRanges,
         to storage: NSTextStorage,
         theme: EditorTheme = .standard,
-        scope: NSRange? = nil
+        scope: NSRange? = nil,
+        drawsReplacements: Bool = true
     ) {
         let full = NSRange(location: 0, length: storage.length)
         guard full.length > 0 else { return }
@@ -61,6 +67,35 @@ public enum MarkdownStyler {
         // or a heading's `# ` would be re-inflated to heading size.
         applyMarkers(
             document, hidden: hidden, to: storage, limit: full, scope: target, theme: theme)
+
+        guard drawsReplacements else { return }
+        // After the marker pass, which would otherwise recolour the task
+        // marker it has just been told to leave visible.
+        hideReplacedMarkers(document, to: storage, limit: full, scope: target)
+    }
+
+    // MARK: - Drawn replacements
+
+    /// Makes the characters a drawn ornament stands in for invisible.
+    ///
+    /// A `- [ ]` cannot simply be *hidden* the way `**` is: collapsing it to
+    /// 0.01pt would leave the checkbox nowhere to sit, and the line would read
+    /// as an unmarked bullet. Instead the characters keep their size — so they
+    /// still reserve exactly the space the checkbox needs, on the baseline, at
+    /// whatever body size the theme is using — and only their colour goes.
+    /// They remain in storage, so ⌘C still copies `- [x] done`.
+    @MainActor
+    private static func hideReplacedMarkers(
+        _ document: ParsedDocument,
+        to storage: NSTextStorage,
+        limit: NSRange,
+        scope: NSRange
+    ) {
+        for span in document.spans where span.kind == .taskMarker {
+            let range = clamp(span.range, to: limit)
+            guard range.length > 0, NSIntersectionRange(range, scope).length > 0 else { continue }
+            storage.addAttribute(.foregroundColor, value: NSColor.clear, range: range)
+        }
     }
 
     // MARK: - Layers

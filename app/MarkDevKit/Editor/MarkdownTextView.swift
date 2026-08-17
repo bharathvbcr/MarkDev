@@ -38,7 +38,15 @@ public final class MarkdownTextView: NSTextView {
 
     /// The most recent parse. Read-only to callers; the outline, backlinks
     /// panel, and inspector all read from here rather than reparsing.
-    public private(set) var parsed: ParsedDocument = .empty
+    public private(set) var parsed: ParsedDocument = .empty {
+        didSet { ornamentIndex = InlineOrnaments(document: parsed) }
+    }
+
+    /// Ornaments for the current parse, rebuilt with it.
+    ///
+    /// Derived once here rather than per fragment: the layout delegate runs
+    /// for every line, and rebuilding this there would make it O(lines).
+    private var ornamentIndex: InlineOrnaments = .empty
 
     /// Called after every reparse, for observers such as the outline view.
     public var onParse: ((ParsedDocument) -> Void)?
@@ -210,7 +218,8 @@ public final class MarkdownTextView: NSTextView {
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus)
         MarkdownStyler.apply(
-            document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope)
+            document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope,
+            drawsReplacements: mode != .source)
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: scope)
@@ -450,8 +459,13 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         let end = textLayoutManager.offset(from: documentStart, to: elementRange.endLocation)
         guard start >= 0, end >= start else { return fragment }
 
-        fragment.decoration = BlockDecoration.decoration(
-            for: NSRange(location: start, length: end - start), in: parsed)
+        let range = NSRange(location: start, length: end - start)
+        fragment.documentRange = range
+        fragment.decoration = BlockDecoration.decoration(for: range, in: parsed)
+        // Source mode shows the characters as written, so nothing may be drawn
+        // over them — a checkbox on top of a `[ ]` the reader asked to see is
+        // the one thing source mode must not do.
+        fragment.ornaments = mode == .source ? [] : ornamentIndex.ornaments(in: range)
         return fragment
     }
 }

@@ -101,6 +101,46 @@ final class BlockDecorationTests: XCTestCase {
         XCTAssertEqual(
             BlockDecoration.decoration(for: NSRange(location: 0, length: 0), in: .empty), .none)
     }
+
+    // MARK: - Ornaments
+
+    func testTaskMarkersBecomeCheckboxOrnaments() {
+        let source = "- [x] done\n- [ ] todo\n"
+        let index = InlineOrnaments(document: ParsedDocument.parse(source))
+        let all = index.ornaments(in: NSRange(location: 0, length: (source as NSString).length))
+
+        XCTAssertEqual(all.count, 2, "one ornament per task marker")
+        XCTAssertEqual(all.map(\.range).sorted { $0.location < $1.location }, all.map(\.range))
+        guard case .checkbox(_, let first) = all[0], case .checkbox(_, let second) = all[1] else {
+            return XCTFail("task markers should resolve to checkboxes")
+        }
+        XCTAssertTrue(first, "`- [x]` is checked")
+        XCTAssertFalse(second, "`- [ ]` is not")
+    }
+
+    func testOrnamentLookupReturnsOnlyThoseOverlappingTheFragment() {
+        // The lookup runs per line, so returning a neighbouring line's
+        // ornament would paint a checkbox onto a line that has none.
+        let source = "- [x] done\n- [ ] todo\n"
+        let index = InlineOrnaments(document: ParsedDocument.parse(source))
+        let secondLine = (source as NSString).range(of: "- [ ] todo")
+
+        let found = index.ornaments(in: secondLine)
+        XCTAssertEqual(found.count, 1)
+        guard case .checkbox(let range, let checked) = try? XCTUnwrap(found.first) else {
+            return XCTFail("expected a checkbox")
+        }
+        XCTAssertFalse(checked)
+        XCTAssertTrue(
+            NSIntersectionRange(range, secondLine).length > 0,
+            "the ornament returned must be the one on this line")
+    }
+
+    func testDocumentsWithoutTasksProduceNoOrnaments() {
+        let index = InlineOrnaments(document: ParsedDocument.parse("just prose\n"))
+        XCTAssertTrue(index.ornaments(in: NSRange(location: 0, length: 11)).isEmpty)
+        XCTAssertTrue(InlineOrnaments.empty.ornaments(in: NSRange(location: 0, length: 10)).isEmpty)
+    }
 }
 
 @MainActor

@@ -108,6 +108,11 @@ public struct EditorTheme {
         return .boldSystemFont(ofSize: bodyFont.pointSize * headingScale[index])
     }
 
+    /// The tick inside a checked checkbox. Always the light value, because it
+    /// sits on ``accentColor`` rather than on the page — so it must contrast
+    /// with the fill, not with the background, and does not follow appearance.
+    public var checkmarkColor: NSColor { .white }
+
     /// Point size that collapses a syntax marker to visually nothing.
     ///
     /// Not zero: a zero-size font produces degenerate metrics in layout.
