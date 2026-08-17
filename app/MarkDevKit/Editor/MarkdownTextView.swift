@@ -56,6 +56,38 @@ public final class MarkdownTextView: ScrollingTextView {
         }
     }
 
+    /// Called when this view takes the keyboard.
+    ///
+    /// The writing tools act on "the editor you are working in", and with
+    /// split panes that is a question only the responder chain can answer.
+    public var onFocus: (() -> Void)?
+
+    /// Mistakes found by the last proofreading pass, underlined in place.
+    ///
+    /// Assigning a set clamps it to the current document: a set that belongs
+    /// to a different document is dropped rather than drawn at whatever
+    /// offsets it happens to hold.
+    public var issues: ProofreadingIssues {
+        get { storedIssues }
+        set {
+            let clamped = newValue.clamped(toLength: textStorage?.length ?? 0)
+            guard clamped != storedIssues else { return }
+            storedIssues = clamped
+            restyle()
+            // Observers are told from here as well as from `didChangeText`,
+            // because a proofreading pass writes findings straight in without
+            // touching the text. There is no input binding for issues, so
+            // this cannot loop back on itself.
+            onIssues?(clamped)
+        }
+    }
+
+    /// Called when an edit moves or invalidates the proofreading issues, so
+    /// the panel listing them stays in step with the underlines.
+    public var onIssues: ((ProofreadingIssues) -> Void)?
+
+    private var storedIssues: ProofreadingIssues = .none
+
     /// Currently collapsed ranges.
     private var hiddenRanges: HiddenRanges = .none
 
@@ -142,6 +174,13 @@ public final class MarkdownTextView: ScrollingTextView {
         guard let storage = textStorage else { return }
         storage.setAttributedString(NSAttributedString(string: markdown))
         pendingEdit = nil
+        // A wholesale replacement is a different document as far as the
+        // proofreader is concerned; keeping the old offsets would underline
+        // arbitrary words in the new text.
+        if !storedIssues.isEmpty {
+            storedIssues = .none
+            onIssues?(storedIssues)
+        }
         document.rebuild(from: markdown)
         parsed = document.parsed
         revealedBlocks = RevealPolicy.revealedBlocks(
@@ -225,9 +264,37 @@ public final class MarkdownTextView: ScrollingTextView {
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: scope)
+        applyProofreadingUnderlines(in: storage, scope: scope)
+        // After every attribute layer, not between two of them: this discards
+        // cached layout fragments, and a fragment rebuilt before the
+        // underlines land would draw the pre-proofread text.
         invalidateFragments(scope: scope)
         repairTypingAttributes()
     }
+
+    /// Underlines the mistakes the proofreader found.
+    ///
+    /// Last of the three attribute layers, for the same reason highlighting
+    /// comes after the styler: `MarkdownStyler.apply` opens with
+    /// `setAttributes`, which drops everything already in range. An underline
+    /// applied before it simply is not there afterwards.
+    private func applyProofreadingUnderlines(in storage: NSTextStorage, scope: NSRange?) {
+        guard !storedIssues.isEmpty else { return }
+        let full = NSRange(location: 0, length: storage.length)
+        let target = scope ?? full
+
+        for issue in storedIssues.issues {
+            let range = NSIntersectionRange(issue.range, full)
+            guard range.length > 0, NSIntersectionRange(range, target).length > 0 else { continue }
+            storage.addAttribute(.underlineStyle, value: Self.issueUnderline, range: range)
+            storage.addAttribute(.underlineColor, value: issue.kind.tint, range: range)
+        }
+    }
+
+    /// The dotted rule drawn under a mistake — the same shape macOS has used
+    /// for spelling since long before this editor existed, so it needs no
+    /// explaining.
+    private static let issueUnderline = NSUnderlineStyle([.thick, .patternDot]).rawValue
 
     /// Colours fenced code through the Rust tree-sitter core.
     ///
@@ -477,7 +544,10 @@ public final class MarkdownTextView: ScrollingTextView {
     public override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
         // Focus changes what is revealed, so the document has to restyle.
-        if became { restyle() }
+        if became {
+            restyle()
+            onFocus?()
+        }
         return became
     }
 
@@ -492,6 +562,10 @@ public final class MarkdownTextView: ScrollingTextView {
         let edited = pendingEditedRange
         pendingEditedRange = nil
         reparse(editedRange: edited)
+        if issuesDidMove {
+            issuesDidMove = false
+            onIssues?(storedIssues)
+        }
     }
 
     /// Captures every user edit before it is applied.
@@ -507,12 +581,83 @@ public final class MarkdownTextView: ScrollingTextView {
         replacementString: String?
     ) -> Bool {
         if let replacementString, !isStyling {
+            let length = (replacementString as NSString).length
             pendingEdit = (affectedCharRange, replacementString)
-            pendingEditedRange = NSRange(
-                location: affectedCharRange.location,
-                length: (replacementString as NSString).length)
+            pendingEditedRange = NSRange(location: affectedCharRange.location, length: length)
+
+            // Carried through the edit rather than thrown away, so fixing one
+            // mistake does not erase every other underline in the document.
+            // This is the same hook the incremental parser uses precisely
+            // because it is the one place that sees both halves of the edit.
+            if !storedIssues.isEmpty {
+                let moved = storedIssues.applying(
+                    edit: affectedCharRange, replacementLength: length)
+                if moved != storedIssues {
+                    storedIssues = moved
+                    issuesDidMove = true
+                }
+            }
         }
         return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+    }
+
+    /// Whether ``storedIssues`` changed during the in-flight edit and the
+    /// observers still have to be told.
+    private var issuesDidMove = false
+
+    // MARK: - Writing tools
+
+    /// Whether an assistant edit can be applied at all.
+    ///
+    /// Reading mode is genuinely read-only, so a Replace button there would be
+    /// a button that does nothing.
+    public var acceptsAssistedEdits: Bool { isEditable }
+
+    /// Replaces `range` with `replacement` as one undoable action.
+    ///
+    /// Routed through `shouldChangeText` / `didChangeText` rather than writing
+    /// to the storage directly. That triad is what registers undo, and it is
+    /// also what feeds this view's own override the range and the replacement
+    /// the incremental parser needs — a raw `replaceCharacters` would leave
+    /// both the undo stack and the parse silently out of step with the text.
+    @discardableResult
+    public func applyAssistedEdit(
+        range: NSRange,
+        replacement: String,
+        actionName: String
+    ) -> Bool {
+        guard isEditable, let storage = textStorage else { return false }
+        guard range.location >= 0, range.length >= 0,
+            range.location + range.length <= storage.length
+        else { return false }
+        guard shouldChangeText(in: range, replacementString: replacement) else { return false }
+
+        undoManager?.setActionName(actionName)
+        storage.replaceCharacters(in: range, with: replacement)
+        didChangeText()
+
+        let inserted = NSRange(
+            location: range.location, length: (replacement as NSString).length)
+        setSelectedRange(inserted)
+        scrollRangeToVisible(inserted)
+        return true
+    }
+
+    /// Where to point a popover for `range`, in this view's coordinates.
+    ///
+    /// `firstRect(forCharacterRange:)` answers in *screen* coordinates — it
+    /// exists for the input method's candidate window — so the result has to
+    /// come back through the window to be usable as a positioning rect.
+    public func anchorRect(for range: NSRange) -> NSRect {
+        scrollRangeToVisible(range)
+        var actual = NSRange()
+        let onScreen = firstRect(forCharacterRange: range, actualRange: &actual)
+        guard !onScreen.isEmpty, let window else {
+            // No window yet, or a range the layout cannot place: the middle of
+            // what is visible is a defensible place for a panel to appear.
+            return NSRect(x: visibleRect.midX, y: visibleRect.midY, width: 1, height: 1)
+        }
+        return convert(window.convertFromScreen(onScreen), from: nil)
     }
 
     /// Diagnostics for the incremental parser: how many edits avoided a

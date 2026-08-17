@@ -26,6 +26,10 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public var onParse: ((ParsedDocument) -> Void)?
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
+    /// Called with the underlying text view when this editor is the one the
+    /// reader is working in — on first appearance, and whenever it takes the
+    /// keyboard. The writing tools attach to whatever arrives here.
+    public var onSurface: ((MarkdownTextView) -> Void)?
     /// Set to scroll the editor to an offset; applied once per request.
     public var reveal: RevealRequest?
 
@@ -36,7 +40,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
         documentDirectory: URL? = nil,
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
-        onFollowWikiLink: ((String) -> Void)? = nil
+        onFollowWikiLink: ((String) -> Void)? = nil,
+        onSurface: ((MarkdownTextView) -> Void)? = nil
     ) {
         self._text = text
         self.mode = mode
@@ -45,6 +50,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self.reveal = reveal
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
+        self.onSurface = onSurface
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -66,11 +72,23 @@ public struct MarkdownEditorView: NSViewRepresentable {
         textView.onFollowWikiLink = { [weak coordinator = context.coordinator] target in
             coordinator?.onFollowWikiLink?(target)
         }
+        textView.onFocus = { [weak coordinator = context.coordinator, weak textView] in
+            guard let textView else { return }
+            coordinator?.onSurface?(textView)
+        }
         textView.setMarkdown(text)
 
         let scrollView = ScrollingTextView.scrollView(hosting: textView)
 
         context.coordinator.textView = textView
+        // Deferred for the same reason `onParse` is: this runs inside
+        // SwiftUI's update pass, and a callback that touches @State from
+        // there is dropped. Without it a fresh window has no writing surface
+        // registered until the editor is first clicked, so ⌘⇧E does nothing.
+        Task { @MainActor [weak textView] in
+            guard let textView else { return }
+            context.coordinator.onSurface?(textView)
+        }
         return scrollView
     }
 
@@ -79,6 +97,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
 
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
+        context.coordinator.onSurface = onSurface
         if textView.mode != mode { textView.mode = mode }
         // Assigning re-renders only on a genuine change; the property guards
         // itself, so a document switching folders repaints its images and one
@@ -108,6 +127,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public func makeCoordinator() -> Coordinator {
         let coordinator = Coordinator(text: $text, onParse: onParse)
         coordinator.onFollowWikiLink = onFollowWikiLink
+        coordinator.onSurface = onSurface
         return coordinator
     }
 
@@ -116,6 +136,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         private let text: Binding<String>
         var onParse: ((ParsedDocument) -> Void)?
         var onFollowWikiLink: ((String) -> Void)?
+        var onSurface: ((MarkdownTextView) -> Void)?
         var appliedReveal: UUID?
         weak var textView: MarkdownTextView?
 
