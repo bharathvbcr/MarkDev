@@ -431,28 +431,6 @@ final class EditorPerformanceTests: XCTestCase {
             "a prose keystroke has regressed; check for work proportional to document size")
     }
 
-    /// A document dominated by GFM tables — the shape that makes
-    /// ``MarkdownStyler/alignTableColumns(_:to:limit:theme:)`` the most
-    /// expensive layer in a restyle, and the one where a per-table scan of
-    /// every block turns into a genuine quadratic.
-    private static func tableDocument(lines: Int) -> String {
-        var out: [String] = []
-        out.reserveCapacity(lines)
-        var i = 0
-        while out.count < lines {
-            out.append("## Table \(i)")
-            out.append("")
-            out.append("| Name | Age | City |")
-            out.append("| --- | --- | --- |")
-            out.append("| Alice \(i) | 30 | Berlin |")
-            out.append("| Bob \(i) | 41 | Lisbon |")
-            out.append("| Carol \(i) | 25 | Oslo |")
-            out.append("")
-            i += 1
-        }
-        return out.prefix(lines).joined(separator: "\n")
-    }
-
     func testTypingInSourceModeIsLinearInTheSizeOfTheDocument() {
         // Source mode used to cost a keystroke that grew with the square of
         // the document: 1.1s at 2,500 lines, 4.3s at 5,000, 18.5s at 10,000.
