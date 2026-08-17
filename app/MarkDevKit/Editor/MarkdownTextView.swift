@@ -62,8 +62,21 @@ public final class MarkdownTextView: ScrollingTextView {
     /// The most recent parse. Read-only to callers; the outline, backlinks
     /// panel, and inspector all read from here rather than reparsing.
     public private(set) var parsed: ParsedDocument = .empty {
-        didSet { listItems = parsed.blocks.filter { $0.kind == .listItem } }
+        didSet {
+            listItems = parsed.blocks.filter { $0.kind == .listItem }
+            // Resolved here, not per fragment and not per styling pass, so the
+            // collapse and the drawing are handed *the same* answer — see
+            // ``RenderedBlocks``. Both assignments to `parsed` happen after the
+            // storage already holds the matching text, which is what makes
+            // reading it here safe.
+            renderedBlocks = RenderedBlocks(
+                document: parsed, text: textStorage?.string as NSString?)
+        }
     }
+
+    /// The blocks drawn as content — a formula, a diagram, an image — instead
+    /// of as their own source. Rebuilt with each parse.
+    private(set) var renderedBlocks: RenderedBlocks = .none
 
     /// The parse's list items, in document order.
     ///
@@ -124,7 +137,11 @@ public final class MarkdownTextView: ScrollingTextView {
     private var storedIssues: ProofreadingIssues = .none
 
     /// Currently collapsed ranges.
-    private var hiddenRanges: HiddenRanges = .none
+    ///
+    /// Readable rather than private so tests can assert against what the view
+    /// actually collapsed. Recomputing it in a test is a second implementation
+    /// of the one question the editor and the renderer must agree on.
+    private(set) var hiddenRanges: HiddenRanges = .none
 
     /// Which blocks are revealed, cached so caret movement only restyles when
     /// the answer actually changes. Without this, every arrow key would
@@ -399,13 +416,21 @@ public final class MarkdownTextView: ScrollingTextView {
         defer { isStyling = false }
 
         hiddenRanges = HiddenRanges(
-            document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus)
-        MarkdownStyler.apply(
+            document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus,
+            rendered: renderedBlocks)
+        // The range the styler *wrote*, which is the scope grown to whole lines
+        // — not the one asked for. Both layers below reapply what its opening
+        // `setAttributes` cleared, so they have to cover exactly the same
+        // ground. Given the ungrown scope they missed the line at each end: an
+        // edit under a code fence cleared the colours of the fence's last line
+        // and left them cleared, and nothing restored them until an unrelated
+        // change happened to force a whole-document pass.
+        let written = MarkdownStyler.apply(
             document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope)
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
-        applyCodeHighlighting(in: storage, scope: scope)
-        applyProofreadingUnderlines(in: storage, scope: scope)
+        applyCodeHighlighting(in: storage, scope: scope == nil ? nil : written)
+        applyProofreadingUnderlines(in: storage, scope: scope == nil ? nil : written)
         // After every attribute layer, not between two of them: this discards
         // cached layout fragments, and a fragment rebuilt before the
         // underlines land would draw the pre-proofread text.
@@ -920,7 +945,8 @@ public final class MarkdownTextView: ScrollingTextView {
     ) {
         let adjusted: [NSValue]
         if !hiddenRanges.ranges.isEmpty, !stillSelecting, ranges.count == 1,
-            let range = ranges.first?.rangeValue, range.length == 0
+            let range = ranges.first?.rangeValue, range.length == 0,
+            !landsInRenderedSource(range.location)
         {
             let previous = selectedRange()
             let forward = range.location >= previous.location
@@ -939,6 +965,29 @@ public final class MarkdownTextView: ScrollingTextView {
         if !stillSelecting, !isStyling {
             updateRevealIfNeeded()
         }
+    }
+
+    /// Whether `offset` is inside the collapsed source of a block drawn as
+    /// content — a diagram, a formula, a picture.
+    ///
+    /// Such a run is not nudged over, and that is the difference between a
+    /// diagram you can edit and one you cannot. The nudge is measured against
+    /// the ranges hidden for the *previous* caret, and its rule — "a collapsed
+    /// marker behaves as though it were zero-width" — is right for a two-character
+    /// `**`, whose block is revealed either way. A rendered block's collapsed
+    /// run is its *whole source*: nudging out of it sends every click on the
+    /// diagram to the character before the opening fence, so the caret never
+    /// arrives inside, the block never reveals, and the first thing typed lands
+    /// in front of the ```` ``` ```` instead of in the graph.
+    ///
+    /// Only in live preview, which is the one mode where arriving reveals
+    /// anything: source mode collapses nothing to begin with, and reading mode
+    /// has no caret to place.
+    private func landsInRenderedSource(_ offset: Int) -> Bool {
+        guard mode == .livePreview, let entry = renderedBlocks.entry(
+            overlapping: NSRange(location: offset, length: 0))
+        else { return false }
+        return hiddenRanges.covers(entry.range)
     }
 }
 
@@ -1001,7 +1050,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
 
         let range = NSRange(location: start, length: end - start)
         fragment.decoration = BlockDecoration.decoration(
-            for: range, in: parsed, text: textStorage?.string as NSString?)
+            for: range, in: parsed, rendered: renderedBlocks, hidden: hiddenRanges)
         resolveRenderedContent(for: fragment)
         resolveCollapsedSyntax(for: fragment, at: range)
         return fragment

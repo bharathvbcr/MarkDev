@@ -162,11 +162,12 @@ public final class RichContentRenderer {
             // The zinc presets are the neutral pair; a themed diagram should
             // sit in the document, not shout a palette of its own.
             let theme: DiagramTheme = dark ? .zincDark : .zincLight
-            guard let image = try MermaidRenderer.renderImage(source: source, theme: theme) else {
+            guard let rendered = try MermaidRenderer.renderImage(source: source, theme: theme) else {
                 let failure = RenderFailure(reason: "Unsupported diagram type")
                 failures[key] = failure
                 return .failure(failure)
             }
+            let image = Self.uprighted(rendered) ?? rendered
 
             var size = image.size
             // Wide graphs are scaled down rather than clipped; a diagram cut

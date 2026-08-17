@@ -18,8 +18,11 @@ import XCTest
 @MainActor
 final class FragmentRenderingTests: XCTestCase {
     /// Lays out `markdown` in a real view and returns its rendered pixels.
-    private func render(_ markdown: String, height: CGFloat = 420) throws -> NSBitmapImageRep {
+    private func render(
+        _ markdown: String, height: CGFloat = 420, mode: EditorMode = .livePreview
+    ) throws -> NSBitmapImageRep {
         let view = MarkdownTextView.make()
+        view.mode = mode
         view.frame = NSRect(x: 0, y: 0, width: 520, height: height)
         view.setMarkdown(markdown)
 
@@ -81,6 +84,32 @@ final class FragmentRenderingTests: XCTestCase {
             }
         }
         return count
+    }
+
+    /// Rows carrying ink anywhere across their width.
+    ///
+    /// Unlike ``decoratedRows(_:)``, which samples one column near the content
+    /// edge to find *decoration*, this finds anything painted at all — which is
+    /// what answers "where on the page is this document drawn".
+    private func inkedRows(_ rep: NSBitmapImageRep) -> [Int] {
+        guard let background = rep.colorAt(x: 2, y: 2)?.usingColorSpace(.deviceRGB) else {
+            return []
+        }
+        var rows: [Int] = []
+        for y in stride(from: 0, to: rep.pixelsHigh, by: 1) {
+            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
+                guard let sample = rep.colorAt(x: x, y: y)?
+                    .usingColorSpace(.deviceRGB) else { continue }
+                if abs(sample.redComponent - background.redComponent) > 0.01
+                    || abs(sample.greenComponent - background.greenComponent) > 0.01
+                    || abs(sample.blueComponent - background.blueComponent) > 0.01
+                {
+                    rows.append(y)
+                    break
+                }
+            }
+        }
+        return rows
     }
 
     /// Rows where any pixel differs from the view's flat background.
@@ -256,15 +285,48 @@ final class FragmentRenderingTests: XCTestCase {
     // MARK: - Rendered content
 
     func testAMathBlockPaintsATypesetFormulaInPlaceOfItsSource() throws {
-        // The source collapses and the formula is drawn in its place, so the
-        // rendered version must cover far more of the surface than the raw
-        // `$$…$$` ever would.
-        let plain = try render("E = mc squared\n")
-        let math = try render("$$\nE = mc^2\n$$\n")
+        // "In place of" is the assertion. The source is collapsed to 0.01pt, so
+        // every inked pixel in this document must be the formula — and there
+        // must be a lot of them, since a fragment that resolves correctly and
+        // then draws nothing is exactly what a pixel test is for.
+        //
+        // This used to compare the ink against the same words as prose, which
+        // passed for the wrong reason: the formula was being drawn once per line
+        // of its own source, so three stacked copies out-inked any sentence.
+        let view = MarkdownTextView.make()
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+        view.setMarkdown("$$\nE = mc^2\n$$\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        view.layoutSubtreeIfNeeded()
 
+        var content = CGRect.null
+        view.textLayoutManager?.enumerateTextLayoutFragments(
+            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                content = content.union(fragment.layoutFragmentFrame)
+            }
+            return true
+        }
+        XCTAssertFalse(content.isNull, "the formula should have typeset")
+
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
         XCTAssertGreaterThan(
-            inkedPixels(math), inkedPixels(plain),
-            "a typeset formula should paint more than its plain-text equivalent")
+            inkedPixels(rep), 150, "the typeset formula should paint substantially")
+
+        // The formula is drawn inside the one fragment that stands in for the
+        // block, so no ink may appear below where that fragment ends. In pixels,
+        // not points: `bitmapImageRepForCachingDisplay` follows the backing
+        // scale, so on a Retina display a row index is half a point.
+        let scale = CGFloat(rep.pixelsHigh) / view.bounds.height
+        let limit = Int((content.maxY + view.textContainerOrigin.y) * scale) + 4
+        let rows = inkedRows(rep)
+        XCTAssertFalse(rows.isEmpty)
+        XCTAssertLessThanOrEqual(
+            rows.max() ?? 0, limit,
+            "ink below row \(limit) means the formula's source is painting as well as the formula")
     }
 
     func testAMathFragmentGrowsToFitTheFormula() throws {
@@ -301,6 +363,7 @@ final class FragmentRenderingTests: XCTestCase {
 
     func testAMermaidFenceRendersADiagramRatherThanCode() throws {
         let view = MarkdownTextView.make()
+        view.mode = .reading
         view.frame = NSRect(x: 0, y: 0, width: 520, height: 500)
         view.setMarkdown("```mermaid\ngraph TD;\n  A --> B;\n```\n")
 
@@ -322,8 +385,96 @@ final class FragmentRenderingTests: XCTestCase {
         XCTAssertGreaterThan(diagrams, 0, "a mermaid fence should render as a diagram")
     }
 
+    func testRenderedContentIsDrawnTheRightWayUp() throws {
+        // A `graph TD` was drawn bottom-up in the running app: "Start" at the
+        // foot, arrows pointing at the ceiling, every label mirrored. Formulas
+        // came out the right way round, which is what hid it — the flip in
+        // `drawRenderedContent` was calibrated against a bitmap captured from a
+        // *flipped* AppKit view, and any image not produced that way was then
+        // drawn upside down.
+        //
+        // Asserted with a picture whose halves cannot be confused, since the
+        // interesting part of an orientation bug is that everything else about
+        // the drawing is right. The fixture's own orientation is asserted first:
+        // otherwise a wrong assumption about which half is the top would read as
+        // a rendering bug.
+        let side = 64
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        // A bitmap context has its origin at the bottom left, so the *upper*
+        // half in these coordinates is the top of the picture.
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: side / 2, width: side, height: side / 2))
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: side, height: side / 2))
+        let fixture = try XCTUnwrap(context.makeImage())
+
+        let check = NSBitmapImageRep(cgImage: fixture)
+        XCTAssertEqual(
+            check.colorAt(x: side / 2, y: 2)?.usingColorSpace(.deviceRGB)?.redComponent, 1,
+            "the fixture's top half must be the red one, or this test is measuring itself")
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("markdev-orientation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("halves.png")
+        try XCTUnwrap(check.representation(using: .png, properties: [:])).write(to: url)
+
+        let view = MarkdownTextView.make()
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+        view.documentDirectory = directory
+        view.setMarkdown("![halves](halves.png)\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        view.layoutSubtreeIfNeeded()
+        // Resized *after* layout, and deliberately: an `NSTextView` sizes itself
+        // from its text, and it settles shorter than the room a rendered block
+        // asks for — which clipped the picture's lower half and read as "the
+        // blue half is never painted".
+        view.setFrameSize(NSSize(width: 400, height: 400))
+
+        let drawn = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: drawn)
+
+        // The rows each half covers, found by its colour rather than by
+        // recomputing the layout's arithmetic.
+        var redRows: [Int] = []
+        var blueRows: [Int] = []
+        for y in 0..<drawn.pixelsHigh {
+            for x in stride(from: 0, to: drawn.pixelsWide, by: 3) {
+                guard let colour = drawn.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                    continue
+                }
+                if colour.redComponent > 0.6, colour.blueComponent < 0.4 {
+                    redRows.append(y)
+                    break
+                }
+                if colour.blueComponent > 0.6, colour.redComponent < 0.4 {
+                    blueRows.append(y)
+                    break
+                }
+            }
+        }
+
+        XCTAssertFalse(redRows.isEmpty, "the picture's red half should be painted")
+        XCTAssertFalse(blueRows.isEmpty, "the picture's blue half should be painted")
+        XCTAssertLessThan(
+            try XCTUnwrap(redRows.max()), try XCTUnwrap(blueRows.min()),
+            "red is the top half of the file, so it must be the top half on screen — "
+                + "red rows \(redRows.min()!)–\(redRows.max()!), "
+                + "blue rows \(blueRows.min()!)–\(blueRows.max()!)")
+    }
+
     func testAMissingImageShowsAnExplanationNotABlank() throws {
         let view = MarkdownTextView.make()
+        // Reading mode, because the explanation stands in for the *collapsed*
+        // `![…](…)`. With the caret in the paragraph the source itself is what
+        // the reader sees, and nothing is rendered to fail.
+        view.mode = .reading
         view.frame = NSRect(x: 0, y: 0, width: 520, height: 300)
         view.documentDirectory = URL(fileURLWithPath: "/tmp")
         view.setMarkdown("![A plan](nope-\(UUID().uuidString).png)\n")

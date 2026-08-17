@@ -39,25 +39,6 @@ extension CalloutKind {
     }
 }
 
-/// Content drawn *in place of* a block's source text.
-public struct RenderedBlock: Sendable, Equatable {
-    public enum Kind: Sendable, Equatable {
-        case math
-        case diagram
-        /// Alt text, shown if the file cannot be loaded.
-        case image(alt: String)
-    }
-
-    public let kind: Kind
-    /// The source to render — LaTeX, Mermaid, or an image path.
-    public let source: String
-
-    public init(kind: Kind, source: String) {
-        self.kind = kind
-        self.source = source
-    }
-}
-
 /// Decoration drawn behind or in place of a block's text.
 public enum BlockDecoration: Sendable, Equatable {
     case none
@@ -102,13 +83,21 @@ extension BlockDecoration {
     /// Resolved from the innermost decorated block containing the range, so a
     /// code fence inside a callout draws as code rather than as the callout
     /// it sits in.
-    /// - Parameter text: the document's text, needed to read the source of a
-    ///   block that is replaced by rendered content. Without it, math and
-    ///   diagrams fall back to being drawn as code.
+    ///
+    /// - Parameters:
+    ///   - rendered: the document's blocks that draw content in place of their
+    ///     source, from ``RenderedBlocks``.
+    ///   - hidden: what is collapsed right now. Rendered content is drawn
+    ///     **only** where the source it replaces is entirely invisible, which
+    ///     is the whole reason this takes the caret's consequences as an
+    ///     argument. Defaulting both to "nothing" means a caller that forgets
+    ///     them gets the document's own source drawn — the direction that
+    ///     shows the reader their text rather than hides it.
     public static func decoration(
         for range: NSRange,
         in document: ParsedDocument,
-        text: NSString? = nil
+        rendered: RenderedBlocks = .none,
+        hidden: HiddenRanges = .none
     ) -> BlockDecoration {
         // A task item is resolved first: its `- [x]` sits inside a list item
         // whose own decoration would otherwise win.
@@ -121,19 +110,16 @@ extension BlockDecoration {
             return row
         }
 
-        // A standalone image is checked before the innermost-block search.
-        // Paragraphs are not decorated blocks in general — treating them as
-        // such would let the paragraph inside a callout win the innermost
-        // rule and erase the callout's own decoration.
-        if let text {
-            for block in document.blocks where block.kind == .paragraph {
-                guard NSIntersectionRange(block.range, range).length > 0
-                    || block.range.contains(range.location)
-                else { continue }
-                if let image = imageBlock(block, in: document, text: text) {
-                    return .rendered(image)
-                }
+        // A block replaced by content, checked before the innermost-block
+        // search. A standalone image lives in a *paragraph*, and paragraphs are
+        // not decorated blocks in general — treating them as such would let the
+        // paragraph inside a callout win the innermost rule and erase the
+        // callout's own decoration.
+        if let entry = rendered.entry(overlapping: range) {
+            if let piece = renderedPiece(of: entry, at: range, hidden: hidden) {
+                return piece
             }
+            // Source visible: fall through and draw the block as what it is.
         }
 
         var best: (block: BlockDescriptor, length: Int)?
@@ -153,16 +139,11 @@ extension BlockDecoration {
 
         switch block.kind {
         case .mathBlock:
-            if let text, let latex = mathSource(of: block, in: text) {
-                return .rendered(RenderedBlock(kind: .math, source: latex))
-            }
+            // `$$…$$` while its source is on screen: a fence in all but name,
+            // and it reads as one. The formula is drawn only once the source
+            // has gone, which is ``renderedPiece(of:at:hidden:)`` above.
             return .code(edge: edge, language: nil)
-        case .mermaidBlock:
-            if let text, let source = fencedSource(of: block, in: text) {
-                return .rendered(RenderedBlock(kind: .diagram, source: source))
-            }
-            return .code(edge: edge, language: block.info)
-        case .codeBlock, .frontmatter:
+        case .codeBlock, .mermaidBlock, .frontmatter:
             return .code(edge: edge, language: block.info)
         case .callout:
             return .callout(kind: block.calloutKind ?? .note, edge: edge)
@@ -184,57 +165,31 @@ extension BlockDecoration {
         }
     }
 
-    /// The LaTeX inside a `$$…$$` block.
-    private static func mathSource(of block: BlockDescriptor, in text: NSString) -> String? {
-        guard let body = clamp(block.range, to: text.length) else { return nil }
-        let raw = text.substring(with: body)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let stripped = raw
-            .trimmingPrefix("$$")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let latex = stripped.hasSuffix("$$")
-            ? String(stripped.dropLast(2)) : stripped
-        let cleaned = latex.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? nil : cleaned
-    }
-
-    /// The body of a fenced block, without its delimiter lines.
-    private static func fencedSource(of block: BlockDescriptor, in text: NSString) -> String? {
-        guard let body = clamp(block.range, to: text.length) else { return nil }
-        var lines = text.substring(with: body).components(separatedBy: "\n")
-        if lines.first?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
-            lines.removeFirst()
-        }
-        if lines.last?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
-            lines.removeLast()
-        }
-        let source = lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
-        return source.isEmpty ? nil : source
-    }
-
-    /// An image standing alone in its own paragraph.
+    /// What the fragment at `range` draws for a block that renders as content,
+    /// or `nil` if that block's source is on screen and should be drawn as it
+    /// is written.
     ///
-    /// Only whole-paragraph images are replaced. An image sitting inside a
-    /// sentence has to stay inline, and swapping it for a block would break
-    /// the line it belongs to.
-    private static func imageBlock(
-        _ block: BlockDescriptor,
-        in document: ParsedDocument,
-        text: NSString
-    ) -> RenderedBlock? {
-        let images = document.spans.filter {
-            $0.kind == .image && NSIntersectionRange($0.range, block.range).length > 0
+    /// Two conditions, and both are load-bearing:
+    ///
+    /// - **The source must be entirely collapsed.** Content is drawn *in place
+    ///   of* the text, not over it. Drawing both put a full-size diagram under
+    ///   every line of its own source, which is what made a mermaid fence
+    ///   impossible to read or edit in source mode — the code was on screen,
+    ///   separated by three hundred points of picture per line.
+    /// - **Only the block's first piece draws it.** TextKit lays out one
+    ///   fragment per line, so a five-line fence is five fragments; each one
+    ///   holding the whole block's content reserved five diagrams' worth of
+    ///   height and stacked five copies down the page. The rest draw nothing,
+    ///   which costs them nothing: a line of pure collapsed syntax has no
+    ///   height left to give.
+    private static func renderedPiece(
+        of entry: RenderedBlocks.Entry, at range: NSRange, hidden: HiddenRanges
+    ) -> BlockDecoration? {
+        guard hidden.covers(entry.range) else { return nil }
+        guard range.length > 0, edge(of: range, within: entry.range).roundsTop else {
+            return BlockDecoration.none
         }
-        guard images.count == 1, let span = images.first else { return nil }
-        guard let source = document.target(for: span), !source.isEmpty else { return nil }
-
-        // The paragraph must be the image and nothing else of substance.
-        guard let body = clamp(block.range, to: text.length) else { return nil }
-        let paragraph = text.substring(with: body).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard paragraph.hasPrefix("!["), paragraph.hasSuffix(")") else { return nil }
-
-        let alt = clamp(span.range, to: text.length).map { text.substring(with: $0) } ?? ""
-        return RenderedBlock(kind: .image(alt: alt), source: source)
+        return .rendered(entry.content)
     }
 
     /// The task decoration for a fragment holding a `- [ ]` marker.
