@@ -1,0 +1,38 @@
+[package]
+name = "markdev"
+version = "0.1.0"
+edition = "2021"
+description = "Native Markdown core for MarkDev — parsing, indexing, and search"
+license = "MIT"
+
+[lib]
+name = "markdev"
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Syntax highlighting for fenced code blocks. tree-sitter rather than a
+# hand-rolled tokenizer: real grammars get raw strings, nested templates, and
+# regex literals right, which a regex-based highlighter never quite does.
+tree-sitter = "0.26"
+tree-sitter-highlight = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-swift = "0.7"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-bash = "0.25"
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dev-dependencies]
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

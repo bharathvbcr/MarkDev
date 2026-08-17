@@ -1,0 +1,212 @@
+# Generated into MarkDev.xcodeproj by `just generate` (xcodegen).
+#
+# An Xcode project rather than SwiftPM because SwiftPM cannot build the
+# Quick Look .appex bundle that gives MarkDev its Space-bar preview in Finder.
+name: MarkDev
+options:
+  bundleIdPrefix: dev.markdev
+  deploymentTarget:
+    # macOS 26 is the floor for the Liquid Glass APIs (glassEffect,
+    # GlassEffectContainer) that the whole chrome layer is built on.
+    macOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # Project-wide, not just on MarkDevKit: the framework's generated
+    # interface references CMarkDev, so every dependent target must be able
+    # to resolve the module too.
+    SWIFT_INCLUDE_PATHS: $(SRCROOT)/core/include
+    MARKETING_VERSION: "0.1.0"
+    # Launch Services caches document-icon artwork per bundle *version*, not
+    # per build: changing the icon without bumping this leaves Finder showing
+    # the old icon indefinitely. Bump when the type declarations or the icon
+    # assets change.
+    CURRENT_PROJECT_VERSION: "4"
+    ONLY_ACTIVE_ARCH: true
+    ENABLE_HARDENED_RUNTIME: true
+    # Signed to run locally; a distribution identity replaces this at release.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: true
+    CODE_SIGNING_ALLOWED: true
+
+targets:
+  # ---------------------------------------------------------------------
+  # Shared framework: the parser bridge, editor engine, and renderer.
+  # Both the app and the Quick Look extension link this, which is why the
+  # renderer must work without any app state.
+  # ---------------------------------------------------------------------
+  MarkDevKit:
+    type: framework
+    platform: macOS
+    sources:
+      - path: app/MarkDevKit
+    # A macOS framework without Versions/A/Resources/Info.plist is not a
+    # valid bundle, and codesign rejects it with an opaque "bundle format
+    # unrecognized" rather than naming the missing file.
+    info:
+      path: app/MarkDevKit/Info.plist
+      properties:
+        CFBundleName: MarkDevKit
+        CFBundlePackageType: FMWK
+        LSMinimumSystemVersion: "26.0"
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDevKit
+        OTHER_LDFLAGS: -lmarkdev
+        DEFINES_MODULE: true
+      configs:
+        # The Rust staticlib must match the Swift configuration, so each
+        # config points at its own cargo target dir. Scoping this per
+        # configuration is what stops a stale release .a from being picked
+        # up by a debug build.
+        debug:
+          LIBRARY_SEARCH_PATHS: $(SRCROOT)/core/target/debug
+        release:
+          LIBRARY_SEARCH_PATHS: $(SRCROOT)/core/target/release
+
+  # ---------------------------------------------------------------------
+  # The app.
+  # ---------------------------------------------------------------------
+  MarkDev:
+    type: application
+    platform: macOS
+    sources:
+      - path: app/MarkDev
+    dependencies:
+      - target: MarkDevKit
+      - target: MarkDevQuickLook
+    info:
+      path: app/MarkDev/Info.plist
+      properties:
+        CFBundleName: MarkDev
+        CFBundleDisplayName: MarkDev
+        CFBundlePackageType: APPL
+        LSMinimumSystemVersion: "26.0"
+        # xcodegen bakes its own CFBundleVersion of "1" unless told otherwise,
+        # so bumping CURRENT_PROJECT_VERSION alone never reaches the bundle —
+        # and Launch Services keeps serving the cached document icon.
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        # The icon is rendered from MarkDevLogo into an asset catalog by
+        # `just icons`. CFBundleIconName is how macOS finds it in the
+        # catalog; CFBundleIconFile names the .icns actool also emits, which
+        # is what older tooling and the Finder's Get Info panel read.
+        CFBundleIconName: AppIcon
+        CFBundleIconFile: AppIcon
+        NSHumanReadableCopyright: ""
+        # Dark-first, but the UI still honours the system setting.
+        NSRequiresAquaSystemAppearance: false
+        # Unsaved tabs require an explicit review; the process must never be
+        # reclaimed or terminated without running that review.
+        NSSupportsAutomaticTermination: false
+        NSSupportsSuddenTermination: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Markdown Document
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            # Rendered from MarkDevLogo by `just icons`. This — an icon on the
+            # app's *document-type claim* — is the only mechanism that works
+            # for this type; see the note on the declaration below.
+            CFBundleTypeIconFile: DocumentIcon
+            LSItemContentTypes:
+              - net.daringfireball.markdown
+          - CFBundleTypeName: Plain Text
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.plain-text
+        # Claims .mdx and .mkd, which the system's own declaration omits.
+        #
+        # **Imported, not exported — and the document icon cannot go here.**
+        # macOS ships its own declaration of `net.daringfireball.markdown` in
+        # CoreTypes. Exporting it from this app to attach `UTTypeIcons` looks
+        # right and does nothing: Launch Services registers the duplicate
+        # declaration as *inactive* (visible in `lsregister -dump`) and never
+        # reads its icons. `CFBundleTypeIconFile` on the document-type claim
+        # above is what actually reaches Finder.
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: net.daringfireball.markdown
+            UTTypeDescription: Markdown Document
+            UTTypeConformsTo:
+              - public.plain-text
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - md
+                - markdown
+                - mdown
+                - mdx
+                - mkd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDev
+        ENABLE_APP_SANDBOX: false
+        COMBINE_HIDPI_IMAGES: true
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  # ---------------------------------------------------------------------
+  # Quick Look preview extension — the Space-bar preview in Finder.
+  # ---------------------------------------------------------------------
+  MarkDevQuickLook:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: app/MarkDevQuickLook
+    dependencies:
+      - target: MarkDevKit
+    info:
+      path: app/MarkDevQuickLook/Info.plist
+      properties:
+        CFBundleName: MarkDevQuickLook
+        CFBundleDisplayName: MarkDev Preview
+        CFBundlePackageType: XPC!
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.preview
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PreviewViewController
+          NSExtensionAttributes:
+            # Only the type the app actually declares. Listing an undeclared
+            # UTI here is silently ignored by Quick Look, which reads as
+            # "extension not working" with nothing to point at.
+            QLSupportedContentTypes:
+              - net.daringfireball.markdown
+            # MarkDev renders its own preview surface rather than handing
+            # Quick Look a thumbnail.
+            QLSupportsSearchableItems: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDev.QuickLook
+        SKIP_INSTALL: true
+
+  # ---------------------------------------------------------------------
+  # Tests.
+  # ---------------------------------------------------------------------
+  MarkDevKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: app/Tests
+    dependencies:
+      - target: MarkDevKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDevKitTests
+        GENERATE_INFOPLIST_FILE: true
+
+schemes:
+  MarkDev:
+    build:
+      targets:
+        MarkDev: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - MarkDevKitTests
