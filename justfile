@@ -93,6 +93,68 @@ build: build-core-debug generate
 build-release: build-core generate
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release build
 
+# A Release signed with a real identity, which is the only kind whose Quick
+# Look extension `pkd` will register. Ad-hoc is not enough — `pluginkit -a`
+# exits 0 and registers nothing — and this is not a guess: on this machine
+# QLMarkdown's extension registers from /Applications with a Developer ID and
+# a team identifier, while MarkDev's, in the same directory, does not with
+# `Signature=adhoc, TeamIdentifier=not set`.
+#
+# Hardened runtime is turned back on here and *only* here. It travels with the
+# identity: a hardened-runtime process cannot load an ad-hoc signed framework,
+# so enabling it on the unsigned path produces an app that dies in dyld before
+# `main` — which is exactly what shipped until it was caught by launching one.
+#
+# Overridden on the command line rather than in project.yml so that a clone
+# with no certificate still builds and runs.
+#
+#     just build-release-signed                      # Apple Development
+#     just build-release-signed "Developer ID Application: You (TEAMID)"
+build-release-signed IDENTITY="Apple Development": build-core generate
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    if ! security find-identity -v -p codesigning | grep -q "{{IDENTITY}}"; then
+        echo "no codesigning identity matching {{IDENTITY}}." >&2
+        echo "Xcode > Settings > Accounts > (your Apple ID) > Manage Certificates" >&2
+        echo "  > + > Apple Development. A free Apple ID is enough." >&2
+        exit 1
+    fi
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release \
+        CODE_SIGN_IDENTITY="{{IDENTITY}}" \
+        ENABLE_HARDENED_RUNTIME=YES \
+        build
+
+# Copy a built Release into /Applications and make the system notice it.
+#
+# The registration steps are not optional bookkeeping. Launch Services caches
+# document-icon artwork per bundle path and version, and Icon Services caches
+# by path, so a bundle that once had no icon keeps showing the placeholder
+# grid — which reads as "the icon is broken" — until the caches are dropped.
+#
+# `install` is the ad-hoc build: the app runs and claims .md, but its Quick
+# Look extension will not register. `install-signed` is the one that gets
+# Space-bar previews working.
+install: build-release install-only
+install-signed IDENTITY="Apple Development": (build-release-signed IDENTITY) install-only
+
+install-only:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    products=$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev \
+        -configuration Release -showBuildSettings 2>/dev/null \
+        | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')
+    app=$products/MarkDev.app
+    codesign --verify --deep --strict "$app"
+    # Replaced, not merged: ditto over an existing bundle leaves behind files
+    # the new build no longer ships.
+    rm -rf /Applications/MarkDev.app
+    ditto "$app" /Applications/MarkDev.app
+    lsregister=/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister
+    killall -9 iconservicesagent 2>/dev/null || true
+    $lsregister -f -R -trusted /Applications/MarkDev.app
+    killall Dock 2>/dev/null || true
+    echo "installed /Applications/MarkDev.app"
+
 test: test-core test-app
 
 test-app: build-core-debug generate
