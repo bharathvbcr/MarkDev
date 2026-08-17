@@ -45,11 +45,12 @@ public final class MarkdownPreviewController {
         // a preview must never be typed into.
         textView.mode = .reading
 
-        view = NSScrollView()
-        view.documentView = textView
-        view.hasVerticalScroller = true
-        view.drawsBackground = false
-        view.autohidesScrollers = true
+        // Through the same helper the editor uses, not a scroll view built by
+        // hand here. TextKit 2 lays out only the visible viewport and needs
+        // the clip view's bounds-change notifications to learn it moved; a
+        // hand-rolled host that omits them scrolls into blank space, and the
+        // omission is invisible until someone scrolls a long note.
+        view = ScrollingTextView.scrollView(hosting: textView)
     }
 
     /// Reads `url` and previews it.

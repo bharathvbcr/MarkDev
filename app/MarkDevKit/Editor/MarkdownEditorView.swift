@@ -68,11 +68,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         }
         textView.setMarkdown(text)
 
-        let scrollView = NSScrollView()
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.autohidesScrollers = true
+        let scrollView = ScrollingTextView.scrollView(hosting: textView)
 
         context.coordinator.textView = textView
         return scrollView
