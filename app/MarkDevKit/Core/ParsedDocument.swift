@@ -49,6 +49,63 @@ public struct ParsedDocument: Sendable, Equatable {
         self.strings = strings
     }
 
+    /// The markers overlapping `range`, as an index range into ``markers``.
+    ///
+    /// The core sorts markers by start offset (`core/src/md/parse.rs`), and the
+    /// incremental parser's shift preserves that order, so the window can be
+    /// found by binary search. Callers that ask this per block — the code-fence
+    /// highlighter does — would otherwise scan every marker in the document for
+    /// every block, which is the quadratic shape this codebase has already been
+    /// bitten by once; see the ``HiddenRanges`` note on `covers`.
+    ///
+    /// Markers are *not* guaranteed disjoint: a blockquote re-marks its `>`
+    /// prefixes over the gap rule's own marker. The search therefore widens
+    /// backwards over neighbours that reach into `range`, which costs a step
+    /// per duplicate rather than a document scan. That widening assumes
+    /// overlapping markers are *adjacent* in sort order — true of duplicates,
+    /// which share a start — rather than one long marker hiding behind several
+    /// short ones. `ParsedDocumentTests` checks the result against a full scan
+    /// over a document containing every construct the parser emits.
+    public func markerIndices(overlapping range: NSRange) -> Range<Int> {
+        guard range.length > 0, !markers.isEmpty else { return 0..<0 }
+        let end = range.location + range.length
+
+        // First marker starting at or after `end` — everything from there on
+        // begins past the range.
+        var upper = markers.count
+        var low = 0
+        var high = markers.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            if markers[mid].range.location >= end {
+                upper = mid
+                high = mid - 1
+            } else {
+                low = mid + 1
+            }
+        }
+
+        // First marker starting at or after `range.location`, then widened
+        // back over any earlier marker that still reaches into the range.
+        var lower = upper
+        low = 0
+        high = upper - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            if markers[mid].range.location >= range.location {
+                lower = mid
+                high = mid - 1
+            } else {
+                low = mid + 1
+            }
+        }
+        while lower > 0, NSMaxRange(markers[lower - 1].range) > range.location {
+            lower -= 1
+        }
+
+        return lower..<upper
+    }
+
     /// The destination a link-like span points at.
     ///
     /// For a wikilink this is the raw target as written — `Note`,
