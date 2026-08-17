@@ -7,6 +7,29 @@
 
 @preconcurrency import AppKit
 
+/// One change to the text, as the storage reports it.
+///
+/// `range` is where the new text sits *after* the change, `delta` how much
+/// longer the document became, and `replacement` the text now occupying
+/// `range`. Everything the incremental parser and the restyle scope need is
+/// derivable from those three.
+public struct TextEdit: Sendable, Equatable {
+    public let range: NSRange
+    public let delta: Int
+    public let replacement: String
+
+    public init(range: NSRange, delta: Int, replacement: String) {
+        self.range = range
+        self.delta = delta
+        self.replacement = replacement
+    }
+
+    /// The range this edit replaced, in the pre-edit document's coordinates.
+    public var replacedRange: NSRange {
+        NSRange(location: range.location, length: max(0, range.length - delta))
+    }
+}
+
 /// A Markdown editor built on TextKit 2 with live preview.
 ///
 /// The TextKit 2 object graph is assembled explicitly —
@@ -99,16 +122,35 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Guards against reentrant styling.
     private var isStyling = false
 
-    /// Where the in-flight edit landed, so the restyle after it can be
-    /// scoped. Cleared once consumed; `nil` means "restyle everything".
-    private var pendingEditedRange: NSRange?
-
-    /// The edit captured from the storage delegate, awaiting application to
-    /// the incremental document.
-    private var pendingEdit: (old: NSRange, replacement: String)?
-
     /// Holds the parse across edits so unchanged structure is not reparsed.
     private var document = IncrementalDocument(text: "")
+
+    /// Set while ``setMarkdown(_:)`` swaps the whole document, so the change
+    /// notifications it provokes do not each start their own reparse of text
+    /// that is about to be parsed anyway.
+    private var isReplacingDocument = false
+
+    /// The edit the text view announced through `shouldChangeText`, waiting
+    /// for the `didChangeText` that applies it.
+    private var announcedEdit: TextEdit?
+
+    /// A change the storage has made that no reparse has accounted for yet.
+    /// Cleared by ``reparse(edit:)``; anything still here when the catch-up
+    /// runs is a change that arrived without announcing itself.
+    private var unparsedChange: PendingChange?
+
+    /// A storage change waiting to be parsed, and how much is known about it.
+    private enum PendingChange {
+        /// An edit whose extent is known, so the restyle can be scoped.
+        case scoped(TextEdit)
+        /// A change whose reported range made no sense. Reparse everything
+        /// rather than trust it.
+        case whole
+    }
+
+    /// Whether a catch-up is already queued, so a burst of storage edits
+    /// schedules one pass rather than one per edit.
+    private var isCatchUpScheduled = false
 
     // MARK: - Construction
 
@@ -165,6 +207,14 @@ public final class MarkdownTextView: ScrollingTextView {
         // The styler colours wikilinks itself; without this AppKit would
         // repaint them its own blue-underlined default.
         linkTextAttributes = [:]
+
+        if let storage = textStorage {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(storageDidProcessEditing(_:)),
+                name: NSTextStorage.didProcessEditingNotification,
+                object: storage)
+        }
     }
 
     // MARK: - Content
@@ -172,8 +222,12 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Replaces the document text and reparses from scratch.
     public func setMarkdown(_ markdown: String) {
         guard let storage = textStorage else { return }
+        isReplacingDocument = true
+        defer { isReplacingDocument = false }
+        // Any edit still in flight described the document being replaced.
+        announcedEdit = nil
+        unparsedChange = nil
         storage.setAttributedString(NSAttributedString(string: markdown))
-        pendingEdit = nil
         // A wholesale replacement is a different document as far as the
         // proofreader is concerned; keeping the old offsets would underline
         // arbitrary words in the new text.
@@ -200,55 +254,104 @@ public final class MarkdownTextView: ScrollingTextView {
 
     /// Reparses and restyles.
     ///
-    /// `editedRange`, when known, scopes the restyle to the affected blocks.
-    /// Restyling the whole buffer per keystroke is O(document) and stalls
-    /// typing in a long file.
-    public func reparse(editedRange: NSRange? = nil) {
+    /// `edit`, when known, scopes the restyle to what the edit actually
+    /// changed. Restyling the whole buffer per keystroke is O(document) and
+    /// stalls typing in a long file.
+    public func reparse(edit: TextEdit? = nil) {
+        unparsedChange = nil
         let previous = parsed
+        let delta = edit?.delta ?? 0
+        let editedRange = edit?.range
         let text = markdown
-        if let edit = pendingEdit {
-            document.apply(range: edit.old, replacement: edit.replacement, fullText: text)
-            pendingEdit = nil
+        var onlyOffsetsMoved = false
+        if let edit {
+            onlyOffsetsMoved = document.apply(
+                range: edit.replacedRange, replacement: edit.replacement, fullText: text)
         } else {
             document.rebuild(from: text)
         }
         parsed = document.parsed
+
+        // The blocks whose syntax appeared or disappeared join the scope. An
+        // edit that moves the caret into another block changes how that block
+        // is drawn without changing a single thing about the parse, so no
+        // amount of comparing the two parses would find it.
+        let revealedBefore = revealedRanges(of: revealedBlocks, in: previous)
+            .map { shift($0, by: delta, at: editedRange) }
         revealedBlocks = RevealPolicy.revealedBlocks(
             in: parsed, selection: selectedRange(), mode: mode)
+        let revealedAfter = revealedRanges(of: revealedBlocks, in: parsed)
 
-        restyle(scope: incrementalScope(from: previous, to: parsed, edited: editedRange))
+        var scope = incrementalScope(
+            from: previous, to: parsed, edited: editedRange, delta: delta,
+            onlyOffsetsMoved: onlyOffsetsMoved)
+        if scope != nil, revealedBefore != revealedAfter {
+            for range in revealedBefore + revealedAfter {
+                scope = scope.map { NSUnionRange($0, range) }
+            }
+        }
+
+        restyle(scope: scope)
         onParse?(parsed)
+    }
+
+    /// The ranges of the blocks at `indices`, in document order.
+    private func revealedRanges(of indices: Set<Int>, in document: ParsedDocument) -> [NSRange] {
+        indices
+            .filter { document.blocks.indices.contains($0) }
+            .map { document.blocks[$0].range }
+            .sorted { $0.location == $1.location ? $0.length < $1.length : $0.location < $1.location }
+    }
+
+    /// A pre-edit range in post-edit coordinates.
+    ///
+    /// Three cases, the same three the core's own shift uses: before the edit
+    /// nothing moves, after it everything moves by `delta`, and across it only
+    /// the end moves.
+    private func shift(_ range: NSRange, by delta: Int, at edited: NSRange?) -> NSRange {
+        guard let edited else { return range }
+        let replacedEnd = edited.location + edited.length - delta
+        if NSMaxRange(range) <= edited.location { return range }
+        if range.location >= replacedEnd {
+            return NSRange(location: max(0, range.location + delta), length: range.length)
+        }
+        return NSRange(location: range.location, length: max(0, range.length + delta))
     }
 
     /// The range worth restyling after an edit, or `nil` to restyle it all.
     ///
-    /// Attributes in `NSTextStorage` shift with the text around them, so an
-    /// ordinary insertion leaves every other block correctly styled already.
-    /// The exception is an edit that changes how *later* text parses — typing
-    /// an opening fence swallows the rest of the file — which shows up as a
-    /// changed sequence of block kinds. That case falls back to a full
-    /// restyle rather than trying to be clever about it.
+    /// Delegates to ``ParseDivergence``, which compares the two parses and
+    /// answers where they stop agreeing. This replaces an earlier rule — *any*
+    /// change in the sequence of block kinds forces a full restyle — which was
+    /// correct but far too blunt. On a 10,000-line file, typing one character
+    /// in front of a heading demotes it to a paragraph, and that single kind
+    /// change cost a whole-document restyle of 922ms: the stall the user sees
+    /// on their first keystroke.
+    ///
+    /// `onlyOffsetsMoved` is the core's own verdict that the edit could not
+    /// have changed structure. It is a promise about spans and markers too, so
+    /// comparing the blocks alone is enough — which is what keeps ordinary
+    /// prose typing off the O(document) comparison entirely.
+    ///
+    /// Falls back to a full restyle when there is no edit to reason from, or
+    /// when either parse has no blocks at all — an empty document on one side
+    /// leaves nothing to line the two up by.
     private func incrementalScope(
         from previous: ParsedDocument,
         to current: ParsedDocument,
-        edited: NSRange?
+        edited: NSRange?,
+        delta: Int,
+        onlyOffsetsMoved: Bool
     ) -> NSRange? {
         guard let edited, !previous.blocks.isEmpty, !current.blocks.isEmpty else { return nil }
-
-        // Any change in block structure means later text may parse
-        // differently; restyle everything.
-        guard previous.blocks.count == current.blocks.count else { return nil }
-        for (old, new) in zip(previous.blocks, current.blocks) where old.kind != new.kind {
-            return nil
-        }
-
-        // Structure held: restyle the blocks the edit touched.
-        var scope = edited
-        for block in current.blocks
-        where NSIntersectionRange(block.range, edited).length > 0 || block.range.contains(edited.location) {
-            scope = NSUnionRange(scope, block.range)
-        }
-        return scope
+        return ParseDivergence.restyleScope(
+            from: previous,
+            to: current,
+            edited: edited,
+            delta: delta,
+            documentLength: textStorage?.length ?? NSMaxRange(edited),
+            depth: onlyOffsetsMoved ? .offsetsOnly : .reparsed
+        )
     }
 
     /// Reapplies attributes for the current parse and selection.
@@ -331,17 +434,19 @@ public final class MarkdownTextView: ScrollingTextView {
         guard range.length > 0 else { return nil }
 
         // Markers cover the fence lines; the body is what they leave behind.
-        let fenceMarkers = parsed.markers
-            .map(\.range)
-            .filter { NSIntersectionRange($0, range).length > 0 }
-            .sorted { $0.location < $1.location }
+        //
+        // Found by binary search, not by filtering every marker in the
+        // document: this runs once per code block, so a scan makes a
+        // whole-document restyle quadratic — 756ms of a 922ms stall on the
+        // first structural edit in a 10,000-line file.
+        let fenceMarkers = parsed.markers[parsed.markerIndices(overlapping: range)]
 
         var start = range.location
         var end = range.location + range.length
-        if let first = fenceMarkers.first, first.location <= start {
+        if let first = fenceMarkers.first?.range, first.location <= start {
             start = first.location + first.length
         }
-        if let last = fenceMarkers.last, last.location + last.length >= end {
+        if let last = fenceMarkers.last?.range, last.location + last.length >= end {
             end = last.location
         }
         guard end > start else { return nil }
@@ -559,31 +664,88 @@ public final class MarkdownTextView: ScrollingTextView {
 
     public override func didChangeText() {
         super.didChangeText()
-        let edited = pendingEditedRange
-        pendingEditedRange = nil
-        reparse(editedRange: edited)
+        guard !isReplacingDocument else { return }
+        let edit = announcedEdit
+        announcedEdit = nil
+        reparse(edit: edit)
+        // After the reparse, and not on the replacement path: `setMarkdown`
+        // has already cleared the issues and told observers, so reporting
+        // again here would announce a set nothing has moved.
         if issuesDidMove {
             issuesDidMove = false
             onIssues?(storedIssues)
         }
     }
 
-    /// Captures every user edit before it is applied.
+    /// Notices every character change the storage makes, and reparses the ones
+    /// nothing else did.
     ///
-    /// This is the hook rather than `NSTextStorageDelegate`, because in
-    /// TextKit 2 the `NSTextContentStorage` is itself the storage's delegate —
-    /// taking that slot would displace it. `shouldChangeText` sees typing,
-    /// paste, delete, and undo alike, and uniquely gives both the range being
-    /// replaced *and* the replacement, which is exactly what the incremental
-    /// parser needs.
+    /// Undo and redo are why this exists. AppKit replays them straight into
+    /// `NSTextStorage`: verified in a real window, with a real first responder
+    /// and AppKit's own undo manager, neither `shouldChangeText` nor
+    /// `didChangeText` fires. Before this, ⌘Z left the document styled for
+    /// text it no longer contained — permanently, until something else
+    /// happened to restyle it.
+    ///
+    /// The work is deferred rather than done here. This notification arrives
+    /// *inside* the storage's edit cycle, where an observer may adjust
+    /// attributes but must not open an editing cycle of its own — and a
+    /// restyle does exactly that. One turn of the runloop later the cycle has
+    /// finished and the same scoped restyle typing gets can be applied safely.
+    /// An announced edit never reaches the catch-up: `didChangeText` runs
+    /// first and clears the change.
+    ///
+    /// Attribute-only edits — every restyle this class performs — carry no
+    /// `.editedCharacters`, so styling cannot feed itself back in here.
+    @objc private func storageDidProcessEditing(_ note: Notification) {
+        guard let storage = note.object as? NSTextStorage, storage === textStorage,
+            storage.editedMask.contains(.editedCharacters),
+            !isStyling, !isReplacingDocument
+        else { return }
+
+        let edited = storage.editedRange
+        let delta = storage.changeInLength
+        if edited.location >= 0, edited.length >= 0, NSMaxRange(edited) <= storage.length,
+            edited.length - delta >= 0
+        {
+            unparsedChange = .scoped(
+                TextEdit(
+                    range: edited,
+                    delta: delta,
+                    replacement: (storage.string as NSString).substring(with: edited)))
+        } else {
+            unparsedChange = .whole
+        }
+
+        guard !isCatchUpScheduled else { return }
+        isCatchUpScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isCatchUpScheduled = false
+            guard let pending = self.unparsedChange else { return }
+            self.unparsedChange = nil
+            switch pending {
+            case .scoped(let edit): self.reparse(edit: edit)
+            case .whole: self.reparse()
+            }
+        }
+    }
+
+    /// Captures every edit the text view is about to make.
+    ///
+    /// Typing, pasting and deleting all pass through here, which is what lets
+    /// them be reparsed synchronously — before the next frame draws. Undo does
+    /// not, and is picked up by ``storageDidProcessEditing(_:)`` instead.
     public override func shouldChangeText(
         in affectedCharRange: NSRange,
         replacementString: String?
     ) -> Bool {
         if let replacementString, !isStyling {
-            let length = (replacementString as NSString).length
-            pendingEdit = (affectedCharRange, replacementString)
-            pendingEditedRange = NSRange(location: affectedCharRange.location, length: length)
+            let inserted = (replacementString as NSString).length
+            announcedEdit = TextEdit(
+                range: NSRange(location: affectedCharRange.location, length: inserted),
+                delta: inserted - affectedCharRange.length,
+                replacement: replacementString)
 
             // Carried through the edit rather than thrown away, so fixing one
             // mistake does not erase every other underline in the document.
@@ -591,14 +753,34 @@ public final class MarkdownTextView: ScrollingTextView {
             // because it is the one place that sees both halves of the edit.
             if !storedIssues.isEmpty {
                 let moved = storedIssues.applying(
-                    edit: affectedCharRange, replacementLength: length)
+                    edit: affectedCharRange, replacementLength: inserted)
                 if moved != storedIssues {
                     storedIssues = moved
                     issuesDidMove = true
                 }
             }
         }
-        return super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+
+        let allowed = super.shouldChangeText(
+            in: affectedCharRange, replacementString: replacementString)
+        if !allowed {
+            // A refused edit never reaches `didChangeText`, so its record would
+            // sit here and be consumed by whatever edit came next — describing
+            // a change to the document that never happened, at offsets that
+            // mean something else now.
+            announcedEdit = nil
+        }
+        return allowed
+    }
+
+    /// Whether every change to the text has been parsed and drawn.
+    ///
+    /// `false` between an unannounced edit — undo, redo, or anything written
+    /// straight into the storage — and the catch-up that reparses it a runloop
+    /// turn later. Tests that inspect styling need to wait for this; the app
+    /// never has to, because the turn happens before the next frame.
+    var hasSettledAfterTextChanges: Bool {
+        unparsedChange == nil && !isCatchUpScheduled
     }
 
     /// Whether ``storedIssues`` changed during the in-flight edit and the
@@ -693,6 +875,10 @@ public final class MarkdownTextView: ScrollingTextView {
 
         super.setSelectedRanges(adjusted, affinity: affinity, stillSelecting: stillSelecting)
 
+        // Safe to style from `parsed` here: a text change reparses inside the
+        // storage's own edit cycle, which finishes before AppKit moves the
+        // caret. Styling from a parse older than the text is what wrote the
+        // previous document's ranges onto the new one.
         if !stillSelecting, !isStyling {
             updateRevealIfNeeded()
         }

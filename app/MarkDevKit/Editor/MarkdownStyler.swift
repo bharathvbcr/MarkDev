@@ -35,6 +35,15 @@ public enum MarkdownStyler {
     /// milliseconds once a file is long enough to matter; scoping it to the
     /// edited region is what keeps typing at one frame.
     ///
+    /// **A scoped pass writes nothing outside its scope, and everything
+    /// inside it.** Every layer is clipped, not merely filtered: a code block
+    /// that reaches past the scope used to have its monospace font applied
+    /// over its *whole* range while the hidden-marker pass only reapplied the
+    /// markers inside the scope — which quietly un-hid the closing fence of a
+    /// block the caller never asked about. Callers rely on the other half of
+    /// the contract too: text outside the scope keeps the attributes it has,
+    /// which `NSTextStorage` has already shifted along with the text.
+    ///
     /// Runs inside one `beginEditing`/`endEditing` pair so TextKit relayouts
     /// once rather than once per attribute run.
     @MainActor
@@ -112,8 +121,8 @@ public enum MarkdownStyler {
         theme: EditorTheme
     ) {
         for block in blocks {
-            let range = clamp(block.range, to: limit)
-            guard range.length > 0, NSIntersectionRange(range, scope).length > 0 else { continue }
+            let range = NSIntersectionRange(clamp(block.range, to: limit), scope)
+            guard range.length > 0 else { continue }
 
             switch block.kind {
             case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter:
@@ -159,8 +168,8 @@ public enum MarkdownStyler {
         theme: EditorTheme
     ) {
         for span in spans {
-            let range = clamp(span.range, to: limit)
-            guard range.length > 0, NSIntersectionRange(range, scope).length > 0 else { continue }
+            let range = NSIntersectionRange(clamp(span.range, to: limit), scope)
+            guard range.length > 0 else { continue }
 
             switch span.kind {
             case .heading:
@@ -230,8 +239,8 @@ public enum MarkdownStyler {
         scope: NSRange
     ) {
         for span in document.spans where span.kind == .wikiLink {
-            let range = clamp(span.range, to: limit)
-            guard range.length > 0, NSIntersectionRange(range, scope).length > 0 else { continue }
+            let range = NSIntersectionRange(clamp(span.range, to: limit), scope)
+            guard range.length > 0 else { continue }
             guard let target = document.target(for: span) else { continue }
             guard
                 let encoded = target.addingPercentEncoding(
@@ -261,18 +270,16 @@ public enum MarkdownStyler {
         // range made styling quadratic and cost seconds per keystroke on a
         // large document.
         for marker in document.markers {
-            let range = clamp(marker.range, to: limit)
-            guard range.length > 0, NSIntersectionRange(range, scope).length > 0,
-                !hidden.covers(range)
-            else { continue }
+            let full = clamp(marker.range, to: limit)
+            let range = NSIntersectionRange(full, scope)
+            guard range.length > 0, !hidden.covers(full) else { continue }
             storage.addAttribute(.foregroundColor, value: theme.markerColor, range: range)
         }
 
         // Hidden markers: shrunk to nothing but still present in storage.
         for range in hidden.ranges {
-            let clamped = clamp(range, to: limit)
-            guard clamped.length > 0, NSIntersectionRange(clamped, scope).length > 0
-            else { continue }
+            let clamped = NSIntersectionRange(clamp(range, to: limit), scope)
+            guard clamped.length > 0 else { continue }
             storage.addAttributes(
                 [
                     .font: theme.hiddenMarkerFont,

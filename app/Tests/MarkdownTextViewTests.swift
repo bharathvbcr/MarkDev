@@ -266,4 +266,186 @@ final class MarkdownTextViewTests: XCTestCase {
         let view = makeView("# Title")
         XCTAssertNotNil(view.textLayoutManager, "editor must be backed by TextKit 2")
     }
+
+    // MARK: - Scoped restyling
+
+    /// A document long enough that a stale block would have to be *found*
+    /// rather than noticed, with every construct that styles differently.
+    private static func mixedDocument(sections: Int) -> String {
+        (0..<sections)
+            .map { i in
+                """
+                ## Section \(i)
+
+                Body with **bold**, *italic*, `code`, and [[Wiki Link \(i)]].
+                Tagged #section\(i) and ==highlighted== for good measure.
+
+                - [ ] task \(i)
+                - item with [a link](https://example.com/\(i))
+
+                ```swift
+                let value\(i) = \(i)
+                ```
+
+                > [!NOTE]
+                > A callout in section \(i).
+                """
+            }
+            .joined(separator: "\n\n")
+    }
+
+    /// Replaces `range` with `replacement` and asserts the result is styled
+    /// exactly as a freshly opened document of the same text would be.
+    ///
+    /// This is what makes it safe to restyle less than the whole buffer: the
+    /// scope may shrink as far as it likes provided the attributes it leaves
+    /// behind are indistinguishable from a full pass.
+    private func assertEditMatchesAFreshParse(
+        of source: String,
+        replacing range: NSRange,
+        with replacement: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let edited = MarkdownTextView.make()
+        edited.setMarkdown(source)
+        edited.setSelectedRange(range)
+        edited.insertText(replacement, replacementRange: range)
+
+        let caret = edited.selectedRange()
+        let fresh = MarkdownTextView.make()
+        fresh.setMarkdown(edited.markdown)
+        // Reveal depends on where the caret is, so the reference document has
+        // to be looked at from the same place.
+        fresh.setSelectedRange(caret)
+
+        guard let actual = edited.textStorage, let expected = fresh.textStorage else {
+            return XCTFail("no storage", file: file, line: line)
+        }
+        XCTAssertEqual(actual.string, expected.string, file: file, line: line)
+
+        var offset = 0
+        while offset < expected.length {
+            var actualRange = NSRange(location: 0, length: 0)
+            var expectedRange = NSRange(location: 0, length: 0)
+            let actualAttributes = actual.attributes(at: offset, effectiveRange: &actualRange)
+            let expectedAttributes = expected.attributes(at: offset, effectiveRange: &expectedRange)
+            // Step to whichever run ends first. Skipping to the end of the
+            // *expected* run walks straight past a difference that sits inside
+            // it — which is exactly how a stale `[foo]` went unnoticed here.
+            let step = min(NSMaxRange(actualRange), NSMaxRange(expectedRange))
+            if actualAttributes as NSDictionary != expectedAttributes as NSDictionary {
+                let context = (expected.string as NSString).substring(
+                    with: NSRange(
+                        location: expectedRange.location,
+                        length: min(expectedRange.length, 40)))
+                XCTFail(
+                    """
+                    styling differs at \(offset) (\(context.debugDescription)) after \
+                    replacing \(NSStringFromRange(range)) with \
+                    \(replacement.debugDescription):
+                    edited:   \(actualAttributes)
+                    expected: \(expectedAttributes)
+                    """,
+                    file: file, line: line)
+                return
+            }
+            offset = max(offset + 1, step)
+        }
+    }
+
+    func testEditThatDemotesAHeadingStillStylesTheRestOfTheDocument() {
+        // Typing in front of `## Section 0` turns a heading into a paragraph,
+        // which changes the sequence of block kinds. That used to force a
+        // whole-document restyle; scoping it to the block that actually
+        // changed must not leave anything below styled from the old parse.
+        assertEditMatchesAFreshParse(
+            of: Self.mixedDocument(sections: 12),
+            replacing: NSRange(location: 0, length: 0),
+            with: "x")
+    }
+
+    func testOpeningAFenceRestylesTheTextItSwallows() {
+        // The opposite case: an edit whose effect reaches to the end of the
+        // file. Everything after the new fence is now code, and no amount of
+        // attribute-shifting makes that right on its own.
+        let source = Self.mixedDocument(sections: 12)
+        let anchor = (source as NSString).range(of: "Tagged #section3")
+        XCTAssertNotEqual(anchor.location, NSNotFound)
+        assertEditMatchesAFreshParse(
+            of: source,
+            replacing: NSRange(location: anchor.location, length: 0),
+            with: "```\n")
+    }
+
+    func testDeletingAcrossABlockBoundaryRestylesTheJoin() {
+        // A deletion moves every later offset *backwards*, so a scope computed
+        // with the wrong sign would land somewhere else entirely.
+        let source = Self.mixedDocument(sections: 12)
+        let anchor = (source as NSString).range(of: "## Section 4")
+        XCTAssertNotEqual(anchor.location, NSNotFound)
+        // Swallows the blank line above the heading and its `## `, merging the
+        // heading into the callout that precedes it.
+        assertEditMatchesAFreshParse(
+            of: source,
+            replacing: NSRange(location: anchor.location - 1, length: 4),
+            with: "")
+    }
+
+    func testAddingALinkReferenceDefinitionRestylesTheLinkItResolves() {
+        // The case block structure cannot see. `[foo]` is literal text until a
+        // definition for it appears — which can be at the foot of the file,
+        // inside a block of its own, changing nothing about the blocks above.
+        // Only the spans move, so only comparing the spans catches it.
+        let source = """
+            See [foo] for the details.
+
+            Another paragraph entirely.
+            """
+        let addition = "\n\n[foo]: https://example.test/foo"
+        assertEditMatchesAFreshParse(
+            of: source,
+            replacing: NSRange(location: (source as NSString).length, length: 0),
+            with: addition)
+
+        // And the styling it should have arrived at, stated outright rather
+        // than only by comparison — a fresh parse that failed to make it a
+        // link would satisfy the comparison above.
+        let view = MarkdownTextView.make()
+        view.setMarkdown(source)
+        view.setSelectedRange(NSRange(location: (source as NSString).length, length: 0))
+        view.insertText(addition, replacementRange: view.selectedRange())
+
+        guard let storage = view.textStorage else { return XCTFail("no storage") }
+        let label = (view.markdown as NSString).range(of: "foo")
+        XCTAssertNotEqual(label.location, NSNotFound)
+        XCTAssertNotNil(
+            storage.attribute(.underlineStyle, at: label.location, effectiveRange: nil),
+            "the definition should have turned [foo] above it into a link")
+    }
+
+    func testRemovingALinkReferenceDefinitionRestylesTheLinkItBreaks() {
+        // The same edit backwards: the link stops resolving and has to lose
+        // its styling, from a block far below the text that changes.
+        let source = """
+            See [foo] for the details.
+
+            Another paragraph entirely.
+
+            [foo]: https://example.test/foo
+            """
+        let definition = (source as NSString).range(of: "\n\n[foo]: https://example.test/foo")
+        XCTAssertNotEqual(definition.location, NSNotFound)
+        assertEditMatchesAFreshParse(of: source, replacing: definition, with: "")
+    }
+
+    func testTypingOverASelectionOfTheSameLengthRestyles() {
+        // The one case where nothing shifts: an equal-length replacement. The
+        // block list is then identical on both sides of the edit, so a scope
+        // derived only from moved offsets would restyle nothing at all.
+        let source = Self.mixedDocument(sections: 12)
+        let anchor = (source as NSString).range(of: "**bold**")
+        XCTAssertNotEqual(anchor.location, NSNotFound)
+        assertEditMatchesAFreshParse(of: source, replacing: anchor, with: "__bold__")
+    }
 }

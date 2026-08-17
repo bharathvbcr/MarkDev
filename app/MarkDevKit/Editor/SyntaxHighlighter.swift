@@ -62,6 +62,17 @@ public final class SyntaxHighlighter {
 
     public init() {}
 
+    /// Empties the cache.
+    ///
+    /// Only measurements need this. The cache holds 256 blocks, so a document
+    /// with more fences than that starts a second pass warm where a smaller
+    /// one starts warm throughout — which quietly turns a scaling test into a
+    /// measurement of the cache instead of the code.
+    func removeAllCachedSpans() {
+        cache.removeAll()
+        order.removeAll()
+    }
+
     /// Whether a grammar exists for `language`.
     public func supports(_ language: String) -> Bool {
         #if canImport(CMarkDev)
