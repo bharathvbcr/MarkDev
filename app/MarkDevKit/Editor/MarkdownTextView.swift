@@ -19,7 +19,7 @@
 /// (reparse), and the typing-attribute fix-up. There is no parallel text
 /// engine.
 @MainActor
-public final class MarkdownTextView: NSTextView {
+public final class MarkdownTextView: ScrollingTextView {
     /// Visual configuration. Setting it restyles.
     public var theme: EditorTheme = .standard {
         didSet { restyle() }
@@ -110,9 +110,10 @@ public final class MarkdownTextView: NSTextView {
         usesFindBar = true
         isIncrementalSearchingEnabled = true
 
-        isVerticallyResizable = true
-        isHorizontallyResizable = false
-        autoresizingMask = [.width]
+        // Resizing behaviour, sizing limits, and container growth all belong
+        // to ``ScrollingTextView`` — setting any of them here would put a
+        // second owner on the one contract that decides whether this view can
+        // scroll at all.
         textContainerInset = theme.insets
         drawsBackground = false
 

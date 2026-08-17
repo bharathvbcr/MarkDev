@@ -15,8 +15,11 @@ import QuickLookUI
 /// paint, so this path shares `MarkDevKit`'s read-only renderer and never
 /// touches the editing machinery.
 final class PreviewViewController: NSViewController, QLPreviewingController {
-    private let textView = NSTextView()
-    private let scrollView = NSScrollView()
+    /// The same scrolling surface the editor uses, minus the editing
+    /// machinery. A bare `NSTextView` scrolls but does not track its
+    /// viewport's width, so resizing the Quick Look panel would clip the
+    /// preview instead of rewrapping it.
+    private let textView = ScrollingTextView()
 
     override func loadView() {
         textView.isEditable = false
@@ -24,11 +27,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         textView.drawsBackground = false
         textView.textContainerInset = NSSize(width: 24, height: 24)
 
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.documentView = textView
-
-        view = scrollView
+        view = ScrollingTextView.scrollView(hosting: textView)
     }
 
     func preparePreviewOfFile(at url: URL) async throws {
