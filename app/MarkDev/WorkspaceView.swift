@@ -134,14 +134,29 @@ struct WorkspaceView: View {
             Text(errorMessage ?? "")
         }
         .animation(GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion), value: showSidebar)
-        .overlay(alignment: .top) {
+        .overlay {
             if showPalette {
-                CommandPalette(isPresented: $showPalette, commands: commands) { run($0) }
-                    .padding(.top, 90)
-                    .transition(
-                        reduceMotion
-                            ? .opacity
-                            : .scale(scale: 0.96).combined(with: .opacity))
+                ZStack(alignment: .top) {
+                    // Clicking away from a launcher is how every launcher is
+                    // dismissed; without the scrim, Escape was the only way
+                    // out. It also dims the window enough to say the palette
+                    // has the keyboard.
+                    Rectangle()
+                        .fill(.black.opacity(0.14))
+                        .ignoresSafeArea()
+                        .onTapGesture { showPalette = false }
+                        .transition(.opacity)
+                        .accessibilityHidden(true)
+
+                    CommandPalette(isPresented: $showPalette, commands: commands) { run($0) }
+                        .padding(.top, 90)
+                        .transition(
+                            reduceMotion
+                                ? .opacity
+                                : .scale(scale: 0.94, anchor: .top)
+                                    .combined(with: .opacity)
+                                    .combined(with: .offset(y: -14)))
+                }
             }
         }
         .animation(
@@ -219,16 +234,15 @@ struct WorkspaceView: View {
     }
 
     private var sidebarToggle: some View {
-        Button {
+        ChromeToggle(
+            symbol: "sidebar.leading",
+            label: showSidebar ? "Hide navigator (⌘\\)" : "Show navigator (⌘\\)",
+            isOn: showSidebar,
+            reduceMotion: reduceMotion
+        ) {
             showSidebar.toggle()
-        } label: {
-            Image(systemName: "sidebar.leading")
         }
-        .buttonStyle(.plain)
-        .padding(GlassTheme.Spacing.snug)
-        .glassEffect(.regular.interactive(), in: .circle)
         .glassEffectID("sidebar", in: glass)
-        .help("Toggle sidebar")
     }
 
     private var searchButton: some View {
@@ -250,20 +264,15 @@ struct WorkspaceView: View {
     }
 
     private var modePicker: some View {
-        Picker("Mode", selection: $mode) {
-            Text("Live").tag(EditorMode.livePreview)
-            Text("Source").tag(EditorMode.source)
-            Text("Read").tag(EditorMode.reading)
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: 190)
-        .padding(.horizontal, GlassTheme.Spacing.tight)
-        .padding(.vertical, 5)
-        .glassEffect(.regular.interactive(), in: .capsule)
-        .glassEffectID("mode", in: glass)
+        ModeSwitcher(mode: $mode)
+            .padding(.horizontal, GlassTheme.Spacing.tight)
+            .padding(.vertical, 3)
+            .glassEffect(.regular.interactive(), in: .capsule)
+            .glassEffectID("mode", in: glass)
     }
 
+    /// Save is a menu rather than a button because "Save As…" has to live
+    /// somewhere reachable without the menu bar.
     private var saveMenu: some View {
         Menu {
             Button("Save") { _ = saveDocument() }
@@ -272,21 +281,26 @@ struct WorkspaceView: View {
             Image(systemName: "square.and.arrow.down")
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .fixedSize()
-        .help("Save")
+        // Matched to the other toolbar controls. Left bare, it read as an
+        // unstyled glyph dropped between two glass capsules.
+        .padding(GlassTheme.Spacing.snug)
+        .glassEffect(.regular.interactive(), in: .circle)
+        .glassEffectID("save", in: glass)
+        .help("Save (⌘S)")
     }
 
     private var inspectorToggle: some View {
-        Button {
+        ChromeToggle(
+            symbol: "sidebar.trailing",
+            label: showInspector ? "Hide inspector (⌥⌘I)" : "Show inspector (⌥⌘I)",
+            isOn: showInspector,
+            reduceMotion: reduceMotion
+        ) {
             showInspector.toggle()
-        } label: {
-            Image(systemName: "sidebar.trailing")
         }
-        .buttonStyle(.plain)
-        .padding(GlassTheme.Spacing.snug)
-        .glassEffect(.regular.interactive(), in: .circle)
         .glassEffectID("inspector", in: glass)
-        .help("Toggle inspector")
     }
 
     private var sidebar: some View {
@@ -306,12 +320,14 @@ struct WorkspaceView: View {
     private func paneView(_ pane: PaneID) -> some View {
         let state = workspace.state(for: pane)
         let document = state.current
+        let isFocused = workspace.focusedPane == pane
+        let isSplit = workspace.layout.paneCount > 1
 
         VStack(spacing: 0) {
             PaneTabBar(
                 state: state,
-                isFocused: workspace.focusedPane == pane,
-                canClosePane: workspace.layout.paneCount > 1,
+                isFocused: isFocused,
+                isSplit: isSplit,
                 onSelect: {
                     workspace.select($0, in: pane)
                     if pane == workspace.focusedPane { refreshVault() }
@@ -346,6 +362,22 @@ struct WorkspaceView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { workspace.focusedPane = pane }
+        // Which pane is focused decides where a link, an outline row, or a
+        // newly opened file lands. The dimmed tab strip says it too, but only
+        // where the tabs are; the outline runs the full height of the pane,
+        // beside the text the reader is actually looking at.
+        .overlay {
+            if isSplit {
+                RoundedRectangle(cornerRadius: GlassTheme.Radius.medium)
+                    .strokeBorder(
+                        Color.accentColor.opacity(isFocused ? 0.45 : 0),
+                        lineWidth: 1.5)
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isFocused)
     }
 
     private var inspector: some View {
@@ -536,17 +568,41 @@ struct WorkspaceView: View {
                 title: showInspector ? "Hide Inspector" : "Show Inspector",
                 symbol: "sidebar.trailing", kind: .action(.toggleInspector), shortcut: "⌥⌘I"),
             Command(
-                title: "Split Right", symbol: "rectangle.split.2x1",
+                title: SplitEdge.trailing.commandTitle,
+                subtitle: SplitEdge.trailing.controlHelp,
+                symbol: SplitEdge.trailing.symbol,
                 kind: .action(.splitRight)),
             Command(
-                title: "Split Down", symbol: "rectangle.split.1x2",
+                title: SplitEdge.bottom.commandTitle,
+                subtitle: SplitEdge.bottom.controlHelp,
+                symbol: SplitEdge.bottom.symbol,
                 kind: .action(.splitDown)),
-            Command(title: "Live Preview", symbol: "eye", kind: .action(.livePreview)),
-            Command(
-                title: "Source Mode", symbol: "chevron.left.forwardslash.chevron.right",
-                kind: .action(.sourceMode)),
-            Command(title: "Reading Mode", symbol: "book", kind: .action(.readingMode)),
         ]
+
+        if workspace.layout.paneCount > 1 {
+            list += [
+                Command(
+                    title: "Close Pane", symbol: "xmark.rectangle",
+                    kind: .action(.closePane), shortcut: "⌃⌘W"),
+                Command(
+                    title: "Focus Next Pane", symbol: "arrow.forward.square",
+                    kind: .action(.focusNextPane), shortcut: "⌥⌘→"),
+                Command(
+                    title: "Focus Previous Pane", symbol: "arrow.backward.square",
+                    kind: .action(.focusPreviousPane), shortcut: "⌥⌘←"),
+            ]
+        }
+
+        // Built from the enum rather than written out, so a mode cannot exist
+        // in the switcher and be missing from the palette.
+        list += EditorMode.allCases.enumerated().map { index, editorMode in
+            Command(
+                title: editorMode.commandTitle,
+                subtitle: editorMode.summary,
+                symbol: editorMode.symbol,
+                kind: .action(.setMode(editorMode)),
+                shortcut: "⌃\(index + 1)")
+        }
 
         // Every vault note is reachable, not just an already-open tab. URLs
         // are deduplicated because one document may be visible in many panes.
@@ -597,9 +653,10 @@ struct WorkspaceView: View {
         case .toggleInspector: showInspector.toggle()
         case .splitRight: workspace.split(workspace.focusedPane, edge: .trailing)
         case .splitDown: workspace.split(workspace.focusedPane, edge: .bottom)
-        case .livePreview: mode = .livePreview
-        case .sourceMode: mode = .source
-        case .readingMode: mode = .reading
+        case .closePane: closePane(workspace.focusedPane)
+        case .focusNextPane: workspace.focusPane(offset: 1)
+        case .focusPreviousPane: workspace.focusPane(offset: -1)
+        case .setMode(let editorMode): mode = editorMode
         }
     }
 
@@ -669,6 +726,11 @@ struct WorkspaceView: View {
     }
 
     private func closePane(_ pane: PaneID) {
+        // The layout refuses to remove the last pane, so asking about its
+        // unsaved work first would prompt for a close that cannot happen.
+        // The tab bar hides its close control here; the ⌃⌘W menu item and the
+        // palette command reach the same code without that gate.
+        guard workspace.layout.paneCount > 1 else { return }
         let documents = workspace.state(for: pane).documents
         guard documents.allSatisfy({ confirmClosing($0.id, in: pane) }) else { return }
         workspace.closePane(pane)
@@ -717,5 +779,47 @@ struct WorkspaceView: View {
         default:
             return false
         }
+    }
+}
+
+/// A toolbar button that shows whether the panel it controls is open.
+///
+/// Both panel toggles used to render identically whether their panel was
+/// showing or not, so the only way to know what the button would do was to
+/// press it and watch. Tinting the glass while the panel is open makes the
+/// control read as a switch — the same treatment the current tab gets.
+private struct ChromeToggle: View {
+    let symbol: String
+    let label: String
+    let isOn: Bool
+    let reduceMotion: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .foregroundStyle(isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.primary))
+        }
+        .buttonStyle(.plain)
+        .padding(GlassTheme.Spacing.snug)
+        .glassEffect(
+            isOn
+                ? .regular.tint(.accentColor.opacity(0.22)).interactive()
+                : .regular.interactive(),
+            in: .circle
+        )
+        .scaleEffect(isHovering ? 1.06 : 1)
+        .onHover { isHovering = $0 }
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isHovering)
+        .animation(
+            GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
+            value: isOn)
+        .help(label)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(isOn ? [.isSelected] : [])
     }
 }

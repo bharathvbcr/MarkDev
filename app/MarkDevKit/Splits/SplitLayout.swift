@@ -46,9 +46,24 @@ public enum SplitEdge: Sendable, Hashable {
 }
 
 /// A node in the pane tree.
-public indirect enum SplitNode: Sendable, Equatable {
+public indirect enum SplitNode: Sendable, Equatable, Identifiable {
     case leaf(PaneID)
     case split(SplitNodeGroup)
+
+    /// Identity that survives its siblings changing.
+    ///
+    /// Borrowed from the pane or split the node stands for, both of which are
+    /// UUID-backed, so no two nodes in a tree can collide. The renderer keys
+    /// its children on this rather than on position: closing the *first* of
+    /// three panes shifts every later pane's index, and a position-keyed list
+    /// reads that as "every pane's contents changed" — tearing down the text
+    /// views and taking each pane's scroll position and undo stack with them.
+    public var id: UUID {
+        switch self {
+        case .leaf(let pane): pane.id
+        case .split(let group): group.id.id
+        }
+    }
 
     /// Every pane beneath this node, left to right and top to bottom.
     public var panes: [PaneID] {

@@ -74,12 +74,24 @@ struct WorkspaceCommands: Commands {
                 "Toggle Inspector", action: .toggleInspector, key: "i",
                 modifiers: [.command, .option])
             Divider()
-            actionButton("Split Right", action: .splitRight)
-            actionButton("Split Down", action: .splitDown)
+            actionButton(SplitEdge.trailing.commandTitle, action: .splitRight)
+            actionButton(SplitEdge.bottom.commandTitle, action: .splitDown)
+            actionButton(
+                "Close Pane", action: .closePane, key: "w", modifiers: [.control, .command])
+            actionButton(
+                "Focus Next Pane", action: .focusNextPane, key: .rightArrow,
+                modifiers: [.option, .command])
+            actionButton(
+                "Focus Previous Pane", action: .focusPreviousPane, key: .leftArrow,
+                modifiers: [.option, .command])
             Divider()
-            actionButton("Live Preview", action: .livePreview)
-            actionButton("Source Mode", action: .sourceMode)
-            actionButton("Reading Mode", action: .readingMode)
+            // Numbered in the enum's own order, so the menu, the palette, and
+            // the toolbar switcher cannot disagree about which mode is which.
+            ForEach(Array(EditorMode.allCases.enumerated()), id: \.element) { index, mode in
+                actionButton(
+                    mode.commandTitle, action: .setMode(mode),
+                    key: KeyEquivalent(Character("\(index + 1)")), modifiers: .control)
+            }
         }
     }
 

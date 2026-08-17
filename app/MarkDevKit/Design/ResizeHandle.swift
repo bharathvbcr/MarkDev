@@ -33,8 +33,26 @@ public struct ResizeHandle: View {
     public let label: String
 
     @State private var isHovering = false
+    @State private var isDragging = false
     @State private var lastTranslation: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Whether the seam should show itself. Dragging counts on its own: the
+    /// pointer routinely leaves the 10pt band mid-drag, and a divider that
+    /// dims the moment it does looks like the grab was lost.
+    private var isActive: Bool { isHovering || isDragging }
+
+    /// Thickness of the drawn line. A hairline at rest so the window reads as
+    /// panels rather than a grid; thicker under the pointer, which is the only
+    /// feedback saying the 1pt line is a 10pt target.
+    private var lineWidth: CGFloat {
+        isActive ? GlassTheme.dividerActiveLineWidth : GlassTheme.dividerLineWidth
+    }
+
+    private var lineColor: Color {
+        if isDragging { return .accentColor.opacity(0.85) }
+        return isHovering ? .accentColor.opacity(0.55) : .primary.opacity(0.10)
+    }
 
     public init(
         axis: SplitAxis,
@@ -51,12 +69,24 @@ public struct ResizeHandle: View {
     public var body: some View {
         // The visible line is hairline; the hit area is much wider, or the
         // divider would be nearly impossible to grab.
-        Rectangle()
-            .fill(Color.primary.opacity(isHovering ? 0.28 : 0.10))
+        Capsule()
+            .fill(lineColor)
             .frame(
-                width: axis == .horizontal ? GlassTheme.dividerLineWidth : nil,
-                height: axis == .vertical ? GlassTheme.dividerLineWidth : nil
+                width: axis == .horizontal ? lineWidth : nil,
+                height: axis == .vertical ? lineWidth : nil
             )
+            // A short grip at the midpoint, so the seam is legible as a
+            // control at a glance instead of only once the pointer finds it.
+            .overlay {
+                Capsule()
+                    .fill(Color.primary.opacity(isActive ? 0.40 : 0))
+                    .frame(
+                        width: axis == .horizontal
+                            ? GlassTheme.dividerGripThickness : GlassTheme.dividerGripLength,
+                        height: axis == .vertical
+                            ? GlassTheme.dividerGripThickness : GlassTheme.dividerGripLength
+                    )
+            }
             .frame(
                 width: axis == .horizontal ? GlassTheme.dividerHitWidth : nil,
                 height: axis == .vertical ? GlassTheme.dividerHitWidth : nil
@@ -77,6 +107,7 @@ public struct ResizeHandle: View {
             .gesture(
                 DragGesture(minimumDistance: 1)
                     .onChanged { value in
+                        isDragging = true
                         let current =
                             axis == .horizontal
                             ? value.translation.width : value.translation.height
@@ -85,12 +116,25 @@ public struct ResizeHandle: View {
                         onDrag(current - lastTranslation)
                         lastTranslation = current
                     }
-                    .onEnded { _ in lastTranslation = 0 }
+                    .onEnded { _ in
+                        isDragging = false
+                        lastTranslation = 0
+                    }
             )
-            .onTapGesture(count: 2, perform: onReset)
+            .onTapGesture(count: 2) {
+                withAnimation(
+                    GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion)
+                ) {
+                    onReset()
+                }
+            }
             .animation(
                 GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
-                value: isHovering)
+                value: isActive)
+            // Nothing about a hairline says it can be double-clicked, so the
+            // reset was reachable only by accident. The tooltip is the one
+            // place a pointer user can be told.
+            .help("\(label) — drag to resize, double-click to reset")
             .accessibilityElement()
             .accessibilityLabel(label)
             .accessibilityHint("Drag to resize. Double-tap to reset.")

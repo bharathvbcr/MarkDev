@@ -40,6 +40,11 @@ public enum GlassTheme {
     /// between panes.
     public static let dividerHitWidth: CGFloat = 10
     public static let dividerLineWidth: CGFloat = 1
+    /// Thickness the line grows to under the pointer or during a drag.
+    public static let dividerActiveLineWidth: CGFloat = 3
+    /// The grip that appears at the seam's midpoint while it is active.
+    public static let dividerGripLength: CGFloat = 26
+    public static let dividerGripThickness: CGFloat = 5
 
     /// Width rules for the navigator, on the leading edge.
     public static let sidebar = PanelWidthRange(preferred: 260, minimum: 180, maximum: 420)
