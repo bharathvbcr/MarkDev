@@ -891,6 +891,40 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     /// Called during layout for every paragraph, so the decoration lookup has
     /// to be cheap — it scans the block list, which is small and already in
     /// memory.
+    /// Captures the theme's drawing colours against *this view's* appearance.
+    ///
+    /// `NSColor.cgColor` resolves a dynamic colour there and then, against
+    /// `NSAppearance.current` — which outside a draw call is whatever AppKit
+    /// last set, not the view's. Read carelessly, a panel meant to be 4% black
+    /// in light mode is captured as 7% *white*, and paints invisibly onto a
+    /// white page. Only the vivid colours survive that, which is why a callout
+    /// would still show while a code panel silently would not.
+    func makePalette() -> BlockDecorationPalette {
+        var palette: BlockDecorationPalette?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            palette = BlockDecorationPalette(theme: theme)
+        }
+        return palette ?? BlockDecorationPalette(theme: theme)
+    }
+
+    /// Recaptures the palette when the system flips between light and dark.
+    ///
+    /// Fragments hold the colours they were built with, so the ones already
+    /// laid out have to be handed the new palette — otherwise a switch to dark
+    /// mode leaves every panel painted for the light one until the text
+    /// happens to change.
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        let captured = makePalette()
+        textLayoutManager?.enumerateTextLayoutFragments(
+            from: textLayoutManager?.documentRange.location
+        ) { fragment in
+            (fragment as? MarkdownLayoutFragment)?.palette = captured
+            return true
+        }
+        needsDisplay = true
+    }
+
     public func textLayoutManager(
         _ textLayoutManager: NSTextLayoutManager,
         textLayoutFragmentFor location: any NSTextLocation,
@@ -898,7 +932,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     ) -> NSTextLayoutFragment {
         let fragment = MarkdownLayoutFragment(
             textElement: textElement, range: textElement.elementRange)
-        fragment.palette = BlockDecorationPalette(theme: theme)
+        fragment.palette = makePalette()
 
         guard let documentStart = textLayoutManager.documentRange.location as NSTextLocation?,
             let elementRange = textElement.elementRange

@@ -5,7 +5,10 @@
 //! regression in the gap algorithm shows up as a readable string diff rather
 //! than a wall of offsets.
 
-use markdev::md::{model::SpanKind, parse};
+use markdev::md::{
+    model::{BlockKind, SpanKind, TableAlignment, TABLE_ALIGNMENT_BITS, TABLE_ALIGNMENT_MASK},
+    parse,
+};
 
 /// Collapses every syntax marker, yielding what live preview shows when the
 /// caret is elsewhere.
@@ -257,4 +260,111 @@ fn markers_never_exceed_the_documents_length() {
             assert!(b.end <= len, "block past end of {source:?}");
         }
     }
+}
+
+#[test]
+fn table_cells_carry_their_column_and_alignment() {
+    // The delimiter row states alignment once for the whole table, but the
+    // renderer pads *cells*. Every cell must therefore be able to answer
+    // "which column am I, and how do I sit in it" on its own.
+    let source = "| Name | Qty |\n|:---|---:|\n| Apple | 3 |\n";
+    let result = parse(source);
+
+    let cells: Vec<(u32, TableAlignment)> = result
+        .blocks
+        .iter()
+        .filter(|b| b.kind == BlockKind::TableCell as u16)
+        .map(|b| {
+            (
+                b.data >> TABLE_ALIGNMENT_BITS,
+                match b.data & TABLE_ALIGNMENT_MASK {
+                    0 => TableAlignment::Auto,
+                    1 => TableAlignment::Left,
+                    2 => TableAlignment::Center,
+                    _ => TableAlignment::Right,
+                },
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        cells,
+        vec![
+            (0, TableAlignment::Left),
+            (1, TableAlignment::Right),
+            (0, TableAlignment::Left),
+            (1, TableAlignment::Right),
+        ],
+        "each cell should report its own column index and the column's alignment"
+    );
+
+    let table = result
+        .blocks
+        .iter()
+        .find(|b| b.kind == BlockKind::Table as u16)
+        .expect("a table block");
+    assert_eq!(table.data, 2, "the table should report its column count");
+}
+
+#[test]
+fn a_ragged_row_does_not_derail_alignment() {
+    // GFM tables are ragged in both directions in the wild, and the parser
+    // squares them off: a long row has its surplus cells dropped, a short one
+    // is padded with empties. So every row reaching a renderer has exactly the
+    // table's column count, and each cell keeps its own column's alignment —
+    // which is what lets the grid be laid out without re-deriving widths.
+    let source = "| A | B |\n|---:|:---|\n| 1 | 2 | 3 |\n| 4 |\n";
+    let result = parse(source);
+    let cells: Vec<(u32, u32)> = result
+        .blocks
+        .iter()
+        .filter(|b| b.kind == BlockKind::TableCell as u16)
+        .map(|b| {
+            (
+                b.data >> TABLE_ALIGNMENT_BITS,
+                b.data & TABLE_ALIGNMENT_MASK,
+            )
+        })
+        .collect();
+
+    let right = TableAlignment::Right as u32;
+    let left = TableAlignment::Left as u32;
+    assert_eq!(
+        cells,
+        vec![
+            (0, right),
+            (1, left),
+            // The `| 3 |` is discarded upstream rather than becoming a third
+            // column — so a row can never widen the table it sits in.
+            (0, right),
+            (1, left),
+            // The short row is padded back out to the declared width, so every
+            // row a renderer sees has exactly the table's column count.
+            (0, right),
+            (1, left),
+        ]
+    );
+}
+
+#[test]
+fn a_second_table_gets_its_own_alignment() {
+    // Alignment is stacked, so the first table's columns cannot leak into a
+    // later one that declares different ones.
+    let source = "| A |\n|---:|\n| 1 |\n\ntext\n\n| B |\n|:---|\n| 2 |\n";
+    let result = parse(source);
+    let alignments: Vec<u32> = result
+        .blocks
+        .iter()
+        .filter(|b| b.kind == BlockKind::TableCell as u16)
+        .map(|b| b.data & TABLE_ALIGNMENT_MASK)
+        .collect();
+    assert_eq!(
+        alignments,
+        vec![
+            TableAlignment::Right as u32,
+            TableAlignment::Right as u32,
+            TableAlignment::Left as u32,
+            TableAlignment::Left as u32,
+        ]
+    );
 }

@@ -56,7 +56,14 @@ public struct EditorTheme {
         secondaryColor: .secondaryLabelColor,
         accentColor: .controlAccentColor,
         codeColor: .systemPink,
-        codeBackground: NSColor.quaternaryLabelColor.withAlphaComponent(0.18),
+        // Not derived from `quaternaryLabelColor`: that colour is already
+        // heavily transparent, so tinting it again lands around 2% ink — a
+        // panel too faint to read as a surface at all, which is most of why
+        // code blocks looked like plain indented text.
+        codeBackground: EditorTheme.adaptive(
+            "codeSurface",
+            light: NSColor(white: 0, alpha: 0.045),
+            dark: NSColor(white: 1, alpha: 0.075)),
         linkColor: .linkColor,
         tagColor: .systemTeal,
         highlightBackground: NSColor.systemYellow.withAlphaComponent(0.28),
@@ -106,6 +113,71 @@ public struct EditorTheme {
     public func headingFont(level: Int) -> NSFont {
         let index = min(max(level, 1), headingScale.count) - 1
         return .boldSystemFont(ofSize: bodyFont.pointSize * headingScale[index])
+    }
+
+    // MARK: - Derived surfaces
+    //
+    // Derived rather than stored: a code panel's border is not an independent
+    // design decision, it is "the code background, one step firmer". Storing
+    // each one would let a theme set a border that no longer belongs to its
+    // own background, and would make every call site of the initialiser churn
+    // whenever the renderer learns to draw one more thing.
+
+    /// A colour that resolves differently in light and dark appearance.
+    ///
+    /// The semantic `NSColor` statics are the right default for *text*, but
+    /// the decoration surfaces need known ink levels: composing an alpha onto
+    /// an already-translucent semantic colour multiplies the two, and the
+    /// result is a panel nobody can see.
+    static func adaptive(_ name: String, light: NSColor, dark: NSColor) -> NSColor {
+        NSColor(name: NSColor.Name(name)) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        }
+    }
+
+    /// Hairline around a code panel, so it reads as a card rather than a
+    /// stretch of tinted paragraph.
+    public var codeBorder: NSColor {
+        Self.adaptive(
+            "codeBorder",
+            light: NSColor(white: 0, alpha: 0.11),
+            dark: NSColor(white: 1, alpha: 0.14))
+    }
+
+    /// Fill behind a table's header row.
+    public var tableHeaderBackground: NSColor {
+        Self.adaptive(
+            "tableHeader",
+            light: NSColor(white: 0, alpha: 0.065),
+            dark: NSColor(white: 1, alpha: 0.10))
+    }
+
+    /// Fill behind alternate body rows. Faint on purpose: banding should help
+    /// the eye track across a wide row, not draw attention to itself.
+    public var tableStripeBackground: NSColor {
+        Self.adaptive(
+            "tableStripe",
+            light: NSColor(white: 0, alpha: 0.028),
+            dark: NSColor(white: 1, alpha: 0.05))
+    }
+
+    /// The grid's own lines.
+    public var tableBorder: NSColor {
+        Self.adaptive(
+            "tableBorder",
+            light: NSColor(white: 0, alpha: 0.14),
+            dark: NSColor(white: 1, alpha: 0.17))
+    }
+
+    /// Fill behind a `#tag` pill.
+    public var tagBackground: NSColor {
+        tagColor.withAlphaComponent(0.16)
+    }
+
+    /// The tick inside a checked checkbox. Always the light value, because it
+    /// sits on the accent colour rather than on the page.
+    public var checkmarkColor: NSColor {
+        .white
     }
 
     /// Point size that collapses a syntax marker to visually nothing.
