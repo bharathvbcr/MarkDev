@@ -95,11 +95,6 @@ public enum MarkdownStyler {
             document, hidden: hidden, to: storage, limit: full, scope: target, theme: theme)
         // After the markers, because it asks what they left visible.
         collapseFullyHiddenLines(hidden: hidden, in: storage, limit: full, scope: target)
-        // Truly last. It measures text the other passes have styled, and its
-        // padding rides on characters that `applyMarkers` also touches — that
-        // pass zeroes kerning on every collapsed marker, which silently wiped
-        // the column padding when this ran before it.
-        alignTableColumns(document, to: storage, limit: full, theme: theme)
     }
 
     // MARK: - Layers
@@ -372,10 +367,9 @@ public enum MarkdownStyler {
     /// count; reaching forward would hand the block's style to the line that
     /// follows it, which is another block's — or nobody's.
     ///
-    /// **Held inside the document, not inside the scope.** This is the second
+    /// **Held inside the document, not inside the scope.** This is the one
     /// deliberate exception to "a scoped pass writes only inside its scope",
-    /// alongside `alignTableColumns`, and it is bounded to the head of one
-    /// line. Clipping it instead leaves that line's *first* character wearing
+    /// and it is bounded to the head of one line. Clipping it instead leaves that line's *first* character wearing
     /// the previous parse's style while the rest of the line gets the new one
     /// — and since the first character is the one TextKit lays the line out
     /// from, the stale half wins: a list item nested in a quote kept the
@@ -670,118 +664,5 @@ public enum MarkdownStyler {
         let location = min(max(range.location, 0), limit.length)
         let length = min(range.length, limit.length - location)
         return NSRange(location: location, length: max(0, length))
-    }
-}
-
-extension MarkdownStyler {
-    /// Aligns a GFM table's columns.
-    ///
-    /// # Why kerning rather than tab stops
-    ///
-    /// The text is never rewritten — MarkDev's whole invariant is that the
-    /// buffer holds the real Markdown — so the `|` separators are still
-    /// there, merely collapsed. Tab stops would need tab characters that do
-    /// not exist. Instead each collapsed pipe is given exactly enough kerning
-    /// to carry the next cell to its column, which turns the separators the
-    /// document already has into the spacing the table needs.
-    ///
-    /// Cells are measured as they are actually styled, so a bold or code cell
-    /// widens its column rather than overflowing it — which is also why this
-    /// runs after every other pass.
-    @MainActor
-    static func alignTableColumns(
-        _ document: ParsedDocument,
-        to storage: NSTextStorage,
-        limit: NSRange,
-        theme: EditorTheme
-    ) {
-        let tables = document.blocks.filter { $0.kind == .table }
-
-        guard !tables.isEmpty else { return }
-
-        for table in tables {
-            let rows = document.blocks.filter {
-                $0.kind == .tableRow || $0.kind == .tableHead
-            }.filter { NSIntersectionRange($0.range, table.range).length > 0 }
-            guard rows.count > 1 else { continue }
-
-            // Cells, grouped by row and ordered across each one.
-            let cellsByRow: [[BlockDescriptor]] = rows.map { row in
-                document.blocks
-                    .filter {
-                        $0.kind == .tableCell
-                            && NSIntersectionRange($0.range, row.range).length > 0
-                    }
-                    .sorted { $0.range.location < $1.range.location }
-            }
-
-            // Clear the padding this pass is about to recompute, before
-            // anything is measured.
-            //
-            // The kern rides on the cell's last character and `measure`
-            // measures the cell *including* that character, so without this
-            // the pass reads back its own previous padding and adds to it.
-            // The restyle scope cannot be relied on to have cleared it: this
-            // layer alone writes across the whole document — one cell's width
-            // can decide a column far outside the scope — so it has to clear
-            // what it is about to rewrite. Zero rather than removed, matching
-            // what `applyMarkers` leaves on a collapsed marker, so an
-            // incrementally styled document and a freshly parsed one carry
-            // the same attributes.
-            for cells in cellsByRow {
-                for cell in cells {
-                    guard let last = lastCharacter(of: cell.range, in: limit) else { continue }
-                    storage.addAttribute(.kern, value: 0, range: last)
-                }
-            }
-
-            // Widest cell per column decides that column's width.
-            var columnWidths: [CGFloat] = []
-            for cells in cellsByRow {
-                for (index, cell) in cells.enumerated() {
-                    let width = measure(cell.range, in: storage, limit: limit)
-                    if index < columnWidths.count {
-                        columnWidths[index] = max(columnWidths[index], width)
-                    } else {
-                        columnWidths.append(width)
-                    }
-                }
-            }
-            guard !columnWidths.isEmpty else { continue }
-
-            for cells in cellsByRow {
-                for (index, cell) in cells.enumerated() where index < columnWidths.count {
-                    let width = measure(cell.range, in: storage, limit: limit)
-                    let padding = max(columnWidths[index] - width, 0) + Metrics.cellGap
-
-                    // The kern rides on the cell's final character, so the
-                    // gap lands between this cell and the next.
-                    guard let last = lastCharacter(of: cell.range, in: limit) else { continue }
-                    storage.addAttribute(.kern, value: padding, range: last)
-                }
-            }
-        }
-    }
-
-    /// Rendered width of a range, as currently styled.
-    @MainActor
-    private static func measure(
-        _ range: NSRange, in storage: NSTextStorage, limit: NSRange
-    ) -> CGFloat {
-        let clamped = clamp(range, to: limit)
-        guard clamped.length > 0 else { return 0 }
-        let substring = storage.attributedSubstring(from: clamped)
-        return ceil(substring.size().width)
-    }
-
-    private static func lastCharacter(of range: NSRange, in limit: NSRange) -> NSRange? {
-        let clamped = clamp(range, to: limit)
-        guard clamped.length > 0 else { return nil }
-        return NSRange(location: clamped.location + clamped.length - 1, length: 1)
-    }
-
-    enum Metrics {
-        /// Breathing room between columns, on top of the widest cell.
-        static let cellGap: CGFloat = 18
     }
 }

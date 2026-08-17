@@ -241,6 +241,97 @@ final class EditorPerformanceTests: XCTestCase {
                 + "structural edit must not restyle the whole buffer")
     }
 
+    /// A document that is mostly tables, for the gates the general fixture
+    /// cannot reach: it contains no table at all, so nothing else here
+    /// measures the grid solver, the cell styling, or the per-row lookups.
+    private static func tableDocument(lines: Int) -> String {
+        var out: [String] = []
+        out.reserveCapacity(lines)
+        var i = 0
+        while out.count < lines {
+            out.append("## Section \(i)")
+            out.append("")
+            out.append("| Concern | Details | Owner |")
+            out.append("|---|:---:|---:|")
+            out.append("| Local dependencies \(i) | `compose.yml` provides **Postgres** | platform |")
+            out.append("| Container engine | podman is the default, docker is the fallback | core |")
+            out.append("| Secrets | Google Cloud Secret Manager | security |")
+            out.append("")
+            i += 1
+        }
+        return out.prefix(lines).joined(separator: "\n")
+    }
+
+    func testOpeningATableHeavyDocumentIsLinearInItsText() {
+        // Every per-row question in the table path is a candidate quadratic:
+        // finding the row's table, finding the table's rows, finding a row's
+        // cells, and keying the solved grid. Each is a binary search or a
+        // single sorted sweep, and this is what would notice if one stopped
+        // being. Four times the text costs about 4x linear and about 16x
+        // quadratic, which leaves a threshold neither a busy machine nor a
+        // modest inefficiency reaches by accident.
+        let small = Self.tableDocument(lines: 2_500)
+        let large = Self.tableDocument(lines: 10_000)
+
+        MarkdownTextView.make().setMarkdown(Self.tableDocument(lines: 100))
+
+        let smallCost = measureColdest { SyntaxHighlighter.shared.removeAllCachedSpans() } _: {
+            let view = MarkdownTextView.make()
+            view.frame = NSRect(x: 0, y: 0, width: 700, height: 900)
+            view.setMarkdown(small)
+        }
+        let largeCost = measureColdest { SyntaxHighlighter.shared.removeAllCachedSpans() } _: {
+            let view = MarkdownTextView.make()
+            view.frame = NSRect(x: 0, y: 0, width: 700, height: 900)
+            view.setMarkdown(large)
+        }
+
+        print(
+            "[perf] opening 10k lines of tables: "
+                + "\(String(format: "%.2f", largeCost * 1000))ms "
+                + "(2.5k lines: \(String(format: "%.2f", smallCost * 1000))ms, "
+                + "ratio \(String(format: "%.2f", largeCost / smallCost))x for 4x the text)")
+
+        XCTAssertLessThan(
+            largeCost / smallCost, 8.0,
+            "opening a table-heavy document is growing faster than its text")
+    }
+
+    func testAKeystrokeInATableHeavyDocumentDoesNotTouchEveryTable() {
+        // The risk the caches exist for: a keystroke drops every solved grid,
+        // and re-solving means re-measuring and re-typesetting cells. Only the
+        // cells that TextKit actually lays out should be paid for, and only
+        // the ones whose text changed should be rebuilt — so the cost must not
+        // grow with the number of tables in the file.
+        func cost(lines: Int) -> TimeInterval {
+            let view = MarkdownTextView.make()
+            view.frame = NSRect(x: 0, y: 0, width: 700, height: 900)
+            view.setMarkdown(Self.tableDocument(lines: lines))
+            view.setSelectedRange(NSRange(location: 0, length: 0))
+
+            return measureFastest(iterations: 8) {
+                view.insertText("x", replacementRange: NSRange(location: 0, length: 0))
+                // The viewport, not the document. TextKit 2 lays out only what
+                // is on screen, so forcing the whole document measures work
+                // the app never does — and turns a linear cost into a number
+                // that grows with the file for reasons the reader never pays.
+                view.textLayoutManager?.textViewportLayoutController.layoutViewport()
+            }
+        }
+
+        let small = cost(lines: 2_500)
+        let large = cost(lines: 10_000)
+        print(
+            "[perf] keystroke in 10k lines of tables: "
+                + "\(String(format: "%.2f", large * 1000))ms "
+                + "(2.5k lines: \(String(format: "%.2f", small * 1000))ms, "
+                + "ratio \(String(format: "%.2f", large / small))x for 4x the text)")
+
+        XCTAssertLessThan(
+            large / small, 8.0,
+            "a keystroke is doing work for tables it never draws")
+    }
+
     func testOpeningADocumentStylesItInLinearTime() {
         // Opening is the one restyle that legitimately covers the whole
         // document, which makes it the place a per-block scan of every marker

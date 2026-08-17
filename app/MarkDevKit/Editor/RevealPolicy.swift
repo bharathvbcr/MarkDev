@@ -48,8 +48,37 @@ public enum RevealPolicy {
             where intersects(block: block.range, selection: selection) {
                 revealed.insert(index)
             }
-            return revealed
+            return expandingTables(revealed, in: document)
         }
+    }
+
+    /// Reveals every block of a table any part of which is revealed.
+    ///
+    /// A table is one construct, not a stack of independent rows. Its rows are
+    /// drawn against columns solved across all of them, so revealing a single
+    /// row leaves the reader with one line of raw pipes — laid out to a width
+    /// nothing else shares — between rows that still agree with each other,
+    /// while the rows around it show their cell text with the pipes hidden and
+    /// no alignment at all. Caret in the table means the whole table is
+    /// Markdown; caret out of it means the whole table is a grid.
+    ///
+    /// Costs nothing for a document whose caret is not in a table, which is
+    /// almost every keystroke.
+    private static func expandingTables(
+        _ revealed: Set<Int>, in document: ParsedDocument
+    ) -> Set<Int> {
+        let tables = document.blocks.enumerated()
+            .filter { $0.element.kind == .table && revealed.contains($0.offset) }
+            .map(\.element.range)
+        guard !tables.isEmpty else { return revealed }
+
+        var expanded = revealed
+        for (index, block) in document.blocks.enumerated() where !expanded.contains(index) {
+            if tables.contains(where: { NSIntersectionRange($0, block.range).length > 0 }) {
+                expanded.insert(index)
+            }
+        }
+        return expanded
     }
 
     /// A caret sitting exactly on a block boundary counts as inside it, so
@@ -74,10 +103,17 @@ public enum RevealPolicy {
         in document: ParsedDocument,
         revealed: Set<Int>
     ) -> [NSRange] {
+        // Table rows included: a row's cells are drawn in place of its
+        // source, exactly as a formula's are. `revealed` already carries the
+        // rule that a table reveals whole — see `expandingTables`.
         var ranges: [NSRange] = []
         for (index, block) in document.blocks.enumerated() {
-            guard block.kind == .mathBlock || block.kind == .mermaidBlock else { continue }
-            guard !revealed.contains(index) else { continue }
+            switch block.kind {
+            case .mathBlock, .mermaidBlock, .tableRow, .tableHead:
+                guard !revealed.contains(index) else { continue }
+            default:
+                continue
+            }
             ranges.append(block.range)
         }
         return ranges
