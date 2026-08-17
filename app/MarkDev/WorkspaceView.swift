@@ -457,14 +457,28 @@ struct WorkspaceView: View {
         }
     }
 
+    /// A chrome control's padding belongs **inside** its label, with a
+    /// `contentShape` matching the glass it draws.
+    ///
+    /// Padding applied to the *outside* of a `.plain` button is not part of
+    /// the button's hit region: only the label's own glyphs are. The capsule
+    /// the eye reads as the control is then mostly dead, and because a click
+    /// near the middle works while one near the edge does nothing, the button
+    /// reads as intermittently unresponsive rather than as a wrong hit area.
+    /// The `contentShape` is what claims the gaps *between* the glyphs too.
+    ///
+    /// The glass itself is applied by `sidebarToggle`, which only draws it
+    /// when the toggle is floating over the canvas — applying it here too
+    /// would stack a second capsule on the collapsed state.
     private var sidebarToggleControl: some View {
         Button {
             showSidebar.toggle()
         } label: {
             Image(systemName: "sidebar.leading")
+                .padding(GlassTheme.Spacing.snug)
+                .contentShape(.circle)
         }
         .buttonStyle(.plain)
-        .padding(GlassTheme.Spacing.snug)
         .help("Toggle sidebar")
     }
 
@@ -478,12 +492,14 @@ struct WorkspaceView: View {
                 Text("⌘K").font(.caption2).foregroundStyle(.tertiary)
             }
             .fixedSize()
+            .padding(.horizontal, GlassTheme.Spacing.regular)
+            .padding(.vertical, GlassTheme.Spacing.snug)
+            .contentShape(.capsule)
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, GlassTheme.Spacing.regular)
-        .padding(.vertical, GlassTheme.Spacing.snug)
         .glassEffect(.regular.interactive(), in: .capsule)
         .glassEffectID("palette", in: glass)
+        .help("Search files and commands")
     }
 
     private var modePicker: some View {
@@ -518,9 +534,10 @@ struct WorkspaceView: View {
             showInspector.toggle()
         } label: {
             Image(systemName: "sidebar.trailing")
+                .padding(GlassTheme.Spacing.snug)
+                .contentShape(.circle)
         }
         .buttonStyle(.plain)
-        .padding(GlassTheme.Spacing.snug)
         .glassEffect(.regular.interactive(), in: .circle)
         .glassEffectID("inspector", in: glass)
         .help("Toggle inspector")

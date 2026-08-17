@@ -73,31 +73,40 @@ public struct PaneTabBar: View {
             value: isFocused)
     }
 
+    /// The padding lives inside each button's label rather than around the
+    /// group, so every point of the capsule belongs to the control under it.
+    /// Padded from the outside, these buttons answer only where their glyphs
+    /// are — roughly a third of what the capsule shows — and a click that
+    /// lands a couple of points off does nothing at all.
     private var paneControls: some View {
-        HStack(spacing: 2) {
-            Button { onSplit(.trailing) } label: {
-                Image(systemName: "rectangle.split.2x1")
+        HStack(spacing: 0) {
+            paneControl("rectangle.split.2x1", help: "Split right") {
+                onSplit(.trailing)
             }
-            .help("Split right")
-
-            Button { onSplit(.bottom) } label: {
-                Image(systemName: "rectangle.split.1x2")
+            paneControl("rectangle.split.1x2", help: "Split down") {
+                onSplit(.bottom)
             }
-            .help("Split down")
-
             if canClosePane {
-                Button(action: onClosePane) {
-                    Image(systemName: "xmark.rectangle")
-                }
-                .help("Close pane")
+                paneControl("xmark.rectangle", help: "Close pane", action: onClosePane)
             }
         }
-        .buttonStyle(.plain)
         .font(.caption)
         .foregroundStyle(.secondary)
-        .padding(.horizontal, GlassTheme.Spacing.tight)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 2)
         .glassEffect(.regular.interactive(), in: .capsule)
+    }
+
+    private func paneControl(
+        _ symbol: String, help: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 5)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -131,6 +140,10 @@ private struct TabChip: View {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
+                        // An 8pt glyph is not a target. The padding has to be
+                        // inside the label to count towards the hit region.
+                        .padding(2)
+                        .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -144,6 +157,9 @@ private struct TabChip: View {
             in: .capsule
         )
         .foregroundStyle(isCurrent ? Color.primary : Color.secondary)
+        // Selecting a tab must work anywhere on the chip, including the gap
+        // beside a short title, not only on the glyphs the tap lands on.
+        .contentShape(.capsule)
         .onHover { isHovering = $0 }
         .onTapGesture(perform: onSelect)
         .animation(
