@@ -69,6 +69,13 @@ public enum BlockDecoration: Sendable, Equatable {
     /// A thematic break, drawn as a line in place of its `---`.
     case rule
     /// A block replaced by rendered content: a formula, a diagram, an image.
+    ///
+    /// Carried by the block's **leading** fragment only. TextKit lays out one
+    /// fragment per line, so a fence answering `.rendered` for every line of
+    /// its source draws the whole picture once per line and pays its full
+    /// height each time: a four-line Mermaid fence rendered as four stacked
+    /// copies of the same diagram. The remaining lines are collapsed syntax
+    /// and decorate as `.none`.
     case rendered(RenderedBlock)
     /// A task list item, whose `[ ]` is drawn as a checkbox.
     case task(checked: Bool)
@@ -131,7 +138,9 @@ extension BlockDecoration {
                     || block.range.contains(range.location)
                 else { continue }
                 if let image = imageBlock(block, in: document, text: text) {
-                    return .rendered(image)
+                    // Only the leading line draws it; see `BlockDecoration.rendered`.
+                    return edge(of: range, within: block.range).roundsTop
+                        ? .rendered(image) : .none
                 }
             }
         }
@@ -154,12 +163,15 @@ extension BlockDecoration {
         switch block.kind {
         case .mathBlock:
             if let text, let latex = mathSource(of: block, in: text) {
-                return .rendered(RenderedBlock(kind: .math, source: latex))
+                // Only the leading line draws it; see `BlockDecoration.rendered`.
+                return edge.roundsTop
+                    ? .rendered(RenderedBlock(kind: .math, source: latex)) : .none
             }
             return .code(edge: edge, language: nil)
         case .mermaidBlock:
             if let text, let source = fencedSource(of: block, in: text) {
-                return .rendered(RenderedBlock(kind: .diagram, source: source))
+                return edge.roundsTop
+                    ? .rendered(RenderedBlock(kind: .diagram, source: source)) : .none
             }
             return .code(edge: edge, language: block.info)
         case .codeBlock, .frontmatter:

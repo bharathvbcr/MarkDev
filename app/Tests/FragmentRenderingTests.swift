@@ -257,14 +257,19 @@ final class FragmentRenderingTests: XCTestCase {
 
     func testAMathBlockPaintsATypesetFormulaInPlaceOfItsSource() throws {
         // The source collapses and the formula is drawn in its place, so the
-        // rendered version must cover far more of the surface than the raw
-        // `$$…$$` ever would.
-        let plain = try render("E = mc squared\n")
+        // same characters typeset must out-paint them left as prose — the
+        // formula is set larger than body text and in display style.
+        //
+        // The baseline used to be a *longer* sentence, which only cleared the
+        // bar because the block painted its formula once per line of `$$…$$`.
+        // Comparing against the identical characters removes the length of the
+        // fixture from the measurement.
+        let plain = try render("E = mc^2\n")
         let math = try render("$$\nE = mc^2\n$$\n")
 
         XCTAssertGreaterThan(
             inkedPixels(math), inkedPixels(plain),
-            "a typeset formula should paint more than its plain-text equivalent")
+            "a typeset formula should paint more than the same characters as prose")
     }
 
     func testAMathFragmentGrowsToFitTheFormula() throws {
@@ -320,6 +325,38 @@ final class FragmentRenderingTests: XCTestCase {
             return true
         }
         XCTAssertGreaterThan(diagrams, 0, "a mermaid fence should render as a diagram")
+    }
+
+    func testAMultiLineRenderedBlockDrawsItsPictureExactlyOnce() throws {
+        // TextKit lays out one fragment per line. Every fragment answering
+        // `.rendered` both draws the whole picture and reserves its full
+        // height, so a four-line Mermaid fence rendered as four stacked copies
+        // of the same diagram and a `$$…$$` formula as three.
+        for (markdown, what) in [
+            ("```mermaid\nflowchart TD\n  A --> B\n  B --> C\n```\n", "a four-line fence"),
+            ("$$\nE = mc^2\n$$\n", "a three-line formula"),
+        ] {
+            let view = MarkdownTextView.make()
+            view.frame = NSRect(x: 0, y: 0, width: 520, height: 900)
+            view.setMarkdown(markdown)
+
+            let manager = try XCTUnwrap(view.textLayoutManager)
+            manager.ensureLayout(for: manager.documentRange)
+
+            var drawing = 0
+            manager.enumerateTextLayoutFragments(
+                from: manager.documentRange.location, options: [.ensuresLayout]
+            ) { fragment in
+                if let fragment = fragment as? MarkdownLayoutFragment,
+                    fragment.renderedContent != nil
+                {
+                    drawing += 1
+                }
+                return true
+            }
+
+            XCTAssertEqual(drawing, 1, "\(what) must draw its picture once, not \(drawing) times")
+        }
     }
 
     func testAMissingImageShowsAnExplanationNotABlank() throws {

@@ -28,6 +28,18 @@ public struct RenderedContent: @unchecked Sendable {
         var rect = CGRect(origin: .zero, size: image.size)
         self.cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
+
+    /// Wraps a bitmap that was rasterised directly.
+    ///
+    /// Going back through `NSImage.cgImage(forProposedRect:)` would ask AppKit
+    /// to re-derive a bitmap this initialiser already has, and the orientation
+    /// of what comes back is AppKit's business rather than the caller's — for
+    /// a picture whose orientation is the whole point, that is worth avoiding.
+    public init(cgImage: CGImage, size: CGSize) {
+        self.image = NSImage(cgImage: cgImage, size: size)
+        self.size = size
+        self.cgImage = cgImage
+    }
 }
 
 /// Why a block could not be rendered.
@@ -54,6 +66,33 @@ public final class RichContentRenderer {
         let source: String
         let scale: Int
         let dark: Bool
+        /// The ink the content was drawn with, for the paths that take one.
+        ///
+        /// A formula is typeset in the colour the caller passes, but the key
+        /// used to record only the *ambient* appearance — so two requests for
+        /// the same formula in different colours collided, and the second was
+        /// served the first one's bitmap. Nothing reaches that today, because
+        /// the one caller derives its colour from the same appearance the key
+        /// samples. That is a coincidence of the current call site rather than
+        /// anything this cache enforces, which is exactly the kind of thing
+        /// that stops being true quietly.
+        var tint: Int = 0
+    }
+
+    /// Packs a colour into a cache key.
+    ///
+    /// Dynamic colours resolve against the appearance in force, so this reads
+    /// the value actually used rather than the catalogue name.
+    private static func tint(of color: NSColor) -> Int {
+        guard let resolved = color.usingColorSpace(.sRGB) else { return color.hash }
+        var packed = 0
+        for component in [
+            resolved.redComponent, resolved.greenComponent,
+            resolved.blueComponent, resolved.alphaComponent,
+        ] {
+            packed = packed << 8 | Int(min(max((component * 255).rounded(), 0), 255))
+        }
+        return packed
     }
 
     private var cache: [Key: RenderedContent] = [:]
@@ -72,6 +111,22 @@ public final class RichContentRenderer {
         order.removeAll()
     }
 
+    /// Buckets a measurement for the cache key.
+    ///
+    /// `Int(_:)` traps on a NaN and on anything past `Int.max`, and every entry
+    /// point here derives its key from a caller-supplied `CGFloat` *before* it
+    /// validates anything. This is a public surface: a nonsense number has to
+    /// come back as a render failure the caller can show, never as a crash.
+    private static func bucket(_ value: CGFloat) -> Int {
+        guard value.isFinite else { return 0 }
+        return Int(min(max(value, -1_000_000), 1_000_000))
+    }
+
+    /// Whether a caller-supplied dimension can be drawn at all.
+    private static func isDrawable(_ value: CGFloat) -> Bool {
+        value.isFinite && value >= 1
+    }
+
     // MARK: - Math
 
     /// Typesets `latex`, inline or display style.
@@ -84,10 +139,20 @@ public final class RichContentRenderer {
         let key = Key(
             kind: display ? "math.display" : "math.inline",
             source: latex,
-            scale: Int(fontSize * 10),
-            dark: isDark)
+            scale: Self.bucket(fontSize * 10),
+            dark: isDark,
+            tint: Self.tint(of: color))
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
+
+        // Checked before the size reaches SwiftMath: a non-finite point size
+        // propagates into the label's metrics, and a NaN height handed back to
+        // TextKit takes the layout down somewhere far from here.
+        guard Self.isDrawable(fontSize), fontSize <= 1_000 else {
+            let failure = RenderFailure(reason: "Unusable font size")
+            failures[key] = failure
+            return .failure(failure)
+        }
 
         // The math font is loaded explicitly rather than relying on
         // SwiftMath's default. That default resolves through `Bundle.module`,
@@ -154,29 +219,32 @@ public final class RichContentRenderer {
         maxWidth: CGFloat,
         dark: Bool
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(kind: "mermaid", source: source, scale: Int(maxWidth), dark: dark)
+        let key = Key(kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
+
+        guard Self.isDrawable(maxWidth) else {
+            let failure = RenderFailure(reason: "No room to draw a diagram")
+            failures[key] = failure
+            return .failure(failure)
+        }
 
         do {
             // The zinc presets are the neutral pair; a themed diagram should
             // sit in the document, not shout a palette of its own.
             let theme: DiagramTheme = dark ? .zincDark : .zincLight
-            guard let image = try MermaidRenderer.renderImage(source: source, theme: theme) else {
+            guard let prepared = try MermaidImageRenderer(theme: theme).prepare(from: source)
+            else {
                 let failure = RenderFailure(reason: "Unsupported diagram type")
                 failures[key] = failure
                 return .failure(failure)
             }
-
-            var size = image.size
-            // Wide graphs are scaled down rather than clipped; a diagram cut
-            // off at the column edge is worse than a smaller readable one.
-            if size.width > maxWidth, size.width > 0 {
-                let scale = maxWidth / size.width
-                size = CGSize(width: maxWidth, height: size.height * scale)
+            guard let rendered = rasterise(prepared, theme: theme, maxWidth: maxWidth) else {
+                let failure = RenderFailure(reason: "Could not rasterise diagram")
+                failures[key] = failure
+                return .failure(failure)
             }
 
-            let rendered = RenderedContent(image: image, size: size)
             store(rendered, for: key)
             return .success(rendered)
         } catch {
@@ -184,6 +252,98 @@ public final class RichContentRenderer {
             failures[key] = failure
             return .failure(failure)
         }
+    }
+
+    /// Rasterised at twice the drawn size, so a diagram is sharp on a Retina
+    /// display without the layout fragment having to resample it.
+    private static let rasterScale: CGFloat = 2
+
+    /// An upper bound on a diagram's bitmap, in pixels.
+    ///
+    /// The *drawn* size is bounded by the column, but the layout is not: a
+    /// graph with a few hundred nodes lays out thousands of points across, and
+    /// rasterising that at full size would allocate hundreds of megabytes for
+    /// a picture that is then drawn 600 points wide. Rendering at the size it
+    /// will be drawn at costs nothing in quality and bounds the allocation.
+    private static let maxRasterPixels: CGFloat = 16_000_000
+
+    /// Draws a laid-out diagram into a bitmap, the right way up.
+    ///
+    /// BeautifulMermaid's own image path cannot be used here. Its
+    /// `DiagramRenderer` draws in a top-left coordinate space — its
+    /// documentation says so, and says callers must flip a `CGContext` before
+    /// calling it — but on AppKit `MermaidImageRenderer._renderPrepared` never
+    /// performs that flip, despite a comment claiming it does. A raw
+    /// `CGContext` has its origin at the bottom left, so every diagram it
+    /// returns is mirrored top to bottom: a `flowchart TD` renders bottom-up
+    /// and the glyphs come out upside down. (The library's `MermaidLayer` and
+    /// `MermaidView` paths do flip, so only the image path is affected.)
+    ///
+    /// Rendering the prepared diagram here rather than flipping the bitmap the
+    /// library hands back matters for more than tidiness: a post-flip would
+    /// silently invert the picture *again* the day the library is fixed, and
+    /// the failure would look exactly like this bug reappearing.
+    private func rasterise(
+        _ prepared: PreparedDiagram,
+        theme: DiagramTheme,
+        maxWidth: CGFloat
+    ) -> RenderedContent? {
+        let bounds = prepared.bounds
+        // A layout can come back degenerate or non-finite from a malformed
+        // source; `CGContext` would accept the NaN and paint nothing.
+        guard bounds.width.isFinite, bounds.height.isFinite,
+            bounds.minX.isFinite, bounds.minY.isFinite,
+            bounds.width >= 1, bounds.height >= 1,
+            maxWidth.isFinite, maxWidth >= 1
+        else { return nil }
+
+        // Wide graphs are scaled down rather than clipped: a diagram cut off
+        // at the column edge is worse than a smaller readable one.
+        let columnFit = min(1, maxWidth / bounds.width)
+        let size = CGSize(width: bounds.width * columnFit, height: bounds.height * columnFit)
+
+        var scale = Self.rasterScale
+        let pixels = size.width * scale * size.height * scale
+        if pixels > Self.maxRasterPixels {
+            scale *= (Self.maxRasterPixels / pixels).squareRoot()
+        }
+
+        let pixelWidth = Int((size.width * scale).rounded())
+        let pixelHeight = Int((size.height * scale).rounded())
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+
+        guard let context = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue)
+        else { return nil }
+
+        // The renderer fills `bounds`, which rounding can leave a hair short of
+        // the bitmap's edge; an unpainted sliver reads as a torn border.
+        if !theme.transparent {
+            context.setFillColor(theme.background.cgColor)
+            context.fill(
+                CGRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)))
+        }
+
+        // Become the top-left space the renderer draws in. Without this the
+        // diagram is mirrored top to bottom — which is the bug above.
+        context.translateBy(x: 0, y: CGFloat(pixelHeight))
+        context.scaleBy(x: 1, y: -1)
+
+        // Map the layout's bounds exactly onto the bitmap. Deriving the factors
+        // from the rounded pixel counts rather than from `scale` keeps the
+        // diagram flush with the edges it was measured against.
+        context.scaleBy(
+            x: CGFloat(pixelWidth) / bounds.width, y: CGFloat(pixelHeight) / bounds.height)
+        context.translateBy(x: -bounds.minX, y: -bounds.minY)
+
+        prepared.render(context, bounds)
+
+        guard let image = context.makeImage() else { return nil }
+        return RenderedContent(cgImage: image, size: size)
     }
 
     /// A readable explanation for a diagram error.
@@ -203,16 +363,26 @@ public final class RichContentRenderer {
         relativeTo base: URL?,
         maxWidth: CGFloat
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(kind: "image", source: source, scale: Int(maxWidth), dark: false)
+        let key = Key(kind: "image", source: source, scale: Self.bucket(maxWidth), dark: false)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
+        guard Self.isDrawable(maxWidth) else {
+            let failure = RenderFailure(reason: "No room to draw an image")
+            failures[key] = failure
+            return .failure(failure)
+        }
         guard let url = resolve(source, relativeTo: base) else {
             let failure = RenderFailure(reason: "Remote images are not loaded")
             failures[key] = failure
             return .failure(failure)
         }
-        guard let image = NSImage(contentsOf: url), image.size.width > 0 else {
+        // Both dimensions, and both finite: a file NSImage decodes to a zero or
+        // NaN size scales to a NaN height, which reaches TextKit as a fragment
+        // measurement and brings the layout down a long way from this line.
+        guard let image = NSImage(contentsOf: url),
+            Self.isDrawable(image.size.width), Self.isDrawable(image.size.height)
+        else {
             let failure = RenderFailure(reason: "Missing image: \(url.lastPathComponent)")
             failures[key] = failure
             return .failure(failure)

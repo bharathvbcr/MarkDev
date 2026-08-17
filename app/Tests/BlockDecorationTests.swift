@@ -107,7 +107,7 @@ final class BlockDecorationTests: XCTestCase {
 
     func testAMathBlockBecomesRenderedLatex() {
         let source = "$$\nE = mc^2\n$$"
-        let decoration = decoration(source, at: range(of: "E = mc^2", in: source), withText: true)
+        let decoration = decoration(source, at: range(of: "$$", in: source), withText: true)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected rendered math, got \(decoration)")
         }
@@ -117,13 +117,42 @@ final class BlockDecorationTests: XCTestCase {
 
     func testAMermaidFenceBecomesARenderedDiagram() {
         let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
-        let decoration = decoration(source, at: range(of: "graph TD", in: source), withText: true)
+        let decoration = decoration(source, at: range(of: "```mermaid", in: source), withText: true)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected a rendered diagram, got \(decoration)")
         }
         XCTAssertEqual(block.kind, .diagram)
         XCTAssertTrue(block.source.hasPrefix("graph TD"), "fence lines are not part of the source")
         XCTAssertFalse(block.source.contains("```"))
+    }
+
+    func testOnlyTheLeadingLineOfARenderedBlockCarriesTheContent() {
+        // TextKit lays out one fragment per line, and each fragment holding
+        // rendered content both draws the whole picture and pays its height.
+        // These two tests used to ask about a line in the *middle* of the
+        // fence, which is exactly the case that must now answer `.none` — a
+        // four-line fence was drawing four stacked copies of one diagram.
+        for source in [
+            "```mermaid\ngraph TD;\n  A --> B;\n```",
+            "$$\nE = mc^2\n$$",
+        ] {
+            let text = source as NSString
+            var rendered: [NSRange] = []
+            var start = 0
+            while start < text.length {
+                let line = text.lineRange(for: NSRange(location: start, length: 0))
+                if decoration(source, at: line, withText: true).rendered != nil {
+                    rendered.append(line)
+                }
+                start = line.location + max(line.length, 1)
+            }
+            XCTAssertEqual(
+                rendered.count, 1,
+                "exactly one line of \(source.debugDescription) may carry the content, "
+                    + "got \(rendered.count)")
+            XCTAssertEqual(
+                rendered.first?.location, 0, "it must be the block's first line")
+        }
     }
 
     func testWithoutTextMathFallsBackToCode() {
@@ -137,8 +166,13 @@ final class BlockDecorationTests: XCTestCase {
     }
 
     func testAStandaloneImageBecomesARenderedImage() {
+        // Asked with the line's own range, which is what a layout fragment
+        // covers. A range starting mid-line is not a fragment and now answers
+        // `.none`, because only a block's leading line carries its content.
         let source = "![A diagram](pictures/plan.png)"
-        let decoration = decoration(source, at: NSRange(location: 2, length: 3), withText: true)
+        let decoration = decoration(
+            source, at: NSRange(location: 0, length: (source as NSString).length),
+            withText: true)
         guard case .rendered(let block) = decoration else {
             return XCTFail("expected a rendered image, got \(decoration)")
         }
