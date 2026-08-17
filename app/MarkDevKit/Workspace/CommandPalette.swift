@@ -143,9 +143,13 @@ public struct CommandPalette: View {
             Button {
                 isPresented = false
             } label: {
-                Text("esc").font(.caption2).foregroundStyle(.secondary)
+                Text("esc")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .controlTarget(Capsule(), padding: GlassTheme.Spacing.tight)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Close palette")
         }
         .padding(.horizontal, GlassTheme.Spacing.loose)
         .padding(.vertical, GlassTheme.Spacing.regular)

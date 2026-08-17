@@ -73,6 +73,7 @@ public struct NavigatorView: View {
                 Image(systemName: "ellipsis")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
@@ -97,6 +98,7 @@ public struct NavigatorView: View {
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.secondary)
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
                 .transition(.scale.combined(with: .opacity))

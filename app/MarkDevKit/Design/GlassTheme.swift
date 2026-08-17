@@ -135,6 +135,38 @@ public struct GlassPanel: ViewModifier {
 }
 
 extension View {
+    /// Pads a control's content and claims the padded area as its hit target.
+    ///
+    /// **Apply this inside a `Button`'s (or `Menu`'s) label, never to the
+    /// button itself.** Padding applied outside decides where a control
+    /// *sits*, not where it *responds*: with `.buttonStyle(.plain)` the
+    /// interactive region is the label's own shape, so
+    ///
+    /// ```swift
+    /// Button { … } label: { Image(systemName: "sidebar.leading") }
+    ///     .buttonStyle(.plain)
+    ///     .padding(10)              // ← grows the glass, not the target
+    ///     .glassEffect(.regular, in: .circle)
+    /// ```
+    ///
+    /// draws a 36pt circle that only answers to the 15pt glyph at its centre.
+    /// The ring around it looks exactly as pressable and does nothing, which
+    /// reads as an app that intermittently ignores clicks. Padding inside the
+    /// label, then naming the padded shape, makes the whole glass live.
+    public func controlTarget<S: Shape>(_ shape: S, padding: EdgeInsets) -> some View {
+        self.padding(padding).contentShape(shape)
+    }
+
+    /// ``controlTarget(_:padding:)`` with the same inset on every side.
+    public func controlTarget<S: Shape>(
+        _ shape: S, padding: CGFloat = GlassTheme.Spacing.snug
+    ) -> some View {
+        controlTarget(
+            shape,
+            padding: EdgeInsets(
+                top: padding, leading: padding, bottom: padding, trailing: padding))
+    }
+
     /// Wraps the view in a glass surface.
     ///
     /// Reserved for chrome. Applying it to the editor canvas is a bug, not a

@@ -255,12 +255,18 @@ struct WorkspaceView: View {
                 Text("⌘K").font(.caption2).foregroundStyle(.tertiary)
             }
             .fixedSize()
+            .controlTarget(
+                Capsule(),
+                padding: EdgeInsets(
+                    top: GlassTheme.Spacing.snug,
+                    leading: GlassTheme.Spacing.regular,
+                    bottom: GlassTheme.Spacing.snug,
+                    trailing: GlassTheme.Spacing.regular))
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, GlassTheme.Spacing.regular)
-        .padding(.vertical, GlassTheme.Spacing.snug)
         .glassEffect(.regular.interactive(), in: .capsule)
         .glassEffectID("palette", in: glass)
+        .help("Search files and commands (⌘K)")
     }
 
     private var modePicker: some View {
@@ -279,13 +285,13 @@ struct WorkspaceView: View {
             Button("Save As…") { _ = saveDocumentAs() }
         } label: {
             Image(systemName: "square.and.arrow.down")
+                .controlTarget(Circle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
         // Matched to the other toolbar controls. Left bare, it read as an
         // unstyled glyph dropped between two glass capsules.
-        .padding(GlassTheme.Spacing.snug)
         .glassEffect(.regular.interactive(), in: .circle)
         .glassEffectID("save", in: glass)
         .help("Save (⌘S)")
@@ -801,9 +807,11 @@ private struct ChromeToggle: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .foregroundStyle(isOn ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.primary))
+                // Inside the label: the whole glass circle is the target, not
+                // just the glyph. See ``View/controlTarget(_:padding:)``.
+                .controlTarget(Circle())
         }
         .buttonStyle(.plain)
-        .padding(GlassTheme.Spacing.snug)
         .glassEffect(
             isOn
                 ? .regular.tint(.accentColor.opacity(0.22)).interactive()
