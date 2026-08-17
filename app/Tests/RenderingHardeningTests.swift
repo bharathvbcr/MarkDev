@@ -336,9 +336,17 @@ final class RenderingHardeningTests: XCTestCase {
         // work touched: fences, alerts, and list markers, whose styling now
         // reaches whole lines and whose stand-ins depend on what is hidden.
         //
-        // Sixty edits per seed of pure structural splicing — fences opening
-        // and closing over their neighbours, items changing container — which
-        // is what shook out the stale-parse restyle on the caret path.
+        // A hundred and twenty edits per seed of pure structural splicing —
+        // fences opening and closing over their neighbours, items changing
+        // container — which is what shook out the stale-parse restyle on the
+        // caret path.
+        //
+        // The count is not arbitrary. At sixty this loop was clean while seed
+        // 209 went on losing a fence's colours at step 62 — the splicing had
+        // not yet produced a fence butted up against a restyle scope, which is
+        // the shape that shows it. See
+        // ``testCodeKeepsItsColoursWhenOnlyTheGrownScopeReachesIt``, which is
+        // that shape written down.
         for seed in (200...215) as ClosedRange<UInt64> {
             var rng = SeededGenerator(seed: seed)
             let source = randomDocument(seed: seed, blocks: 10)
@@ -346,7 +354,7 @@ final class RenderingHardeningTests: XCTestCase {
             view.frame = NSRect(x: 0, y: 0, width: 520, height: 700)
             view.setMarkdown(source)
 
-            for step in 0..<60 {
+            for step in 0..<120 {
                 let length = (view.markdown as NSString).length
                 let start = length == 0 ? 0 : Int.random(in: 0...length, using: &rng)
                 let run = length == 0 ? 0 : Int.random(in: 0...min(10, length - start), using: &rng)
@@ -378,6 +386,79 @@ final class RenderingHardeningTests: XCTestCase {
                 }
             }
         }
+    }
+
+    /// A code block the styler reached only by *growing* the scope keeps its
+    /// tree-sitter colours.
+    ///
+    /// ``MarkdownStyler/apply(document:hidden:to:theme:scope:)`` grows the
+    /// scope to whole lines — one either side — and opens by clearing what it
+    /// settled on. The layers after it, highlighting and proofreading
+    /// underlines, used to scope themselves to the range that was *asked* for
+    /// instead, so whatever the growth reached was cleared and never put back.
+    /// Nothing comes back for it either: the next edit scopes itself to where
+    /// it lands, so a fence stays the colour of prose until something restyles
+    /// the whole document.
+    ///
+    /// Retyping two characters of the paragraph *below* a fence is enough. The
+    /// block ends exactly where the restyle scope begins, so it does not
+    /// intersect it at all — while the growth back over the previous line
+    /// reaches a whole line into the block's body and wipes `let`.
+    func testCodeKeepsItsColoursWhenOnlyTheGrownScopeReachesIt() {
+        let source = "```swift\nlet x = 1\n```\npara\n"
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 700)
+        view.setMarkdown(source)
+
+        let retyped = (source as NSString).range(of: "ra")
+        view.setSelectedRange(retyped)
+        view.insertText("x", replacementRange: view.selectedRange())
+
+        let fresh = MarkdownTextView.make()
+        fresh.frame = view.frame
+        fresh.setMarkdown(view.markdown)
+        fresh.setSelectedRange(view.selectedRange())
+        view.setSelectedRange(fresh.selectedRange())
+
+        guard let edited = view.textStorage, let expected = fresh.textStorage else {
+            return XCTFail("no storage")
+        }
+        // The keyword is asserted by name as well as through the oracle: a
+        // `let` the same colour as prose is the whole bug, and it should be
+        // legible in the failure rather than spelled as an attribute dump.
+        let keyword = (view.markdown as NSString).range(of: "let").location
+        XCTAssertEqual(
+            edited.attribute(.foregroundColor, at: keyword, effectiveRange: nil) as? NSColor,
+            expected.attribute(.foregroundColor, at: keyword, effectiveRange: nil) as? NSColor,
+            "the keyword lost its highlight colour to the styler's grown scope")
+        if let drift = Self.firstDifference(between: edited, and: expected) {
+            XCTFail(drift)
+        }
+    }
+
+    /// The styler reports the range it wrote, not the one it was handed.
+    ///
+    /// The contract every later attribute layer is scoped by. Asserted on its
+    /// own because it is invisible at the call site: a caller that keeps using
+    /// its own range compiles, runs, and quietly loses whatever the growth
+    /// covered.
+    func testTheStylerReportsTheRangeItWrote() {
+        let source = "alpha\nbeta\ngamma\ndelta\n"
+        let parsed = ParsedDocument.parse(source)
+        let storage = NSTextStorage(attributedString: NSAttributedString(string: source))
+        let hidden = HiddenRanges(
+            document: parsed, selection: NSRange(location: 0, length: 0), mode: .livePreview)
+
+        let asked = (source as NSString).range(of: "et")
+        let written = MarkdownStyler.apply(
+            document: parsed, hidden: hidden, to: storage, scope: asked)
+
+        XCTAssertEqual(
+            NSIntersectionRange(written, asked), asked,
+            "the reported range must cover the one asked for")
+        XCTAssertEqual(
+            written, NSRange(location: 0, length: 17),
+            "two characters inside `beta` grow to whole lines, one either side")
     }
 
     /// Where two stylings of the same text stop agreeing, and on what.

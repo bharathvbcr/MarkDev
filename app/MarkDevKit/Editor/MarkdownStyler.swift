@@ -59,16 +59,28 @@ public enum MarkdownStyler {
     ///
     /// Runs inside one `beginEditing`/`endEditing` pair so TextKit relayouts
     /// once rather than once per attribute run.
+    ///
+    /// - Returns: the range this pass actually wrote — `scope` grown to whole
+    ///   lines. **A later attribute layer must scope itself to this, not to
+    ///   the range it asked for.** The pass opens by clearing `setAttributes`
+    ///   over the grown range, so a layer that reapplies its own attributes
+    ///   over the *requested* range leaves whatever the growth reached erased.
+    ///   The growth reaches both ways, and a code fence a line off the scope
+    ///   in either direction lost its tree-sitter colours exactly this way —
+    ///   and kept them lost, since nothing revisits a block the next edit does
+    ///   not touch.
     @MainActor
+    @discardableResult
     public static func apply(
         document: ParsedDocument,
         hidden: HiddenRanges,
         to storage: NSTextStorage,
         theme: EditorTheme = .standard,
         scope: NSRange? = nil
-    ) {
+    ) -> NSRange {
+        let empty = NSRange(location: 0, length: 0)
         let full = NSRange(location: 0, length: storage.length)
-        guard full.length > 0 else { return }
+        guard full.length > 0 else { return empty }
         // Grown to whole lines. Paragraph attributes are a property of a line
         // — TextKit lays one out with the style of its first character — so a
         // scope ending mid-line would leave that line's style decided by
@@ -77,7 +89,7 @@ public enum MarkdownStyler {
         // wholly inside it" as the same question about a line.
         let target = wholeLines(
             clamp(scope ?? full, to: full), in: storage.string as NSString, limit: full)
-        guard target.length > 0 else { return }
+        guard target.length > 0 else { return empty }
 
         storage.beginEditing()
         defer { storage.endEditing() }
@@ -100,6 +112,7 @@ public enum MarkdownStyler {
         // pass zeroes kerning on every collapsed marker, which silently wiped
         // the column padding when this ran before it.
         alignTableColumns(document, to: storage, limit: full, theme: theme)
+        return target
     }
 
     // MARK: - Layers
