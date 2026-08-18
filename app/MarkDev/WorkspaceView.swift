@@ -70,6 +70,17 @@ struct WorkspaceView: View {
     /// The note under the held Space bar, if any.
     @State private var peek: URL?
 
+    /// The window this workspace is in, and how ready it is to be shown a
+    /// document opened from Finder. Filled in by ``HostWindowReader``.
+    @State private var surface = DocumentSurface()
+
+    /// This workspace's registration with ``DocumentInbox``, withdrawn when it
+    /// goes away. Held so *this* registration is withdrawn and no other:
+    /// SwiftUI builds a throwaway workspace for every incoming file open, and
+    /// clearing a shared handler would let the throwaway's departure silence
+    /// the window on screen.
+    @State private var inboxRegistration: DocumentSurfaceToken?
+
     /// Whether the link graph is up.
     @State private var showGraph = false
 
@@ -217,6 +228,7 @@ struct WorkspaceView: View {
             open(dropped: urls)
         }
         .background(WindowCloseGuard { confirmClosingAll() })
+        .background(HostWindowReader(surface: surface))
         .focusedSceneValue(
             \.workspaceCommandHandler,
             WorkspaceCommandHandler { run($0) })
@@ -316,11 +328,16 @@ struct WorkspaceView: View {
         .onChange(of: workspace.layout) { _, _ in pruneOrphanedState() }
         .onChange(of: workspace.focusedPane) { _, _ in refreshVault() }
         .onOpenURL(perform: openFile)
-        // Files from Finder, the Dock, or `open`. Drained on appear as well as
-        // on change, because a double-click that launches the app delivers its
-        // request before this view exists.
+        // Files from Finder, the Dock, or `open`. Registered rather than
+        // drained: a double-click that launches the app delivers its request
+        // before this view exists, and SwiftUI builds a throwaway workspace
+        // for each request besides — so the inbox picks the surface with a
+        // window on screen instead of trusting whoever asked last.
         .onAppear {
-            DocumentInbox.shared.setHandler { openFromInbox($0) }
+            if let inboxRegistration { DocumentInbox.shared.unregister(inboxRegistration) }
+            inboxRegistration = DocumentInbox.shared.register(
+                readiness: { surface.readiness },
+                deliver: { takeFromInbox($0) })
         }
         .animation(
             GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
@@ -329,6 +346,10 @@ struct WorkspaceView: View {
             GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
             value: showTerminal)
         .onDisappear {
+            if let inboxRegistration {
+                DocumentInbox.shared.unregister(inboxRegistration)
+            }
+            inboxRegistration = nil
             for task in statsTasks.values { task.cancel() }
         }
     }
@@ -702,14 +723,35 @@ struct WorkspaceView: View {
         }
     }
 
-    /// Opens dropped files, and treats a dropped folder as a vault.
+    /// Answers whether this workspace can show `request`, and takes it on if
+    /// it can.
     ///
-    /// Reports success if *anything* was usable rather than requiring the whole
-    /// drop to be: a selection dragged out of Finder routinely carries an
-    /// image or a PDF alongside the notes, and rejecting the entire drop for
-    /// one of them reads as the app refusing a drag it plainly understood.
-    /// Whatever could not be opened still surfaces through the usual alert.
-    @discardableResult
+    /// The window is checked here rather than trusted from the readiness that
+    /// chose this surface: choosing and delivering are two moments, and the
+    /// whole failure this replaces was a workspace that no longer had a window
+    /// accepting documents on behalf of the one that did.
+    ///
+    /// Opening itself is deferred a turn. This is called from the inbox, which
+    /// the view registers with during SwiftUI's update pass, and mutating
+    /// workspace state from inside that pass is the documented way to have the
+    /// change dropped.
+    private func takeFromInbox(_ request: DocumentOpenRequest) -> Bool {
+        guard !request.isEmpty else { return false }
+        guard surface.canShowDocument else { return false }
+        surface.bringToFront()
+        Task { @MainActor in
+            // Asked once more on the far side of the deferral: a turn is short,
+            // but it is long enough for a window to close, and handing the
+            // files back is what keeps "taken" from meaning "lost".
+            guard surface.canShowDocument else {
+                DocumentInbox.shared.receive(request.urls)
+                return
+            }
+            openFromInbox(request)
+        }
+        return true
+    }
+
     /// Opens whatever Launch Services handed the app.
     ///
     /// Routed through the same rules as a drag onto the window — a folder is a
@@ -725,6 +767,14 @@ struct WorkspaceView: View {
         if errorMessage == nil, let truncation { errorMessage = truncation }
     }
 
+    /// Opens dropped files, and treats a dropped folder as a vault.
+    ///
+    /// Reports success if *anything* was usable rather than requiring the whole
+    /// drop to be: a selection dragged out of Finder routinely carries an
+    /// image or a PDF alongside the notes, and rejecting the entire drop for
+    /// one of them reads as the app refusing a drag it plainly understood.
+    /// Whatever could not be opened still surfaces through the usual alert.
+    @discardableResult
     private func open(dropped urls: [URL]) -> Bool {
         var openedAnything = false
         for url in urls {

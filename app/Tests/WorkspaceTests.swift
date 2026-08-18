@@ -67,6 +67,32 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(workspace.state(for: pane), before)
     }
 
+    func testOpeningARemoteLocationIsRefusedRatherThanFetched() {
+        // `String(contentsOf:)` takes an `https:` URL and fetches it,
+        // synchronously, on the main actor. Every open funnels through this
+        // boundary — Finder, a drop, a wikilink, `onOpenURL` — so opening a
+        // note must be refused here rather than turned into a network request.
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        let before = workspace.state(for: pane)
+        let remote = URL(string: "https://example.com/note.md")!
+
+        XCTAssertThrowsError(try workspace.open(remote, in: pane)) { error in
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(remote))
+        }
+        XCTAssertEqual(workspace.state(for: pane), before)
+    }
+
+    func testOpeningARemoteLocationBesideAPaneLeavesNoSplit() {
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        let layout = workspace.layout
+
+        XCTAssertThrowsError(
+            try workspace.open(URL(string: "https://example.com/note.md")!, beside: pane))
+        XCTAssertEqual(workspace.layout, layout)
+    }
+
     func testOpeningTheSameFileTwiceFocusesTheExistingTab() throws {
         let root = try makeVault()
         defer { try? FileManager.default.removeItem(at: root) }

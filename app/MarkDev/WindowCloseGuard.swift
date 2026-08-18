@@ -150,6 +150,34 @@ struct WindowCloseGuard: NSViewRepresentable {
 
 @MainActor
 final class MarkDevApplicationDelegate: NSObject, NSApplicationDelegate {
+    /// Watches for a window becoming key, so a file waiting for somewhere to
+    /// go is retried the moment there is somewhere.
+    ///
+    /// The inbox cannot see this for itself: readiness is answered by AppKit,
+    /// and nothing in SwiftUI reports "a window is now on screen".
+    private var keyWindowObserver: (any NSObjectProtocol)?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        keyWindowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { DocumentInbox.shared.refresh() }
+        }
+    }
+
+    /// Clicking the Dock icon with no windows open must bring one back.
+    ///
+    /// Returning true is the whole of it: AppKit reopens the window group
+    /// itself. Asking ``DocumentInbox`` for a window here *as well* — which
+    /// looks like belt and braces — opens two windows on every Dock click,
+    /// measured. The inbox's own request is for the other case: a document
+    /// arriving when there is no window and no reopen to piggyback on.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication, hasVisibleWindows flag: Bool
+    ) -> Bool {
+        true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         WindowCloseRegistry.shared.reviewForTermination() ? .terminateNow : .terminateCancel
     }

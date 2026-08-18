@@ -41,6 +41,7 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
     case destinationAlreadyOpen(URL)
     case destinationExists(URL)
     case documentChangedOnDisk(URL)
+    case unsupportedLocation(URL)
 
     public var errorDescription: String? {
         switch self {
@@ -56,6 +57,8 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
             "\(url.lastPathComponent) already exists."
         case .documentChangedOnDisk(let url):
             "\(url.lastPathComponent) changed on disk. Reload it or use Save As to preserve both versions."
+        case .unsupportedLocation(let url):
+            "MarkDev can only open files on this Mac, and \(url.scheme ?? "that location") is not one."
         }
     }
 }
@@ -372,6 +375,14 @@ public final class Workspace {
     /// This is the canonical read boundary for both ordinary opens and drops.
     /// Keeping it ahead of any pane mutation is what makes open failure atomic.
     private func resolvedDocument(for requestedURL: URL) throws -> OpenDocument {
+        // Every open — Finder, a drop, a wikilink, a URL handed to the app —
+        // arrives here, so this is where a location that is not a file on this
+        // machine is refused. `String(contentsOf:)` will happily take an
+        // `https:` URL and fetch it, synchronously, on the main actor: opening
+        // a note must never become a network request.
+        guard requestedURL.isFileURL else {
+            throw WorkspaceError.unsupportedLocation(requestedURL)
+        }
         let url = requestedURL.standardizedFileURL
         if let existing = allDocuments.first(where: { $0.url == url }) {
             return existing
