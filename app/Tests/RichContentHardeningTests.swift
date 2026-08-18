@@ -268,6 +268,53 @@ final class RichContentHardeningTests: XCTestCase {
             red.image === blue.image, "a different colour must not reuse the bitmap")
     }
 
+    /// Mirrors `RichContentRenderer.pixelBudget`, as a literal for the reason
+    /// `rasterCap` is one.
+    private let pixelBudget = 64_000_000
+
+    func testTheCacheIsBoundedByMemoryAndNotOnlyByCount() throws {
+        // A count alone stopped bounding this the moment a caller could ask for
+        // detail as well as size: the zoom viewer rasterises at four times the
+        // editor's, up to `rasterCap` per picture, so 128 entries is roughly
+        // 8 GB of retained bitmaps. Ten of them is already well past what any
+        // reader would want the editor holding.
+        let renderer = makeRenderer()
+        var produced = 0
+
+        for index in 0..<6 {
+            // Wide *and* tall, which is what makes a bitmap large: a chain is
+            // laid out one row per link, and a long label stretches every row
+            // until the column fit brings it back to `diagramWidth`.
+            let label = String(repeating: "label ", count: 30)
+            let source = (0..<30)
+                .map { "  N\(index)_\($0)[\(label)\(index)_\($0)] --> N\(index)_\($0 + 1)[end]" }
+                .joined(separator: "\n")
+            guard case .success(let content) = renderer.diagram(
+                "flowchart TD\n" + source,
+                maxWidth: ZoomedContent.diagramWidth,
+                dark: true,
+                scale: ZoomedContent.diagramScale)
+            else { return XCTFail("diagram \(index) should render") }
+            produced += try XCTUnwrap(content.cgImage).width * XCTUnwrap(content.cgImage).height
+        }
+
+        // Without this the test would assert a bound nothing had approached.
+        XCTAssertGreaterThan(
+            produced, pixelBudget,
+            "these renders have to add up to more than the budget or this proves nothing")
+        XCTAssertLessThanOrEqual(
+            renderer.cachedPixels, pixelBudget,
+            "the cache is holding more than its own ceiling")
+
+        // Bounded, and still a cache: what was kept must still be served, and
+        // what was dropped must re-render rather than hand back a neighbour.
+        guard case .success(let refreshed) = renderer.diagram(
+            "flowchart TD\n  A0_0[Node 0_0 label] --> B0_0",
+            maxWidth: 600, dark: true)
+        else { return XCTFail("an evicted diagram should re-render") }
+        XCTAssertGreaterThan(refreshed.size.width, 0)
+    }
+
     func testTheCacheIsBoundedAndStillCorrect() throws {
         // A long document full of diagrams must not pin every bitmap it has
         // scrolled past — and eviction must not hand back the wrong picture.

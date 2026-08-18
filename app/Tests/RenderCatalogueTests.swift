@@ -171,6 +171,31 @@ final class RenderCatalogueTests: XCTestCase {
             height: 400, caret: 0)
     }
 
+    func testBlockControls() throws {
+        // The chips: copy on every code panel, labelled or not, and zoom in the
+        // corner of a rendered diagram.
+        try dump(
+            "17-controls",
+            """
+            Intro paragraph.
+
+            ```swift
+            let x = 1
+            let somewhatLonger = 2
+            ```
+
+            ```
+            a fence with no language at all
+            ```
+
+            ```mermaid
+            flowchart TD
+            A[Start] --> B[Finish]
+            ```
+            """,
+            height: 620, caret: 0)
+    }
+
     func testTableInsideQuote() throws {
         try dump(
             "09-table-in-quote",

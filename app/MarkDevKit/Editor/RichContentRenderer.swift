@@ -66,6 +66,13 @@ public final class RichContentRenderer {
         let source: String
         let scale: Int
         let dark: Bool
+        /// How many bitmap pixels per point were asked for.
+        ///
+        /// Part of the key because it is not derivable from the others: the
+        /// same diagram at the same width is a different bitmap at reading
+        /// detail and at viewing detail, and without this the viewer would be
+        /// served whichever of the two the editor had already cached.
+        var raster: Int = 0
         /// The ink the content was drawn with, for the paths that take one.
         ///
         /// A formula is typeset in the colour the caller passes, but the key
@@ -98,9 +105,23 @@ public final class RichContentRenderer {
     private var cache: [Key: RenderedContent] = [:]
     private var failures: [Key: RenderFailure] = [:]
     private var order: [Key] = []
+    private var failureOrder: [Key] = []
     /// Bounded: a long document full of diagrams should not pin every bitmap
     /// it has ever scrolled past.
     private let limit = 128
+
+    /// Ceiling on what the cache retains, counted in bitmap pixels.
+    ///
+    /// A count alone stopped bounding this the moment a caller could ask for
+    /// detail as well as size. Reading-size renders are a megapixel or two, so
+    /// 128 of them is small; a diagram opened in the zoom viewer is rasterised
+    /// up to ``maxRasterPixels``, and 128 of *those* is about 8 GB. The count
+    /// still applies — this is the second of two bounds, and whichever binds
+    /// first evicts.
+    private let pixelBudget = 64_000_000
+
+    /// What the cache is currently holding, in pixels.
+    private(set) var cachedPixels = 0
 
     public init() {}
 
@@ -109,6 +130,8 @@ public final class RichContentRenderer {
         cache.removeAll()
         failures.removeAll()
         order.removeAll()
+        failureOrder.removeAll()
+        cachedPixels = 0
     }
 
     /// Buckets a measurement for the cache key.
@@ -150,7 +173,7 @@ public final class RichContentRenderer {
         // TextKit takes the layout down somewhere far from here.
         guard Self.isDrawable(fontSize), fontSize <= 1_000 else {
             let failure = RenderFailure(reason: "Unusable font size")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
@@ -160,7 +183,7 @@ public final class RichContentRenderer {
         // and a nil font silently typesets to zero size instead of failing.
         guard let font = MTFontManager.manager.latinModernFont(withSize: fontSize) else {
             let failure = RenderFailure(reason: "Math font unavailable")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
@@ -178,7 +201,7 @@ public final class RichContentRenderer {
             let failure = RenderFailure(
                 reason: error.localizedDescription.isEmpty
                     ? "Invalid formula" : error.localizedDescription)
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
@@ -188,14 +211,14 @@ public final class RichContentRenderer {
         let size = label.fittingSize
         guard size.width > 0, size.height > 0 else {
             let failure = RenderFailure(reason: "Empty formula")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
         label.frame = CGRect(origin: .zero, size: size)
         guard let rep = label.bitmapImageRepForCachingDisplay(in: label.bounds) else {
             let failure = RenderFailure(reason: "Could not rasterise formula")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
         label.cacheDisplay(in: label.bounds, to: rep)
@@ -214,18 +237,26 @@ public final class RichContentRenderer {
     /// Unsupported diagram types come back as a failure carrying the reason,
     /// so the editor can show the source with an explanation instead of an
     /// empty space.
+    /// - Parameter scale: bitmap pixels per point. The default is enough for a
+    ///   Retina display at reading size; the zoom viewer asks for more, because
+    ///   a diagram opened large is one the reader is looking *at* rather than
+    ///   past. The pixel cap below still applies, so this cannot be used to
+    ///   allocate an unbounded bitmap.
     public func diagram(
         _ source: String,
         maxWidth: CGFloat,
-        dark: Bool
+        dark: Bool,
+        scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark)
+        let key = Key(
+            kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark,
+            raster: Self.bucket(scale * 10))
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
         guard Self.isDrawable(maxWidth) else {
             let failure = RenderFailure(reason: "No room to draw a diagram")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
@@ -236,12 +267,14 @@ public final class RichContentRenderer {
             guard let prepared = try MermaidImageRenderer(theme: theme).prepare(from: source)
             else {
                 let failure = RenderFailure(reason: "Unsupported diagram type")
-                failures[key] = failure
+                store(failure, for: key)
                 return .failure(failure)
             }
-            guard let rendered = rasterise(prepared, theme: theme, maxWidth: maxWidth) else {
+            guard let rendered = rasterise(
+                prepared, theme: theme, maxWidth: maxWidth, scale: scale)
+            else {
                 let failure = RenderFailure(reason: "Could not rasterise diagram")
-                failures[key] = failure
+                store(failure, for: key)
                 return .failure(failure)
             }
 
@@ -249,14 +282,14 @@ public final class RichContentRenderer {
             return .success(rendered)
         } catch {
             let failure = RenderFailure(reason: describe(error))
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
     }
 
     /// Rasterised at twice the drawn size, so a diagram is sharp on a Retina
     /// display without the layout fragment having to resample it.
-    private static let rasterScale: CGFloat = 2
+    public static let rasterScale: CGFloat = 2
 
     /// An upper bound on a diagram's bitmap, in pixels.
     ///
@@ -286,7 +319,8 @@ public final class RichContentRenderer {
     private func rasterise(
         _ prepared: PreparedDiagram,
         theme: DiagramTheme,
-        maxWidth: CGFloat
+        maxWidth: CGFloat,
+        scale requested: CGFloat
     ) -> RenderedContent? {
         let bounds = prepared.bounds
         // A layout can come back degenerate or non-finite from a malformed
@@ -302,7 +336,7 @@ public final class RichContentRenderer {
         let columnFit = min(1, maxWidth / bounds.width)
         let size = CGSize(width: bounds.width * columnFit, height: bounds.height * columnFit)
 
-        var scale = Self.rasterScale
+        var scale = requested.isFinite && requested >= 1 ? requested : Self.rasterScale
         let pixels = size.width * scale * size.height * scale
         if pixels > Self.maxRasterPixels {
             scale *= (Self.maxRasterPixels / pixels).squareRoot()
@@ -369,12 +403,12 @@ public final class RichContentRenderer {
 
         guard Self.isDrawable(maxWidth) else {
             let failure = RenderFailure(reason: "No room to draw an image")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
         guard let url = resolve(source, relativeTo: base) else {
             let failure = RenderFailure(reason: "Remote images are not loaded")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
         // Both dimensions, and both finite: a file NSImage decodes to a zero or
@@ -384,7 +418,7 @@ public final class RichContentRenderer {
             Self.isDrawable(image.size.width), Self.isDrawable(image.size.height)
         else {
             let failure = RenderFailure(reason: "Missing image: \(url.lastPathComponent)")
-            failures[key] = failure
+            store(failure, for: key)
             return .failure(failure)
         }
 
@@ -419,12 +453,48 @@ public final class RichContentRenderer {
     // MARK: - Cache
 
     private func store(_ content: RenderedContent, for key: Key) {
-        cache[key] = content
-        order.append(key)
-        if order.count > limit {
-            let evicted = order.removeFirst()
-            cache.removeValue(forKey: evicted)
+        if let replaced = cache.removeValue(forKey: key) {
+            cachedPixels -= Self.pixels(of: replaced)
+        } else {
+            order.append(key)
         }
+        cache[key] = content
+        cachedPixels += Self.pixels(of: content)
+
+        // Never past the last entry: one bitmap larger than the whole budget
+        // still has to be returned to the caller who just asked for it, and a
+        // cache that evicts what it is in the middle of handing back would
+        // re-render it on the very next request, forever.
+        while order.count > 1, cache.count > limit || cachedPixels > pixelBudget {
+            let evicted = order.removeFirst()
+            if let content = cache.removeValue(forKey: evicted) {
+                cachedPixels -= Self.pixels(of: content)
+            }
+        }
+    }
+
+    /// Remembers a failure, under the same bound as a success.
+    ///
+    /// Unbounded, this grew with the document rather than with the cache: a
+    /// note referencing a thousand missing images recorded a thousand keys
+    /// that nothing would ever drop.
+    private func store(_ failure: RenderFailure, for key: Key) {
+        if failures.updateValue(failure, forKey: key) == nil { failureOrder.append(key) }
+        while failureOrder.count > limit {
+            failures.removeValue(forKey: failureOrder.removeFirst())
+        }
+    }
+
+    /// What an entry costs to keep, in bitmap pixels.
+    ///
+    /// The rasterised size, not the drawn size: the same diagram at the same
+    /// width is sixteen times the memory at the viewer's detail as at the
+    /// editor's, and it is the bitmap that is being held.
+    private static func pixels(of content: RenderedContent) -> Int {
+        if let image = content.cgImage { return image.width * image.height }
+        let area = content.size.width * content.size.height
+        guard area.isFinite, area > 0 else { return 0 }
+        return Int(min(area, CGFloat(Int32.max)))
     }
 
     private var isDark: Bool {

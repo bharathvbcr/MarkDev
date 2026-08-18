@@ -179,6 +179,36 @@ public struct EditorTheme {
             dark: NSColor(white: 1, alpha: 0.17))
     }
 
+    /// Fill behind a block's copy or zoom chip.
+    ///
+    /// Nearly opaque, unlike every other surface here, because this one is not
+    /// always drawn on the page: a zoom chip sits on top of whatever the
+    /// picture happens to be, and a 6% tint over a photograph is a control
+    /// nobody can find.
+    public var controlBackground: NSColor {
+        Self.adaptive(
+            "controlChip",
+            light: NSColor(white: 1, alpha: 0.86),
+            dark: NSColor(white: 0.24, alpha: 0.9))
+    }
+
+    /// The same chip under the pointer.
+    public var controlHighlight: NSColor {
+        Self.adaptive(
+            "controlChipHover",
+            light: NSColor(white: 1, alpha: 1),
+            dark: NSColor(white: 0.34, alpha: 1))
+    }
+
+    /// Hairline around a chip, so it keeps an edge on a background that
+    /// happens to match its fill.
+    public var controlBorder: NSColor {
+        Self.adaptive(
+            "controlChipBorder",
+            light: NSColor(white: 0, alpha: 0.17),
+            dark: NSColor(white: 1, alpha: 0.22))
+    }
+
     /// Fill behind a `#tag` pill.
     public var tagBackground: NSColor {
         tagColor.withAlphaComponent(0.16)

@@ -220,16 +220,29 @@ final class BlockLayoutTests: XCTestCase {
         XCTAssertEqual(fragments(view).compactMap(\.blockLabel), ["WARNING"])
     }
 
-    func testAnUnlabelledFenceReservesNoLabelStrip() throws {
-        // The strip is bought by the label. A block without one should not pay
-        // for space nothing is drawn in.
+    func testAPanelPaysForAStripOnlyWhenSomethingIsDrawnInIt() throws {
+        // The rule is unchanged — a block does not buy space nothing occupies —
+        // but what occupies the strip is no longer only the label. A code panel
+        // draws a copy chip there, so an unlabelled fence now reserves the same
+        // strip a labelled one does; a quote, which draws neither, still pays
+        // nothing.
         let plain = makeView("```\nx\n```\n")
         let labelled = makeView("```swift\nlet x = 1\n```\n")
+        let quote = makeView("> just a quote\n")
 
-        let plainTop = try XCTUnwrap(fragments(plain).first { $0.decoration.hasBackground }).topMargin
+        let plainTop = try XCTUnwrap(
+            fragments(plain).first { $0.decoration.hasBackground }
+        ).topMargin
         let labelledTop = try XCTUnwrap(
             fragments(labelled).first { $0.blockLabel != nil }
         ).topMargin
-        XCTAssertGreaterThan(labelledTop, plainTop)
+        let quoteTop = try XCTUnwrap(
+            fragments(quote).first { $0.decoration.hasBackground }
+        ).topMargin
+
+        XCTAssertEqual(
+            plainTop, labelledTop, accuracy: 0.001,
+            "both fences carry a copy chip, so both reserve the strip it sits in")
+        XCTAssertLessThan(quoteTop, plainTop, "a quote draws nothing above its first line")
     }
 }

@@ -27,6 +27,10 @@ struct BlockDecorationPalette: Sendable {
     /// Font for a drawn list bullet or number. Sized from the body font, so a
     /// bullet keeps its place beside the text at any type size.
     let listMarkerFont: CTFont
+    /// Fill, hover fill, and edge of a block's copy or zoom chip.
+    let controlBackground: CGColor
+    let controlHighlight: CGColor
+    let controlBorder: CGColor
     let accent: CGColor
     /// Contrasts with `accent`, for the tick inside a filled checkbox.
     let checkmark: CGColor
@@ -51,6 +55,9 @@ struct BlockDecorationPalette: Sendable {
         listMarkerFont = CTFontCreateUIFontForLanguage(
             .system, theme.bodyFont.pointSize * 0.85, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, theme.bodyFont.pointSize * 0.85, nil)
+        controlBackground = theme.controlBackground.cgColor
+        controlHighlight = theme.controlHighlight.cgColor
+        controlBorder = theme.controlBorder.cgColor
         accent = theme.accentColor.cgColor
         checkmark = NSColor.white.cgColor
         note = theme.calloutAccent(.note).cgColor
@@ -120,6 +127,28 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// pipes out as ordinary text and this fragment adds nothing.
     var tableRow: TableRowLayout?
 
+    /// Whether this fragment draws the chip that copies its block's code.
+    ///
+    /// Set by the delegate rather than derived from ``decoration``, like
+    /// ``blockLabel`` and for the same kind of reason: whether a control can be
+    /// offered is not a question about the parse. A copy chip needs a
+    /// pasteboard and a zoom chip needs a window, and one of those is missing
+    /// inside a Quick Look extension.
+    var offersCopy = false
+
+    /// Whether this fragment draws the chip that opens its content large.
+    var offersZoom = false
+
+    /// The chip under the pointer, drawn brighter than the others.
+    var hoveredControl: BlockControl?
+
+    /// Whether the copy chip is showing its confirmation.
+    ///
+    /// Copying leaves nothing on screen to see — the pasteboard is somewhere
+    /// else — so a control that gives no answer reads as one that did nothing,
+    /// and the reader clicks it again.
+    var copyConfirmed = false
+
     /// Height the rendered content needs, including its own padding.
     private var contentHeight: CGFloat {
         // A drawn table row stands in for text that has been collapsed to
@@ -136,15 +165,31 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// Extra space above the block, so a code background does not butt
     /// against the paragraph above it.
     override var topMargin: CGFloat {
-        // A label sits in the top strip, so the strip has to be tall enough to
-        // hold it — otherwise it prints over the block's first line of text.
-        let label = blockLabel == nil ? 0 : Metrics.labelHeight
         switch decoration {
-        case .code(let edge, _) where edge.roundsTop: return Metrics.blockPadding + label
-        case .callout(_, let edge) where edge.roundsTop: return Metrics.blockPadding + label
+        case .code(let edge, _) where edge.roundsTop: return Metrics.blockPadding + topStrip
+        case .callout(_, let edge) where edge.roundsTop: return Metrics.blockPadding + topStrip
         case .rule: return Metrics.rulePadding
         default: return super.topMargin
         }
+    }
+
+    /// Height of the strip above a panel's first line.
+    ///
+    /// Bought by whatever is drawn in it — a label, a control, or both — and
+    /// not otherwise, so a block pays for no space nothing occupies. It is the
+    /// strip's *existence* that has to be stable, not its contents: a code
+    /// panel offering a copy chip keeps the strip whether or not its fence is
+    /// labelled, and whether or not the caret is inside it, so moving the caret
+    /// through a fence no longer reflows the page around it.
+    private var topStrip: CGFloat {
+        blockLabel == nil && !offersCopy ? 0 : Metrics.labelHeight
+    }
+
+    /// Vertical band the strip's contents are centred in — the strip itself
+    /// plus the padding beneath it, which is empty until the block's first line
+    /// of text.
+    private var stripBand: CGFloat {
+        Metrics.labelHeight + Metrics.blockPadding
     }
 
     override var bottomMargin: CGFloat {
@@ -212,6 +257,35 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             gutter: gutter, inset: inset)
         guard x.isFinite else { return nil }
         return CGRect(x: x, y: 0, width: gutter, height: max(layoutFragmentFrame.height, 1))
+    }
+
+    /// The chips this fragment draws, with the rects they occupy in the space
+    /// `draw(at:in:)` works in.
+    ///
+    /// The one place that decides where a control is. Drawing and hit-testing
+    /// both read it, so a chip cannot be painted in one place and clicked in
+    /// another — which is a control that looks like nothing at all.
+    var controlRects: [(control: BlockControl, rect: CGRect)] {
+        var found: [(BlockControl, CGRect)] = []
+        if offersCopy {
+            found.append(
+                (.copy, BlockControlLayout.copyRect(inPanel: decorationRect, stripHeight: stripBand)))
+        }
+        if offersZoom, let content = renderedContentRect {
+            found.append(
+                (.zoom, BlockControlLayout.zoomRect(forContent: content, inPanel: decorationRect)))
+        }
+        return found
+    }
+
+    /// The control a click at `point` — in fragment-local coordinates — lands
+    /// on, if any.
+    func control(at point: CGPoint) -> BlockControl? {
+        for (control, rect) in controlRects
+        where BlockControlLayout.hitArea(of: rect).contains(point) {
+            return control
+        }
+        return nil
     }
 
     /// The rect the decoration covers.
@@ -328,9 +402,13 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             drawPanel(
                 in: context, at: point, edge: edge,
                 fill: palette?.codeBackground, border: palette?.codeBorder, bar: nil)
+            // Leading, like a callout's. The trailing end of the strip belongs
+            // to the copy chip, and two things tucked against one edge is an
+            // offset that depends on how long the language happens to be —
+            // `javascript` would have run into the chip.
             drawBlockLabel(
                 in: context, at: point, colour: palette?.secondaryColor.copy(alpha: 0.75),
-                alignment: .trailing)
+                alignment: .leading)
         case .callout(let kind, let edge):
             let accent = palette?.calloutAccent(kind)
             drawPanel(
@@ -353,6 +431,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
 
         if listMarker != nil { drawListMarker(in: context, at: point) }
         drawInlineCodePills(in: context, at: point)
+        drawControls(in: context, at: point)
 
         super.draw(at: point, in: context)
     }
@@ -567,6 +646,116 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         context.textPosition = CGPoint(x: right - width, y: baseline)
         CTLineDraw(line, context)
+    }
+
+    // MARK: - Controls
+
+    /// Draws the block's chips: the one that copies its code, the one that
+    /// opens its picture.
+    ///
+    /// Drawn *after* the panel and before the text, so a chip sits on the
+    /// decoration it belongs to; a code line long enough to reach the strip
+    /// would otherwise be painted over by its own block's control.
+    private func drawControls(in context: CGContext, at point: CGPoint) {
+        guard let palette else { return }
+        for (control, rect) in controlRects {
+            let placed = rect.offsetBy(dx: point.x, dy: point.y)
+            guard placed.width > 0, placed.height > 0 else { continue }
+
+            context.saveGState()
+            let path = CGPath(
+                roundedRect: placed, cornerWidth: BlockControlLayout.radius,
+                cornerHeight: BlockControlLayout.radius, transform: nil)
+            context.addPath(path)
+            context.setFillColor(
+                hoveredControl == control ? palette.controlHighlight : palette.controlBackground)
+            context.fillPath()
+
+            context.addPath(
+                CGPath(
+                    roundedRect: placed.insetBy(dx: 0.5, dy: 0.5),
+                    cornerWidth: BlockControlLayout.radius,
+                    cornerHeight: BlockControlLayout.radius, transform: nil))
+            context.setStrokeColor(palette.controlBorder)
+            context.setLineWidth(1)
+            context.strokePath()
+
+            // The glyph is drawn in a square inside the chip, so both controls
+            // are the same weight however wide their chip is.
+            let side = min(placed.height - Metrics.controlGlyphInset * 2, placed.width)
+            let glyph = CGRect(
+                x: placed.midX - side / 2, y: placed.midY - side / 2,
+                width: side, height: side)
+            context.setLineWidth(1.2)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+
+            switch control {
+            case .copy:
+                if copyConfirmed {
+                    drawTick(in: glyph, context: context, colour: palette.accent)
+                } else {
+                    drawCopyGlyph(in: glyph, context: context, palette: palette)
+                }
+            case .zoom:
+                drawZoomGlyph(in: glyph, context: context, colour: palette.secondaryColor)
+            }
+            context.restoreGState()
+        }
+    }
+
+    /// Two sheets, one behind the other: the icon every reader already knows
+    /// means "copy".
+    private func drawCopyGlyph(
+        in glyph: CGRect, context: CGContext, palette: BlockDecorationPalette
+    ) {
+        let sheet = glyph.width * 0.72
+        let back = CGRect(
+            x: glyph.maxX - sheet, y: glyph.minY, width: sheet, height: sheet)
+        let front = CGRect(
+            x: glyph.minX, y: glyph.maxY - sheet, width: sheet, height: sheet)
+
+        context.setStrokeColor(palette.secondaryColor)
+        context.addPath(CGPath(roundedRect: back, cornerWidth: 1.5, cornerHeight: 1.5, transform: nil))
+        context.strokePath()
+
+        // The front sheet is filled with the chip's own colour before it is
+        // stroked, so it reads as being *in front* rather than as two squares
+        // crossing each other.
+        let path = CGPath(roundedRect: front, cornerWidth: 1.5, cornerHeight: 1.5, transform: nil)
+        context.addPath(path)
+        context.setFillColor(
+            hoveredControl == .copy ? palette.controlHighlight : palette.controlBackground)
+        context.fillPath()
+        context.addPath(path)
+        context.strokePath()
+    }
+
+    /// Four corners pointing outward — the expand glyph, rather than a
+    /// magnifier: this opens the picture, it does not enlarge it in place.
+    private func drawZoomGlyph(in glyph: CGRect, context: CGContext, colour: CGColor) {
+        let arm = glyph.width * 0.36
+        context.setStrokeColor(colour)
+        for corner in [(true, true), (false, true), (true, false), (false, false)] {
+            let x = corner.0 ? glyph.minX : glyph.maxX
+            let y = corner.1 ? glyph.minY : glyph.maxY
+            let dx = corner.0 ? arm : -arm
+            let dy = corner.1 ? arm : -arm
+            context.move(to: CGPoint(x: x + dx, y: y))
+            context.addLine(to: CGPoint(x: x, y: y))
+            context.addLine(to: CGPoint(x: x, y: y + dy))
+        }
+        context.strokePath()
+    }
+
+    /// The same tick a checked checkbox draws, sized to a chip.
+    private func drawTick(in glyph: CGRect, context: CGContext, colour: CGColor) {
+        context.setStrokeColor(colour)
+        context.setLineWidth(1.6)
+        context.move(to: CGPoint(x: glyph.minX, y: glyph.midY))
+        context.addLine(to: CGPoint(x: glyph.minX + glyph.width * 0.32, y: glyph.maxY - 1))
+        context.addLine(to: CGPoint(x: glyph.maxX, y: glyph.minY + 1))
+        context.strokePath()
     }
 
     /// Draws a rounded pill behind every run of inline code on this fragment's
@@ -970,6 +1159,8 @@ extension MarkdownLayoutFragment {
         static let checkboxGutter: CGFloat = 21
         /// Strip a block label occupies above the block's first line.
         static let labelHeight: CGFloat = 11
+        /// Space between a chip's edge and the glyph inside it.
+        static let controlGlyphInset: CGFloat = 3
         /// Gutter a list bullet or number is set in, ending just before the
         /// item's text. Narrower than the 16pt a list item is indented by, so
         /// it always fits inside the indent the styler already reserves.

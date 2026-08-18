@@ -69,6 +69,7 @@ public final class MarkdownTextView: ScrollingTextView {
         didSet {
             listItems = parsed.blocks.filter { $0.kind == .listItem }
             tableBlocks = parsed.blocks.filter { $0.kind == .table }
+            codeBlocks = parsed.blocks.filter { Self.holdsCode($0.kind) }
             // The solved grids describe the previous parse's offsets, so they
             // go; the styled cells are keyed on their own source and stay.
             tableLayout.invalidate()
@@ -89,6 +90,16 @@ public final class MarkdownTextView: ScrollingTextView {
     /// block to answer it is the quadratic this codebase has paid for three
     /// times already.
     private var tableBlocks: [BlockDescriptor] = []
+
+    /// The parse's code-like blocks, in document order.
+    ///
+    /// Kept for the reason ``tableBlocks`` and ``listItems`` are: the layout
+    /// delegate asks "which block is this fence" once per code panel, and
+    /// scanning every block to answer it is the quadratic this codebase has
+    /// already paid for four times — most recently at 8.2 seconds of a single
+    /// keystroke. None of these kinds nests inside another, so the array is
+    /// disjoint as well as sorted, and can be searched.
+    private var codeBlocks: [BlockDescriptor] = []
 
     /// The blocks drawn as content — a formula, a diagram, an image — instead
     /// of as their own source. Rebuilt with each parse.
@@ -178,6 +189,43 @@ public final class MarkdownTextView: ScrollingTextView {
     /// constant of the mode and there is nothing for a cache to notice
     /// changing. See ``RevealPolicy/revealFollowsCaret(_:)``.
     private var revealedBlocks: Set<Int> = []
+
+    /// The fragment line whose code block was last copied, so its chip can
+    /// show a tick — and can still show it after a relayout.
+    var confirmedCopyLine: NSRange?
+
+    /// The fragment currently drawing that tick.
+    ///
+    /// Held as well as the line because the tick is state on the *fragment*,
+    /// and clearing `confirmedCopyLine` alone does not repaint anything: only
+    /// a fragment that is rebuilt afterwards re-reads it. Without this, copying
+    /// a second block left the first one ticked for as long as its fragment
+    /// survived — two chips claiming to hold the pasteboard, one of them
+    /// lying.
+    weak var confirmedCopyFragment: MarkdownLayoutFragment?
+
+    /// Takes the tick away again.
+    var copyConfirmation: Task<Void, Never>?
+
+    /// How long the copy chip confirms for. Long enough to be seen after the
+    /// eye has moved on, short enough that it is gone before the reader
+    /// wonders whether the control is stuck.
+    static let copyConfirmationSeconds: Double = 1.6
+
+    /// The chip under the pointer, and the fragment drawing it.
+    var hoveredControl: BlockControl?
+    weak var hoveredControlFragment: MarkdownLayoutFragment?
+
+    /// Tracks the pointer for the hover state above.
+    var controlTracking: NSTrackingArea?
+
+    /// The fragments currently drawing a chip, and the only thing hit-testing
+    /// looks through.
+    ///
+    /// Weak, because TextKit owns fragment lifetime: a line that is rebuilt or
+    /// dropped takes its entry with it, so this never holds a fragment the
+    /// layout has finished with, and never needs sweeping.
+    let controlFragments = NSHashTable<MarkdownLayoutFragment>.weakObjects()
 
     /// Guards against reentrant styling.
     private var isStyling = false
@@ -295,6 +343,11 @@ public final class MarkdownTextView: ScrollingTextView {
             storedIssues = .none
             onIssues?(storedIssues)
         }
+        // And for the same reason a copy confirmation does not survive it: the
+        // tick names a line of the document being replaced. Left set, it is
+        // matched against the *new* document's offsets, and whatever fence
+        // happens to sit there opens wearing a tick for a copy nobody made.
+        clearCopyConfirmation()
         document.rebuild(from: markdown)
         parsed = document.parsed
         refreshRevealedBlocks()
@@ -531,7 +584,8 @@ public final class MarkdownTextView: ScrollingTextView {
 
             // The fence lines are syntax, not code; highlighting them would
             // colour the ``` as if it were part of the program.
-            guard let body = codeBody(of: block, in: text) else { continue }
+            guard let body = CodeBlockSource.bodyRange(of: block, in: parsed, text: text)
+            else { continue }
             let code = text.substring(with: body)
 
             for span in SyntaxHighlighter.shared.spans(language: language, code: code) {
@@ -542,31 +596,6 @@ public final class MarkdownTextView: ScrollingTextView {
                     .foregroundColor, value: theme.color(for: span.kind), range: absolute)
             }
         }
-    }
-
-    /// The code inside a fence, excluding the delimiter lines.
-    private func codeBody(of block: BlockDescriptor, in text: NSString) -> NSRange? {
-        let range = NSIntersectionRange(block.range, NSRange(location: 0, length: text.length))
-        guard range.length > 0 else { return nil }
-
-        // Markers cover the fence lines; the body is what they leave behind.
-        //
-        // Found by binary search, not by filtering every marker in the
-        // document: this runs once per code block, so a scan makes a
-        // whole-document restyle quadratic — 756ms of a 922ms stall on the
-        // first structural edit in a 10,000-line file.
-        let fenceMarkers = parsed.markers[parsed.markerIndices(overlapping: range)]
-
-        var start = range.location
-        var end = range.location + range.length
-        if let first = fenceMarkers.first?.range, first.location <= start {
-            start = first.location + first.length
-        }
-        if let last = fenceMarkers.last?.range, last.location + last.length >= end {
-            end = last.location
-        }
-        guard end > start else { return nil }
-        return NSRange(location: start, length: end - start)
     }
 
     /// Rebuilds layout fragments so their decoration matches the new parse.
@@ -754,6 +783,9 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Ticks a checkbox when one is clicked, before the caret moves.
     public override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        // Before anything else, and before the caret moves: a chip is drawn on
+        // top of the block, so a click that lands on one was meant for it.
+        if handleControlClick(at: point) { return }
         // Only the gutter counts: clicking the item's text should place the
         // caret, not toggle the task.
         if isInCheckboxGutter(point), let marker = taskMarker(atCheckbox: point) {
@@ -1139,6 +1171,9 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         resolveRenderedContent(for: fragment)
         resolveTableRow(for: fragment, at: range)
         resolveCollapsedSyntax(for: fragment, at: range)
+        // Last: a zoom chip is offered only where there is a picture to open,
+        // which is not known until the content above has been resolved.
+        resolveControls(for: fragment, at: range)
         return fragment
     }
 }
@@ -1268,6 +1303,372 @@ extension MarkdownTextView {
     enum Metrics {
         /// The least width a table is ever solved for.
         static let narrowestTable: CGFloat = 120
+    }
+}
+
+// MARK: - Block controls
+
+extension MarkdownTextView {
+    /// Decides which chips this fragment offers.
+    ///
+    /// Resolved here rather than in ``BlockDecoration`` for the reason
+    /// ``resolveCollapsedSyntax(for:at:)`` is: it is not a question about the
+    /// parse. A zoom chip needs a window to open, which a Quick Look extension
+    /// does not have, and it needs a picture that actually rendered — a block
+    /// showing its failure has nothing to enlarge.
+    func resolveControls(for fragment: MarkdownLayoutFragment, at range: NSRange) {
+        switch fragment.decoration {
+        case .code(let edge, _):
+            // The head of the block only: the chip belongs to the panel, and
+            // one per line of a fence would be a column of them.
+            fragment.offersCopy = edge.roundsTop && hasCopyableCode(at: range)
+        case .rendered:
+            fragment.offersZoom =
+                ContentZoomViewer.isAvailable && fragment.renderedContentRect != nil
+        default:
+            break
+        }
+        // Re-derived rather than carried on the fragment, because a fragment is
+        // rebuilt whenever its block is restyled — and a confirmation that
+        // disappeared because the reader typed somewhere else would read as the
+        // copy having been undone.
+        fragment.copyConfirmed = fragment.offersCopy && confirmedCopyLine == range
+
+        // Registered here because this is the one place that decides a fragment
+        // offers a control, so the set hit-testing searches cannot fall out of
+        // step with the set that draws.
+        if fragment.offersCopy || fragment.offersZoom {
+            controlFragments.add(fragment)
+        } else {
+            controlFragments.remove(fragment)
+        }
+    }
+
+    /// Whether the block at `range` has any code to put on the pasteboard.
+    ///
+    /// An empty fence offers no chip: a control that can only ever do nothing
+    /// is worse than no control.
+    private func hasCopyableCode(at range: NSRange) -> Bool {
+        guard let text = textStorage?.string as NSString?,
+            let block = codeBlock(containing: range)
+        else { return false }
+        return CodeBlockSource.hasCode(of: block, in: parsed, text: text)
+    }
+
+    /// The code-like block covering `range`, found by binary search.
+    ///
+    /// The same search ``table(containing:)`` makes, over an index built once
+    /// per parse. A scan would be the shape this file's own history warns
+    /// about: it is asked once per code panel *per layout pass*, so a document
+    /// of a thousand fences would walk a thousand blocks a thousand times.
+    private func codeBlock(containing range: NSRange) -> BlockDescriptor? {
+        var low = 0
+        var high = codeBlocks.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if NSMaxRange(codeBlocks[mid].range) <= range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        guard low < codeBlocks.count else { return nil }
+        let candidate = codeBlocks[low]
+        guard NSIntersectionRange(candidate.range, range).length > 0
+            || NSLocationInRange(range.location, candidate.range)
+        else { return nil }
+        return candidate
+    }
+
+    /// The blocks whose text is code rather than prose — the same set
+    /// ``BlockDecoration`` draws a code panel for.
+    private static func holdsCode(_ kind: BlockKind) -> Bool {
+        switch kind {
+        case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter: true
+        default: false
+        }
+    }
+
+    /// The control a click at `point` lands on, with the fragment that drew it.
+    func blockControl(at point: CGPoint)
+        -> (fragment: MarkdownLayoutFragment, control: BlockControl, range: NSRange)?
+    {
+        // Nothing to find in a document with neither a listing nor a picture,
+        // which is most of them. This runs on every mouse *move*, so the
+        // cheapest possible answer for the common case is worth having.
+        guard !codeBlocks.isEmpty || !renderedBlocks.entries.isEmpty else { return nil }
+        let origin = textContainerOrigin
+        let target = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+
+        // Asked of the fragments that draw chips, rather than of TextKit's
+        // point lookup.
+        //
+        // `NSTextLayoutManager.textLayoutFragment(for:)` searches the container's
+        // *usage bounds*, and those lag the real layout after an edit — measured
+        // here at three fragments behind, with the document 843pt tall inside a
+        // 900pt viewport and every fragment laid out and on screen. Any chip
+        // below that stale edge came back nil: drawn, visible, and dead to the
+        // pointer. Nothing about it looked wrong, which is the whole problem
+        // with a control whose drawing and hit-testing are answered by
+        // different mechanisms.
+        //
+        // Walking the chips is also the smaller search. There is one entry per
+        // code panel and per picture, not one per line, and the common document
+        // has none at all — which the guard above has already answered.
+        var found: [(fragment: MarkdownLayoutFragment, control: BlockControl, range: NSRange)] = []
+        for fragment in controlFragments.allObjects {
+            // A fragment is only as wide as its own line, and the line a copy
+            // chip is drawn on is a collapsed ```` ```swift ```` — four
+            // hundredths of a point. So this is against what the fragment
+            // *paints*, never against its frame.
+            let frame = fragment.layoutFragmentFrame
+            let painted = fragment.renderingSurfaceBounds.offsetBy(dx: frame.minX, dy: frame.minY)
+            guard painted.contains(target) else { continue }
+            let local = CGPoint(x: target.x - frame.minX, y: target.y - frame.minY)
+            guard let control = fragment.control(at: local),
+                let range = characterRange(of: fragment),
+                // TextKit keeps fragments alive after it has stopped laying
+                // them out, and a left-over one answers about the page as it
+                // used to be: measured here, an orphan still sitting at the top
+                // of the document claimed a click meant for the fragment that
+                // replaced it. Weak references do not settle this — the object
+                // is alive, it is simply no longer the one on screen — so the
+                // layout is asked which fragment owns that text now.
+                isInCurrentLayout(fragment)
+            else { continue }
+            found.append((fragment, control, range))
+        }
+        // Ordered by position rather than by whatever the table iterated in, so
+        // that a point two chips could both claim resolves the same way twice.
+        return found.min { $0.range.location < $1.range.location }
+
+    }
+
+    /// Whether the layout manager still lays this fragment out for its own text.
+    private func isInCurrentLayout(_ fragment: MarkdownLayoutFragment) -> Bool {
+        guard let manager = textLayoutManager,
+            let location = fragment.textElement?.elementRange?.location
+        else { return false }
+        return manager.textLayoutFragment(for: location) === fragment
+    }
+
+    /// A fragment's element range, in the offsets the parse is expressed in.
+    private func characterRange(of fragment: NSTextLayoutFragment) -> NSRange? {
+        guard let manager = textLayoutManager,
+            let element = fragment.textElement?.elementRange
+        else { return nil }
+        let start = manager.offset(from: manager.documentRange.location, to: element.location)
+        let end = manager.offset(from: manager.documentRange.location, to: element.endLocation)
+        guard start >= 0, end >= start else { return nil }
+        return NSRange(location: start, length: end - start)
+    }
+
+    /// Runs the chip at `point`, and reports whether there was one.
+    ///
+    /// Split out of `mouseDown` so the whole path — hit test, action,
+    /// confirmation — can be exercised without synthesising an `NSEvent`. A
+    /// control tested only as far as its hit test is a control whose *action*
+    /// nothing has run.
+    @discardableResult
+    func handleControlClick(at point: CGPoint) -> Bool {
+        guard let hit = blockControl(at: point) else { return false }
+        perform(hit.control, on: hit.fragment, at: hit.range)
+        return true
+    }
+
+    /// Runs what a chip does.
+    private func perform(
+        _ control: BlockControl, on fragment: MarkdownLayoutFragment, at range: NSRange
+    ) {
+        switch control {
+        case .copy:
+            // The fragment's whole range, which is the range the chip was
+            // *offered* from. Asking with a bare offset instead is not the same
+            // question, and the difference is a whole class of block: a fence
+            // inside a list item begins after the spaces that indent it, so the
+            // line starts at 198 while the block starts at 200. The offer, made
+            // by intersection, found the block; the action, made from a point,
+            // fell in the gap — and the chip was drawn, clicked, confirmed
+            // nothing and copied nothing.
+            if copyCode(in: range) { confirmCopy(on: fragment, at: range) }
+        case .zoom:
+            guard let block = fragment.decoration.rendered else { return }
+            ContentZoomViewer.shared.present(
+                block,
+                documentDirectory: documentDirectory,
+                textColor: theme.textColor,
+                dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+        }
+    }
+
+    /// Puts the code of the block containing `offset` on the pasteboard.
+    ///
+    /// Public because it is the *action*, not the chip: it is worth reaching
+    /// from a menu or a shortcut later, and a control whose behaviour lives
+    /// only inside a mouse handler cannot be.
+    ///
+    /// The pasteboard is left alone when there is nothing to copy. Clearing it
+    /// to write an empty string would throw away whatever the reader had
+    /// already put there, in answer to a click that did nothing.
+    @discardableResult
+    public func copyCodeBlock(at offset: Int) -> Bool {
+        copyCode(in: NSRange(location: offset, length: 0))
+    }
+
+    /// Copies the code of the block `range` falls in.
+    ///
+    /// Range-based rather than point-based so that a caller which *found* a
+    /// block by intersection can act on the same block it found. See the note
+    /// in ``perform(_:on:at:)``.
+    @discardableResult
+    func copyCode(in range: NSRange) -> Bool {
+        guard let text = textStorage?.string as NSString?,
+            let block = codeBlock(containing: range)
+        else { return false }
+        let code = CodeBlockSource.copyText(of: block, in: parsed, text: text)
+        guard !code.isEmpty else { return false }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.setString(code, forType: .string)
+    }
+
+    /// Shows the copy chip's tick, and takes it away again.
+    private func confirmCopy(on fragment: MarkdownLayoutFragment, at range: NSRange) {
+        // The previous confirmation goes first, chip and all. Cancelling its
+        // timer is not enough: the timer is the only thing that would have
+        // unticked that chip, so cancelling it alone is what left the tick
+        // there for good.
+        clearCopyConfirmation()
+        confirmedCopyLine = range
+        confirmedCopyFragment = fragment
+        fragment.copyConfirmed = true
+        redraw(fragment)
+
+        copyConfirmation = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.copyConfirmationSeconds))
+            guard !Task.isCancelled, let self else { return }
+            self.clearCopyConfirmation()
+        }
+    }
+
+    /// Takes the confirmation off the chip showing it, and forgets the line.
+    ///
+    /// Both halves matter. The line is what a fragment rebuilt later reads to
+    /// decide whether to draw the tick, and the fragment is what is on screen
+    /// now — clearing only the line repaints nothing.
+    func clearCopyConfirmation() {
+        copyConfirmation?.cancel()
+        copyConfirmation = nil
+        confirmedCopyLine = nil
+        if let fragment = confirmedCopyFragment {
+            confirmedCopyFragment = nil
+            guard fragment.copyConfirmed else { return }
+            fragment.copyConfirmed = false
+            redraw(fragment)
+        }
+    }
+
+    /// Repaints one fragment, and nothing else.
+    private func redraw(_ fragment: MarkdownLayoutFragment) {
+        let frame = fragment.layoutFragmentFrame
+        let origin = textContainerOrigin
+        setNeedsDisplay(
+            fragment.renderingSurfaceBounds.offsetBy(
+                dx: frame.minX + origin.x, dy: frame.minY + origin.y))
+    }
+
+    // MARK: - Hover
+
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let controlTracking { removeTrackingArea(controlTracking) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [
+                .mouseMoved, .mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow,
+                .inVisibleRect,
+            ],
+            owner: self)
+        addTrackingArea(area)
+        controlTracking = area
+    }
+
+    public override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        updateHover(at: nil)
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observeScrolling()
+    }
+
+    /// Watches the viewport so hover can be re-tested when the page moves.
+    private func observeScrolling() {
+        NotificationCenter.default.removeObserver(
+            self, name: NSView.boundsDidChangeNotification, object: nil)
+        guard let clip = enclosingScrollView?.contentView else { return }
+        clip.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(viewportDidScroll),
+            name: NSView.boundsDidChangeNotification, object: clip)
+    }
+
+    @objc private func viewportDidScroll() {
+        refreshHover()
+    }
+
+    /// Re-tests what is under a pointer that has not moved.
+    ///
+    /// Scrolling moves the page beneath a stationary pointer and AppKit reports
+    /// no mouse event for it, so a chip scrolled out from under the pointer
+    /// stayed lit — and, because the hover state is what puts the arrow cursor
+    /// up, the pointer stayed an arrow over ordinary text until it was moved.
+    func refreshHover() {
+        guard let window else { return updateHover(at: nil) }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        updateHover(at: visibleRect.contains(point) ? point : nil)
+    }
+
+    /// Keeps the pointer from being an I-beam over something that is not text.
+    ///
+    /// Both halves are needed. The tracking area's `cursorUpdate` is what AppKit
+    /// consults when the pointer enters, and setting the cursor in `mouseMoved`
+    /// is what corrects it as the pointer crosses a chip without leaving the
+    /// view — the text view's own cursor rects cover the whole surface, and
+    /// nothing else would take the I-beam back off.
+    public override func cursorUpdate(with event: NSEvent) {
+        if hoveredControl != nil {
+            NSCursor.arrow.set()
+        } else {
+            super.cursorUpdate(with: event)
+        }
+    }
+
+    /// Lights the chip under the pointer, and puts out the one that was.
+    func updateHover(at point: CGPoint?) {
+        let hit = point.flatMap { blockControl(at: $0) }
+        guard hit?.control != hoveredControl || hit?.fragment !== hoveredControlFragment else {
+            return
+        }
+
+        if let previous = hoveredControlFragment {
+            previous.hoveredControl = nil
+            redraw(previous)
+        }
+        hoveredControlFragment = hit?.fragment
+        hoveredControl = hit?.control
+        if let fragment = hit?.fragment {
+            fragment.hoveredControl = hit?.control
+            redraw(fragment)
+            NSCursor.arrow.set()
+        }
     }
 }
 
