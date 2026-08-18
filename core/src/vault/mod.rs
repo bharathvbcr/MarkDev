@@ -6,5 +6,5 @@ pub mod note;
 pub mod search;
 
 pub use graph::{Graph, GraphEdge, GraphNode, GraphQuery};
-pub use index::{Backlink, Resolution, SearchHit, TagCount, UnlinkedMention, Vault};
+pub use index::{Backlink, OutgoingLink, Resolution, SearchHit, TagCount, UnlinkedMention, Vault};
 pub use note::{Heading, Note, WikiLink};

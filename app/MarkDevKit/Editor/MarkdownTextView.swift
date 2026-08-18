@@ -45,7 +45,14 @@ public struct TextEdit: Sendable, Equatable {
 public final class MarkdownTextView: ScrollingTextView {
     /// Visual configuration. Setting it restyles.
     public var theme: EditorTheme = .standard {
-        didSet { restyle() }
+        didSet {
+            // A formula is typeset at a size and an ink taken from the theme,
+            // and both are in the render cache's key — so what was warmed
+            // belongs to the theme just replaced. Forgotten rather than
+            // re-queued here: `restyle` leads to a draw, and the draw asks.
+            warmedGeometry = nil
+            restyle()
+        }
     }
 
     /// How much syntax is shown. Setting it restyles.
@@ -105,6 +112,36 @@ public final class MarkdownTextView: ScrollingTextView {
     /// of as their own source. Rebuilt with each parse.
     private(set) var renderedBlocks: RenderedBlocks = .none
 
+    /// The geometry the last warm was asked for.
+    ///
+    /// Everything in the render cache's key that is not the block itself: a
+    /// warm made at another width or appearance would be a cache full of
+    /// entries nothing goes on to read.
+    private struct PrefetchGeometry: Equatable {
+        let width: CGFloat
+        let dark: Bool
+        let directory: URL?
+    }
+
+    private var warmedGeometry: PrefetchGeometry?
+
+    /// What the last warm was asked to render.
+    ///
+    /// Kept so that a keystroke which leaves the document's pictures alone —
+    /// which is nearly every keystroke — re-queues nothing. Comparing
+    /// ``renderedBlocks`` instead would re-warm a document whenever anything
+    /// *moved*, since its entries carry ranges, and typing at the top of a
+    /// note shifts every one of them.
+    private var warmedContents: [RenderedBlock] = []
+
+    /// Where this view's warm requests go.
+    ///
+    /// The shared prefetcher, because the cache it fills is shared and two
+    /// panes warming against separate budgets would between them exceed the
+    /// one budget there is. Injectable so a test can watch what a view asks
+    /// for without competing with every other test for it.
+    var contentPrefetcher: ContentPrefetcher = .shared
+
     /// The parse's list items, in document order.
     ///
     /// Kept because the layout delegate asks "does an item start on this line"
@@ -128,6 +165,7 @@ public final class MarkdownTextView: ScrollingTextView {
         didSet {
             guard documentDirectory != oldValue else { return }
             textLayoutManager?.invalidateLayout(for: textLayoutManager!.documentRange)
+            prefetchRenderedContent()
         }
     }
 
@@ -348,10 +386,17 @@ public final class MarkdownTextView: ScrollingTextView {
         // matched against the *new* document's offsets, and whatever fence
         // happens to sit there opens wearing a tick for a copy nobody made.
         clearCopyConfirmation()
+        // The queue describes the document being replaced — including the
+        // notes *it* linked to, which are no longer what the reader is one
+        // click away from.
+        contentPrefetcher.cancel()
+        warmedGeometry = nil
+        warmedContents = []
         document.rebuild(from: markdown)
         parsed = document.parsed
         refreshRevealedBlocks()
         restyle()
+        prefetchRenderedContent()
         onParse?(parsed)
     }
 
@@ -419,6 +464,7 @@ public final class MarkdownTextView: ScrollingTextView {
         }
 
         restyle(scope: scope)
+        prefetchRenderedContent()
         onParse?(parsed)
     }
 
@@ -1110,6 +1156,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         resolveTablesIfWidthChanged()
+        prefetchRenderedContent()
     }
 
     /// Re-solves tables once the geometry has settled.
@@ -1124,15 +1171,24 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     public override func layout() {
         super.layout()
         resolveTablesIfWidthChanged()
+        prefetchRenderedContent()
     }
 
     public override func viewWillDraw() {
         super.viewWillDraw()
         resolveTablesIfWidthChanged()
+        // The same three hooks the tables use, for the same reason: the frame
+        // is set before the container has tracked it, and the container tracks
+        // before TextKit has laid text into it. A warm made against a width
+        // that is about to change is a cache full of misses.
+        prefetchRenderedContent()
     }
 
     public override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        // Diagrams are rasterised per appearance, so the warmed set belongs to
+        // the palette that has just been replaced.
+        prefetchRenderedContent()
         // Table cells are styled into attributed strings, which bake their
         // colours in — unlike the palette, they cannot be swapped on a
         // fragment already laid out, so they are rebuilt from scratch.
@@ -1776,35 +1832,84 @@ extension MarkdownTextView {
     /// metrics from anywhere.
     func resolveRenderedContent(for fragment: MarkdownLayoutFragment) {
         guard let block = fragment.decoration.rendered else { return }
-        // The column the content has to fit, minus the panel's own padding.
-        let width = max(bounds.width - theme.insets.width * 2 - 32, 120)
 
-        let result: Result<RenderedContent, RenderFailure>
-        switch block.kind {
-        case .math:
-            result = RichContentRenderer.shared.math(
-                block.source,
-                fontSize: theme.bodyFont.pointSize * 1.25,
-                color: theme.textColor,
-                display: true)
-        case .diagram:
-            let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            result = RichContentRenderer.shared.diagram(
-                block.source, maxWidth: width, dark: dark)
-        case .image(let alt):
-            result = RichContentRenderer.shared.image(
-                at: block.source, relativeTo: documentDirectory, maxWidth: width
-            )
-            .mapError { failure in
-                // Alt text is the author's own description; showing it beats
-                // a bare file name the reader cannot place.
-                alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")
+        switch RichContentRenderer.shared.render(renderRequest(for: block)) {
+        case .success(let content):
+            fragment.renderedContent = content
+        case .failure(let failure):
+            // Alt text is the author's own description; showing it beats a
+            // bare file name the reader cannot place. Applied here rather than
+            // inside the renderer because it is how this surface *presents* a
+            // failure — the cache holds the failure itself, so the prefetcher
+            // and the fragment still share one answer.
+            if case .image(let alt) = block.kind, !alt.isEmpty {
+                fragment.renderFailure = RenderFailure(reason: "\(alt) — \(failure.reason)")
+            } else {
+                fragment.renderFailure = failure
             }
         }
+    }
 
-        switch result {
-        case .success(let content): fragment.renderedContent = content
-        case .failure(let failure): fragment.renderFailure = failure
+    /// What it takes to draw `block` in this view, right now.
+    ///
+    /// The one place the view's geometry and palette become render parameters.
+    /// The prefetcher warms against the same value, and the render cache is
+    /// keyed on all of it — so a second, subtly different derivation here
+    /// would not draw anything wrong, it would quietly make every warmed entry
+    /// a miss.
+    func renderRequest(for block: RenderedBlock) -> RenderRequest {
+        RenderRequest(block: block, directory: documentDirectory, context: renderContext)
+    }
+
+    /// The width, appearance and ink content is rendered against.
+    public var renderContext: RenderContext {
+        RenderContext(
+            // The column the content has to fit, minus the panel's own padding.
+            width: max(bounds.width - theme.insets.width * 2 - 32, 120),
+            dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua,
+            mathFontSize: theme.bodyFont.pointSize * 1.25,
+            textColor: theme.textColor)
+    }
+
+    /// Warms every picture in the document, not only the ones on screen.
+    ///
+    /// Cheap to call from anywhere the geometry might have settled: it does
+    /// nothing at all unless the parse, the column, the appearance or the
+    /// document's directory has changed since the last warm, which is what
+    /// lets it hang off `viewWillDraw`.
+    ///
+    /// Skipped without a window. A view built to measure something, or one
+    /// under test, has no reader to smooth a scroll for, and spending the
+    /// shared cache's budget on it takes room from a window that has.
+    func prefetchRenderedContent() {
+        // Not guarded on there being anything to draw: a document that has
+        // *stopped* having pictures — the last diagram deleted, or a note
+        // replaced by a plainer one — still has to say so, or the queue goes
+        // on warming what the reader no longer has open.
+        guard window != nil else { return }
+        let context = renderContext
+        guard context.width > 1 else { return }
+
+        let geometry = PrefetchGeometry(
+            width: context.width.rounded(), dark: context.dark, directory: documentDirectory)
+        if geometry == warmedGeometry, warmsTheSameContentAsLastTime() { return }
+
+        warmedGeometry = geometry
+        warmedContents = renderedBlocks.entries.map(\.content)
+        contentPrefetcher.warmDocument(warmedContents, in: documentDirectory, using: context)
+    }
+
+    /// Whether this parse's pictures are the ones already queued.
+    ///
+    /// Written as a walk rather than as `map(\.content) == warmedContents`
+    /// because the answer is nearly always yes, and the point is to allocate
+    /// nothing on the keystroke path to find that out.
+    private func warmsTheSameContentAsLastTime() -> Bool {
+        let entries = renderedBlocks.entries
+        guard entries.count == warmedContents.count else { return false }
+        for index in entries.indices where entries[index].content != warmedContents[index] {
+            return false
         }
+        return true
     }
 }

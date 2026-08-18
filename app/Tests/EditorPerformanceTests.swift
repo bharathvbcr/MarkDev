@@ -139,6 +139,97 @@ final class EditorPerformanceTests: XCTestCase {
             "debug parse is unexpectedly slow — check for superlinear behaviour")
     }
 
+    // MARK: - Reading ahead
+
+    /// A note whose pictures are what costs, rather than its prose.
+    private static func documentWithFormulas(_ count: Int) -> String {
+        var out = "Opening paragraph.\n\n"
+        for index in 0..<count {
+            out += "Paragraph \(index) of ordinary prose.\n\n$$\nx_{\(index)} = \(index)\n$$\n\n"
+        }
+        return out
+    }
+
+    /// A view in a window, which is the only place the warm runs at all.
+    private func hostedEditor() -> (MarkdownTextView, NSWindow, ContentPrefetcher) {
+        let prefetcher = ContentPrefetcher(renderer: RichContentRenderer())
+        let view = MarkdownTextView.make()
+        view.contentPrefetcher = prefetcher
+        let scrollView = ScrollingTextView.scrollView(hosting: view)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 400),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        scrollView.frame = NSRect(x: 0, y: 0, width: 700, height: 400)
+        window.contentView?.addSubview(scrollView)
+        window.contentView?.layoutSubtreeIfNeeded()
+        return (view, window, prefetcher)
+    }
+
+    /// The warm hangs off `reparse` and off `viewWillDraw`, so its *decision*
+    /// is on the keystroke path and on the scroll path.
+    ///
+    /// Every other gate in this file uses a windowless view, where the warm
+    /// declines to run at all — so without this one, the cost added to a
+    /// keystroke by reading ahead would be measured by nothing. What is gated
+    /// is the check, not the rendering: deciding "these are the pictures I
+    /// have already queued" must not walk the document in a way that grows
+    /// into a stall.
+    func testDecidingWhetherToWarmCostsAlmostNothingPerKeystroke() {
+        // The window is never closed. An `NSWindow` built in code is released
+        // when it closes, so the reference the test still holds over-releases
+        // it — which takes the runner down *after* the assertion has passed,
+        // and reads as an unexplained "test execute failed". Nothing else in
+        // this suite closes one either.
+        let (view, window, prefetcher) = hostedEditor()
+        defer { withExtendedLifetime(window) {} }
+        view.setMarkdown(Self.documentWithFormulas(400))
+        view.prefetchRenderedContent()
+        while prefetcher.step() {}
+
+        // Timed in a batch because one decision is too short to measure, then
+        // asserted per decision: what lands on a keystroke is one of them.
+        let rounds = 1_000
+        let decisions = measureBest {
+            for _ in 0..<rounds { view.prefetchRenderedContent() }
+        }
+        let each = decisions.best / Double(rounds)
+
+        print(
+            "[perf] warm decision over 400 pictures: "
+                + "\(String(format: "%.3f", each * 1000))ms each, \(decisions.description) "
+                + "for \(rounds)")
+        // A twentieth of a frame. Ample for a walk over the document's
+        // pictures, and nowhere near enough for one that touched its text.
+        XCTAssertLessThan(
+            each, Self.frameBudget / 20,
+            "the per-keystroke check must be far cheaper than the work it avoids")
+    }
+
+    func testTheWarmDecisionGrowsWithTheDocumentRatherThanFasterThanIt() {
+        let (small, smallWindow, smallPrefetcher) = hostedEditor()
+        let (large, largeWindow, largePrefetcher) = hostedEditor()
+        defer { withExtendedLifetime((smallWindow, largeWindow)) {} }
+        small.setMarkdown(Self.documentWithFormulas(200))
+        large.setMarkdown(Self.documentWithFormulas(800))
+        small.prefetchRenderedContent()
+        large.prefetchRenderedContent()
+        while smallPrefetcher.step() {}
+        while largePrefetcher.step() {}
+
+        let smallCost = measureFastest {
+            for _ in 0..<200 { small.prefetchRenderedContent() }
+        }
+        let largeCost = measureFastest {
+            for _ in 0..<200 { large.prefetchRenderedContent() }
+        }
+        let ratio = largeCost / max(smallCost, 1e-9)
+
+        print("[perf] warm decision, 4x the pictures: \(String(format: "%.1f", ratio))x")
+        XCTAssertLessThan(
+            ratio, 8,
+            "four times the pictures should cost about four times as much, not more")
+    }
+
     func testEditorWorkPerKeystrokeStaysUnderAFrame() {
         // Gates the part Swift owns: restyle plus relayout.
         //

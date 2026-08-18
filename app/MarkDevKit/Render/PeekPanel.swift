@@ -158,7 +158,10 @@ public enum PeekLoader {
             return .failure(PeekLoadFailure(reason: "Too large to preview (\(readable))"))
         }
 
-        guard let data = try? Data(contentsOf: url) else {
+        // Bytes rather than text from the cache: a peek accepts an encoding
+        // that opening the document does not, and a cache of decoded strings
+        // would have to settle on one policy for both.
+        guard let data = try? NoteTextCache.shared.read(url) else {
             return .failure(PeekLoadFailure(reason: "Could not read \(url.lastPathComponent)"))
         }
         // Latin-1 as a fallback, matching the Quick Look extension: a note

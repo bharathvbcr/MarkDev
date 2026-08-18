@@ -49,6 +49,30 @@ pub struct TagCount {
     pub count: u32,
 }
 
+/// A link a note points *out* at, with where it lands.
+///
+/// The mirror of [`Backlink`], and it carries the resolution rather than
+/// leaving the caller to ask again: "which notes is this one connected to"
+/// is one question, and answering it in two calls invites a caller to pair
+/// a link with a resolution made against a different index state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutgoingLink {
+    /// The target as written, without the `#anchor` or `|alias`.
+    pub target: String,
+    /// Heading anchor, when the link was `[[Note#Heading]]`.
+    pub anchor: Option<String>,
+    /// What the reader sees — the alias when there is one.
+    pub display: String,
+    pub line: u32,
+    /// UTF-16 offset of the link in this note.
+    pub offset: u32,
+    /// Vault-relative path of the note it resolves to, or `None` when the
+    /// link is broken. A broken link is reported rather than dropped: a note
+    /// linking at something that does not exist yet is ordinary in a vault,
+    /// and a caller that wants only the live ones can filter.
+    pub path: Option<String>,
+}
+
 /// A resolved link destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolution {
@@ -210,6 +234,30 @@ impl Vault {
             path: note.path.clone(),
             offset,
         })
+    }
+
+    /// The links `path` points out at, in the order they appear in the note.
+    ///
+    /// Duplicates are kept — a note may link the same target three times, and
+    /// which occurrence a caller cares about is the caller's business.
+    pub fn links(&self, path: &str) -> Vec<OutgoingLink> {
+        let Some(&index) = self.by_path.get(path) else {
+            return Vec::new();
+        };
+        self.notes[index]
+            .links
+            .iter()
+            .map(|link| OutgoingLink {
+                target: link.target.clone(),
+                anchor: link.anchor.clone(),
+                display: link.display.clone(),
+                line: link.line,
+                offset: link.offset,
+                path: self
+                    .lookup(&link.target)
+                    .map(|target| self.notes[target].path.clone()),
+            })
+            .collect()
     }
 
     /// Links pointing at `path`, newest-path-first is not meaningful here so

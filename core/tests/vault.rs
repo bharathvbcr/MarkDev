@@ -198,6 +198,60 @@ fn unresolvable_links_are_reported_as_broken() {
     assert!(vault.resolve("Nowhere", None).is_none());
 }
 
+// MARK: - Outgoing links
+
+#[test]
+fn outgoing_links_carry_the_note_they_resolve_to() {
+    let vault = demo();
+    let links = vault.links("Welcome.md");
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].target, "Architecture");
+    assert_eq!(links[0].path.as_deref(), Some("Architecture.md"));
+    // The alias is what the reader sees; the target is what resolves.
+    assert_eq!(links[1].display, "the roadmap");
+    assert_eq!(links[1].path.as_deref(), Some("Projects/Roadmap.md"));
+}
+
+#[test]
+fn outgoing_links_report_a_broken_target_rather_than_dropping_it() {
+    // Dropped instead, a caller counting links would report a note as having
+    // none — which is a different fact from "all of them are broken".
+    let vault = vault(&[("a.md", "# A\n\n[[Nowhere]] and [[A]]")]);
+    let links = vault.links("a.md");
+    assert_eq!(links.len(), 2);
+    assert_eq!(links[0].target, "Nowhere");
+    assert_eq!(links[0].path, None);
+    assert_eq!(links[1].path.as_deref(), Some("a.md"));
+}
+
+#[test]
+fn outgoing_links_keep_anchors_and_repeats() {
+    let vault = vault(&[
+        ("a.md", "[[B#Section]]\n\n[[B]] again [[B]]"),
+        ("b.md", "# B\n\n## Section\n"),
+    ]);
+    let links = vault.links("a.md");
+    assert_eq!(links.len(), 3, "a repeated link is three occurrences");
+    assert_eq!(links[0].anchor.as_deref(), Some("Section"));
+    assert!(links
+        .iter()
+        .all(|link| link.path.as_deref() == Some("b.md")));
+}
+
+#[test]
+fn a_note_outside_the_vault_has_no_outgoing_links() {
+    let vault = demo();
+    assert!(vault.links("Nothing/Here.md").is_empty());
+}
+
+#[test]
+fn outgoing_links_follow_an_edit() {
+    let mut vault = vault(&[("a.md", "# A"), ("b.md", "# B")]);
+    assert!(vault.links("a.md").is_empty());
+    vault.update("a.md", "# A\n\n[[b]]");
+    assert_eq!(vault.links("a.md")[0].path.as_deref(), Some("b.md"));
+}
+
 // MARK: - Backlinks
 
 #[test]

@@ -56,6 +56,10 @@ struct WorkspaceView: View {
 
     /// The vault's link graph. Owned here so every pane shares one index.
     @State private var vault = VaultIndex()
+
+    /// Reads ahead along the focused note's links. Owned beside the index it
+    /// asks, and for the same reason: one window, one read-ahead.
+    @State private var warmer = ConnectedNoteWarmer()
     @State private var outline: [VaultHeading] = []
     @State private var backlinks: [Backlink] = []
     @State private var mentions: [UnlinkedMention] = []
@@ -834,6 +838,7 @@ struct WorkspaceView: View {
             outline = []
             backlinks = []
             mentions = []
+            warmer.cancel()
             return
         }
 
@@ -844,12 +849,16 @@ struct WorkspaceView: View {
         guard let url = document.url, let path = vault.relativePath(for: url) else {
             backlinks = []
             mentions = []
+            warmer.cancel()
             return
         }
 
         vault.update(path: path, text: document.text)
         backlinks = vault.backlinks(for: path)
         mentions = vault.unlinkedMentions(for: path)
+        // After the update, so a link typed a moment ago is one this can see.
+        // Debounced inside the warmer: this runs on every keystroke.
+        warmer.warm(from: url, in: vault)
     }
 
     /// Publishes cheap parse-derived state immediately and schedules the

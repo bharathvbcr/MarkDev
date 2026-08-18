@@ -35,6 +35,22 @@ public struct UnlinkedMention: Codable, Identifiable, Sendable, Hashable {
     public var id: String { "\(path):\(line):\(offset)" }
 }
 
+/// A link a note points *out* at, and where it lands.
+public struct OutgoingLink: Codable, Identifiable, Sendable, Hashable {
+    /// The target as written, without the `#anchor` or `|alias`.
+    public let target: String
+    public let anchor: String?
+    /// What the reader sees — the alias when there is one.
+    public let display: String
+    public let line: UInt32
+    /// UTF-16 offset of the link in the note it was written in.
+    public let offset: UInt32
+    /// Vault-relative path of the note it resolves to, or `nil` when broken.
+    public let path: String?
+
+    public var id: String { "\(line):\(offset):\(target)" }
+}
+
 /// A full-text search hit.
 public struct SearchHit: Codable, Identifiable, Sendable, Hashable {
     public let path: String
@@ -162,6 +178,16 @@ public final class VaultIndex {
 
     public func backlinks(for path: String) -> [Backlink] {
         query(path) { md_vault_backlinks($0, $1) }
+    }
+
+    /// The links `path` points out at, in the order they appear in the note.
+    ///
+    /// The outbound half of ``backlinks(for:)``. Answered from the index
+    /// rather than by re-parsing the open document: the index read the note
+    /// when it indexed it, and a second parse of text already on screen is
+    /// work in service of nothing.
+    public func links(for path: String) -> [OutgoingLink] {
+        query(path) { md_vault_links($0, $1) }
     }
 
     public func unlinkedMentions(for path: String) -> [UnlinkedMention] {

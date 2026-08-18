@@ -387,7 +387,13 @@ public final class Workspace {
         if let existing = allDocuments.first(where: { $0.url == url }) {
             return existing
         }
-        let text = try String(contentsOf: url, encoding: .utf8)
+        // Through the cache, which serves the bytes only when the file's size
+        // and modification time still match what was read — so a note the
+        // warmer already pulled in opens without a synchronous read here. On a
+        // local disk that saves a millisecond; on iCloud Drive or a network
+        // volume it is the difference between opening a note and waiting on a
+        // volume with the main actor held.
+        let text = try NoteTextCache.shared.utf8Text(at: url)
         return OpenDocument(url: url, text: text)
     }
 

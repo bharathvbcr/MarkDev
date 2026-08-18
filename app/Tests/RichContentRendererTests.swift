@@ -151,6 +151,77 @@ final class RichContentRendererTests: XCTestCase {
         XCTAssertEqual(content.size.height, 200, accuracy: 1, "aspect ratio should hold")
     }
 
+    func testTwoNotesWithTheSameImageNameDoNotShareABitmap() throws {
+        // The cache used to be keyed on the reference *as written*, so two
+        // notes in different folders that both say `![](picture.png)` collided
+        // and the second was served the first one's bitmap. Reading ahead
+        // along a note's links turns that from unlucky into routine: it fills
+        // the cache from directories other than the open document's.
+        let parent = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevImageKeys-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: parent) }
+
+        func directory(named name: String, imageWidth: CGFloat) throws -> URL {
+            let directory = parent.appendingPathComponent(name)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            let size = CGSize(width: imageWidth, height: 100)
+            let image = NSImage(size: size)
+            image.lockFocus()
+            NSColor.systemBlue.drawSwatch(in: CGRect(origin: .zero, size: size))
+            image.unlockFocus()
+            let data = try XCTUnwrap(
+                NSBitmapImageRep(data: image.tiffRepresentation ?? Data())?
+                    .representation(using: .png, properties: [:]))
+            try data.write(to: directory.appendingPathComponent("picture.png"))
+            return directory
+        }
+
+        let first = try directory(named: "One", imageWidth: 100)
+        let second = try directory(named: "Two", imageWidth: 200)
+
+        let renderer = makeRenderer()
+        guard case .success(let one) = renderer.image(
+            at: "picture.png", relativeTo: first, maxWidth: 400),
+            case .success(let two) = renderer.image(
+                at: "picture.png", relativeTo: second, maxWidth: 400)
+        else { return XCTFail("both images should load") }
+
+        XCTAssertEqual(one.size.width, 100, accuracy: 0.5)
+        XCTAssertEqual(
+            two.size.width, 200, accuracy: 0.5,
+            "the second note's picture, not the first note's under the same name")
+    }
+
+    func testTheSameFileReachedTwoWaysIsOneCacheEntry() throws {
+        // The flip side of keying on the resolved file: an absolute reference
+        // and a relative one naming the same picture must not be two bitmaps.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevImageKeys-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let size = CGSize(width: 120, height: 60)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.systemGreen.drawSwatch(in: CGRect(origin: .zero, size: size))
+        image.unlockFocus()
+        let file = directory.appendingPathComponent("shared.png")
+        try XCTUnwrap(
+            NSBitmapImageRep(data: image.tiffRepresentation ?? Data())?
+                .representation(using: .png, properties: [:])
+        ).write(to: file)
+
+        let renderer = makeRenderer()
+        guard case .success(let relative) = renderer.image(
+            at: "shared.png", relativeTo: directory, maxWidth: 400),
+            case .success(let absolute) = renderer.image(
+                at: file.path, relativeTo: nil, maxWidth: 400)
+        else { return XCTFail("both spellings should load") }
+
+        XCTAssertTrue(relative.image === absolute.image, "one file, one bitmap")
+    }
+
     func testAMissingImageReportsItsName() {
         let renderer = makeRenderer()
         guard case .failure(let failure) = renderer.image(

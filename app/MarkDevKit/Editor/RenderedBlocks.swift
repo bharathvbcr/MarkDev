@@ -9,8 +9,8 @@
 import Foundation
 
 /// Content drawn *in place of* a block's source text.
-public struct RenderedBlock: Sendable, Equatable {
-    public enum Kind: Sendable, Equatable {
+public struct RenderedBlock: Sendable, Equatable, Hashable {
+    public enum Kind: Sendable, Equatable, Hashable {
         case math
         case diagram
         /// Alt text, shown if the file cannot be loaded.

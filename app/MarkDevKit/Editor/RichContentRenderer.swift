@@ -42,6 +42,44 @@ public struct RenderedContent: @unchecked Sendable {
     }
 }
 
+/// Everything a block's appearance depends on besides the block itself.
+///
+/// Bundled into one value because the render cache is keyed on all of it: a
+/// bitmap made at a different width, appearance, or ink is not the one the
+/// caller will ask for, so a prefetch built from a *different* context fills
+/// the cache with entries nothing will ever hit. Passing the context around
+/// keeps that impossible to get subtly wrong.
+public struct RenderContext: Equatable {
+    /// The column the content has to fit, in points.
+    public let width: CGFloat
+    public let dark: Bool
+    /// Point size a display formula is typeset at.
+    public let mathFontSize: CGFloat
+    /// Ink a formula is typeset in.
+    public let textColor: NSColor
+
+    public init(width: CGFloat, dark: Bool, mathFontSize: CGFloat, textColor: NSColor) {
+        self.width = width
+        self.dark = dark
+        self.mathFontSize = mathFontSize
+        self.textColor = textColor
+    }
+}
+
+/// One block, and everything needed to draw it.
+public struct RenderRequest: Equatable {
+    public let block: RenderedBlock
+    /// Directory relative image paths resolve against.
+    public let directory: URL?
+    public let context: RenderContext
+
+    public init(block: RenderedBlock, directory: URL?, context: RenderContext) {
+        self.block = block
+        self.directory = directory
+        self.context = context
+    }
+}
+
 /// Why a block could not be rendered.
 ///
 /// Surfaced rather than swallowed: a diagram that silently fails to appear is
@@ -118,12 +156,20 @@ public final class RichContentRenderer {
     /// up to ``maxRasterPixels``, and 128 of *those* is about 8 GB. The count
     /// still applies — this is the second of two bounds, and whichever binds
     /// first evicts.
-    private let pixelBudget = 64_000_000
+    ///
+    /// Not private: ``ContentPrefetcher`` sizes its own ceiling as a fraction
+    /// of this rather than writing down a second number that can drift out of
+    /// step with it. Settable at construction for the same reason — a test
+    /// that has to prove what happens at the ceiling should not have to
+    /// allocate sixty megapixels to reach it.
+    let pixelBudget: Int
 
     /// What the cache is currently holding, in pixels.
     private(set) var cachedPixels = 0
 
-    public init() {}
+    public init(pixelBudget: Int = 64_000_000) {
+        self.pixelBudget = pixelBudget
+    }
 
     /// Discards everything, for a theme or appearance change.
     public func invalidate() {
@@ -150,6 +196,92 @@ public final class RichContentRenderer {
         value.isFinite && value >= 1
     }
 
+    // MARK: - Rendering one block
+
+    /// Renders whatever `request` describes.
+    ///
+    /// The single mapping from "a block, here, now" to a render call. Both the
+    /// layout fragment that draws a block and the prefetcher that warms it
+    /// ahead of the scroll go through this, so the two cannot ask for
+    /// different bitmaps of the same thing — which, since the cache is keyed
+    /// on exactly these parameters, would mean the prefetch quietly warmed
+    /// entries nothing would ever hit.
+    public func render(_ request: RenderRequest) -> Result<RenderedContent, RenderFailure> {
+        switch request.block.kind {
+        case .math:
+            return math(
+                request.block.source,
+                fontSize: request.context.mathFontSize,
+                color: request.context.textColor,
+                display: true)
+        case .diagram:
+            return diagram(
+                request.block.source, maxWidth: request.context.width,
+                dark: request.context.dark)
+        case .image:
+            return image(
+                at: request.block.source, relativeTo: request.directory,
+                maxWidth: request.context.width)
+        }
+    }
+
+    /// Whether `request` is already answered, without rendering anything.
+    ///
+    /// A failure counts: it is a decision already taken, and re-taking it is
+    /// the work this is asked in order to avoid. Used by the prefetcher to
+    /// walk past what the reader has already scrolled through, which is most
+    /// of a warm on a document that has been open for a while.
+    public func isCached(_ request: RenderRequest) -> Bool {
+        let key = key(for: request)
+        return cache[key] != nil || failures[key] != nil
+    }
+
+    /// The cache key `request` would be answered from.
+    private func key(for request: RenderRequest) -> Key {
+        switch request.block.kind {
+        case .math:
+            return key(
+                forMath: request.block.source, fontSize: request.context.mathFontSize,
+                color: request.context.textColor, display: true)
+        case .diagram:
+            return key(
+                forDiagram: request.block.source, maxWidth: request.context.width,
+                dark: request.context.dark, scale: Self.rasterScale)
+        case .image:
+            return key(
+                forImage: resolve(request.block.source, relativeTo: request.directory)?.path
+                    ?? request.block.source,
+                maxWidth: request.context.width)
+        }
+    }
+
+    // Key builders. Each public render method and ``isCached`` derive their
+    // key from the same one: two places assembling a `Key` by hand is how a
+    // probe comes to disagree with the store it is probing.
+
+    private func key(
+        forMath latex: String, fontSize: CGFloat, color: NSColor, display: Bool
+    ) -> Key {
+        Key(
+            kind: display ? "math.display" : "math.inline",
+            source: latex,
+            scale: Self.bucket(fontSize * 10),
+            dark: isDark,
+            tint: Self.tint(of: color))
+    }
+
+    private func key(
+        forDiagram source: String, maxWidth: CGFloat, dark: Bool, scale: CGFloat
+    ) -> Key {
+        Key(
+            kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark,
+            raster: Self.bucket(scale * 10))
+    }
+
+    private func key(forImage file: String, maxWidth: CGFloat) -> Key {
+        Key(kind: "image", source: file, scale: Self.bucket(maxWidth), dark: false)
+    }
+
     // MARK: - Math
 
     /// Typesets `latex`, inline or display style.
@@ -159,12 +291,7 @@ public final class RichContentRenderer {
         color: NSColor,
         display: Bool
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(
-            kind: display ? "math.display" : "math.inline",
-            source: latex,
-            scale: Self.bucket(fontSize * 10),
-            dark: isDark,
-            tint: Self.tint(of: color))
+        let key = key(forMath: latex, fontSize: fontSize, color: color, display: display)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
@@ -248,9 +375,7 @@ public final class RichContentRenderer {
         dark: Bool,
         scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(
-            kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark,
-            raster: Self.bucket(scale * 10))
+        let key = key(forDiagram: source, maxWidth: maxWidth, dark: dark, scale: scale)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
@@ -397,7 +522,14 @@ public final class RichContentRenderer {
         relativeTo base: URL?,
         maxWidth: CGFloat
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = Key(kind: "image", source: source, scale: Self.bucket(maxWidth), dark: false)
+        // Keyed on the *resolved file*, not on the reference as written. Two
+        // notes in different folders that both say `![](diagram.png)` mean two
+        // different pictures, and a key built from the text alone served the
+        // first one's bitmap for the second. Warming the notes an open one
+        // links to turns that from unlucky into routine: a prefetch fills the
+        // cache from directories other than the document's own.
+        let url = resolve(source, relativeTo: base)
+        let key = key(forImage: url?.path ?? source, maxWidth: maxWidth)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
@@ -406,7 +538,7 @@ public final class RichContentRenderer {
             store(failure, for: key)
             return .failure(failure)
         }
-        guard let url = resolve(source, relativeTo: base) else {
+        guard let url else {
             let failure = RenderFailure(reason: "Remote images are not loaded")
             store(failure, for: key)
             return .failure(failure)

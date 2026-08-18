@@ -504,6 +504,29 @@ pub unsafe extern "C" fn md_vault_backlinks(
     handle.serve(&value)
 }
 
+/// JSON array of the links `path` points out at, each with the note it
+/// resolves to.
+///
+/// The outbound half of [`md_vault_backlinks`]. It exists so a caller can ask
+/// "what is this note connected to" without re-parsing the note it already
+/// has on screen — which is a second parse of the same text, answering a
+/// question the index answered when it read the file.
+///
+/// # Safety
+///
+/// `handle` must be live; `path` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_links(
+    handle: *mut VaultHandle,
+    path: *const c_char,
+) -> *const c_char {
+    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+        return ptr::null();
+    };
+    let value = handle.vault.links(path);
+    handle.serve(&value)
+}
+
 /// JSON array of unlinked mentions for `path`.
 ///
 /// # Safety
@@ -920,7 +943,14 @@ mod tests {
         assert!(!handle.is_null());
         assert_eq!(unsafe { md_vault_note_count(handle) }, 2);
 
+        let a = CString::new("A.md").expect("path");
         let b = CString::new("B.md").expect("path");
+        let links = read(unsafe { md_vault_links(handle, a.as_ptr()) }).expect("json");
+        assert!(
+            links.contains("\"path\":\"B.md\""),
+            "A links to B, resolved: {links}"
+        );
+
         let json = read(unsafe { md_vault_backlinks(handle, b.as_ptr()) }).expect("json");
         assert!(
             json.contains("A.md"),
@@ -1004,6 +1034,7 @@ mod tests {
         assert!(unsafe { md_vault_open(ptr::null()) }.is_null());
         assert_eq!(unsafe { md_vault_note_count(ptr::null()) }, 0);
         assert!(unsafe { md_vault_backlinks(ptr::null_mut(), ptr::null()) }.is_null());
+        assert!(unsafe { md_vault_links(ptr::null_mut(), ptr::null()) }.is_null());
         assert!(unsafe { md_vault_tags(ptr::null_mut()) }.is_null());
         assert!(unsafe { md_vault_notes_with_tag(ptr::null_mut(), ptr::null()) }.is_null());
         unsafe { md_vault_free(ptr::null_mut()) };
