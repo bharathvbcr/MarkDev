@@ -254,6 +254,218 @@ final class RichContentRendererTests: XCTestCase {
         }
     }
 
+    // MARK: - Vector images
+
+    /// An SVG whose nominal size is `size`, drawing a filled circle.
+    ///
+    /// A circle rather than a rectangle because the tests below measure the
+    /// *edge*: a shape whose outline is axis-aligned is sharp at any
+    /// resolution, and would pass whether it had been rendered or resampled.
+    private func circleSVG(size: Int) -> String {
+        """
+        <svg xmlns="http://www.w3.org/2000/svg" width="\(size)" height="\(size)" \
+        viewBox="0 0 \(size) \(size)"><circle cx="\(size / 2)" cy="\(size / 2)" \
+        r="\(size / 2 - 1)" fill="black"/></svg>
+        """
+    }
+
+    /// Writes `files` into a directory of their own, removed when the test ends.
+    private func directory(containing files: [String: String]) throws -> URL {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevVectors-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        for (name, contents) in files {
+            try contents.write(
+                to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        return directory
+    }
+
+    /// How many pixels of `image` sit on an edge — neither transparent nor
+    /// opaque.
+    ///
+    /// The measure of whether a picture was *rendered* at its size or blown up
+    /// from a smaller one. Rendering leaves a band one pixel wide along the
+    /// outline; resampling smears the same outline across as many pixels as it
+    /// was magnified by.
+    private func edgePixels(of image: CGImage) throws -> Int {
+        let width = image.width
+        let height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        try pixels.withUnsafeMutableBytes { raw in
+            guard let context = CGContext(
+                data: raw.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue)
+            else { throw RenderFailure(reason: "could not build a probe context") }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return stride(from: 3, to: pixels.count, by: 4)
+            .reduce(into: 0) { count, offset in
+                if pixels[offset] > 8, pixels[offset] < 247 { count += 1 }
+            }
+    }
+
+    func testAVectorKeepsItsOwnSizeInTheColumn() throws {
+        // A 16-point icon is a 16-point icon. Being able to draw a vector at
+        // any size is not a reason to stretch one across the column.
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 16)])
+        guard case .success(let content) = makeRenderer().image(
+            at: "icon.svg", relativeTo: directory, maxWidth: 400)
+        else { return XCTFail("an SVG should load") }
+
+        XCTAssertEqual(content.size.width, 16, accuracy: 0.5)
+        XCTAssertEqual(
+            try XCTUnwrap(content.cgImage).width, 32,
+            "rasterised at the drawn size and the Retina scale, not at the file's own")
+    }
+
+    func testAVectorAskedForLargerIsRenderedRatherThanResampled() throws {
+        // The whole of what "SVG support" means: a mark written at a nominal
+        // 16 points and asked for at 400 has to be *drawn* at 400. Enlarging
+        // the 16-point bitmap would look like this test passing — same size,
+        // same everything — and be a blur on the page, which is why what is
+        // measured here is the outline rather than the size.
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 16)])
+        let renderer = makeRenderer()
+
+        guard case .success(let drawn) = renderer.image(
+            at: "icon.svg", relativeTo: directory, maxWidth: 800, width: 400)
+        else { return XCTFail("an SVG should load") }
+        XCTAssertEqual(drawn.size.width, 400, accuracy: 0.5, "the width the note asked for")
+
+        let bitmap = try XCTUnwrap(drawn.cgImage)
+        XCTAssertEqual(bitmap.width, 800, "800 pixels for 400 points at the Retina scale")
+
+        // The control: the same file at its own size, enlarged to the same
+        // bitmap. Self-anchoring — it is the picture this would have produced
+        // had the vector been resampled rather than rendered.
+        guard case .success(let small) = renderer.image(
+            at: "icon.svg", relativeTo: directory, maxWidth: 16)
+        else { return XCTFail("an SVG should load") }
+        let context = try XCTUnwrap(
+            CGContext(
+                data: nil, width: bitmap.width, height: bitmap.height,
+                bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    | CGBitmapInfo.byteOrder32Big.rawValue))
+        context.interpolationQuality = .high
+        context.draw(
+            try XCTUnwrap(small.cgImage),
+            in: CGRect(x: 0, y: 0, width: bitmap.width, height: bitmap.height))
+
+        let rendered = try edgePixels(of: bitmap)
+        let resampled = try edgePixels(of: try XCTUnwrap(context.makeImage()))
+        XCTAssertLessThan(
+            rendered, resampled / 4,
+            "the outline is smeared over \(rendered) pixels, against \(resampled) for the "
+                + "same picture blown up — this vector was resampled, not rendered")
+    }
+
+    func testAVectorWithAHugeCanvasIsRasterisedAtTheSizeItIsDrawn() throws {
+        // The bound that matters for memory: the nominal size in the file says
+        // nothing about how big the picture is on the page, and a 4000-point
+        // canvas decoded at its own scale for a 600-point column is 64 times
+        // the bitmap anyone asked for.
+        let directory = try directory(containing: ["big.svg": circleSVG(size: 4000)])
+        guard case .success(let content) = makeRenderer().image(
+            at: "big.svg", relativeTo: directory, maxWidth: 600)
+        else { return XCTFail("an SVG should load") }
+
+        XCTAssertEqual(content.size.width, 600, accuracy: 0.5)
+        XCTAssertEqual(try XCTUnwrap(content.cgImage).width, 1200)
+    }
+
+    func testAVectorAskedForAtAnAbsurdSizeIsStillBounded() throws {
+        // A note can ask for any width it likes; the bitmap held for it cannot
+        // grow without limit. The picture is still drawn at the size asked
+        // for — it is the *detail* that gives way.
+        let directory = try directory(containing: ["big.svg": circleSVG(size: 100)])
+        guard case .success(let content) = makeRenderer().image(
+            at: "big.svg", relativeTo: directory, maxWidth: 20_000, width: 20_000)
+        else { return XCTFail("an SVG should load") }
+
+        let bitmap = try XCTUnwrap(content.cgImage)
+        XCTAssertEqual(content.size.width, 20_000, accuracy: 1)
+        XCTAssertLessThanOrEqual(
+            bitmap.width * bitmap.height, 17_000_000,
+            "\(bitmap.width)x\(bitmap.height) is past the raster cap")
+    }
+
+    func testARasterIsNotTreatedAsScalable() throws {
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 16)])
+        let renderer = makeRenderer()
+        XCTAssertTrue(renderer.isScalable(at: "icon.svg", relativeTo: directory))
+        XCTAssertTrue(renderer.isScalable(at: "ICON.SVG", relativeTo: directory))
+        XCTAssertFalse(renderer.isScalable(at: "icon.png", relativeTo: directory))
+        XCTAssertFalse(renderer.isScalable(at: "icon", relativeTo: directory))
+        XCTAssertFalse(
+            renderer.isScalable(at: "https://example.com/a.svg", relativeTo: directory),
+            "a remote reference resolves to no file at all")
+    }
+
+    func testAMalformedVectorFailsRatherThanDrawingNothing() throws {
+        let directory = try directory(containing: ["broken.svg": "this is not markup"])
+        guard case .failure = makeRenderer().image(
+            at: "broken.svg", relativeTo: directory, maxWidth: 400)
+        else { return XCTFail("an unreadable SVG should report a failure") }
+    }
+
+    // MARK: - A width the note asked for
+
+    func testTheWidthOnABlockReachesTheRender() throws {
+        // The wiring an `<img width=…>` depends on: the width travels on the
+        // block, through `render(_:)`, to the size the picture is drawn at.
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 400)])
+        let request = RenderRequest(
+            block: RenderedBlock(kind: .image(alt: ""), source: "icon.svg", width: 72),
+            directory: directory,
+            context: RenderContext(
+                width: 600, dark: false, mathFontSize: 16, textColor: .labelColor))
+
+        guard case .success(let content) = makeRenderer().render(request) else {
+            return XCTFail("an SVG should load")
+        }
+        XCTAssertEqual(content.size.width, 72, accuracy: 0.5)
+    }
+
+    func testAWidthPastTheColumnIsStillBoundedByIt() throws {
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 16)])
+        guard case .success(let content) = makeRenderer().image(
+            at: "icon.svg", relativeTo: directory, maxWidth: 300, width: 900)
+        else { return XCTFail("an SVG should load") }
+        XCTAssertEqual(content.size.width, 300, accuracy: 0.5)
+    }
+
+    func testTheCachedProbeAgreesWithTheRenderForAWidthedImage() throws {
+        // `isCached` is what the prefetcher walks past on, so it has to answer
+        // about the entry `render` would actually make. Two pictures of one
+        // file differing only in the width the note asked for are two entries.
+        let directory = try directory(containing: ["icon.svg": circleSVG(size: 400)])
+        let renderer = makeRenderer()
+        func request(width: CGFloat?) -> RenderRequest {
+            RenderRequest(
+                block: RenderedBlock(kind: .image(alt: ""), source: "icon.svg", width: width),
+                directory: directory,
+                context: RenderContext(
+                    width: 600, dark: false, mathFontSize: 16, textColor: .labelColor))
+        }
+
+        XCTAssertFalse(renderer.isCached(request(width: 72)))
+        guard case .success = renderer.render(request(width: 72)) else {
+            return XCTFail("an SVG should load")
+        }
+        XCTAssertTrue(renderer.isCached(request(width: 72)), "the probe missed what it just made")
+        XCTAssertFalse(
+            renderer.isCached(request(width: 144)),
+            "a different width is a different picture")
+        XCTAssertFalse(renderer.isCached(request(width: nil)))
+    }
+
     // MARK: - Caching
 
     func testResultsAreCachedAndInvalidatable() {

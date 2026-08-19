@@ -8,6 +8,7 @@
 import AppKit
 import BeautifulMermaid
 import SwiftMath
+import UniformTypeIdentifiers
 
 /// Something drawn in place of a block's source text.
 public struct RenderedContent: @unchecked Sendable {
@@ -142,6 +143,17 @@ public final class RichContentRenderer {
 
     private var cache: [Key: RenderedContent] = [:]
     private var failures: [Key: RenderFailure] = [:]
+    /// Where to find the bitmap already made for a vector that proved
+    /// expensive to rasterise, by file.
+    ///
+    /// A *key*, not a bitmap. Holding the picture here would put megapixels
+    /// outside the accounting `cachedPixels` does — which is the bug
+    /// ``pixelBudget`` was added to fix, reintroduced one layer up. This way
+    /// the cache stays the only owner of a bitmap: if the entry has since been
+    /// evicted the lookup simply misses, the picture is rasterised again, and
+    /// it is measured again.
+    private var expensive: [String: Key] = [:]
+    private var expensiveOrder: [String] = []
     private var order: [Key] = []
     private var failureOrder: [Key] = []
     /// Bounded: a long document full of diagrams should not pin every bitmap
@@ -167,8 +179,12 @@ public final class RichContentRenderer {
     /// What the cache is currently holding, in pixels.
     private(set) var cachedPixels = 0
 
-    public init(pixelBudget: Int = 64_000_000) {
+    public init(
+        pixelBudget: Int = 64_000_000,
+        expensiveRasterBudget: Duration = .milliseconds(250)
+    ) {
         self.pixelBudget = pixelBudget
+        self.expensiveRasterBudget = expensiveRasterBudget
     }
 
     /// Discards everything, for a theme or appearance change.
@@ -177,6 +193,8 @@ public final class RichContentRenderer {
         failures.removeAll()
         order.removeAll()
         failureOrder.removeAll()
+        expensive.removeAll()
+        expensiveOrder.removeAll()
         cachedPixels = 0
     }
 
@@ -221,7 +239,7 @@ public final class RichContentRenderer {
         case .image:
             return image(
                 at: request.block.source, relativeTo: request.directory,
-                maxWidth: request.context.width)
+                maxWidth: request.context.width, width: request.block.width)
         }
     }
 
@@ -251,7 +269,7 @@ public final class RichContentRenderer {
             return key(
                 forImage: resolve(request.block.source, relativeTo: request.directory)?.path
                     ?? request.block.source,
-                maxWidth: request.context.width)
+                width: Self.boundedWidth(request.context.width, request.block.width))
         }
     }
 
@@ -278,8 +296,33 @@ public final class RichContentRenderer {
             raster: Self.bucket(scale * 10))
     }
 
-    private func key(forImage file: String, maxWidth: CGFloat) -> Key {
-        Key(kind: "image", source: file, scale: Self.bucket(maxWidth), dark: false)
+    /// - Parameter width: the drawn width from ``boundedWidth(_:_:)``, not the
+    ///   raw column. An `<img width=72>` and the same file with no width are
+    ///   two different pictures of one file, and in the same column — and a
+    ///   vector opened in the viewer is a third, which is what makes this the
+    ///   whole of what distinguishes two requests for one file.
+    private func key(forImage file: String, width: CGFloat) -> Key {
+        Key(kind: "image", source: file, scale: Self.bucket(width), dark: false)
+    }
+
+    /// The width an image is drawn at, decided before its file is opened.
+    ///
+    /// A width asked for — an author's `<img width=…>`, or the viewer opening
+    /// a vector — is a request rather than a promise: the column still bounds
+    /// it. Nonsense is dropped rather than clamped, so a `width="0"` in a note
+    /// means "the file's own size" and not "no picture".
+    ///
+    /// Derivable from the request alone, which is what lets ``isCached(_:)``
+    /// answer without reading the file.
+    private static func boundedWidth(_ maxWidth: CGFloat, _ requested: CGFloat?) -> CGFloat {
+        guard let requested = sanitised(requested) else { return maxWidth }
+        return min(requested, maxWidth)
+    }
+
+    /// A caller-supplied width, or `nil` if it cannot mean anything.
+    private static func sanitised(_ width: CGFloat?) -> CGFloat? {
+        guard let width, isDrawable(width) else { return nil }
+        return width
     }
 
     // MARK: - Math
@@ -425,6 +468,23 @@ public final class RichContentRenderer {
     /// will be drawn at costs nothing in quality and bounds the allocation.
     private static let maxRasterPixels: CGFloat = 16_000_000
 
+    /// The pixels-per-point a picture `size` points across can be rasterised
+    /// at without passing ``maxRasterPixels``.
+    ///
+    /// Shared by the diagram and the vector-image paths, which have the same
+    /// problem: neither has pixels of its own, so both would otherwise
+    /// rasterise whatever their layout happens to measure. A nonsense scale
+    /// falls back to ``rasterScale`` rather than failing — it reaches this
+    /// from a caller-supplied number, and a picture is owed to the reader.
+    private static func fittedScale(_ requested: CGFloat, for size: CGSize) -> CGFloat {
+        var scale = requested.isFinite && requested >= 1 ? requested : rasterScale
+        let pixels = size.width * scale * size.height * scale
+        if pixels > maxRasterPixels {
+            scale *= (maxRasterPixels / pixels).squareRoot()
+        }
+        return scale
+    }
+
     /// Draws a laid-out diagram into a bitmap, the right way up.
     ///
     /// BeautifulMermaid's own image path cannot be used here. Its
@@ -461,11 +521,7 @@ public final class RichContentRenderer {
         let columnFit = min(1, maxWidth / bounds.width)
         let size = CGSize(width: bounds.width * columnFit, height: bounds.height * columnFit)
 
-        var scale = requested.isFinite && requested >= 1 ? requested : Self.rasterScale
-        let pixels = size.width * scale * size.height * scale
-        if pixels > Self.maxRasterPixels {
-            scale *= (Self.maxRasterPixels / pixels).squareRoot()
-        }
+        let scale = Self.fittedScale(requested, for: size)
 
         let pixelWidth = Int((size.width * scale).rounded())
         let pixelHeight = Int((size.height * scale).rounded())
@@ -517,10 +573,17 @@ public final class RichContentRenderer {
     // MARK: - Images
 
     /// Loads an embedded image, resolving relative paths against `base`.
+    ///
+    /// - Parameters:
+    ///   - width: the width to draw at whatever the file's own size — an
+    ///     author's `<img width=…>`, or the viewer opening a vector. Bounded
+    ///     by `maxWidth`, and ignored when it cannot mean anything. Without
+    ///     one the file's own size is used, scaled down to fit.
     public func image(
         at source: String,
         relativeTo base: URL?,
-        maxWidth: CGFloat
+        maxWidth: CGFloat,
+        width requested: CGFloat? = nil
     ) -> Result<RenderedContent, RenderFailure> {
         // Keyed on the *resolved file*, not on the reference as written. Two
         // notes in different folders that both say `![](diagram.png)` mean two
@@ -529,11 +592,13 @@ public final class RichContentRenderer {
         // links to turns that from unlucky into routine: a prefetch fills the
         // cache from directories other than the document's own.
         let url = resolve(source, relativeTo: base)
-        let key = key(forImage: url?.path ?? source, maxWidth: maxWidth)
+        let asked = Self.sanitised(requested)
+        let bounded = Self.boundedWidth(maxWidth, asked)
+        let key = key(forImage: url?.path ?? source, width: bounded)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
-        guard Self.isDrawable(maxWidth) else {
+        guard Self.isDrawable(bounded) else {
             let failure = RenderFailure(reason: "No room to draw an image")
             store(failure, for: key)
             return .failure(failure)
@@ -543,24 +608,223 @@ public final class RichContentRenderer {
             store(failure, for: key)
             return .failure(failure)
         }
-        // Both dimensions, and both finite: a file NSImage decodes to a zero or
-        // NaN size scales to a NaN height, which reaches TextKit as a fragment
-        // measurement and brings the layout down a long way from this line.
-        guard let image = NSImage(contentsOf: url),
-            Self.isDrawable(image.size.width), Self.isDrawable(image.size.height)
-        else {
+
+        let scalable = Self.isScalable(url)
+        // Weighed before it is opened, because opening it is already most of
+        // the cost. See ``maxVectorBytes``.
+        if scalable, let oversized = Self.tooLargeToDraw(url) {
+            store(oversized, for: key)
+            return .failure(oversized)
+        }
+
+        guard let image = NSImage(contentsOf: url) else {
             let failure = RenderFailure(reason: "Missing image: \(url.lastPathComponent)")
             store(failure, for: key)
             return .failure(failure)
         }
-
-        var size = image.size
-        if size.width > maxWidth {
-            size = CGSize(width: maxWidth, height: size.height * (maxWidth / size.width))
+        // Both dimensions, and both finite: a file NSImage decodes to a zero or
+        // NaN size scales to a NaN height, which reaches TextKit as a fragment
+        // measurement and brings the layout down a long way from this line.
+        guard Self.isDrawable(image.size.width), Self.isDrawable(image.size.height) else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
         }
-        let rendered = RenderedContent(image: image, size: size)
+
+        // A width the note asked for is honoured as asked; without one the
+        // file's own size stands, scaled down only if it overruns the column.
+        // Growing a picture is therefore always something the document said,
+        // never something this decided — which is what keeps a small icon
+        // small.
+        let natural = image.size
+        let drawnWidth = asked == nil ? min(natural.width, bounded) : bounded
+        let size = Self.drawable(
+            CGSize(width: drawnWidth, height: natural.height * (drawnWidth / natural.width)))
+
+        guard scalable else {
+            let rendered = RenderedContent(image: image, size: size)
+            store(rendered, for: key)
+            return .success(rendered)
+        }
+        return vector(image, at: size, from: url.path, for: key)
+    }
+
+    /// Draws a vector at `size`, or serves one already drawn if drawing it
+    /// again would cost too much.
+    ///
+    /// A vector is rasterised at the size it is drawn, not resampled from the
+    /// nominal size written in the file: that is what makes an SVG asked for
+    /// at twice its nominal width sharp instead of blurred, and it is also
+    /// what bounds the bitmap — a 4,000-point viewBox drawn 600 points wide
+    /// would otherwise be decoded at its own scale and held at it.
+    ///
+    /// The exception is the file that proved expensive. Rasterising is
+    /// **geometry**-bound, not pixel-bound: a path-dense SVG measured here at
+    /// ~2.6ms per kilobyte costs the same second whether it is drawn at 300
+    /// points or 3,000. Since a picture is re-rendered whenever the width it
+    /// is drawn at changes, and the column changes with every step of a window
+    /// resize, that second is otherwise paid again and again — on the main
+    /// actor, where it is a stalled app rather than a slow one. So a
+    /// rasterisation past ``expensiveRasterBudget`` is kept, and every later
+    /// size of that file is served by scaling what is kept.
+    ///
+    /// That is the one place this deliberately magnifies rather than
+    /// re-renders, and the trade is stated plainly: a heavy picture goes
+    /// slightly soft when the column changes, instead of freezing the window
+    /// every time it does.
+    private func vector(
+        _ image: NSImage, at size: CGSize, from file: String, for key: Key
+    ) -> Result<RenderedContent, RenderFailure> {
+        if let already = expensive[file], let kept = cache[already], let bitmap = kept.cgImage {
+            let content = RenderedContent(cgImage: bitmap, size: size)
+            store(content, for: key)
+            return .success(content)
+        }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        guard let rendered = rasterise(image, at: size) else {
+            let failure = RenderFailure(reason: "Could not rasterise image")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+        if clock.now - started > expensiveRasterBudget { remember(key, for: file) }
+
         store(rendered, for: key)
         return .success(rendered)
+    }
+
+    /// The most a vector file may weigh before it is refused, in bytes.
+    ///
+    /// Rasterising one is unbounded work with no cheap way to predict it and
+    /// no way to interrupt it: it happens on the main actor, synchronously,
+    /// while TextKit builds a fragment. Measured on this machine, path-dense
+    /// SVG costs about 2.6ms per kilobyte — 104KB drew in 0.36s and 10MB in
+    /// **30 seconds**, which is not a slow app but a hung one.
+    ///
+    /// Bytes are a poor predictor of drawing cost and the only one available
+    /// before drawing. The bound is set where it refuses almost nothing real:
+    /// of 400 SVGs found on this machine the median was 1.4KB and the 99th
+    /// percentile 315KB, so a megabyte is far out in the tail — and what it
+    /// buys is that no note can hang the window for half a minute.
+    private static let maxVectorBytes = 1_048_576
+
+    /// A rasterisation slower than this marks its file as expensive to draw.
+    ///
+    /// Not private, and settable at construction, so a test can prove what
+    /// happens past it without needing a fixture slow enough to get there —
+    /// which would be a test whose meaning changed with the machine it ran on.
+    let expensiveRasterBudget: Duration
+
+    /// Refuses a file too heavy to rasterise, naming what it weighs.
+    ///
+    /// A file whose size cannot be read is *not* refused: the read is an
+    /// optimisation, and failing closed on a stat error would mean a picture
+    /// on a volume with awkward permissions silently stopped drawing.
+    private static func tooLargeToDraw(_ url: URL) -> RenderFailure? {
+        guard let bytes = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+            bytes > maxVectorBytes
+        else { return nil }
+        let megabytes = Double(bytes) / 1_048_576
+        return RenderFailure(
+            reason: String(
+                format: "%@ is too large to draw (%.1f MB)", url.lastPathComponent, megabytes))
+    }
+
+    /// The most either side of a drawn picture may measure, in points.
+    ///
+    /// A vector's aspect ratio is whatever its `viewBox` says, so a note can
+    /// ask for a picture 100,000 points tall as easily as a square one — and
+    /// that measurement is handed to TextKit as a fragment's height. The cap
+    /// is far past any real picture: a 900x20,000 pixel screenshot drawn in a
+    /// 600-point column comes to 13,333 points and is untouched.
+    private static let maxDrawnLength: CGFloat = 20_000
+
+    /// `size` brought back to something that can actually be drawn: never
+    /// longer than ``maxDrawnLength`` on a side, and never thinner than a
+    /// point.
+    ///
+    /// The floor is not defensive tidying. A hairline divider is a real thing
+    /// to put in a note — a 10,000x1 `viewBox` — and in a 600-point column it
+    /// comes to 0.06 points tall, which is a picture no bitmap has a row for.
+    /// Refusing it would tell the reader their divider is broken; drawing it
+    /// one point tall is what they asked for as nearly as the screen allows.
+    /// The shape is kept while it can be, and given up rather than the
+    /// picture.
+    private static func drawable(_ size: CGSize) -> CGSize {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            return CGSize(width: 1, height: 1)
+        }
+        let excess = max(size.width, size.height) / maxDrawnLength
+        let fitted = excess > 1
+            ? CGSize(width: size.width / excess, height: size.height / excess) : size
+        return CGSize(width: max(1, fitted.width), height: max(1, fitted.height))
+    }
+
+    /// Whether the file `source` names can be drawn at any size without
+    /// losing detail.
+    ///
+    /// An SVG has no pixels of its own — the size in the file is a nominal
+    /// one — so it is rasterised at the size it will be drawn. A raster has
+    /// pixels, and enlarging them is not detail, which is why the two are
+    /// sized by different rules and why ``ContentZoomViewer`` has to ask.
+    public func isScalable(at source: String, relativeTo base: URL?) -> Bool {
+        guard let url = resolve(source, relativeTo: base) else { return false }
+        return Self.isScalable(url)
+    }
+
+    /// Read from the file's name rather than its bytes, because this is asked
+    /// before anything has been loaded — it decides how a picture is *sized*,
+    /// and the size decides the bitmap that is then made.
+    ///
+    /// The two cannot disagree in a way that matters: `NSImage(contentsOf:)`
+    /// resolves a file's type from its extension as well, and measured here,
+    /// it declines a file whose extension and content disagree — SVG markup in
+    /// a `.png`, and a PNG in a `.svg`, both come back nil. So a mislabelled
+    /// file is a clean failure rather than a vector sized as a raster.
+    private static func isScalable(_ url: URL) -> Bool {
+        UTType(filenameExtension: url.pathExtension)?.conforms(to: .svg) ?? false
+    }
+
+    /// Draws a vector image into a bitmap of its own, at the size it will be
+    /// drawn on the page.
+    ///
+    /// `NSImage` is asked to draw rather than to hand back a `CGImage`:
+    /// `cgImage(forProposedRect:)` rasterises at the *display's* backing scale
+    /// whatever is asked of it, so the detail a picture is held at would
+    /// depend on which screen the app happened to be on.
+    /// A vector's detail comes from the size it is laid out at rather than
+    /// from a scale of its own: the viewer opens one *larger*, where it opens
+    /// a diagram at the same size in more detail. So there is one scale here —
+    /// the Retina one — and no knob for a caller to disagree with.
+    private func rasterise(_ image: NSImage, at size: CGSize) -> RenderedContent? {
+        guard Self.isDrawable(size.width), Self.isDrawable(size.height) else { return nil }
+
+        let scale = Self.fittedScale(Self.rasterScale, for: size)
+        let pixelWidth = Int((size.width * scale).rounded())
+        let pixelHeight = Int((size.height * scale).rounded())
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+
+        guard let context = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue)
+        else { return nil }
+
+        // Left transparent where the picture does not paint: an SVG with no
+        // background of its own belongs on the page, not on a white card.
+        let graphics = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphics
+        image.draw(
+            in: CGRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)),
+            from: .zero, operation: .sourceOver, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let bitmap = context.makeImage() else { return nil }
+        return RenderedContent(cgImage: bitmap, size: size)
     }
 
     /// Resolves an image reference to a local file.
@@ -614,6 +878,18 @@ public final class RichContentRenderer {
         if failures.updateValue(failure, forKey: key) == nil { failureOrder.append(key) }
         while failureOrder.count > limit {
             failures.removeValue(forKey: failureOrder.removeFirst())
+        }
+    }
+
+    /// Notes where the bitmap for an expensive file can be found.
+    ///
+    /// Bounded by count alone, which is all it needs: what is stored is a key,
+    /// and the pixels it points at are the cache's and are bounded there.
+    /// Dropped wholesale by ``invalidate()``, along with what it points at.
+    private func remember(_ key: Key, for file: String) {
+        if expensive.updateValue(key, forKey: file) == nil { expensiveOrder.append(file) }
+        while expensiveOrder.count > limit {
+            expensive.removeValue(forKey: expensiveOrder.removeFirst())
         }
     }
 

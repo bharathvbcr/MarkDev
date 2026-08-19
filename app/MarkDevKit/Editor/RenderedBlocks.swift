@@ -6,6 +6,7 @@
 //  once per parse.
 //
 
+import CoreGraphics
 import Foundation
 
 /// Content drawn *in place of* a block's source text.
@@ -20,10 +21,19 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
     public let kind: Kind
     /// The source to render — LaTeX, Mermaid, or an image path.
     public let source: String
+    /// A width the note asked for, in points, if it said one.
+    ///
+    /// Only an `<img width=…>` can: Markdown has no way to spell it, so this
+    /// is `nil` for everything a `![](…)` produces. Carried on the block
+    /// rather than resolved here because it is part of *what to draw*, which
+    /// is what the render cache is keyed on — deciding it a second time at the
+    /// render call is how a warmed entry becomes one nothing ever hits.
+    public let width: CGFloat?
 
-    public init(kind: Kind, source: String) {
+    public init(kind: Kind, source: String, width: CGFloat? = nil) {
         self.kind = kind
         self.source = source
+        self.width = width
     }
 }
 
@@ -93,6 +103,8 @@ public struct RenderedBlocks: Sendable, Equatable {
                 content = Self.math(block, in: text)
             case .mermaidBlock:
                 content = Self.diagram(block, in: text)
+            case .htmlBlock:
+                content = Self.htmlImage(block.range, in: text)
             case .paragraph:
                 paragraphs.append((index, block))
                 continue
@@ -126,7 +138,19 @@ public struct RenderedBlocks: Sendable, Equatable {
             { continue }
             // Cheapest test first, and it reads two characters rather than
             // copying the paragraph out.
-            guard Self.looksLikeAnImage(block.range, in: text) else { continue }
+            //
+            // A paragraph can hold the HTML spelling as well: an `<img>` on a
+            // line of its own is a block, but the same tag under a list bullet
+            // or on the line after a sentence is inline HTML inside a
+            // paragraph, and it is the same picture either way.
+            guard Self.looksLikeAnImage(block.range, in: text) else {
+                if let content = Self.htmlImage(block.range, in: text),
+                    let range = Self.clamp(block.range, to: text.length)
+                {
+                    found.append(Entry(block: index, range: range, content: content))
+                }
+                continue
+            }
 
             let spans: [StyleSpan]
             if let built = images {
@@ -267,6 +291,51 @@ public struct RenderedBlocks: Sendable, Equatable {
         var last = end - 1
         while last > first, isWhitespace(text.character(at: last)) { last -= 1 }
         return text.character(at: last) == 0x29  // )
+    }
+
+    /// A block that is one `<img>` tag and nothing else.
+    ///
+    /// Nothing else in raw HTML renders: the tag is recognised precisely so
+    /// that the source it replaces is certainly a picture. Anything this
+    /// refuses stays on the page as the markup the author wrote, which is the
+    /// honest answer for HTML the editor cannot draw.
+    ///
+    /// The two cheap tests come first and read characters straight out of the
+    /// string, for the reason ``looksLikeAnImage(_:in:)`` does: this is asked
+    /// of every paragraph and every HTML block in the document on every parse,
+    /// and an HTML block can be a whole page of markup. Copying each one out
+    /// to look at it would be that allocation per block per keystroke.
+    private static func htmlImage(_ range: NSRange, in text: NSString) -> RenderedBlock? {
+        guard let body = clamp(range, to: text.length),
+            body.length <= HTMLImageTag.maximumLength,
+            looksLikeAnImageTag(body, in: text),
+            let tag = HTMLImageTag.parse(text.substring(with: body))
+        else { return nil }
+        return RenderedBlock(
+            kind: .image(alt: tag.alt), source: tag.source, width: tag.width)
+    }
+
+    /// Whether `body`'s text opens with `<img` and closes with `>`.
+    ///
+    /// Five characters, and the decision for everything that is not a picture:
+    /// a `<div>`, a comment, a table of raw HTML. ``HTMLImageTag/parse(_:)``
+    /// decides for what gets past it.
+    private static func looksLikeAnImageTag(_ body: NSRange, in text: NSString) -> Bool {
+        guard body.length >= 4 else { return false }
+
+        var first = body.location
+        let end = NSMaxRange(body)
+        while first < end, isWhitespace(text.character(at: first)) { first += 1 }
+        guard first + 3 < end,
+            text.character(at: first) == 0x3C,  // <
+            (text.character(at: first + 1) | 0x20) == 0x69,  // i
+            (text.character(at: first + 2) | 0x20) == 0x6D,  // m
+            (text.character(at: first + 3) | 0x20) == 0x67  // g
+        else { return false }
+
+        var last = end - 1
+        while last > first, isWhitespace(text.character(at: last)) { last -= 1 }
+        return text.character(at: last) == 0x3E  // >
     }
 
     private static func isWhitespace(_ character: unichar) -> Bool {
