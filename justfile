@@ -88,10 +88,10 @@ generate: icons
 # --- App -------------------------------------------------------------------
 
 build: build-core-debug generate
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug build
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation build
 
 build-release: build-core generate
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release build
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release -skipPackagePluginValidation build
 
 # A Release signed with a real identity.
 #
@@ -156,6 +156,7 @@ build-release-signed IDENTITY="Apple Development": build-core generate
         DEVELOPMENT_TEAM="$team" \
         CODE_SIGN_STYLE=Manual \
         ENABLE_HARDENED_RUNTIME=YES \
+        -skipPackagePluginValidation \
         build
 
 # Copy a built Release into /Applications and make the system notice it.
@@ -192,7 +193,7 @@ install-only:
 test: test-core test-app
 
 test-app: build-core-debug generate
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug test
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test
 
 run: build
     open "$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')/MarkDev.app"
