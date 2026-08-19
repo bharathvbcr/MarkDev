@@ -230,12 +230,6 @@ extension BlockDecoration {
         return .tableRow(isHeader: isHeader, isLast: isLast)
     }
 
-    private static func clamp(_ range: NSRange, to length: Int) -> NSRange? {
-        let location = min(max(range.location, 0), length)
-        let size = min(range.length, length - location)
-        return size > 0 ? NSRange(location: location, length: size) : nil
-    }
-
     /// Which piece of a multi-line block `range` covers.
     static func edge(of range: NSRange, within block: NSRange) -> BlockEdge {
         let blockEnd = block.location + block.length
