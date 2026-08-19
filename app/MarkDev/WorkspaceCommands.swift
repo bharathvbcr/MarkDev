@@ -110,9 +110,10 @@ struct WorkspaceCommands: Commands {
                 modifiers: [.command, .shift])
             actionButton("Clear Proofreading Marks", action: .clearProofreading)
             Divider()
-            actionButton("Summarize Document", action: .summarizeDocument)
-            actionButton("Suggest a Title", action: .suggestTitle)
-            actionButton("Suggest Tags", action: .suggestTags)
+            actionButton("Read This Note", action: .analyzeNote)
+            Divider()
+            actionButton("Ask MANVI…", action: .askHarness)
+            actionButton("Run MANVI in a Terminal", action: .openHarnessTerminal)
         }
     }
 

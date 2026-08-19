@@ -35,9 +35,14 @@ public enum CommandAction: Sendable, Equatable {
     case proofreadDocument
     /// Remove the proofreading underlines.
     case clearProofreading
-    case summarizeDocument
-    case suggestTitle
-    case suggestTags
+    /// Read the note and fill in the Assist panel's structured brief.
+    case analyzeNote
+    /// Open the Assist panel on the local harness.
+    case askHarness
+    /// Open a terminal already running the harness.
+    case openHarnessTerminal
+    /// Swap the terminal between the drawer and the inspector.
+    case moveTerminal
 }
 
 /// Something the palette can run.

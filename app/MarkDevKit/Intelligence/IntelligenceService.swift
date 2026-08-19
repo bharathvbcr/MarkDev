@@ -160,6 +160,32 @@ public final class IntelligenceService {
         }
     }
 
+    /// Reads a whole note and reports on it as fields.
+    ///
+    /// Structured output, and authored rather than transformed: the summary and
+    /// the title are the model's own sentences about the note, so this keeps
+    /// the default guardrails rather than the permissive ones — the permissive
+    /// set exists for text the *author* wrote and this request produces none of
+    /// the author's text back.
+    ///
+    /// Cold rather than creative. A title suggested twice for the same note
+    /// coming back differently reads as the feature being unreliable, which is
+    /// worse than it reading as unimaginative.
+    public func brief(_ text: String) async throws -> NoteBrief {
+        try requireReady()
+        let session = LanguageModelSession(
+            model: authoring, instructions: NoteBriefPrompt.instructions)
+        do {
+            let response = try await session.respond(
+                to: NoteBriefPrompt.prompt(for: text),
+                generating: NoteBrief.self,
+                options: GenerationOptions(temperature: 0.2))
+            return response.content.normalized
+        } catch {
+            throw Self.describe(error)
+        }
+    }
+
     private func requireReady() throws {
         // Re-read rather than trust the cached value: the model can finish
         // downloading between the panel opening and a button being pressed,

@@ -182,6 +182,20 @@ final class MarkDevApplicationDelegate: NSObject, NSApplicationDelegate {
         WindowCloseRegistry.shared.reviewForTermination() ? .terminateNow : .terminateCancel
     }
 
+    /// Ends every shell the app forked.
+    ///
+    /// A terminal's process used to die with the view that hosted it. It no
+    /// longer does — the pty is owned by ``TerminalSessions`` so the terminal
+    /// can be moved between the drawer and the sidebar without restarting — so
+    /// the guarantee has to be restated at the two points a view teardown used
+    /// to cover. The window's is in `WorkspaceView.onDisappear`; this is the
+    /// other, and it is the one that matters most, because Quit is how a Mac
+    /// app usually ends and a shell orphaned there outlives everything that
+    /// could find it.
+    func applicationWillTerminate(_ notification: Notification) {
+        LiveShells.shared.endAll()
+    }
+
     /// Receives files opened from Finder, the Dock, or `open`.
     ///
     /// This is the hook, not SwiftUI's `onOpenURL`: that covers URL schemes,

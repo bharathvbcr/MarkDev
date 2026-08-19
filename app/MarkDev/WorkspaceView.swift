@@ -27,6 +27,11 @@ struct WorkspaceView: View {
     @AppStorage("shell.inspectorWidth") private var storedInspectorWidth =
         Double(GlassTheme.inspector.preferred)
     @AppStorage("shell.showTerminal") private var showTerminal = false
+    /// Which panel the terminal is drawn in. A preference about how someone
+    /// works, so it outlives the window like the others.
+    @AppStorage("shell.terminalPlacement") private var terminalPlacement: TerminalPlacement =
+        .drawer
+    @AppStorage("shell.assistEngine") private var assistEngine: AssistEngine = .apple
     @AppStorage("shell.terminalHeight") private var storedTerminalHeight =
         Double(GlassTheme.terminal.preferred)
 
@@ -87,6 +92,10 @@ struct WorkspaceView: View {
 
     /// Whether the link graph is up.
     @State private var showGraph = false
+
+    /// Where MANVI is, or `nil` if it could not be found. See the note on
+    /// ``findHarness()``.
+    @State private var harnessBinary: URL?
 
     /// Every open shell. Owned here, not by the drawer, so hiding the drawer
     /// does not kill a running build — see ``TerminalSessions``.
@@ -172,7 +181,7 @@ struct WorkspaceView: View {
                     // glass something to refract instead of a flat panel.
                     .backgroundExtensionEffect()
 
-                    if showTerminal {
+                    if showTerminal && terminalPlacement == .drawer {
                         ResizeHandle(
                             axis: .vertical,
                             label: "Terminal divider",
@@ -184,18 +193,14 @@ struct WorkspaceView: View {
                                 storedTerminalHeight = Double(GlassTheme.terminal.preferred)
                             })
                     }
-                    if terminalMounted {
-                        // Collapsed rather than removed. Removing the drawer
-                        // tears down its host views, and tearing down a host
-                        // ends its shell — so ⌘J would throw away whatever was
-                        // running. Height zero keeps the ptys alive.
-                        TerminalDrawer(
-                            sessions: terminals,
-                            document: workspace.document(in: workspace.focusedPane)?.url,
-                            vault: workspace.vaultRoot,
-                            onClose: { showTerminal = false },
-                            onError: { errorMessage = $0 }
-                        )
+                    if terminalMounted && terminalPlacement == .drawer {
+                        // Collapsed rather than removed. The shells no longer
+                        // depend on it — they are owned by ``TerminalSessions``
+                        // so that the terminal can be moved to the inspector
+                        // without restarting — but rebuilding the whole panel
+                        // on every ⌘J still costs a relayout of every session's
+                        // view for nothing.
+                        terminalPanel(placement: .drawer)
                         .frame(height: showTerminal ? terminalHeight : 0)
                         .clipped()
                         .opacity(showTerminal ? 1 : 0)
@@ -338,6 +343,7 @@ struct WorkspaceView: View {
         // for each request besides — so the inbox picks the surface with a
         // window on screen instead of trusting whoever asked last.
         .onAppear {
+            findHarness()
             if let inboxRegistration { DocumentInbox.shared.unregister(inboxRegistration) }
             inboxRegistration = DocumentInbox.shared.register(
                 readiness: { surface.readiness },
@@ -355,15 +361,127 @@ struct WorkspaceView: View {
             }
             inboxRegistration = nil
             for task in statsTasks.values { task.cancel() }
+            // The shells are owned by ``TerminalSessions`` now, not by the
+            // views, which is what lets the terminal be moved between panels
+            // without restarting. The cost is that a window going away no
+            // longer ends them by itself, so it has to be said here — and
+            // again in ``LiveShells`` for the case a window never closes,
+            // which is Quit.
+            terminals.endAllHosts()
         }
     }
 
     // MARK: - Terminal
 
-    /// Shows or hides the drawer, mounting it the first time.
+    /// The terminal, wherever it is being drawn.
+    ///
+    /// One builder for both placements rather than a view per panel: the two
+    /// differ only in chrome, and a second copy is how the drawer's `+` and the
+    /// sidebar's `+` come to open different things.
+    private func terminalPanel(placement: TerminalPlacement) -> some View {
+        TerminalDrawer(
+            sessions: terminals,
+            document: workspace.document(in: workspace.focusedPane)?.url,
+            vault: workspace.vaultRoot,
+            placement: placement,
+            onClose: placement == .drawer ? { showTerminal = false } : nil,
+            onMove: { setTerminalPlacement(placement.other) },
+            onOpenHarness: harnessBinary == nil ? nil : { openHarnessTerminal() },
+            onError: { errorMessage = $0 }
+        )
+    }
+
+    /// Whether the terminal is on screen right now.
+    ///
+    /// Two different questions depending on where it lives, which is why this
+    /// is derived rather than stored: in the drawer it is a panel that is open
+    /// or closed, and in the inspector it is a *tab*, so it is showing exactly
+    /// when the inspector is open on it. A single stored flag would go out of
+    /// step the first time somebody clicked the tab directly, and ⌘J would then
+    /// toggle the wrong way round.
+    private var isTerminalVisible: Bool {
+        switch terminalPlacement {
+        case .drawer: showTerminal
+        case .inspector: showInspector && inspectorTab == .terminal
+        }
+    }
+
+    /// Shows or hides the terminal, wherever it lives.
     private func setTerminal(visible: Bool) {
-        if visible { terminalMounted = true }
-        showTerminal = visible
+        switch terminalPlacement {
+        case .drawer:
+            if visible { terminalMounted = true }
+            showTerminal = visible
+        case .inspector:
+            if visible {
+                showInspector = true
+                inspectorTab = .terminal
+            } else if inspectorTab == .terminal {
+                // Leaving the tab selected would mean ⌘J appeared to do
+                // nothing. The inspector itself stays open: the reader asked to
+                // put the terminal away, not the panel it is in.
+                inspectorTab = .outline
+            }
+        }
+    }
+
+    /// Moves the terminal between the drawer and the inspector.
+    ///
+    /// Nothing restarts: both panels draw the same sessions, and the pty view
+    /// is re-parented rather than rebuilt — see ``TerminalProcessHost``. What
+    /// this has to do is make sure the destination is actually on screen, since
+    /// moving a terminal into a panel the reader has closed is a move that
+    /// looks like a deletion.
+    private func setTerminalPlacement(_ placement: TerminalPlacement) {
+        terminalPlacement = placement
+        terminalMounted = true
+        setTerminal(visible: true)
+    }
+
+    /// Where MANVI is, looked up once for the window.
+    ///
+    /// Held rather than computed. It decides whether the terminal's `+` offers
+    /// to run the harness, so it is read while a view is being built — and
+    /// `body` is re-evaluated on every keystroke, which would make the lookup a
+    /// handful of filesystem probes per character typed. Looking it up once
+    /// also buys the *full* search, login shell included, which is the only way
+    /// to see a `PATH` set by a version manager.
+
+    /// Opens a shell already running the harness, rooted at the note's folder.
+    ///
+    /// The command is typed into an interactive login shell rather than being
+    /// the shell — see ``TerminalSession/initialCommand``. Rooted at the note
+    /// rather than at the vault because that is what the reader is working on,
+    /// and MANVI resolves everything it reads from where it was started.
+    private func findHarness() {
+        let configured = writingTools.harness.settings.binaryPath
+        Task {
+            harnessBinary = await HarnessLocator.locate(configured: configured)?.url
+        }
+    }
+
+    private func openHarnessTerminal() {
+        guard let binary = harnessBinary else {
+            errorMessage =
+                "MarkDev couldn’t find MANVI. Set its path under MANVI settings in the Assist "
+                + "panel."
+            return
+        }
+        let directory =
+            workspace.document(in: workspace.focusedPane)?.url?.deletingLastPathComponent()
+            ?? workspace.vaultRoot
+        let config = TerminalSession.resolve(
+            document: nil,
+            vault: directory,
+            initialCommand: binary.path.contains(" ") ? "\"\(binary.path)\"" : binary.path)
+        do {
+            try terminals.reveal(config)
+            setTerminal(visible: true)
+        } catch let failure as TerminalOpenFailure {
+            errorMessage = failure.reason
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     /// Opens a shell rooted at `directory`, from the sidebar.
@@ -700,7 +818,12 @@ struct WorkspaceView: View {
             backlinks: backlinks,
             mentions: mentions,
             assistant: writingTools.document,
+            harness: writingTools.harness,
+            terminal: terminalPlacement == .inspector
+                ? AnyView(terminalPanel(placement: .inspector))
+                : nil,
             tab: $inspectorTab,
+            engine: $assistEngine,
             onReveal: { offset in
                 reveals[workspace.focusedPane] = RevealRequest(offset: offset)
             },
@@ -708,7 +831,8 @@ struct WorkspaceView: View {
                 guard let url = vault.url(for: path) else { return }
                 openFile(url)
                 reveals[workspace.focusedPane] = RevealRequest(offset: Int(offset))
-            }
+            },
+            onMoveTerminalHere: { setTerminalPlacement(.inspector) }
         )
         .padding(.top, Self.toolbarHeight)
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
@@ -846,6 +970,14 @@ struct WorkspaceView: View {
         // standalone files as well as notes inside a vault.
         outline = documentOutlines[document.id] ?? []
 
+        // The harness runs against a file and a vault, so both follow the
+        // focused document. Set before the vault guard below, not after: a note
+        // outside any vault is exactly the case where the harness has only the
+        // file to go on, and skipping it there would point a run at whichever
+        // note happened to be open previously.
+        writingTools.harness.documentURL = document.url
+        writingTools.harness.vaultURL = workspace.vaultRoot
+
         guard let url = document.url, let path = vault.relativePath(for: url) else {
             backlinks = []
             mentions = []
@@ -961,7 +1093,7 @@ struct WorkspaceView: View {
                 title: showInspector ? "Hide Inspector" : "Show Inspector",
                 symbol: "sidebar.trailing", kind: .action(.toggleInspector), shortcut: "⌥⌘I"),
             Command(
-                title: showTerminal ? "Hide Terminal" : "Show Terminal",
+                title: isTerminalVisible ? "Hide Terminal" : "Show Terminal",
                 symbol: "apple.terminal", kind: .action(.toggleTerminal), shortcut: "⌘J"),
             Command(
                 title: showGraph ? "Hide Graph" : "Graph View",
@@ -987,14 +1119,23 @@ struct WorkspaceView: View {
                 title: "Clear Proofreading Marks", symbol: "eraser",
                 kind: .action(.clearProofreading)),
             Command(
-                title: "Summarize Document", symbol: WritingTask.summarize.symbol,
-                kind: .action(.summarizeDocument)),
+                title: "Read This Note",
+                subtitle: "Summary, key points, a title, and tags",
+                symbol: "sparkles.rectangle.stack",
+                kind: .action(.analyzeNote)),
             Command(
-                title: "Suggest a Title", symbol: WritingTask.suggestTitle.symbol,
-                kind: .action(.suggestTitle)),
+                title: "Ask MANVI…",
+                subtitle: "The local harness, with the whole vault to read",
+                symbol: "cpu", kind: .action(.askHarness)),
             Command(
-                title: "Suggest Tags", symbol: WritingTask.suggestTags.symbol,
-                kind: .action(.suggestTags)),
+                title: "Run MANVI in a Terminal",
+                symbol: "apple.terminal", kind: .action(.openHarnessTerminal)),
+            Command(
+                title: terminalPlacement == .drawer
+                    ? "Move Terminal to Sidebar" : "Move Terminal to Drawer",
+                symbol: terminalPlacement == .drawer
+                    ? "arrow.right.to.line" : "arrow.down.to.line",
+                kind: .action(.moveTerminal)),
         ]
 
         if workspace.layout.paneCount > 1 {
@@ -1069,7 +1210,7 @@ struct WorkspaceView: View {
         case .saveAs: _ = saveDocumentAs()
         case .toggleSidebar: showSidebar.toggle()
         case .toggleInspector: showInspector.toggle()
-        case .toggleTerminal: setTerminal(visible: !showTerminal)
+        case .toggleTerminal: setTerminal(visible: !isTerminalVisible)
         case .toggleGraph: showGraph.toggle()
         case .splitRight: workspace.split(workspace.focusedPane, edge: .trailing)
         case .splitDown: workspace.split(workspace.focusedPane, edge: .bottom)
@@ -1080,9 +1221,10 @@ struct WorkspaceView: View {
         case .writingTools: writingTools.inline.open()
         case .proofreadDocument: runProofreading()
         case .clearProofreading: writingTools.document.clearIssues()
-        case .summarizeDocument: runDocumentTask(.summarize)
-        case .suggestTitle: runDocumentTask(.suggestTitle)
-        case .suggestTags: runDocumentTask(.suggestTags)
+        case .analyzeNote: analyzeNote()
+        case .askHarness: showAssist(engine: .harness)
+        case .openHarnessTerminal: openHarnessTerminal()
+        case .moveTerminal: setTerminalPlacement(terminalPlacement.other)
         }
     }
 
@@ -1092,15 +1234,30 @@ struct WorkspaceView: View {
     /// findings land in a hidden tab reads as a menu item that did nothing
     /// except draw some underlines with no way to act on them.
     private func runProofreading() {
-        showInspector = true
-        inspectorTab = .assist
+        showAssist(engine: .apple)
         writingTools.document.proofread()
     }
 
-    private func runDocumentTask(_ task: WritingTask) {
+    private func analyzeNote() {
+        showAssist(engine: .apple)
+        writingTools.document.analyze()
+    }
+
+    /// Opens the Assist panel on one engine.
+    ///
+    /// Revealing the panel is part of every one of these actions, not a
+    /// nicety: a result that lands in a hidden tab reads as a menu item that
+    /// did nothing.
+    private func showAssist(engine: AssistEngine) {
         showInspector = true
         inspectorTab = .assist
-        writingTools.document.generate(task)
+        assistEngine = engine
+        if engine == .harness {
+            writingTools.harness.documentURL =
+                workspace.document(in: workspace.focusedPane)?.url
+            writingTools.harness.vaultURL = workspace.vaultRoot
+            writingTools.harness.refreshAvailability()
+        }
     }
 
     private func openVault() {

@@ -37,11 +37,16 @@ public final class DocumentAssistant {
         case failed(String)
     }
 
-    /// A whole-document question and its answer.
-    public enum Insight: Equatable {
+    /// The state of the structured reading of the note.
+    ///
+    /// Carries `truncated` on the way out rather than only in the panel: a
+    /// brief of the first four thousand characters of a long note is useful,
+    /// and a brief presented as covering a document it only saw the opening of
+    /// is misleading. The state is what says which one is on screen.
+    public enum Reading: Equatable {
         case idle
-        case running(WritingTask)
-        case ready(WritingTask, truncated: Bool)
+        case running
+        case ready(truncated: Bool)
         case failed(String)
     }
 
@@ -58,14 +63,20 @@ public final class DocumentAssistant {
     @ObservationIgnored public private(set) weak var surface: MarkdownTextView?
 
     public private(set) var review: Review = .idle
-    public private(set) var insight: Insight = .idle
-    public private(set) var insightText = ""
+    public private(set) var reading: Reading = .idle
+    /// What the last reading found. Empty until one has finished.
+    ///
+    /// Settable within the framework rather than through a test-only method:
+    /// the apply actions below are the part worth testing and they need a brief
+    /// to apply, and a `setBriefForTesting` shipped in the app would be a seam
+    /// nothing else uses.
+    public internal(set) var brief = NoteBrief(summary: "", keyPoints: [], title: "", tags: [])
     /// The mistakes marked in the attached editor. See the note above: this
     /// follows the editor, never the other way round.
     public private(set) var issues: ProofreadingIssues = .none
 
     @ObservationIgnored private let reviewRequest = IntelligenceRequest()
-    @ObservationIgnored private let insightRequest = IntelligenceRequest()
+    @ObservationIgnored private let readingRequest = IntelligenceRequest()
 
     public init(service: IntelligenceService) {
         self.service = service
@@ -93,9 +104,8 @@ public final class DocumentAssistant {
         return false
     }
 
-    public var isThinking: Bool {
-        if case .running = insight { return true }
-        return false
+    public var isReading: Bool {
+        reading == .running
     }
 
     // MARK: - Proofreading
@@ -230,65 +240,129 @@ public final class DocumentAssistant {
         surface.undoManager?.endUndoGrouping()
     }
 
-    // MARK: - Insights
+    // MARK: - Reading the note
 
-    /// Answers a whole-document question — a summary, a title, some tags.
-    public func generate(_ task: WritingTask) {
+    /// Reads the note and fills in ``brief``.
+    ///
+    /// One request, not four. The panel used to offer Summarize, Key Points,
+    /// Suggest a Title and Suggest Tags as separate buttons returning free text
+    /// into a shared box; each was a round trip to the same model about the
+    /// same document, and none of the four answers could be *applied* to
+    /// anything, because an opaque string affords nothing but Copy. See
+    /// ``NoteBrief``.
+    public func analyze() {
         guard let surface else { return }
         service.refreshAvailability()
         guard service.state.isReady else {
-            insight = .failed(service.state.guidance)
+            reading = .failed(service.state.guidance)
             return
         }
 
         let (text, truncated) = Self.source(from: surface.markdown)
         guard !text.isEmpty else {
-            insight = .failed("This document is empty.")
+            reading = .failed("This document is empty.")
             return
         }
 
-        insightText = ""
-        insight = .running(task)
-
-        insightRequest.start { [weak self] in
+        reading = .running
+        readingRequest.start { [weak self] in
             guard let self else { return }
             do {
-                let result = try await self.service.rewrite(task: task, text: text) { partial in
-                    self.insightText = partial
-                }
+                let found = try await self.service.brief(text)
                 try Task.checkCancellation()
-                self.insightText = result
-                self.insight = result.isEmpty
+                self.brief = found
+                self.reading =
+                    found.isEmpty
                     ? .failed("Apple Intelligence returned nothing for that.")
-                    : .ready(task, truncated: truncated)
+                    : .ready(truncated: truncated)
             } catch is CancellationError {
-                self.insight = self.insightRequest.didTimeOut
+                self.reading = self.readingRequest.didTimeOut
                     ? .failed(IntelligenceFailure.timedOut.localizedDescription)
                     : .idle
             } catch {
-                self.insight = .failed(error.localizedDescription)
+                self.reading = .failed(error.localizedDescription)
             }
         }
     }
 
-    public func stopThinking() {
-        insightRequest.cancel()
-        insight = .idle
+    public func stopReading() {
+        readingRequest.cancel()
+        reading = .idle
     }
 
-    public func copyInsight() {
-        guard !insightText.isEmpty else { return }
+    /// Copies one piece of the brief.
+    public func copy(_ text: String) {
+        guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(insightText, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
-    /// Puts the result at the top of the document.
-    public func insertInsightAtTop() {
-        guard let surface, surface.acceptsAssistedEdits, !insightText.isEmpty else { return }
-        surface.applyAssistedEdit(
-            range: NSRange(location: 0, length: 0),
-            replacement: insightText + "\n\n",
-            actionName: "Insert Apple Intelligence Result")
+    /// Puts the suggested title in as the note's first heading.
+    ///
+    /// Replaces an existing leading `# ` heading rather than stacking a second
+    /// one on top of it, which is what an unconditional insert at the top would
+    /// do — and a note with two H1s is a note whose outline is now wrong.
+    @discardableResult
+    public func applyTitle() -> Bool {
+        guard let surface, surface.acceptsAssistedEdits, !brief.title.isEmpty else { return false }
+        let existing = Self.leadingHeadingRange(in: surface.markdown)
+        return surface.applyAssistedEdit(
+            range: existing ?? NSRange(location: 0, length: 0),
+            replacement: existing == nil ? "# \(brief.title)\n\n" : "# \(brief.title)",
+            actionName: existing == nil ? "Insert Title" : "Replace Title")
+    }
+
+    /// Inserts the tags as a line at the caret.
+    @discardableResult
+    public func insertTags() -> Bool {
+        guard let surface, surface.acceptsAssistedEdits, !brief.tags.isEmpty else { return false }
+        return surface.applyAssistedEdit(
+            range: surface.selectedRange(),
+            replacement: brief.tagLine,
+            actionName: "Insert Tags")
+    }
+
+    /// Inserts the key points as a bullet list at the caret.
+    @discardableResult
+    public func insertKeyPoints() -> Bool {
+        guard let surface, surface.acceptsAssistedEdits, !brief.keyPoints.isEmpty else {
+            return false
+        }
+        return surface.applyAssistedEdit(
+            range: surface.selectedRange(),
+            replacement: brief.keyPointList,
+            actionName: "Insert Key Points")
+    }
+
+    /// Inserts the summary at the caret.
+    @discardableResult
+    public func insertSummary() -> Bool {
+        guard let surface, surface.acceptsAssistedEdits, !brief.summary.isEmpty else {
+            return false
+        }
+        return surface.applyAssistedEdit(
+            range: surface.selectedRange(),
+            replacement: brief.summary,
+            actionName: "Insert Summary")
+    }
+
+    /// The range of a leading ATX heading, if the note opens with one.
+    ///
+    /// Read off the text rather than off the parse, because this runs while the
+    /// panel is open and the parse belongs to the editor. It is deliberately
+    /// strict: only a `#` heading on the very first line counts, so a note that
+    /// opens with frontmatter or a paragraph gets an insertion rather than
+    /// having its first line rewritten.
+    nonisolated static func leadingHeadingRange(in markdown: String) -> NSRange? {
+        let text = markdown as NSString
+        guard text.length > 0 else { return nil }
+        let firstLine = text.lineRange(for: NSRange(location: 0, length: 0))
+        let line = text.substring(with: firstLine)
+        guard line.hasPrefix("# ") else { return nil }
+        // The newline is left out: replacing it would join the heading to
+        // whatever follows.
+        let trimmed = line.hasSuffix("\n") ? firstLine.length - 1 : firstLine.length
+        return NSRange(location: 0, length: trimmed)
     }
 
     /// As much of the document as one request may carry, and whether that was

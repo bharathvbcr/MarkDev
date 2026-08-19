@@ -96,7 +96,7 @@ final class WritingPromptTests: XCTestCase {
     func testEveryPresetIsDistinctAndDescribed() {
         let ids = Set(WritingTask.presets.map(\.id))
         XCTAssertEqual(ids.count, WritingTask.presets.count, "preset ids must be unique")
-        for task in WritingTask.presets + WritingTask.documentPresets {
+        for task in WritingTask.presets {
             XCTAssertFalse(task.title.isEmpty)
             XCTAssertFalse(task.directive.isEmpty)
         }

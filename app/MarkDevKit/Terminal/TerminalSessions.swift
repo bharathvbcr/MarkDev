@@ -5,6 +5,7 @@
 //  The shells that exist, independent of whether the drawer is on screen.
 //
 
+import AppKit
 import Foundation
 import Observation
 
@@ -71,6 +72,21 @@ public final class TerminalSessions {
     /// Always either `nil` or the id of a session in ``sessions``.
     public private(set) var selection: TerminalSessionState.ID?
 
+    /// The live pty behind each session, once something has drawn it.
+    ///
+    /// # Why the process lives here rather than in the view
+    ///
+    /// Because the terminal can now be drawn in two places — the drawer along
+    /// the bottom, or the inspector down the right-hand side — and with the
+    /// pty owned by the view, *moving* it is a restart: SwiftUI tears the old
+    /// representable down and builds a new one. The same argument that put
+    /// this list above the drawer puts the process above the representable.
+    ///
+    /// Hosts are created lazily, by ``host(for:)``, which only a view calls.
+    /// So a `TerminalSessions` that nothing has drawn — every one in the test
+    /// suite — forks nothing, and ``close(_:)`` finds no host to end.
+    @ObservationIgnored private var hosts: [TerminalSessionState.ID: TerminalProcessHost] = [:]
+
     /// The most shells that may exist at once.
     ///
     /// Bounded because each one is a real process holding a pty: a stuck
@@ -126,8 +142,13 @@ public final class TerminalSessions {
     /// to open. The drawer's own "+" calls ``open(_:)`` and always forks.
     @discardableResult
     public func reveal(_ config: TerminalSession) throws -> TerminalSessionState.ID {
+        // Matched on the command as well as the directory. A shell opened to
+        // run an agent and a shell opened to type in are two different things
+        // in one folder, and folding them together would answer "run MANVI
+        // here" by selecting a plain prompt that is not running it.
         if let existing = sessions.first(where: {
             $0.isLive && $0.config.workingDirectory == config.workingDirectory
+                && $0.config.initialCommand == config.initialCommand
         }) {
             selection = existing.id
             return existing.id
@@ -148,6 +169,7 @@ public final class TerminalSessions {
         guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         let wasSelected = selection == id
         sessions.remove(at: index)
+        endHost(id)
 
         guard wasSelected else { return }
         guard !sessions.isEmpty else {
@@ -160,7 +182,47 @@ public final class TerminalSessions {
     public func closeAll() {
         sessions.removeAll()
         selection = nil
+        endAllHosts()
     }
+
+    /// Ends every shell without disturbing the session list.
+    ///
+    /// This is what a closing window calls. The list is about to be discarded
+    /// with the window, but the processes are not attached to it — see
+    /// ``TerminalProcessHost``, where teardown stopped riding on the view
+    /// hierarchy so that a terminal could be moved between panels.
+    public func endAllHosts() {
+        for host in hosts.values { host.end() }
+        hosts.removeAll()
+    }
+
+    private func endHost(_ id: TerminalSessionState.ID) {
+        hosts.removeValue(forKey: id)?.end()
+    }
+
+    // MARK: - The processes
+
+    /// The live terminal for `id`, forking one if this is the first time it
+    /// has been drawn.
+    ///
+    /// Returns `nil` for a session that is not in the list, so a stale view
+    /// cannot resurrect a tab that has been closed.
+    public func host(for id: TerminalSessionState.ID) -> TerminalProcessHost? {
+        if let existing = hosts[id] { return existing }
+        guard let session = sessions.first(where: { $0.id == id }) else { return nil }
+        let host = TerminalProcessHost(
+            id: id,
+            session: session.config,
+            generation: session.generation,
+            onTitleChange: { [weak self] title in self?.setTitle(title, for: id) },
+            onExit: { [weak self] exit in self?.markExited(exit, for: id) })
+        hosts[id] = host
+        return host
+    }
+
+    /// Whether a shell has actually been forked for `id`. For tests: a session
+    /// that has never been drawn holds no process.
+    public func hasHost(for id: TerminalSessionState.ID) -> Bool { hosts[id] != nil }
 
     /// Relaunches the shell in place, keeping its tab and directory.
     public func restart(_ id: TerminalSessionState.ID) {
@@ -191,6 +253,7 @@ public final class TerminalSessions {
     /// way, and it sets the selection itself immediately afterwards.
     private func remove(_ id: TerminalSessionState.ID) {
         sessions.removeAll { $0.id == id }
+        endHost(id)
         if selection == id { selection = sessions.first?.id }
     }
 }

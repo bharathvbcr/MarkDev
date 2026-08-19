@@ -33,7 +33,15 @@ public struct TerminalDrawer: View {
     /// rather than picking a folder in the sidebar.
     public let document: URL?
     public let vault: URL?
+    /// Which panel is drawing this. Only the chrome differs — the sessions,
+    /// and the processes behind them, are the same either way.
+    public var placement: TerminalPlacement = .drawer
     public var onClose: (() -> Void)?
+    /// Moves the terminal to the other panel.
+    public var onMove: (() -> Void)?
+    /// Opens a shell already running the local harness. `nil` hides the option
+    /// rather than offering one that cannot work — see ``HarnessLocator``.
+    public var onOpenHarness: (() -> Void)?
     /// Surfaced rather than swallowed: refusing to open the ninth terminal is
     /// a decision the reader has to be told about.
     public var onError: ((String) -> Void)?
@@ -44,13 +52,19 @@ public struct TerminalDrawer: View {
         sessions: TerminalSessions,
         document: URL?,
         vault: URL?,
+        placement: TerminalPlacement = .drawer,
         onClose: (() -> Void)? = nil,
+        onMove: (() -> Void)? = nil,
+        onOpenHarness: (() -> Void)? = nil,
         onError: ((String) -> Void)? = nil
     ) {
         self.sessions = sessions
         self.document = document
         self.vault = vault
+        self.placement = placement
         self.onClose = onClose
+        self.onMove = onMove
+        self.onOpenHarness = onOpenHarness
         self.onError = onError
     }
 
@@ -92,12 +106,42 @@ public struct TerminalDrawer: View {
 
             Spacer(minLength: 0)
 
-            Button(action: openNewSession) {
-                Image(systemName: "plus")
+            // A menu rather than a button once there is more than one kind of
+            // shell to open. The harness entry is absent, not disabled, when
+            // MANVI could not be found: a dead control is worse than no
+            // control, which is the same rule the zoom chip follows in a Quick
+            // Look preview.
+            if let onOpenHarness {
+                Menu {
+                    Button("New Shell", action: openNewSession)
+                    Button("Run MANVI Here", action: onOpenHarness)
+                } label: {
+                    Image(systemName: "plus")
+                } primaryAction: {
+                    openNewSession()
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("New terminal")
+                .accessibilityLabel("New terminal")
+            } else {
+                Button(action: openNewSession) {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.plain)
+                .help("New terminal")
+                .accessibilityLabel("New terminal")
             }
-            .buttonStyle(.plain)
-            .help("New terminal")
-            .accessibilityLabel("New terminal")
+
+            if let onMove {
+                Button(action: onMove) {
+                    Image(systemName: placement.moveSymbol)
+                }
+                .buttonStyle(.plain)
+                .help(placement.moveHelp)
+                .accessibilityLabel(placement.moveHelp)
+            }
 
             if let current = sessions.current {
                 Button { sessions.restart(current.id) } label: {
@@ -110,7 +154,7 @@ public struct TerminalDrawer: View {
 
             if let onClose {
                 Button(action: onClose) {
-                    Image(systemName: "chevron.down")
+                    Image(systemName: placement.hideSymbol)
                 }
                 .buttonStyle(.plain)
                 .help("Hide the terminal")
@@ -145,10 +189,10 @@ public struct TerminalDrawer: View {
 
             ForEach(sessions.sessions) { session in
                 TerminalHostView(
-                    session: session.config,
-                    generation: session.generation,
-                    onTitleChange: { sessions.setTitle($0, for: session.id) },
-                    onExit: { sessions.markExited($0, for: session.id) }
+                    sessions: sessions,
+                    id: session.id,
+                    config: session.config,
+                    generation: session.generation
                 )
                 .opacity(session.id == sessions.selection ? 1 : 0)
                 // A hidden shell must not take clicks or keystrokes meant for
@@ -238,128 +282,62 @@ private struct TerminalTab: View {
     }
 }
 
-/// Hosts SwiftTerm's local-process terminal.
+/// Shows the terminal a session already owns.
+///
+/// Deliberately almost empty. Everything that used to be here — forking the
+/// shell, holding the delegate, ending the process on teardown — moved to
+/// ``TerminalProcessHost`` so that the terminal could be drawn in the drawer
+/// *or* in the inspector without moving it being a restart. What is left is
+/// the one thing a representable is for: putting an existing `NSView` on
+/// screen.
+///
+/// Note what is **not** here: no `dismantleNSView`. A dismantle now means "this
+/// panel stopped drawing the terminal", which happens every time the reader
+/// moves it, and ending the shell there is precisely the bug this split exists
+/// to remove. Teardown is explicit — ``TerminalSessions/close(_:)``,
+/// ``TerminalSessions/endAllHosts()``, and ``LiveShells/endAll()`` when the app
+/// quits.
 struct TerminalHostView: NSViewRepresentable {
-    let session: TerminalSession
-    /// Changing this tears the shell down and launches a new one.
+    @Bindable var sessions: TerminalSessions
+    let id: TerminalSessionState.ID
+    let config: TerminalSession
+    /// Changing this relaunches the shell in place.
     let generation: Int
-    let onTitleChange: (String) -> Void
-    let onExit: (TerminalExit) -> Void
 
-    func makeNSView(context: Context) -> LocalProcessTerminalView {
-        let view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
-        view.processDelegate = context.coordinator
-        context.coordinator.apply(theme: .standard, to: view)
-        context.coordinator.launch(session, in: view)
-        return view
+    func makeNSView(context: Context) -> NSView {
+        // A container rather than the terminal itself. `makeNSView` may run
+        // while the previous panel still holds the same terminal view, and an
+        // `NSView` has one superview: returning it directly would have SwiftUI
+        // re-parent a view the outgoing hierarchy is still tearing down, which
+        // is an ordering this code does not control. Owning a wrapper means
+        // the move is a `addSubview` we perform ourselves, after both sides
+        // have settled.
+        let container = PassthroughView()
+        attach(to: container)
+        return container
     }
 
-    func updateNSView(_ view: LocalProcessTerminalView, context: Context) {
-        context.coordinator.onTitleChange = onTitleChange
-        context.coordinator.onExit = onExit
-
-        // A running shell is never relocated. The reader may be halfway
-        // through a command, and moving the working directory under it —
-        // or worse, restarting it — because they clicked another tab would
-        // destroy work. New directories reach the shell when it is restarted,
-        // which is an explicit act, or by opening a second session.
-        guard context.coordinator.generation != generation else { return }
-        context.coordinator.generation = generation
-        view.terminate()
-        context.coordinator.launch(session, in: view)
+    func updateNSView(_ container: NSView, context: Context) {
+        attach(to: container)
+        sessions.host(for: id)?.relaunchIfNeeded(config, generation: generation)
     }
 
-    /// Ends the shell when its view goes away.
-    ///
-    /// Without this the process outlives every trace of it: closing a tab or
-    /// the window left a shell — and anything it was running — alive with no
-    /// terminal attached and no way to reach it again. It survived until the
-    /// app quit, and a `sleep 100000` or a dev server survived that.
-    static func dismantleNSView(_ view: LocalProcessTerminalView, coordinator: Coordinator) {
-        // The delegate first, so a callback from the dying pty cannot mark an
-        // unrelated tab dead.
-        coordinator.isDismantled = true
-        view.processDelegate = nil
-
-        // Captured before `terminate`, which clears the process state.
-        let pid = view.process?.shellPid ?? 0
-        view.terminate()
-        // `terminate` signals only the shell and reaps nothing. Anything the
-        // shell started — a dev server, a watcher — survives it, and the
-        // shell itself lingers as a zombie. See ``TerminalReaper``.
-        TerminalReaper.end(processGroup: pid)
+    private func attach(to container: NSView) {
+        guard let terminal = sessions.host(for: id)?.view else { return }
+        guard terminal.superview !== container else { return }
+        terminal.removeFromSuperview()
+        terminal.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(terminal)
+        NSLayoutConstraint.activate([
+            terminal.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            terminal.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            terminal.topAnchor.constraint(equalTo: container.topAnchor),
+            terminal.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(
-            generation: generation, onTitleChange: onTitleChange, onExit: onExit)
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, LocalProcessTerminalViewDelegate {
-        var generation: Int
-        var onTitleChange: (String) -> Void
-        var onExit: (TerminalExit) -> Void
-        /// Set once the view is torn down, so a late callback from the dying
-        /// pty cannot write into state that has moved on.
-        var isDismantled = false
-
-        init(
-            generation: Int,
-            onTitleChange: @escaping (String) -> Void,
-            onExit: @escaping (TerminalExit) -> Void
-        ) {
-            self.generation = generation
-            self.onTitleChange = onTitleChange
-            self.onExit = onExit
-        }
-
-        func launch(_ session: TerminalSession, in view: LocalProcessTerminalView) {
-            // Re-resolved at launch, not reused from when the session was
-            // created: a vault can be renamed or a folder deleted between
-            // opening a tab and restarting it, and launching into a directory
-            // that is gone fails in a way the reader cannot act on.
-            let live = session.revalidated()
-            view.startProcess(
-                executable: live.shell,
-                args: [],
-                environment: Terminal.getEnvironmentVariables(termName: "xterm-256color"),
-                execName: live.argv0,
-                currentDirectory: live.workingDirectory)
-            onTitleChange((live.workingDirectory as NSString).lastPathComponent)
-        }
-
-        /// Matches the terminal to the editor's own palette.
-        ///
-        /// The drawer is content, not chrome, so it takes the editor theme's
-        /// colours rather than glass — a shell rendered on a translucent
-        /// surface is unreadable the moment anything scrolls behind it.
-        func apply(theme: EditorTheme, to view: LocalProcessTerminalView) {
-            view.font = theme.monoFont
-            view.nativeForegroundColor = theme.textColor
-            view.nativeBackgroundColor = theme.codeBackground
-            view.installColors(SwiftTerm.Color.paleColors)
-        }
-
-        // MARK: LocalProcessTerminalViewDelegate
-
-        func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
-
-        func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
-            guard !isDismantled, !title.isEmpty else { return }
-            onTitleChange(title)
-        }
-
-        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
-            guard !isDismantled, let directory, !directory.isEmpty else { return }
-            onTitleChange((directory as NSString).lastPathComponent)
-        }
-
-        /// - Parameter exitCode: named that way by SwiftTerm, but it is the
-        ///   raw `waitpid` status. See ``TerminalExit``.
-        func processTerminated(source: TerminalView, exitCode: Int32?) {
-            guard !isDismantled else { return }
-            onExit(TerminalExit(waitStatus: exitCode))
-        }
+    /// A container that never intercepts a click meant for the terminal.
+    final class PassthroughView: NSView {
+        override var acceptsFirstResponder: Bool { false }
     }
 }

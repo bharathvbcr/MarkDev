@@ -26,17 +26,26 @@ public final class WritingTools {
     public let inline: WritingAssistant
     /// Proofreading and whole-document questions, shown in the inspector.
     public let document: DocumentAssistant
+    /// The local harness, shown beside them in the same panel.
+    ///
+    /// Here rather than in its own owner for the same "which editor" reason the
+    /// other two are: with split panes there are several surfaces, and a run
+    /// that applied its answer to a pane the reader is not looking at would
+    /// overwrite the wrong note.
+    public let harness: HarnessAssistant
 
     public init() {
         let service = IntelligenceService()
         self.service = service
         inline = WritingAssistant(service: service)
         document = DocumentAssistant(service: service)
+        harness = HarnessAssistant()
     }
 
-    /// Points both panels at the editor the reader is working in.
+    /// Points every panel at the editor the reader is working in.
     public func attach(to surface: MarkdownTextView) {
         inline.surface = surface
         document.attach(to: surface)
+        harness.attach(to: surface)
     }
 }

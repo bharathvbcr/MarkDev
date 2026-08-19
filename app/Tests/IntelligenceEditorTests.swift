@@ -75,7 +75,14 @@ final class IntelligencePanelTests: XCTestCase {
                 replacement: "We were", kind: .grammar, explanation: "Verb agreement.")
         ])
 
-        let size = fittingSize(of: AssistInspectorView(assistant: assistant) { _ in })
+        var engine = AssistEngine.apple
+        let binding = Binding(get: { engine }, set: { engine = $0 })
+        let size = fittingSize(
+            of: AssistInspectorView(
+                assistant: assistant,
+                harness: HarnessAssistant(),
+                engine: binding,
+                onReveal: { _ in }))
         XCTAssertGreaterThan(size.height, 100, "an issue row and both sections must be laid out")
     }
 }

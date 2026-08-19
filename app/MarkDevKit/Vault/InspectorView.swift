@@ -12,12 +12,14 @@ public enum InspectorTab: String, CaseIterable, Sendable {
     case outline = "Outline"
     case links = "Links"
     case assist = "Assist"
+    case terminal = "Terminal"
 
     var symbol: String {
         switch self {
         case .outline: "list.bullet.indent"
         case .links: "link"
         case .assist: "apple.intelligence"
+        case .terminal: "apple.terminal"
         }
     }
 }
@@ -29,6 +31,14 @@ public struct InspectorView: View {
     public let mentions: [UnlinkedMention]
     /// The window's writing-tools state, for the Assist tab.
     public let assistant: DocumentAssistant
+    /// The local harness, shown beside it under the same tab.
+    public let harness: HarnessAssistant
+    /// The terminal, when the reader has parked it here rather than in the
+    /// drawer. `nil` means it lives along the bottom, and the Terminal tab
+    /// says so and offers to move it.
+    public let terminal: AnyView?
+    /// Moves the terminal into this panel.
+    public let onMoveTerminalHere: () -> Void
     /// Called with a UTF-16 offset in the current document to scroll to.
     ///
     /// Shared by the outline and the proofreading list: "take me to this
@@ -39,6 +49,7 @@ public struct InspectorView: View {
     public let onOpenNote: (String, UInt32) -> Void
 
     @Binding private var tab: InspectorTab
+    @Binding private var engine: AssistEngine
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
@@ -46,45 +57,108 @@ public struct InspectorView: View {
         backlinks: [Backlink],
         mentions: [UnlinkedMention],
         assistant: DocumentAssistant,
+        harness: HarnessAssistant,
+        terminal: AnyView?,
         tab: Binding<InspectorTab>,
+        engine: Binding<AssistEngine>,
         onReveal: @escaping (Int) -> Void,
-        onOpenNote: @escaping (String, UInt32) -> Void
+        onOpenNote: @escaping (String, UInt32) -> Void,
+        onMoveTerminalHere: @escaping () -> Void
     ) {
         self.outline = outline
         self.backlinks = backlinks
         self.mentions = mentions
         self.assistant = assistant
+        self.harness = harness
+        self.terminal = terminal
         self._tab = tab
+        self._engine = engine
         self.onReveal = onReveal
         self.onOpenNote = onOpenNote
+        self.onMoveTerminalHere = onMoveTerminalHere
     }
 
     public var body: some View {
         VStack(spacing: GlassTheme.Spacing.snug) {
             picker
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: GlassTheme.Spacing.tight) {
-                    switch tab {
-                    case .outline: outlineSection
-                    case .links: linksSection
-                    case .assist:
-                        AssistInspectorView(assistant: assistant, onReveal: onReveal)
+            // The terminal is not scrolled. It does its own scrolling, it
+            // wants every point of height it can get, and a pty inside a
+            // `ScrollView` fights the scroll wheel with the shell for it.
+            if tab == .terminal {
+                terminalSection
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: GlassTheme.Spacing.tight) {
+                        switch tab {
+                        case .outline: outlineSection
+                        case .links: linksSection
+                        case .assist:
+                            AssistInspectorView(
+                                assistant: assistant,
+                                harness: harness,
+                                engine: $engine,
+                                onReveal: onReveal)
+                        case .terminal: EmptyView()
+                        }
                     }
+                    .padding(.horizontal, GlassTheme.Spacing.tight)
+                    .padding(.bottom, GlassTheme.Spacing.snug)
                 }
-                .padding(.horizontal, GlassTheme.Spacing.tight)
-                .padding(.bottom, GlassTheme.Spacing.snug)
+                .scrollContentBackground(.hidden)
             }
-            .scrollContentBackground(.hidden)
         }
         .padding(GlassTheme.Spacing.snug)
         .animation(
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion), value: tab)
     }
 
+    // MARK: - Terminal
+
+    /// The shell, when this panel is where it lives.
+    ///
+    /// The terminal is one thing that can be drawn in one of two places, never
+    /// two terminals — moving it re-parents the same `NSView`, so a running
+    /// build survives the move. See ``TerminalProcessHost``. This tab therefore
+    /// either holds it or offers to fetch it; it never forks a second one.
+    @ViewBuilder
+    private var terminalSection: some View {
+        if let terminal {
+            terminal
+                .clipShape(RoundedRectangle(cornerRadius: GlassTheme.Radius.small))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: GlassTheme.Spacing.tight) {
+                Image(systemName: "apple.terminal")
+                    .font(.title3)
+                    .foregroundStyle(.tertiary)
+                Text("The terminal is in the drawer")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Text("Move it here to keep a shell beside the note. Whatever is running keeps running.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                Button("Move It Here", action: onMoveTerminalHere)
+                    .controlSize(.small)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, GlassTheme.Spacing.loose)
+            .padding(.horizontal, GlassTheme.Spacing.tight)
+        }
+    }
+
     private var picker: some View {
+        // Icons alone. With four tabs there is no width for four words in a
+        // panel that starts at 300 points and can be dragged to 220 — the
+        // labels truncate to two characters each, which is less legible than
+        // the symbol they sit beside. The name survives as the tooltip and as
+        // the accessibility label, which is where a reader who needs it looks.
         Picker("", selection: $tab) {
             ForEach(InspectorTab.allCases, id: \.self) { tab in
-                Label(tab.rawValue, systemImage: tab.symbol).tag(tab)
+                Image(systemName: tab.symbol)
+                    .accessibilityLabel(tab.rawValue)
+                    .help(tab.rawValue)
+                    .tag(tab)
             }
         }
         .pickerStyle(.segmented)

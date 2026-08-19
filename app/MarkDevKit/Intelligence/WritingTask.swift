@@ -168,39 +168,11 @@ extension WritingTask {
             """,
         output: .derived)
 
-    public static let suggestTitle = WritingTask(
-        id: "title",
-        title: "Suggest a Title",
-        symbol: "textformat.size",
-        directive: """
-            Suggest one title for this document. Output the title alone, on a \
-            single line, with no `#`, no quotation marks, and no other text.
-            """,
-        output: .derived)
-
-    public static let suggestTags = WritingTask(
-        id: "tags",
-        title: "Suggest Tags",
-        symbol: "number",
-        directive: """
-            Suggest between three and six topic tags for this document. Output \
-            them on one line, each beginning with `#`, separated by spaces, \
-            lowercase, using hyphens instead of spaces inside a tag. Output \
-            nothing else.
-            """,
-        output: .derived)
-
     /// Rewrites offered on a selection, in the order the panel shows them.
     public static let presets: [WritingTask] = [
         .proofread, .rewrite, .concise, .expand, .simplify,
         .professional, .friendly, .bulletList, .table,
         .summarize, .keyPoints, .continueWriting,
-    ]
-
-    /// Things asked of the document as a whole, offered in the inspector
-    /// rather than at the caret — none of them is an edit to a passage.
-    public static let documentPresets: [WritingTask] = [
-        .summarize, .keyPoints, .suggestTitle, .suggestTags,
     ]
 
     /// A task built from something the reader typed.

@@ -68,11 +68,27 @@ public struct TerminalSession: Sendable, Equatable {
     /// user's own tools on `PATH` — without it, a coding CLI installed by
     /// Homebrew or a version manager is simply not found.
     public let argv0: String
+    /// A line typed into the shell once it has started, or `nil`.
+    ///
+    /// Typed rather than passed as `-c`, and that is the whole reason it is a
+    /// separate field instead of arguments on the launch: `zsh -c "manvi"` is
+    /// not a login shell and not an interactive one, so it neither reads the
+    /// profile that puts the tool on `PATH` nor leaves anything behind when
+    /// the command exits. Sent into an interactive login shell instead, the
+    /// command appears in the scrollback where the reader can see and re-run
+    /// it, and the shell survives it.
+    public let initialCommand: String?
 
-    public init(shell: String, workingDirectory: String, argv0: String) {
+    public init(
+        shell: String,
+        workingDirectory: String,
+        argv0: String,
+        initialCommand: String? = nil
+    ) {
         self.shell = shell
         self.workingDirectory = workingDirectory
         self.argv0 = argv0
+        self.initialCommand = initialCommand
     }
 
     /// The shell to launch.
@@ -157,13 +173,15 @@ public struct TerminalSession: Sendable, Equatable {
         return TerminalSession(
             shell: shell,
             workingDirectory: directory,
-            argv0: "-" + (shell as NSString).lastPathComponent)
+            argv0: "-" + (shell as NSString).lastPathComponent,
+            initialCommand: initialCommand)
     }
 
     /// The session for a given document and vault.
     public static func resolve(
         document: URL?,
         vault: URL?,
+        initialCommand: String? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> TerminalSession {
@@ -172,7 +190,8 @@ public struct TerminalSession: Sendable, Equatable {
             shell: shell,
             workingDirectory: resolveWorkingDirectory(
                 document: document, vault: vault, fileManager: fileManager),
-            argv0: "-" + (shell as NSString).lastPathComponent
+            argv0: "-" + (shell as NSString).lastPathComponent,
+            initialCommand: initialCommand
         )
     }
 }
