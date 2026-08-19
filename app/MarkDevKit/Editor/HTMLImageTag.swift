@@ -28,6 +28,29 @@ import Foundation
 /// Only `src`, `alt` and `width` are read. `align`, `hspace` and `vspace` ask
 /// for text to flow around the picture, which the editor draws in place of a
 /// whole block and cannot do; they are ignored rather than half-honoured.
+///
+/// # The grammar is CommonMark's, not a browser's
+///
+/// What may be accepted is decided by the question "would a Markdown renderer
+/// show this to the reader as text?" — because accepting it here *hides* it.
+/// CommonMark's raw-HTML open tag is exactly the set for which the answer is
+/// no, so this parses that grammar and nothing wider. A browser's tokenizer is
+/// the wrong reference and looked like the right one: it recovers from errors
+/// the Markdown parser refuses, and every place the two disagree is a line of
+/// the reader's note taken off the page. Three shapes it used to admit, each
+/// literal text to the core and each verified against it in
+/// `HTMLImageTagTests`:
+///
+/// - `<img\u{00A0}src="x.svg">` — a Unicode space where the grammar allows
+///   only ASCII. `Character.isWhitespace` is true for it and for U+2003, so
+///   the separator rule quietly spanned all of Unicode.
+/// - `<img src="a.svg"alt="b">` — CommonMark writes an attribute as
+///   `whitespace+ name`, so the gap between two of them is grammar, not
+///   tidying.
+/// - `<img src=x.svg <img src=y.svg>` — an unquoted value and an attribute
+///   name are both narrower than "anything up to a space", and here the core
+///   reads visible text followed by a *different* picture than the one this
+///   returned.
 public struct HTMLImageTag: Equatable, Sendable {
     /// The `src`, as written — resolved against the document's directory by
     /// the renderer, exactly like a Markdown image's target.
@@ -64,14 +87,23 @@ public struct HTMLImageTag: Equatable, Sendable {
         // stored for a native string rather than a walk over it.
         guard text.utf8.count <= maximumLength else { return nil }
 
-        var scanner = TagScanner(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        // Trimmed by the grammar's own whitespace, not by
+        // `.whitespacesAndNewlines` — that set strips U+200B, U+00A0 and
+        // U+2003, none of which the grammar allows anywhere. A leading one
+        // makes the line literal text to the core, and trimming it away was
+        // enough to have this call it a picture.
+        var scanner = TagScanner(TagScanner.trimmed(text))
         guard scanner.take("<img"), scanner.atTagNameBoundary else { return nil }
 
         var attributes: [String: String] = [:]
         while true {
-            scanner.skipWhitespace()
+            // The gap is part of the grammar: CommonMark writes an attribute
+            // as `whitespace+ name`, so `<img src="a.svg"alt="b">` is a
+            // paragraph of literal text and hiding it would take a line of the
+            // note off the page.
+            let spaced = scanner.skipWhitespace()
             if scanner.take("/>") || scanner.take(">") { break }
-            guard let (name, value) = scanner.attribute() else { return nil }
+            guard spaced, let (name, value) = scanner.attribute() else { return nil }
             // First wins, which is how a browser reads a repeated attribute.
             if attributes[name] == nil { attributes[name] = value }
         }
@@ -122,7 +154,55 @@ private struct TagScanner {
     /// `<img>` with a stray `e`.
     var atTagNameBoundary: Bool {
         guard let next = peek() else { return false }
-        return next.isWhitespace || next == ">" || next == "/"
+        return Self.isWhitespace(next) || next == ">" || next == "/"
+    }
+
+    /// The six characters CommonMark counts as whitespace inside a tag.
+    ///
+    /// `Character.isWhitespace` is the whole Unicode White_Space property, and
+    /// using it made U+00A0 and U+2003 separate a tag's attributes. They do
+    /// not: the core reads `<img\u{00A0}src="x.svg">` as a paragraph of text,
+    /// and a separator rule wider than the grammar's is a rule that hides it.
+    static func isWhitespace(_ character: Character) -> Bool {
+        switch character {
+        case " ", "\t", "\n", "\u{0B}", "\u{0C}", "\r": return true
+        default: return false
+        }
+    }
+
+    /// `text` without the whitespace either end, by the grammar's own
+    /// definition of it.
+    static func trimmed(_ text: String) -> String {
+        var characters = Substring(text)
+        while let first = characters.first, isWhitespace(first) { characters.removeFirst() }
+        while let last = characters.last, isWhitespace(last) { characters.removeLast() }
+        return String(characters)
+    }
+
+    /// `[A-Za-z_:]` — what CommonMark lets an attribute name open with.
+    private static func isNameStart(_ character: Character) -> Bool {
+        character.isASCII && (character.isLetter || character == "_" || character == ":")
+    }
+
+    /// `[A-Za-z0-9_.:-]` — and what it may continue with.
+    private static func isNameContinuation(_ character: Character) -> Bool {
+        guard character.isASCII else { return false }
+        return character.isLetter || character.isNumber
+            || character == "_" || character == "." || character == ":" || character == "-"
+    }
+
+    /// An unquoted value is one or more characters, none of them a separator
+    /// or a delimiter that could end the tag somewhere else.
+    ///
+    /// Narrower than "anything up to a space", which is what let
+    /// `<img src=x.svg <img src=y.svg>` through — text the core shows to the
+    /// reader, in front of a *second* tag naming a different picture.
+    private static func isUnquotedValue(_ character: Character) -> Bool {
+        guard !isWhitespace(character) else { return false }
+        switch character {
+        case "\"", "'", "=", "<", ">", "`": return false
+        default: return true
+        }
     }
 
     private func peek(_ offset: Int = 0) -> Character? {
@@ -143,8 +223,13 @@ private struct TagScanner {
         return true
     }
 
-    mutating func skipWhitespace() {
-        while let next = peek(), next.isWhitespace { index += 1 }
+    /// Consumes whitespace, answering whether there was any — which the
+    /// attribute grammar requires there to be.
+    @discardableResult
+    mutating func skipWhitespace() -> Bool {
+        let start = index
+        while let next = peek(), Self.isWhitespace(next) { index += 1 }
+        return index > start
     }
 
     /// One `name`, `name=value`, `name="value"` or `name='value'` pair.
@@ -152,15 +237,25 @@ private struct TagScanner {
     /// The name is lowercased: HTML attribute names are case-insensitive, and
     /// `SRC` in a hand-written tag is the same attribute as `src`.
     mutating func attribute() -> (name: String, value: String)? {
-        var name = ""
-        while let next = peek(), !next.isWhitespace, next != "=", next != ">", next != "/" {
+        guard let first = peek(), Self.isNameStart(first) else { return nil }
+        var name = String(first)
+        index += 1
+        while let next = peek(), Self.isNameContinuation(next) {
             name.append(next)
             index += 1
         }
-        guard !name.isEmpty else { return nil }
 
+        // `=` may be spaced away from its name, so finding out whether this
+        // attribute has a value means looking past whitespace — and putting it
+        // back if there is none. Consumed here, the gap would no longer be
+        // there for the *next* attribute to be separated by, and the whole tag
+        // would be refused.
+        let beforeGap = index
         skipWhitespace()
-        guard take("=") else { return (name.lowercased(), "") }
+        guard take("=") else {
+            index = beforeGap
+            return (name.lowercased(), "")
+        }
         skipWhitespace()
 
         var value = ""
@@ -182,7 +277,7 @@ private struct TagScanner {
             guard peek() == quote else { return nil }
             index += 1
         } else {
-            while let next = peek(), !next.isWhitespace, next != ">" {
+            while let next = peek(), Self.isUnquotedValue(next) {
                 value.append(next)
                 index += 1
             }
@@ -203,6 +298,18 @@ private enum HTMLEntities {
         "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": "\u{00A0}",
     ]
 
+    /// The longest entity name that can mean anything.
+    ///
+    /// `#x10FFFF` is eight characters and every named entity above is shorter,
+    /// so nothing longer is worth reading. The bound is on the *search* and
+    /// not merely on the result, which is the whole point: looking for the `;`
+    /// anywhere in the rest of the value — which is what this used to do —
+    /// walks to the end of the string once per `&`, and an unquoted `src` runs
+    /// to the end of the tag. Measured, a tag of 4,000 ampersands cost **94ms**
+    /// against 8µs for an ordinary one, on the parse path, once per keystroke
+    /// per tag. Pinned by `HTMLImageTagTests.testDecodingIsLinearInTheValue`.
+    private static let maximumNameLength = 8
+
     static func decoded(_ text: String) -> String {
         guard text.contains("&") else { return text }
 
@@ -211,9 +318,7 @@ private enum HTMLEntities {
         while let start = rest.firstIndex(of: "&") {
             result += rest[rest.startIndex..<start]
             rest = rest[rest.index(after: start)...]
-            guard let end = rest.firstIndex(of: ";"),
-                rest.distance(from: rest.startIndex, to: end) <= 8
-            else {
+            guard let end = terminator(in: rest) else {
                 result.append("&")
                 continue
             }
@@ -228,6 +333,19 @@ private enum HTMLEntities {
             }
         }
         return result + rest
+    }
+
+    /// The `;` closing an entity, looked for over at most
+    /// ``maximumNameLength`` characters rather than over the whole value.
+    private static func terminator(in rest: Substring) -> Substring.Index? {
+        var index = rest.startIndex
+        var seen = 0
+        while index != rest.endIndex, seen <= maximumNameLength {
+            if rest[index] == ";" { return index }
+            index = rest.index(after: index)
+            seen += 1
+        }
+        return nil
     }
 
     private static func expand(_ name: String) -> String? {

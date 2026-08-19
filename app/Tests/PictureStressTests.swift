@@ -234,6 +234,164 @@ final class PictureStressTests: XCTestCase {
         }
     }
 
+    /// The offsets of `source` that are raw HTML **to the core** — inside an
+    /// html block, or inside an inline-HTML span.
+    ///
+    /// The oracle every other assertion here was missing. Asking
+    /// ``HTMLImageTag/parse(_:)`` whether what got hidden was a picture asks
+    /// the reader that decided to hide it, so the two agree by construction and
+    /// the interesting failure — the tag reader admitting something the *core*
+    /// calls ordinary text — cannot show up. This asks the parser instead.
+    private func rawHTMLOffsets(in parsed: ParsedDocument) -> IndexSet {
+        var offsets = IndexSet()
+        for block in parsed.blocks where block.kind == .htmlBlock && block.range.length > 0 {
+            offsets.insert(integersIn: block.range.location..<NSMaxRange(block.range))
+        }
+        for span in parsed.spans where span.kind == .inlineHTML && span.range.length > 0 {
+            offsets.insert(integersIn: span.range.location..<NSMaxRange(span.range))
+        }
+        return offsets
+    }
+
+    /// Fails if any collapsed range covers a character the core calls text.
+    private func assertNothingHiddenWasText(
+        _ source: String, _ context: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let text = source as NSString
+        let parsed = ParsedDocument.parse(source)
+        let markup = rawHTMLOffsets(in: parsed)
+        let rendered = RenderedBlocks(document: parsed, text: text)
+
+        for entry in rendered.entries {
+            guard case .image = entry.content.kind else { continue }
+            for offset in entry.range.location..<NSMaxRange(entry.range) {
+                let character = text.character(at: offset)
+                // Whitespace either side of the tag is inside the block and
+                // belongs to nobody; it is not text the reader loses.
+                let blank =
+                    character == 0x20 || character == 0x09 || character == 0x0A
+                    || character == 0x0D
+                if blank || markup.contains(offset) { continue }
+                XCTFail(
+                    "\(context): hid \(text.substring(with: entry.range).debugDescription), "
+                        + "whose character at \(offset) "
+                        + "(\(text.substring(with: NSRange(location: offset, length: 1)).debugDescription)) "
+                        + "is text to the core, not markup",
+                    file: file, line: line)
+                return
+            }
+        }
+    }
+
+    // MARK: - What the core calls text is never hidden
+
+    func testShapesTheCoreReadsAsTextAreNeverHidden() {
+        // Each of these is a paragraph of ordinary text to the core, and each
+        // was hidden and drawn over by a picture before the paragraph path was
+        // made to consult the core's own spans. They are listed as well as
+        // fuzzed because each names a distinct way a browser's tokenizer and
+        // CommonMark part company, and a fuzzer that stops producing one of
+        // them would go quiet rather than fail.
+        let markup = [
+            "<img\u{00A0}src=\"mark.svg\">",
+            "<img\u{2003}src=\"mark.svg\">",
+            #"<img src="a.svg"alt="b">"#,
+            "<img src=a`b.svg>",
+            #"<img src=a"b.svg>"#,
+            "<img src=a=b.svg>",
+            "<img src=x.svg <img src=y.svg>",
+            "\u{200B}<img src=\"mark.svg\">",
+        ]
+        for candidate in markup {
+            for container in ["\(candidate)", "- \(candidate)", "> \(candidate)"] {
+                let source = "keep this line\n\n\(container)\n\nand this one\n"
+                assertNothingHiddenWasText(source, container.debugDescription)
+            }
+        }
+    }
+
+    func testTheOneThatDrewADifferentPictureThanTheCoreReads() {
+        // The sharpest of them, kept on its own because it fails in two ways at
+        // once. The core reads `<img src=x.svg ` as visible text and then a tag
+        // naming **y.svg**; the old path hid the text and drew **x.svg** — so
+        // the reader lost a line *and* got a picture no other renderer shows.
+        let source = "before\n\n<img src=x.svg <img src=y.svg>\n\nafter\n"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        XCTAssertTrue(
+            rendered.entries.isEmpty,
+            "hid a paragraph the core reads as text followed by a different picture: "
+                + "\(rendered.entries.map(\.content.source))")
+    }
+
+    func testMutatedTagsNeverHideAnythingTheCoreCallsText() {
+        // The same storm as `testMutatedTagsInADocumentNeverHideWhatTheyCannotDraw`,
+        // judged by the core instead of by the tag reader — and across the
+        // containers a picture is actually written in, because where the tag
+        // sits decides whether it is a block or an inline span, and the two
+        // reach this code by different paths.
+        var generator = SeededGenerator(seed: 0xC0DE_11A6)
+        let alphabet = Array(
+            #"<>"'/= &;#imgsrcaltwidth0123456789.%`\#u{000A}\#u{00A0}\#u{200B}\#u{2003}"#)
+        let seeds = [
+            #"<img src="assets/mark.svg" alt="The mark" width="72">"#,
+            "<img src=mark.svg>",
+            "<img\n  src=\"assets/mark.svg\"\n  alt=\"The mark\"\n>",
+        ]
+        let containers = ["%@", "- %@", "> %@", "text and then\n%@"]
+
+        for step in 0..<4_000 {
+            var characters = Array(seeds[step % seeds.count])
+            for _ in 0..<Int.random(in: 1...8, using: &generator) {
+                guard !characters.isEmpty else { break }
+                let position = Int.random(in: 0..<characters.count, using: &generator)
+                switch Int.random(in: 0..<3, using: &generator) {
+                case 0: characters.remove(at: position)
+                case 1:
+                    characters.insert(
+                        alphabet[Int.random(in: 0..<alphabet.count, using: &generator)],
+                        at: position)
+                default:
+                    characters[position] =
+                        alphabet[Int.random(in: 0..<alphabet.count, using: &generator)]
+                }
+            }
+            let mangled = String(characters)
+            let container = containers[step % containers.count]
+            let placed = container.replacingOccurrences(of: "%@", with: mangled)
+            let source = "keep this line\n\n\(placed)\n\nand this one\n"
+            assertNothingHiddenWasText(source, "step \(step) \(mangled.debugDescription)")
+        }
+    }
+
+    func testTheGoodSpellingsStillDrawAfterAllThatStrictness() {
+        // The other half of the bargain: tightening the grammar until nothing
+        // textual gets through is worthless if it also stopped reading the tags
+        // people write. Every one of these is raw HTML to the core.
+        let spellings = [
+            #"<img src="mark.svg">"#,
+            "<img src=mark.svg>",
+            "<img src='mark.svg'>",
+            #"<img src="mark.svg" alt="M" width="72">"#,
+            #"<img src="mark.svg" />"#,
+            #"<IMG SRC="mark.svg">"#,
+            #"<img  src = "mark.svg"  alt = "M" >"#,
+            "<img\tsrc=\"mark.svg\">",
+            #"<img src="mark.svg" align="left" hspace="12">"#,
+            #"<img src="&amp;mark.svg">"#,
+        ]
+        for spelling in spellings {
+            for container in ["\(spelling)", "- \(spelling)", "> \(spelling)"] {
+                let source = "before\n\n\(container)\n\nafter\n"
+                let parsed = ParsedDocument.parse(source)
+                let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+                XCTAssertEqual(
+                    rendered.entries.count, 1,
+                    "\(container.debugDescription) should still draw one picture")
+            }
+        }
+    }
+
     func testAnAbsurdlyTallPictureStillLaysOut() throws {
         // The drawn size becomes a fragment's height, so an aspect ratio a
         // note can write in one line is an aspect ratio TextKit has to lay

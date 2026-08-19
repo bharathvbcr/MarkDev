@@ -415,8 +415,12 @@ final class RenderedBlockTests: XCTestCase {
     }
 
     func testAnImgTagUnderABulletIsAPictureToo() throws {
-        // Under a bullet the same tag is inline HTML inside a paragraph rather
-        // than a block of its own, and it is the same picture either way.
+        // Not because it becomes inline HTML — which is what this said, and
+        // measuring the core says otherwise: a lone tag on its own line is an
+        // *html block* under a bullet exactly as it is at the top level, and
+        // inside a blockquote and a footnote definition too. It reaches this
+        // code by the same path as any other html block; what is asserted is
+        // that a container does not lose it.
         let source = "- <img src=\"mark.svg\">\n"
         let parsed = ParsedDocument.parse(source)
         let rendered = RenderedBlocks(document: parsed, text: source as NSString)
@@ -433,6 +437,11 @@ final class RenderedBlockTests: XCTestCase {
             "<img>",
             #"<img alt="no source">"#,
             "<!-- <img src=\"a.svg\"> -->",
+            // A `<br>` cannot be drawn, only inserted, and collapsed syntax
+            // shrinks rather than being replaced — so there is nothing to put
+            // in its place and it keeps its source, `clear` and all.
+            #"<br clear="left">"#,
+            #"text<br clear="left">more"#,
         ] {
             let source = "before\n\n\(markup)\n\nafter\n"
             let parsed = ParsedDocument.parse(source)

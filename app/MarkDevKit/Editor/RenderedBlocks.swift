@@ -127,6 +127,7 @@ public struct RenderedBlocks: Sendable, Equatable {
         // standalone image: sorting the span list up front cost every note the
         // price of a feature it does not use.
         var images: [StyleSpan]?
+        var inlineHTML: [StyleSpan]?
         let claimed = found.map(\.range)
         var cursor = 0
         for (index, block) in paragraphs {
@@ -139,15 +140,32 @@ public struct RenderedBlocks: Sendable, Equatable {
             // Cheapest test first, and it reads two characters rather than
             // copying the paragraph out.
             //
-            // A paragraph can hold the HTML spelling as well: an `<img>` on a
-            // line of its own is a block, but the same tag under a list bullet
-            // or on the line after a sentence is inline HTML inside a
-            // paragraph, and it is the same picture either way.
+            // A paragraph can hold the HTML spelling as well. Which paragraphs
+            // is not something to reason about: a lone `<img>` on its own line
+            // is an *html block* wherever it sits — measured, including under a
+            // bullet, inside a blockquote and in a footnote definition — so the
+            // paragraph case is the tag that shares its paragraph with
+            // something, and the something is why the span index below has the
+            // last word.
             guard Self.looksLikeAnImage(block.range, in: text) else {
-                if let content = Self.htmlImage(block.range, in: text),
-                    let range = Self.clamp(block.range, to: text.length)
-                {
-                    found.append(Entry(block: index, range: range, content: content))
+                guard let body = Self.clamp(block.range, to: text.length),
+                    Self.looksLikeAnImageTag(body, in: text)
+                else { continue }
+                // Built once, and only for a document that has a paragraph
+                // shaped like a tag — the same bargain `images` makes, and for
+                // the same reason: almost no note has one.
+                let spans: [StyleSpan]
+                if let built = inlineHTML {
+                    spans = built
+                } else {
+                    spans = document.spans
+                        .lazy
+                        .filter { $0.kind == .inlineHTML }
+                        .sorted { $0.range.location < $1.range.location }
+                    inlineHTML = spans
+                }
+                if let content = Self.htmlImage(inParagraph: block, in: text, among: spans) {
+                    found.append(Entry(block: index, range: body, content: content))
                 }
                 continue
             }
@@ -315,6 +333,54 @@ public struct RenderedBlocks: Sendable, Equatable {
             kind: .image(alt: tag.alt), source: tag.source, width: tag.width)
     }
 
+    /// A paragraph whose whole content is one raw-HTML `<img>` tag.
+    ///
+    /// The tag is read out of the span **the core marked as raw HTML**, never
+    /// out of the paragraph's characters — and that is the whole of the safety
+    /// here. Whether a run of `<…>` is markup or the text of it is a question
+    /// about the document, not about the string: `<img\u{00A0}src="x.svg">`,
+    /// `<img src="a.svg"alt="b">` and ``<img src=a`b.svg>`` are each a
+    /// paragraph of ordinary text to the core, and reading the paragraph
+    /// directly — which is what this used to do — hid all three and drew a
+    /// picture over them. `<img src=x.svg <img src=y.svg>` was the one that
+    /// showed the shape of it: the core reads visible text and *then* a tag
+    /// naming `y.svg`, and the old path hid the text and drew `x.svg`.
+    ///
+    /// Everything outside the span has to be whitespace, for the reason
+    /// ``image(_:in:text:images:)`` insists the same: the block is hidden
+    /// whole, so anything else in it is text the reader loses. That check is
+    /// last because it is the only one that walks the paragraph; a `<br>` or a
+    /// `<span>` is turned away by ``looksLikeAnImageTag(_:in:)`` first.
+    private static func htmlImage(
+        inParagraph block: BlockDescriptor, in text: NSString, among spans: [StyleSpan]
+    ) -> RenderedBlock? {
+        guard let span = onlySpan(in: block.range, among: spans),
+            let body = clamp(block.range, to: text.length),
+            let tag = clamp(span.range, to: text.length),
+            looksLikeAnImageTag(tag, in: text),
+            isOnlyWhitespace(in: body, outside: tag, of: text)
+        else { return nil }
+        return htmlImage(tag, in: text)
+    }
+
+    /// Whether everything in `body` that `inner` does not cover is whitespace.
+    private static func isOnlyWhitespace(
+        in body: NSRange, outside inner: NSRange, of text: NSString
+    ) -> Bool {
+        guard inner.location >= body.location, NSMaxRange(inner) <= NSMaxRange(body) else {
+            return false
+        }
+        for offset in body.location..<inner.location
+        where !isWhitespace(text.character(at: offset)) {
+            return false
+        }
+        for offset in NSMaxRange(inner)..<NSMaxRange(body)
+        where !isWhitespace(text.character(at: offset)) {
+            return false
+        }
+        return true
+    }
+
     /// Whether `body`'s text opens with `<img` and closes with `>`.
     ///
     /// Five characters, and the decision for everything that is not a picture:
@@ -353,7 +419,7 @@ public struct RenderedBlocks: Sendable, Equatable {
         text: NSString,
         images: [StyleSpan]
     ) -> RenderedBlock? {
-        guard let span = onlyImage(in: block.range, among: images) else { return nil }
+        guard let span = onlySpan(in: block.range, among: images) else { return nil }
         guard let source = document.target(for: span), !source.isEmpty else { return nil }
 
         // The paragraph must be the image and nothing else of substance.
@@ -365,12 +431,15 @@ public struct RenderedBlocks: Sendable, Equatable {
         return RenderedBlock(kind: .image(alt: alt), source: source)
     }
 
-    /// The single image span inside `range`, or `nil` if there are none or
-    /// more than one.
+    /// The single span inside `range`, or `nil` if there are none or more than
+    /// one.
     ///
-    /// `images` is sorted by start offset, so the first candidate is found by
-    /// binary search and "is there a second" costs one more step.
-    private static func onlyImage(in range: NSRange, among images: [StyleSpan]) -> StyleSpan? {
+    /// `spans` is one kind of span, already filtered and sorted by start
+    /// offset, so the first candidate is found by binary search and "is there a
+    /// second" costs one more step. Shared by the two spellings of a picture:
+    /// a paragraph holding two images is a paragraph, and so is one holding two
+    /// tags.
+    private static func onlySpan(in range: NSRange, among images: [StyleSpan]) -> StyleSpan? {
         guard !images.isEmpty, range.length > 0 else { return nil }
 
         // First span that could still reach into `range`: everything before it
