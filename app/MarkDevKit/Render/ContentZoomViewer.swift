@@ -42,6 +42,21 @@ public enum ZoomedContent {
     /// the viewer's job is to show the file, not to resample it.
     public static let imageWidth: CGFloat = 8000
 
+    /// Width a vector image is laid out at when opened.
+    ///
+    /// A vector has no pixels to resample — magnifying one is *rendering* it,
+    /// which is the whole bargain this viewer makes — so opening it large
+    /// means laying it out large, and any width the note asked for is a
+    /// statement about the page rather than about the file. A raster has no
+    /// such freedom and keeps its own size, which is why the two are asked
+    /// for differently.
+    ///
+    /// Rasterised at the ordinary Retina scale rather than the diagram's
+    /// fourfold: here the *size* is what the viewer adds. A diagram is already
+    /// at its natural size in the editor, since a graph's layout size is the
+    /// graph's own, so detail is all there is to add there.
+    public static let vectorWidth: CGFloat = 2000
+
     /// Renders `block` at viewing size.
     public static func render(
         _ block: RenderedBlock,
@@ -57,8 +72,12 @@ public enum ZoomedContent {
             return RichContentRenderer.shared.diagram(
                 block.source, maxWidth: diagramWidth, dark: dark, scale: diagramScale)
         case .image(let alt):
+            let scalable = RichContentRenderer.shared.isScalable(
+                at: block.source, relativeTo: documentDirectory)
             return RichContentRenderer.shared.image(
-                at: block.source, relativeTo: documentDirectory, maxWidth: imageWidth
+                at: block.source, relativeTo: documentDirectory,
+                maxWidth: scalable ? vectorWidth : imageWidth,
+                width: scalable ? vectorWidth : nil
             )
             .mapError { failure in
                 alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")

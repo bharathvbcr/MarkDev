@@ -576,6 +576,63 @@ final class ContentZoomTests: XCTestCase {
         XCTAssertEqual(zoomed.size.width, 900, accuracy: 1)
     }
 
+    func testAVectorOpensLargerThanItIsRead() throws {
+        // The other half of "the viewer re-renders, it does not magnify". A
+        // raster opens at its own size because enlarging its pixels is not
+        // detail; a vector has no pixels of its own, so opening one means
+        // laying it out at viewing size — and a 72-point mark opened at 72
+        // points is a viewer that did nothing.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("markdev-zoom-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try """
+            <svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" \
+            viewBox="0 0 72 72"><circle cx="36" cy="36" r="35" fill="black"/></svg>
+            """
+            .write(
+                to: directory.appendingPathComponent("mark.svg"), atomically: true,
+                encoding: .utf8)
+
+        let read = try XCTUnwrap(
+            try? RichContentRenderer.shared.image(
+                at: "mark.svg", relativeTo: directory, maxWidth: 600).get())
+        let zoomed = try XCTUnwrap(
+            try? ZoomedContent.render(
+                RenderedBlock(kind: .image(alt: "mark"), source: "mark.svg"),
+                documentDirectory: directory, textColor: .labelColor, dark: false
+            ).get())
+
+        XCTAssertEqual(read.size.width, 72, accuracy: 0.5, "in the note it is a 72-point mark")
+        XCTAssertEqual(zoomed.size.width, ZoomedContent.vectorWidth, accuracy: 1)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(zoomed.cgImage).width, try XCTUnwrap(read.cgImage).width * 10,
+            "opened, it must be a bigger picture and not the same one stretched")
+    }
+
+    func testAWidthTheNoteAskedForDoesNotFollowAVectorIntoTheViewer() throws {
+        // `<img width="72">` is a statement about the page. The viewer exists
+        // to get past the page.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("markdev-zoom-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try """
+            <svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" \
+            viewBox="0 0 400 400"><circle cx="200" cy="200" r="199" fill="black"/></svg>
+            """
+            .write(
+                to: directory.appendingPathComponent("mark.svg"), atomically: true,
+                encoding: .utf8)
+
+        let zoomed = try XCTUnwrap(
+            try? ZoomedContent.render(
+                RenderedBlock(kind: .image(alt: ""), source: "mark.svg", width: 72),
+                documentDirectory: directory, textColor: .labelColor, dark: false
+            ).get())
+        XCTAssertEqual(zoomed.size.width, ZoomedContent.vectorWidth, accuracy: 1)
+    }
+
     func testAMissingImageReportsWhyRatherThanOpeningEmpty() {
         let result = ZoomedContent.render(
             RenderedBlock(kind: .image(alt: ""), source: "nothing-here.png"),

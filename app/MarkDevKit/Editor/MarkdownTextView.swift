@@ -1864,12 +1864,38 @@ extension MarkdownTextView {
     /// The width, appearance and ink content is rendered against.
     public var renderContext: RenderContext {
         RenderContext(
-            // The column the content has to fit, minus the panel's own padding.
-            width: max(bounds.width - theme.insets.width * 2 - 32, 120),
+            // The column the content has to fit, minus the panel's own padding,
+            // quantised — see `renderWidth(for:)`.
+            width: Self.renderWidth(for: bounds.width - theme.insets.width * 2 - 32),
             dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua,
             mathFontSize: theme.bodyFont.pointSize * 1.25,
             textColor: theme.textColor)
     }
+
+    /// The width pictures are rendered against, for a column of `column`.
+    ///
+    /// Quantised, because the render cache is keyed on this and every distinct
+    /// value is a fresh render of *every* picture in the document — a diagram
+    /// laid out again, an SVG rasterised again. The column changes with every
+    /// step of a window resize, so the raw value means a document full of
+    /// pictures re-renders continuously while the window is being dragged, on
+    /// the main actor.
+    ///
+    /// Rounded **down**, never up: a picture is measured against the width it
+    /// is given, so rounding up would let one overrun the column it has to fit
+    /// in. What it costs is at most ``renderWidthStep`` points of unused
+    /// margin on the widest pictures; what it buys is that a resize crosses a
+    /// handful of widths instead of hundreds.
+    static func renderWidth(for column: CGFloat) -> CGFloat {
+        let step = renderWidthStep
+        guard column.isFinite, column > minimumRenderWidth else { return minimumRenderWidth }
+        return max(minimumRenderWidth, (column / step).rounded(.down) * step)
+    }
+
+    static let renderWidthStep: CGFloat = 16
+    /// The narrowest column pictures are rendered for. A pane can be dragged
+    /// narrower than this; a picture drawn for it would be a stamp.
+    static let minimumRenderWidth: CGFloat = 120
 
     /// Warms every picture in the document, not only the ones on screen.
     ///

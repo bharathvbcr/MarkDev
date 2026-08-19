@@ -16,7 +16,8 @@ import XCTest
 @MainActor
 final class RenderCatalogueTests: XCTestCase {
     private func dump(
-        _ name: String, _ markdown: String, height: CGFloat = 560, caret: Int? = nil
+        _ name: String, _ markdown: String, height: CGFloat = 560, caret: Int? = nil,
+        documentDirectory: URL? = nil
     ) throws {
         guard let directory = ProcessInfo.processInfo.environment["MARKDEV_CATALOGUE_DIR"] else {
             throw XCTSkip("MARKDEV_CATALOGUE_DIR unset")
@@ -31,6 +32,10 @@ final class RenderCatalogueTests: XCTestCase {
         view.drawsBackground = true
         view.backgroundColor = .white
         view.frame = NSRect(x: 0, y: 0, width: 720, height: height)
+        // Before `setMarkdown`, or the first layout pass resolves every
+        // embedded picture against nothing and paints a failure it then has to
+        // correct.
+        view.documentDirectory = documentDirectory
         view.setMarkdown(markdown)
         if let caret {
             view.setSelectedRange(NSRange(location: caret, length: 0))
@@ -305,5 +310,40 @@ final class RenderCatalogueTests: XCTestCase {
             | | | |
             """,
             height: 280, caret: 0)
+    }
+
+    func testPicturesInBothSpellings() throws {
+        // A vector at its own size, the same one sized by an `<img>` tag, and
+        // markup that is not a picture and keeps its source.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevCatalogue-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        try """
+            <svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" \
+            viewBox="0 0 160 160"><circle cx="80" cy="80" r="72" fill="none" \
+            stroke="#2f6fed" stroke-width="10"/><path d="M40 96 L72 56 L104 104 L128 72" \
+            fill="none" stroke="#111827" stroke-width="10" stroke-linejoin="round"/></svg>
+            """
+            .write(
+                to: directory.appendingPathComponent("mark.svg"), atomically: true,
+                encoding: .utf8)
+
+        try dump(
+            "20-pictures-svg",
+            """
+            Intro paragraph.
+
+            ![The mark](mark.svg)
+
+            The same mark, sized by the note:
+
+            <img src="mark.svg" alt="The mark" width="72">
+
+            And markup that is not a picture:
+
+            <div>left as it is</div>
+            """,
+            height: 700, caret: 0, documentDirectory: directory)
     }
 }

@@ -237,6 +237,42 @@ final class RenderedContentOrientationTests: XCTestCase {
             "the loaded image must sit the same way up as the file it came from")
     }
 
+    func testAVectorIsRasterisedTheRightWayUp() throws {
+        // Nothing else in the vector path asserts orientation: every other
+        // test of it measures a *size*, and a picture rendered perfectly and
+        // upside down has exactly the size it should. This is the same trap
+        // the Mermaid image path fell into — a raw `CGContext` has its origin
+        // at the bottom left, and whether AppKit takes that into account when
+        // it draws into one is AppKit's business rather than something to
+        // assume.
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevOrientation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A band across the top fifth, clear of the corners: the probe reads
+        // its background from the top-left pixel, so a fixture whose ink
+        // starts there would have the probe measuring the picture inside out.
+        try """
+            <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" \
+            viewBox="0 0 100 100"><rect width="100" height="100" fill="white"/>\
+            <rect x="10" y="10" width="80" height="20" fill="black"/></svg>
+            """
+            .write(
+                to: directory.appendingPathComponent("banded.svg"), atomically: true,
+                encoding: .utf8)
+
+        guard case .success(let content) = RichContentRenderer().image(
+            at: "banded.svg", relativeTo: directory, maxWidth: 200, width: 200)
+        else { return XCTFail("an SVG should load") }
+
+        let profile = try measure(content)
+        XCTAssertLessThan(
+            profile.centroid, 0.35,
+            "the band is at the top of the file and must be at the top of the picture "
+                + "(centroid \(profile.centroid))")
+    }
+
     /// A bitmap whose halves differ, for detecting a vertical flip.
     ///
     /// Built through a `CGContext` rather than `NSImage.lockFocus` so that the

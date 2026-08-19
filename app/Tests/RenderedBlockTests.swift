@@ -364,6 +364,108 @@ final class RenderedBlockTests: XCTestCase {
         }
     }
 
+    // MARK: - The HTML spelling of a picture
+
+    func testAStandaloneImgTagIsAPicture() throws {
+        // Markdown cannot say how wide a picture should be, so a note that
+        // needs to say it writes the tag. Rendered as its own source, that is
+        // the author's markup shown to a reader who wanted the mark.
+        let source = """
+            intro
+
+            <img src="assets/mark.svg" alt="The mark" width="72">
+
+            after
+            """
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+
+        let entry = try XCTUnwrap(rendered.entries.first, "the tag should render as a picture")
+        XCTAssertEqual(rendered.entries.count, 1)
+        XCTAssertEqual(entry.content.source, "assets/mark.svg")
+        XCTAssertEqual(entry.content.width, 72)
+        guard case .image(let alt) = entry.content.kind else {
+            return XCTFail("expected an image")
+        }
+        XCTAssertEqual(alt, "The mark")
+        XCTAssertEqual(
+            (source as NSString).substring(with: entry.range)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            #"<img src="assets/mark.svg" alt="The mark" width="72">"#,
+            "the range that collapses has to be the tag and nothing else")
+    }
+
+    func testAnImgTagCollapsesAndComesBackLikeAnyOtherPicture() throws {
+        let source = "<img src=\"mark.svg\" alt=\"m\">\n\nafter\n"
+        let view = view(source, mode: .livePreview)
+        let outside = (source as NSString).range(of: "after").location
+
+        view.setSelectedRange(NSRange(location: outside, length: 0))
+        let entry = try XCTUnwrap(view.renderedBlocks.entries.first)
+        XCTAssertTrue(
+            view.hiddenRanges.covers(entry.range),
+            "the tag is replaced by the picture, so it collapses whole")
+        XCTAssertEqual(fragments(view).filter { $0.decoration.rendered != nil }.count, 1)
+
+        view.setSelectedRange(NSRange(location: 3, length: 0))
+        XCTAssertFalse(
+            view.hiddenRanges.covers(entry.range),
+            "the markup has to come back to be edited")
+        XCTAssertTrue(fragments(view).allSatisfy { $0.decoration.rendered == nil })
+    }
+
+    func testAnImgTagUnderABulletIsAPictureToo() throws {
+        // Under a bullet the same tag is inline HTML inside a paragraph rather
+        // than a block of its own, and it is the same picture either way.
+        let source = "- <img src=\"mark.svg\">\n"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        XCTAssertEqual(try XCTUnwrap(rendered.entries.first).content.source, "mark.svg")
+    }
+
+    func testHTMLThatIsNotOnePictureKeepsItsSource() {
+        // Everything here is markup the editor cannot draw. Rendering any of
+        // it as a picture would hide text the reader wrote.
+        for markup in [
+            "<div>hello</div>",
+            #"<img src="a.svg"><img src="b.svg">"#,
+            #"see <img src="a.svg"> here"#,
+            "<img>",
+            #"<img alt="no source">"#,
+            "<!-- <img src=\"a.svg\"> -->",
+        ] {
+            let source = "before\n\n\(markup)\n\nafter\n"
+            let parsed = ParsedDocument.parse(source)
+            let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+            XCTAssertTrue(
+                rendered.entries.isEmpty,
+                "\(markup.debugDescription) is markup, not a picture")
+        }
+    }
+
+    func testBothSpellingsOfAPictureCanShareADocument() {
+        let source = """
+            ![a](a.png)
+
+            <img src="b.svg" width="120">
+
+            ```mermaid
+            graph TD;
+            A-->B;
+            ```
+            """
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        XCTAssertEqual(rendered.entries.count, 3)
+        XCTAssertEqual(rendered.entries.map(\.content.width), [nil, 120, nil])
+
+        for (previous, next) in zip(rendered.entries, rendered.entries.dropFirst()) {
+            XCTAssertLessThanOrEqual(
+                NSMaxRange(previous.range), next.range.location,
+                "entries must stay ascending and disjoint")
+        }
+    }
+
     func testNoTextMeansNoRenderedBlocks() {
         let parsed = ParsedDocument.parse("```mermaid\ngraph TD;\nA-->B;\n```\n")
         XCTAssertTrue(RenderedBlocks(document: parsed, text: nil).entries.isEmpty)
