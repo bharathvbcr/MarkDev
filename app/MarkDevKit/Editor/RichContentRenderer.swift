@@ -231,7 +231,8 @@ public final class RichContentRenderer {
                 request.block.source,
                 fontSize: request.context.mathFontSize,
                 color: request.context.textColor,
-                display: true)
+                display: true,
+                maxWidth: request.context.width)
         case .diagram:
             return diagram(
                 request.block.source, maxWidth: request.context.width,
@@ -260,7 +261,8 @@ public final class RichContentRenderer {
         case .math:
             return key(
                 forMath: request.block.source, fontSize: request.context.mathFontSize,
-                color: request.context.textColor, display: true)
+                color: request.context.textColor, display: true,
+                maxWidth: request.context.width)
         case .diagram:
             return key(
                 forDiagram: request.block.source, maxWidth: request.context.width,
@@ -278,13 +280,28 @@ public final class RichContentRenderer {
     // probe comes to disagree with the store it is probing.
 
     private func key(
-        forMath latex: String, fontSize: CGFloat, color: NSColor, display: Bool
+        forMath latex: String, fontSize: CGFloat, color: NSColor, display: Bool,
+        maxWidth: CGFloat?
     ) -> Key {
+        // The column is part of the key for the same reason it is for a
+        // diagram: a formula wider than its column is scaled down to fit, so
+        // the same source at two widths draws at two sizes and one bitmap
+        // must not be served for both.
+        //
+        // `dark` is deliberately *not* sampled here. A formula paints no
+        // background — its whole appearance-dependence is the ink it is
+        // drawn in, which `tint` already carries — and sampling the ambient
+        // appearance made the key a function of *when* it was derived:
+        // measured in a fresh process, `NSApp`'s effective appearance reads
+        // light for the first call and dark for the second, which split one
+        // formula into two cache entries and left ``isCached(_:)`` probing
+        // beside the entry `render(_:)` had just stored.
         Key(
             kind: display ? "math.display" : "math.inline",
             source: latex,
             scale: Self.bucket(fontSize * 10),
-            dark: isDark,
+            dark: false,
+            raster: Self.bucket(Self.sanitised(maxWidth) ?? 0),
             tint: Self.tint(of: color))
     }
 
@@ -327,14 +344,88 @@ public final class RichContentRenderer {
 
     // MARK: - Math
 
+    /// The most a formula's source may weigh before it is refused, in bytes.
+    ///
+    /// Typesetting is linear in the source and happens on the main actor,
+    /// synchronously, while TextKit builds a fragment — measured here at
+    /// roughly 6ms per kilobyte, so a 64KB "formula" costs a third of a
+    /// second per layout pass before anything else runs. Real formulas are
+    /// tiny: a page of dense mathematics is a few hundred bytes, and even
+    /// machine-generated output past 8KB lays out tens of thousands of points
+    /// wide — wider than any column, where it was previously clipped at the
+    /// view edge anyway. Refusing names the problem; clipping hid it.
+    private static let maxMathBytes = 8_192
+
+    /// The deepest brace nesting a formula may reach.
+    ///
+    /// SwiftMath parses recursively: every group (`{…}`, a `\frac` argument,
+    /// a superscript's operand) descends another stack frame in
+    /// `MTMathListBuilder.buildInternal`, with no depth limit of its own.
+    /// Measured here, a formula nested ~50 script levels deep — about 200
+    /// bytes — overflows the stack and takes the *process* down: SIGSEGV on
+    /// the guard page, uncatchable, from a note the reader merely opened.
+    /// The boundary moves with build configuration and stack state (depth 49
+    /// survived where 50 died), which is exactly why the bound sits far below
+    /// it rather than at it. Real mathematics nests three or four levels;
+    /// thirty is already generous, and KaTeX refuses far sooner than that.
+    ///
+    /// Depth is what drives both failure modes, not just the crash: nested
+    /// `\frac`s also grow superlinearly in time (measured: 56ms at 200 deep,
+    /// 774ms at 500). A brace-depth scan is one linear pass over bytes the
+    /// renderer was about to walk anyway.
+    private static let maxMathDepth = 30
+
+    /// Counts the maximum simultaneous `{…}` nesting of a LaTeX source.
+    ///
+    /// Braces are the grouping construct every recursive descent follows —
+    /// arguments, scripts, environments all arrive through them — so their
+    /// nesting is the cheap proxy for the parser's recursion depth. Escaped
+    /// braces (`\{`, `\}`) render as literal glyphs rather than opening
+    /// groups, so they are skipped; an unterminated `{` still counts to the
+    /// end, which only makes the estimate conservative.
+    static func nestingDepth(of latex: String) -> Int {
+        var depth = 0
+        var deepest = 0
+        var escaped = false
+        for byte in latex.utf8 {
+            if escaped {
+                escaped = false
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\\"):
+                escaped = true
+            case UInt8(ascii: "{"):
+                depth += 1
+                deepest = max(deepest, depth)
+            case UInt8(ascii: "}"):
+                depth = max(0, depth - 1)
+            default:
+                break
+            }
+        }
+        return deepest
+    }
+
     /// Typesets `latex`, inline or display style.
+    ///
+    /// - Parameter maxWidth: the column the result has to fit, when there is
+    ///   one. A formula laid out wider than it is scaled down whole — the same
+    ///   bargain diagrams make ("scaled down rather than clipped") — because a
+    ///   wide formula drawn at its natural size ran past the view edge and was
+    ///   cut off mid-symbol. `nil` draws at natural size, which is what the
+    ///   zoom viewer wants; the pixel cap below still applies either way.
     public func math(
         _ latex: String,
         fontSize: CGFloat,
         color: NSColor,
-        display: Bool
+        display: Bool,
+        maxWidth: CGFloat? = nil
     ) -> Result<RenderedContent, RenderFailure> {
-        let key = key(forMath: latex, fontSize: fontSize, color: color, display: display)
+        let column = Self.sanitised(maxWidth)
+        let key = key(
+            forMath: latex, fontSize: fontSize, color: color, display: display,
+            maxWidth: maxWidth)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
@@ -343,6 +434,23 @@ public final class RichContentRenderer {
         // TextKit takes the layout down somewhere far from here.
         guard Self.isDrawable(fontSize), fontSize <= 1_000 else {
             let failure = RenderFailure(reason: "Unusable font size")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+
+        // Both structural bounds are checked before SwiftMath sees the source:
+        // the parse is where the runaway cost lives, so refusing after it
+        // would be paying for the thing being refused.
+        guard latex.utf8.count <= Self.maxMathBytes else {
+            let kilobytes = Double(latex.utf8.count) / 1_024
+            let failure = RenderFailure(
+                reason: String(format: "Formula too long (%.1f KB)", kilobytes))
+            store(failure, for: key)
+            return .failure(failure)
+        }
+        let depth = Self.nestingDepth(of: latex)
+        guard depth <= Self.maxMathDepth else {
+            let failure = RenderFailure(reason: "Formula too deeply nested")
             store(failure, for: key)
             return .failure(failure)
         }
@@ -378,26 +486,74 @@ public final class RichContentRenderer {
         // `fittingSize`, not `intrinsicContentSize`: SwiftMath overrides the
         // former on macOS and the latter only on iOS, so reading the iOS name
         // here returns NSView's default of zero and every formula looks empty.
-        let size = label.fittingSize
+        var size = label.fittingSize
         guard size.width > 0, size.height > 0 else {
             let failure = RenderFailure(reason: "Empty formula")
             store(failure, for: key)
             return .failure(failure)
         }
 
+        // A formula wider than its column is scaled down whole, aspect ratio
+        // intact — the diagram rule. Whatever remains is then bounded by the
+        // same drawn-size cap a picture answers to: a formula cannot ask for
+        // a fragment taller than the page either.
+        if let column, size.width > column {
+            let fit = column / size.width
+            size = CGSize(width: size.width * fit, height: size.height * fit)
+        }
+        size = Self.drawable(size)
+
+        // `cacheDisplay` draws the *view*, whose bounds are still zero unless
+        // they are set first — measured here as ink compressed into a sliver
+        // of the bitmap, which reads as a formula rendered at the wrong size.
         label.frame = CGRect(origin: .zero, size: size)
-        guard let rep = label.bitmapImageRepForCachingDisplay(in: label.bounds) else {
+        guard let rep = Self.rasterise(label, at: size) else {
             let failure = RenderFailure(reason: "Could not rasterise formula")
             store(failure, for: key)
             return .failure(failure)
         }
-        label.cacheDisplay(in: label.bounds, to: rep)
 
         let image = NSImage(size: size)
         image.addRepresentation(rep)
         let rendered = RenderedContent(image: image, size: size)
         store(rendered, for: key)
         return .success(rendered)
+    }
+
+    /// Draws a typeset formula into a bitmap whose pixel size is chosen here.
+    ///
+    /// `bitmapImageRepForCachingDisplay(in:)` — the call this replaces —
+    /// sized the bitmap by whatever the main screen's backing scale happened
+    /// to be, which left the allocation hostage to the display the app was
+    /// launched on and unbounded in pixels: measured here, a flat 37KB source
+    /// laid out 334,000 points wide and rasterised to 668,296×25 — 16.7
+    /// megapixels, past ``maxRasterPixels`` and some 67MB for one line of
+    /// symbols. Building the rep explicitly lets ``fittedScale`` cap the
+    /// pixels the same way it caps them for diagrams and vectors, and keeps
+    /// the Retina detail those paths get.
+    private static func rasterise(_ label: MTMathUILabel, at size: CGSize) -> NSBitmapImageRep? {
+        guard size.width.isFinite, size.height.isFinite, size.width >= 1, size.height >= 1 else {
+            return nil
+        }
+        let scale = fittedScale(rasterScale, for: size)
+        let pixelWidth = max(1, Int((size.width * scale).rounded()))
+        let pixelHeight = max(1, Int((size.height * scale).rounded()))
+        guard
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: pixelWidth, pixelsHigh: pixelHeight,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        else { return nil }
+        // A hand-built rep defaults to 72dpi, which makes its *point* size its
+        // pixel count — twice the view for a Retina-scale bitmap — and
+        // `cacheDisplay` then maps the view into the bottom-left quarter.
+        // Stating the point size is what tells AppKit the two grids differ.
+        rep.size = size
+        // `cacheDisplay(in:to:)` maps the view's points onto whatever pixel
+        // grid the representation carries, so the formula fills the bitmap
+        // whether it asked for one point or four per point.
+        label.cacheDisplay(in: CGRect(origin: .zero, size: size), to: rep)
+        return rep
     }
 
     // MARK: - Diagrams
@@ -903,9 +1059,5 @@ public final class RichContentRenderer {
         let area = content.size.width * content.size.height
         guard area.isFinite, area > 0 else { return 0 }
         return Int(min(area, CGFloat(Int32.max)))
-    }
-
-    private var isDark: Bool {
-        NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 }
