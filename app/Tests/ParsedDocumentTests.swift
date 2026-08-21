@@ -54,6 +54,72 @@ final class ParsedDocumentTests: XCTestCase {
         XCTAssertTrue(doc.spans.contains { $0.kind == .link })
     }
 
+    func testCurrencyProseNeverBecomesMathAcrossTheFFI() {
+        // The contract the reader sees: a sentence of prices reaches the page
+        // exactly as written — no hidden dollars (the gap), no math styling.
+        // Enforced in core/tests/math.rs; this pins it across the bridge, so
+        // a stale libmarkdev.a cannot quietly bring the bug back.
+        for source in [
+            "Price $50-$100 per unit",
+            "US$5 or A$10 shipped",
+            "price$5 each",
+            "Cost $5 and$6 today",
+            "He gave me $$5 and I gave him $$10 back",
+            "![chart $5](pic$a.png)",
+        ] {
+            let doc = ParsedDocument.parse(source)
+            XCTAssertTrue(
+                doc.spans.filter { $0.kind == .inlineMath }.isEmpty,
+                "\(source) must produce no inline math"
+            )
+            XCTAssertTrue(
+                doc.blocks.filter { $0.kind == .mathBlock }.isEmpty,
+                "\(source) must produce no formula block"
+            )
+            XCTAssertTrue(
+                doc.markers.isEmpty,
+                "\(source) must hide nothing — hidden dollars are the gap"
+            )
+        }
+    }
+
+    func testComparisonsNeverBecomeHighlightsAcrossTheFFI() {
+        // The `==highlight==` scanner had no adjacency rules at all and ate
+        // comparisons, base64 URL padding, and `=` runs. Same bargain as the
+        // dollar contract above.
+        for source in [
+            "x == y == z",
+            "if a == b and c == d",
+            "a ==== b",
+            "see https://x.com/?t=dGVzdA== and https://y.com/?t=cGFzcw==",
+        ] {
+            let doc = ParsedDocument.parse(source)
+            XCTAssertTrue(
+                doc.spans.filter { $0.kind == .highlight }.isEmpty,
+                "\(source) must produce no highlight"
+            )
+            XCTAssertTrue(doc.markers.isEmpty, "\(source) must hide nothing")
+        }
+    }
+
+    func testCJKMathAndHighlightCrossTheFFI() {
+        // CJK carries no spaces, so glued delimiters are normal spelling
+        // there; the adjacency rules are ASCII-only precisely so this works.
+        let math = ParsedDocument.parse("其中$x$是变量")
+        XCTAssertEqual(math.spans.filter { $0.kind == .inlineMath }.count, 1)
+        let highlight = ParsedDocument.parse("这是==重点==内容")
+        XCTAssertEqual(highlight.spans.filter { $0.kind == .highlight }.count, 1)
+    }
+
+    func testGenuineMathStillCrossesTheFFI() {
+        let doc = ParsedDocument.parse("Euler said $e = mc^2$ loudly")
+        XCTAssertEqual(doc.spans.filter { $0.kind == .inlineMath }.count, 1)
+        XCTAssertEqual(doc.markers.count, 2, "both `$` delimiters hide")
+        XCTAssertTrue(
+            ParsedDocument.parse("$$\na = b\n$$").blocks.contains { $0.kind == .mathBlock }
+        )
+    }
+
     func testRangesStayInsideTheDocument() {
         // Out-of-bounds ranges would crash NSTextStorage rather than
         // misrender, so this is a hard invariant of the bridge.

@@ -196,35 +196,39 @@ pub fn parse(source: &str) -> ParseResult {
                 cover(&mut stack, range);
             }
             Event::InlineMath(_) => {
-                emit_delimited_leaf(
-                    &range,
-                    source,
-                    SpanKind::InlineMath,
-                    1,
-                    &mapper,
-                    &mut result,
-                    &block_stack,
-                    inline_depth,
-                );
+                if inline_math_is_valid(source, &range) {
+                    emit_delimited_leaf(
+                        &range,
+                        source,
+                        SpanKind::InlineMath,
+                        1,
+                        &mapper,
+                        &mut result,
+                        &block_stack,
+                        inline_depth,
+                    );
+                }
                 cover(&mut stack, range);
             }
             Event::DisplayMath(_) => {
-                let block = push_block(
-                    &mut result,
-                    &mapper,
-                    &range,
-                    BlockKind::MathBlock,
-                    block_stack.len() as u16,
-                    0,
-                    NO_INFO,
-                );
-                if block_stack.is_empty() {
-                    result.top_level.push(range.clone());
-                }
-                // `$$` on both sides is syntax, the formula between is content.
-                mark(&mut result, &mapper, range.start..range.start + 2, block);
-                if range.end >= range.start + 2 {
-                    mark(&mut result, &mapper, range.end - 2..range.end, block);
+                if display_math_is_valid(source, &range) {
+                    let block = push_block(
+                        &mut result,
+                        &mapper,
+                        &range,
+                        BlockKind::MathBlock,
+                        block_stack.len() as u16,
+                        0,
+                        NO_INFO,
+                    );
+                    if block_stack.is_empty() {
+                        result.top_level.push(range.clone());
+                    }
+                    // `$$` on both sides is syntax, the formula between is content.
+                    mark(&mut result, &mapper, range.start..range.start + 2, block);
+                    if range.end >= range.start + 2 {
+                        mark(&mut result, &mapper, range.end - 2..range.end, block);
+                    }
                 }
                 cover(&mut stack, range);
             }
@@ -560,6 +564,117 @@ fn delimiter_run(source: &str, range: &Range<usize>, byte: u8) -> usize {
         .take_while(|&&b| b == byte)
         .count()
 }
+/// Whether an inline `$…$` event should render as math rather than as the
+/// literal text the reader typed.
+///
+/// `pulldown-cmark` pairs two `$`s whenever the first has a non-space after
+/// it and the second a non-space before it — pandoc's rule, written for
+/// documents that are mostly mathematics. In notes that are mostly prose it
+/// eats currency: `$50-$100` pairs on the hyphen, hiding both dollars and
+/// styling `50-` as math. Three refusals, each named for the prose it
+/// protects:
+///
+/// - **Letter before plus digit after is a currency mark.** `US$5`,
+///   `A$10`, `price$5` — an ASCII alphanumeric welded to the left of the
+///   opener with a digit on its right is money, not LaTeX. The check is
+///   ASCII-only deliberately: Chinese and Japanese are written without
+///   spaces, so `其中$x$是变量` is the *normal* spelling of glued math, and
+///   a Unicode-letter rule would refuse every one of those.
+/// - **Nothing follows the closer but a digit.** Pandoc's own currency
+///   rule: `$50-$100` closes before the second `0`, `$5 and$6` before the
+///   `6`. A letter suffix is a word, so `$n$th` survives.
+/// - **The content never spans markup.** A `$` pair that reaches across
+///   `](` is eating an image — `![chart $5](pic$a.png)` pairs its dollars
+///   through the link separator because pulldown's scanner runs before
+///   images resolve. Refusing leaves every character the reader typed on
+///   the page, unstyled; the honest failure.
+///
+/// The two pulldown rules — non-space after the opener, non-space before
+/// the closer — are re-checked rather than trusted, so this function stays
+/// correct even if the upstream pairing ever loosens.
+fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+    let bytes = source.as_bytes();
+    // Structural sanity: `$` at both ends with something between, and both
+    // ends on character boundaries so the adjacency reads below cannot slice
+    // mid-character however odd the caller.
+    if range.len() < 3
+        || range.end > bytes.len()
+        || !source.is_char_boundary(range.start)
+        || !source.is_char_boundary(range.end)
+    {
+        return false;
+    }
+    let (opener, closer) = (range.start, range.end - 1);
+    if bytes[opener] != b'$' || bytes[closer] != b'$' {
+        return false;
+    }
+    if bytes[opener + 1].is_ascii_whitespace() || bytes[closer - 1].is_ascii_whitespace() {
+        return false;
+    }
+    // Currency signature: letter welded to the left, digit straight after.
+    // Both halves must hold — `the$x$axis` has a digit nowhere in sight.
+    if opener > 0 && bytes[opener - 1].is_ascii_alphanumeric() && bytes[opener + 1].is_ascii_digit()
+    {
+        return false;
+    }
+    if source[range.end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    // Real LaTeX never contains `](`; a mangled image always does.
+    if bytes[opener + 1..closer]
+        .windows(2)
+        .any(|window| window == b"](")
+    {
+        return false;
+    }
+    true
+}
+
+/// The same question for `$$…$$`.
+///
+/// Display pairing ignores whitespace entirely — pulldown-cmark only asks
+/// that both delimiters be doubled — so `He gave me $$5 and I gave him $$10`
+/// becomes a formula block *inside the sentence*, which the editor replaces
+/// with a typeset bitmap: a hole where the sentence was. The currency
+/// rules refuse it exactly as [`inline_math_is_valid`] does. Block math on
+/// its own lines ends at a newline or the end of the document and passes
+/// untouched; so does inline display math between words (`text $$x$$ more`),
+/// which notes in the wild rely on.
+fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+    let bytes = source.as_bytes();
+    // Structural sanity: `$$` at both ends with something between, on
+    // character boundaries, for the same reason the inline check insists.
+    if range.len() < 5
+        || range.end > bytes.len()
+        || !source.is_char_boundary(range.start)
+        || !source.is_char_boundary(range.end)
+    {
+        return false;
+    }
+    if &bytes[range.start..range.start + 2] != b"$$" || &bytes[range.end - 2..range.end] != b"$$" {
+        return false;
+    }
+    // Currency signature, same as inline: "word$$5 …" is slang for money
+    // (`gave him $$10`), not display math.
+    if range.start > 0
+        && bytes[range.start - 1].is_ascii_alphanumeric()
+        && bytes[range.start + 2].is_ascii_digit()
+    {
+        return false;
+    }
+    if source[range.end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    true
+}
 
 /// Emits a span for a leaf construct and hides its delimiters.
 #[allow(clippy::too_many_arguments)]
@@ -700,22 +815,32 @@ fn scan_text_extensions(
     let base = range.start;
 
     // ==highlight==
+    //
+    // Pairing is MarkDev's own, so the adjacency rules live here rather
+    // than in a vendored parser: the opener must sit outside an ASCII word,
+    // both inner flanks must be tight (`== spaced ==` is prose), nothing
+    // may follow the closer but a digit, and an empty pair hides nothing.
+    // Without them `x == y == z` swallowed the words between, base64 URL
+    // padding paired across two URLs, and `a ==== b` hid four characters
+    // and drew nothing — the pure gap this rule exists to refuse.
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == b'=' && bytes[i + 1] == b'=' {
             if let Some(close) = find_pair(bytes, i + 2, b'=') {
-                push_span(
-                    result,
-                    mapper,
-                    &(base + i + 2..base + close),
-                    SpanKind::Highlight,
-                    0,
-                    0,
-                );
-                mark_current(result, mapper, base + i..base + i + 2, block_stack);
-                mark_current(result, mapper, base + close..base + close + 2, block_stack);
-                i = close + 2;
-                continue;
+                if highlight_is_valid(text, i, close) {
+                    push_span(
+                        result,
+                        mapper,
+                        &(base + i + 2..base + close),
+                        SpanKind::Highlight,
+                        0,
+                        0,
+                    );
+                    mark_current(result, mapper, base + i..base + i + 2, block_stack);
+                    mark_current(result, mapper, base + close..base + close + 2, block_stack);
+                    i = close + 2;
+                    continue;
+                }
             }
         }
         i += 1;
@@ -750,6 +875,41 @@ fn find_pair(bytes: &[u8], from: usize, delim: u8) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Whether the `==` run at `open` may highlight up to the one at `close`.
+///
+/// Both are offsets into `text`, the `Text` event being scanned; `close`
+/// is the start of the closing run, so the content is `open+2..close`.
+/// The rules mirror [`inline_math_is_valid`] and exist for the same
+/// reason: a pair that forms across ordinary prose hides its delimiters
+/// and styles everything between, which reads as data loss.
+///
+/// The boundary check is ASCII-only for the reason its sibling's is:
+/// Chinese and Japanese carry no spaces, so `这是==重点==内容` is normal
+/// spelling, not an equals sign welded into a word.
+fn highlight_is_valid(text: &str, open: usize, close: usize) -> bool {
+    let bytes = text.as_bytes();
+    // An empty or absent body highlights nothing — `a ==== b` must keep
+    // every character it typed.
+    if close <= open + 2 {
+        return false;
+    }
+    // Tight inner flanks: `== spaced ==` is arithmetic, not emphasis.
+    if bytes[open + 2].is_ascii_whitespace() || bytes[close - 1].is_ascii_whitespace() {
+        return false;
+    }
+    // Outside an ASCII word on the left: base64 padding (`dGVzdA==`) and
+    // glued comparisons (`a=b==c`) both put `==` inside a token.
+    if open > 0 && bytes[open - 1].is_ascii_alphanumeric() {
+        return false;
+    }
+    // Nothing follows the closer but a digit — the currency rule again,
+    // because `==5==6` is arithmetic.
+    if bytes.get(close + 2).is_some_and(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    true
 }
 
 /// Byte ranges of `#tag` occurrences in `text`.
