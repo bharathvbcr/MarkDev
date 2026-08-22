@@ -294,6 +294,33 @@ final class SyntaxHighlighterTests: XCTestCase {
         let second = highlighter.spans(language: "rust", code: code)
         XCTAssertEqual(first, second)
     }
+
+    /// Eviction follows *use*, not insertion: scrolling back over early
+    /// fences keeps them warm, where insertion-order eviction re-ran
+    /// tree-sitter on every pass back.
+    func testRecentlyUsedEntriesSurviveEviction() {
+        let highlighter = SyntaxHighlighter()
+
+        // Fill well past the limit: with room for 256, entries 0..<44 have
+        // already been evicted when this loop ends.
+        for index in 0..<300 {
+            _ = highlighter.spans(language: "rust", code: "fn filler\(index)() {}")
+        }
+
+        // Re-reading an old fence is use — filler50 sits near the front of
+        // the insertion order, ten evictions from safety under FIFO.
+        let revived = "fn filler50() {}"
+        _ = highlighter.spans(language: "rust", code: revived)
+
+        // Ten more insertions: recency keeps the revived block, insertion
+        // order takes it instead.
+        for index in 300..<310 {
+            _ = highlighter.spans(language: "rust", code: "fn late\(index)() {}")
+        }
+        XCTAssertTrue(
+            highlighter.isCached(language: "rust", code: revived),
+            "a recently used block was evicted while colder ones stayed")
+    }
 }
 
 @MainActor
@@ -418,6 +445,21 @@ final class TaskAndTableTests: XCTestCase {
             for: body, in: document)
         else { return XCTFail("expected a table row for the body") }
         XCTAssertFalse(bodyIsHeader)
+    }
+
+    /// Every table owns its own header. Looking the `.tableHead` up across
+    /// the whole document — which is what this used to do — shaded only the
+    /// first table's header and left every later one looking like body rows.
+    func testASecondTableShadesItsOwnHeader() {
+        let source = table() + "\n\n" + table()
+        let document = ParsedDocument.parse(source)
+        let secondTableHeader = (source as NSString).range(
+            of: "Language", options: .backwards)
+
+        guard case .tableRow(let isHeader, _) = BlockDecoration.decoration(
+            for: secondTableHeader, in: document)
+        else { return XCTFail("expected a table row for the second table's header") }
+        XCTAssertTrue(isHeader, "the second table's header lost its shading")
     }
 
     /// A view showing `markdown` with the caret parked off the table.

@@ -568,6 +568,67 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         case trailing
     }
 
+    // MARK: - Measured lines
+
+    /// A Core Text line and its metrics, built once and reused across draws.
+    struct MeasuredLine {
+        let line: CTLine
+        let width: CGFloat
+        let ascent: CGFloat
+        let descent: CGFloat
+    }
+
+    /// Everything that changes a line's ink apart from its colour.
+    struct LineKey: Hashable {
+        let text: String
+        let fontName: String
+        let fontSize: CGFloat
+        let kern: Double
+    }
+
+    /// Lines drawn in strips and gutters, cached by ``LineKey``.
+    ///
+    /// A fragment repaints often — hover ticks, copy confirmations, scroll
+    /// damage — and every pass used to build an attributed string, a Core
+    /// Text line, and its metrics again. Colour is deliberately absent from
+    /// the key: the cached line carries none, and ``CTLineDraw`` falls back
+    /// to the context's fill colour, so one line serves every tint the
+    /// palette can produce. It lives on the fragment and dies with it, so
+    /// nothing here needs a bound of its own. Draw-time only; layout metrics
+    /// never consult it.
+    var measuredLines: [LineKey: MeasuredLine] = [:]
+
+    /// The line for `text`, measuring it on first use.
+    private func measuredLine(text: String, font: CTFont, kern: Double) -> MeasuredLine {
+        let key = LineKey(
+            text: text,
+            fontName: CTFontCopyPostScriptName(font) as String,
+            fontSize: CTFontGetSize(font),
+            kern: kern)
+        if let cached = measuredLines[key] { return cached }
+
+        var attributes: [CFString: Any] = [kCTFontAttributeName: font]
+        if kern != 0 { attributes[kCTKernAttributeName] = kern as CFNumber }
+        guard
+            let attributed = CFAttributedStringCreate(
+                nil, text as CFString, attributes as CFDictionary)
+        else { return Self.emptyMeasuredLine }
+
+        let line = CTLineCreateWithAttributedString(attributed)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+        let value = MeasuredLine(line: line, width: width, ascent: ascent, descent: descent)
+        measuredLines[key] = value
+        return value
+    }
+
+    /// What a line that could not be built measures: nothing.
+    private static let emptyMeasuredLine = MeasuredLine(
+        line: CTLineCreateWithAttributedString(
+            CFAttributedStringCreate(nil, "" as CFString, nil)!),
+        width: 0, ascent: 0, descent: 0)
+
     /// Draws the label standing in for the block's collapsed opening line.
     private func drawBlockLabel(
         in context: CGContext,
@@ -578,34 +639,25 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         guard let label = blockLabel, !label.isEmpty, let palette, let colour else { return }
         let rect = decorationRect.offsetBy(dx: point.x, dy: point.y)
 
-        let attributes: [CFString: Any] = [
-            kCTFontAttributeName: palette.labelFont,
-            kCTForegroundColorAttributeName: colour,
-            // Small caps read as a label rather than as a very short line of
-            // text, and the tracking is what keeps them from setting solid.
-            kCTKernAttributeName: 0.6 as CFNumber,
-        ]
-        guard let attributed = CFAttributedStringCreate(
-            nil, label as CFString, attributes as CFDictionary)
-        else { return }
-        let line = CTLineCreateWithAttributedString(attributed)
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+        // Small caps read as a label rather than as a very short line of
+        // text, and the tracking is what keeps them from setting solid.
+        let measured = measuredLine(text: label, font: palette.labelFont, kern: 0.6)
 
         let x: CGFloat
         switch alignment {
         case .leading: x = rect.minX + Metrics.panelInset
-        case .trailing: x = rect.maxX - width - Metrics.panelInset
+        case .trailing: x = rect.maxX - measured.width - Metrics.panelInset
         }
         // Centred in the strip the label's own height bought.
-        let top = rect.minY + (Metrics.labelHeight + Metrics.blockPadding - ascent - descent) / 2
+        let top = rect.minY
+            + (Metrics.labelHeight + Metrics.blockPadding - measured.ascent - measured.descent) / 2
 
         context.saveGState()
         defer { context.restoreGState() }
+        context.setFillColor(colour)
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-        context.textPosition = CGPoint(x: x, y: top + ascent)
-        CTLineDraw(line, context)
+        context.textPosition = CGPoint(x: x, y: top + measured.ascent)
+        CTLineDraw(measured.line, context)
     }
 
     /// Draws the bullet or number standing in for a collapsed list marker.
@@ -622,30 +674,21 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             gutter: Metrics.listMarkerGutter,
             inset: 0)
 
-        let attributes: [CFString: Any] = [
-            kCTFontAttributeName: palette.listMarkerFont,
-            kCTForegroundColorAttributeName: palette.secondaryColor,
-        ]
-        guard let attributed = CFAttributedStringCreate(
-            nil, marker as CFString, attributes as CFDictionary)
-        else { return }
-        let line = CTLineCreateWithAttributedString(attributed)
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+        let measured = measuredLine(text: marker, font: palette.listMarkerFont, kern: 0)
 
         // Right-aligned in its gutter, so "9." and "10." share an edge with
         // the text rather than with each other's first digit.
         let right = x + Metrics.listMarkerGutter - Metrics.listMarkerGap
         // On the first line's baseline: the marker belongs to the line it
         // opens, not to the middle of a wrapped paragraph.
-        let baseline = point.y + (firstLineBaseline ?? ascent)
+        let baseline = point.y + (firstLineBaseline ?? measured.ascent)
 
         context.saveGState()
         defer { context.restoreGState() }
+        context.setFillColor(palette.secondaryColor)
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-        context.textPosition = CGPoint(x: right - width, y: baseline)
-        CTLineDraw(line, context)
+        context.textPosition = CGPoint(x: right - measured.width, y: baseline)
+        CTLineDraw(measured.line, context)
     }
 
     // MARK: - Controls

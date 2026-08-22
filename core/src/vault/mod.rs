@@ -3,6 +3,7 @@
 pub mod graph;
 pub mod index;
 pub mod note;
+pub mod rename;
 pub mod search;
 
 pub use graph::{Graph, GraphEdge, GraphNode, GraphQuery};

@@ -50,6 +50,9 @@ public struct Command: Identifiable, Sendable {
     public enum Kind: Sendable, Equatable {
         case action(CommandAction)
         case file(URL)
+        /// A note found because of what is *inside* it. Opens the file and
+        /// scrolls to `line`, which the search index reports 1-based.
+        case searchResult(URL, line: UInt32)
     }
 
     public let id: UUID
@@ -59,6 +62,25 @@ public struct Command: Identifiable, Sendable {
     public let kind: Kind
     /// Shown right-aligned, e.g. `⌘\`.
     public let shortcut: String?
+
+    /// UTF-16 offset of the start of `line`, 1-based as the vault index
+    /// numbers lines.
+    ///
+    /// Exposed rather than inlined in a handler so the arithmetic can be
+    /// asserted against: an off-by-one here scrolls to the wrong paragraph,
+    /// which looks exactly like search being broken.
+    public static func offset(ofLine line: UInt32, in text: String) -> Int {
+        guard line > 1 else { return 0 }
+        let target = Int(line) - 1
+        var offset = 0
+        var newlines = 0
+        for scalar in text.utf16 {
+            if newlines == target { return offset }
+            if scalar == UInt16(UnicodeScalar("\n").value) { newlines += 1 }
+            offset += 1
+        }
+        return offset
+    }
 
     public init(
         id: UUID = UUID(),
@@ -85,6 +107,13 @@ public struct Command: Identifiable, Sendable {
 public struct CommandPalette: View {
     @Binding public var isPresented: Bool
     public let commands: [Command]
+    /// Full-text search over note contents, asked once per query change.
+    ///
+    /// Filenames answer "which note was that"; this answers "where did I
+    /// write that", which is the other half of why a palette exists. `nil` in
+    /// a context with no vault — the palette still lists actions and open
+    /// tabs there.
+    public let contentSearch: ((String) -> [Command])?
     public let onRun: (Command) -> Void
 
     /// What last moved the highlight.
@@ -109,18 +138,53 @@ public struct CommandPalette: View {
 
     private static let listSpace = "CommandPalette.results"
 
-    public init(isPresented: Binding<Bool>, commands: [Command], onRun: @escaping (Command) -> Void) {
+    public init(
+        isPresented: Binding<Bool>,
+        commands: [Command],
+        contentSearch: ((String) -> [Command])? = nil,
+        onRun: @escaping (Command) -> Void
+    ) {
         self._isPresented = isPresented
         self.commands = commands
+        self.contentSearch = contentSearch
         self.onRun = onRun
     }
 
     private var results: [Command] {
-        Array(FuzzyMatch.rank(commands, query: query) { command in
+        let matched = Array(FuzzyMatch.rank(commands, query: query) { command in
             // Match on the subtitle too, so a file can be found by its folder.
             [command.title, command.subtitle ?? ""].joined(separator: " ")
         }.prefix(40))
+
+        // Content hits join only once the query could plausibly be a word,
+        // and never crowd out what a filename match already answers. A note
+        // already surfaced by its title is not offered twice below by its
+        // contents — the same file appearing in two shapes reads as a glitch.
+        guard let contentSearch, query.count >= 2, matched.count < Self.contentThreshold
+        else { return matched }
+
+        var seenURLs = Set(matched.compactMap { command -> URL? in
+            switch command.kind {
+            case .file(let url): url
+            case .searchResult(let url, _): url
+            case .action: nil
+            }
+        })
+        let hits = contentSearch(query).prefix(Self.maximumContentHits)
+        return matched + hits.filter { command in
+            switch command.kind {
+            case .file(let url), .searchResult(let url, _):
+                seenURLs.insert(url).inserted
+            case .action:
+                true
+            }
+        }
     }
+
+    /// Below this many title matches, contents get a say; above it, the
+    /// reader is clearly narrowing a filename and hits would be noise.
+    private static let contentThreshold = 5
+    private static let maximumContentHits = 8
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -193,13 +257,15 @@ public struct CommandPalette: View {
             ScrollView {
                 LazyVStack(spacing: 2) {
                     ForEach(Array(results.enumerated()), id: \.element.id) { index, command in
-                        CommandRow(command: command, isHighlighted: index == highlighted)
-                            .id(index)
-                            .onTapGesture { run(command) }
-                            .onContinuousHover(coordinateSpace: .named(Self.listSpace)) { phase in
-                                guard case .active(let location) = phase else { return }
-                                pointerMoved(to: location, highlighting: index)
-                            }
+                        CommandRow(command: command, isHighlighted: index == highlighted) {
+                            run(command)
+                        }
+                        .id(index)
+                        .onTapGesture { run(command) }
+                        .onContinuousHover(coordinateSpace: .named(Self.listSpace)) { phase in
+                            guard case .active(let location) = phase else { return }
+                            pointerMoved(to: location, highlighting: index)
+                        }
                     }
                 }
                 .padding(GlassTheme.Spacing.tight)
@@ -281,6 +347,7 @@ public struct CommandPalette: View {
 private struct CommandRow: View {
     let command: Command
     let isHighlighted: Bool
+    let onActivate: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -324,6 +391,10 @@ private struct CommandRow: View {
         .animation(
             GlassTheme.motion(.easeOut(duration: 0.12), reduceMotion: reduceMotion),
             value: isHighlighted)
-        .accessibilityAddTraits(isHighlighted ? [.isSelected] : [])
+        // One element, one button: without the trait the rows are plain text
+        // VoiceOver cannot activate, and the palette becomes keyboard-only.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isHighlighted ? [.isButton, .isSelected] : [.isButton])
+        .accessibilityAction { onActivate() }
     }
 }

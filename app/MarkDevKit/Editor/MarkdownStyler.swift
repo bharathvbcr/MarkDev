@@ -314,9 +314,6 @@ public enum MarkdownStyler {
             guard !isFollowedByBlankLine(clamped, in: text) else { continue }
             // The block's last line, whole: a line is laid out with the style
             // of its first character, so spacing written onto the final
-            // character alone would simply not be read.
-            // The block's last line, whole: a line is laid out with the style
-            // of its first character, so spacing written onto the final
             // character alone would simply not be read. The scope covers whole
             // lines, so a line it touches at all is a line it holds entirely.
             let last = clamp(

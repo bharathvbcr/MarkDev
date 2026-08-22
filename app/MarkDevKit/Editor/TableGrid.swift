@@ -90,14 +90,17 @@ public struct TableGrid: Sendable, Equatable {
     ///
     /// Auto table layout, in the shape every table renderer converges on:
     /// give every column what it asks for when the table fits, and when it
-    /// does not, take the excess from the columns that are over their fair
-    /// share, in proportion to how far over they are — never below the width
-    /// of their widest unbreakable word.
+    /// does not, cap every column at a common ceiling and lower the ceiling
+    /// until the table fits — never below the width of a column's widest
+    /// unbreakable word.
     ///
-    /// Taking it proportionally to *excess* rather than to width is what keeps
-    /// a narrow column narrow: a label column of 80pt beside a prose column of
-    /// 900pt should not lose 8% of itself to make room, because it was never
-    /// the reason the table did not fit.
+    /// Lowering a *ceiling*, rather than sharing the deficit out in
+    /// proportion to each column's surplus, is what keeps a narrow column
+    /// narrow: a label column of 80pt beside a prose column of 900pt should
+    /// not lose 8% of itself to make room, because it was never the reason
+    /// the table did not fit. The implementation below is that bisection;
+    /// this comment used to describe the proportional alternative it
+    /// replaced.
     public static func solve(
         demands: [TableColumnDemand],
         available: CGFloat,

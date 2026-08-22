@@ -27,6 +27,47 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
         self.persistedText = url == nil || hasUnsavedChanges ? nil : text
     }
 
+    /// Whether `text` is exactly what was last read from or written to disk.
+    ///
+    /// Public because the watcher asks it of documents it does not own, and
+    /// ``persistedText`` itself must stay private: handing out the baseline
+    /// hands out a second source of truth.
+    public func matchesPersisted(_ text: String) -> Bool {
+        persistedText == text
+    }
+
+    /// The document after its file was re-read from disk.
+    ///
+    /// Both constructors below are the only ways outside code may touch the
+    /// persisted baseline, which is what keeps "what was last written" a
+    /// fact about files rather than an editable field.
+    public func reloaded(from text: String) -> OpenDocument {
+        var copy = self
+        copy.text = text
+        copy.persistedText = text
+        copy.hasUnsavedChanges = false
+        return copy
+    }
+
+    /// The same document at a new location, after a rename on disk.
+    ///
+    /// Text and baseline are deliberately carried across unchanged: a rename
+    /// moves bytes, it does not edit them.
+    public func retargeted(to newURL: URL) -> OpenDocument {
+        var copy = self
+        copy.url = newURL
+        return copy
+    }
+
+    /// This document's own text adopted as the baseline, for when the reader
+    /// has chosen it over what the disk holds now.
+    public func keepingLocal() -> OpenDocument {
+        var copy = self
+        copy.persistedText = copy.text
+        copy.hasUnsavedChanges = false
+        return copy
+    }
+
     /// Title for the tab. Untitled documents still need a stable label.
     public var title: String {
         url?.deletingPathExtension().lastPathComponent ?? "Untitled"
@@ -279,6 +320,47 @@ public final class Workspace {
         panes[pane]?.selection = document
     }
 
+    /// Writes every dirty, file-backed document back where it came from.
+    ///
+    /// - Returns: how many documents were written.
+    ///
+    /// A crash otherwise forfeits everything since the last manual ⌘S, which
+    /// for a writing app is work the reader did not agree to lose. The write
+    /// is the same atomic replace a manual save makes; an untitled document is
+    /// untouched, because autosaving one would have to invent a location the
+    /// reader never chose.
+    ///
+    /// A file changed underneath this workspace is *not* overwritten: the
+    /// exact-content guard a manual save applies is applied here too, and the
+    /// document simply stays dirty so the next explicit save surfaces the
+    /// conflict through its usual alert. Quietly winning that race would be
+    /// data loss wearing a convenience's name.
+    @discardableResult
+    public func autosave() -> Int {
+        var written = 0
+        for document in allDocuments {
+            guard document.hasUnsavedChanges, let url = document.url else { continue }
+            // Same closed door as ``save(in:to:overwrite:)``: only write over
+            // exactly the bytes this document was read from.
+            if let persisted = document.persistedText,
+                (try? String(contentsOf: url, encoding: .utf8)) != persisted
+            {
+                continue
+            }
+            do {
+                try document.text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                continue
+            }
+            var saved = document
+            saved.persistedText = saved.text
+            saved.hasUnsavedChanges = false
+            propagate(saved)
+            written += 1
+        }
+        return written
+    }
+
     /// Closes a tab. A pane left with no tabs gets a fresh empty one rather
     /// than rendering blank.
     public func close(_ document: OpenDocument.ID, in pane: PaneID) {
@@ -374,7 +456,10 @@ public final class Workspace {
     ///
     /// This is the canonical read boundary for both ordinary opens and drops.
     /// Keeping it ahead of any pane mutation is what makes open failure atomic.
-    private func resolvedDocument(for requestedURL: URL) throws -> OpenDocument {
+    /// Internal rather than private because session restoration is a second
+    /// reader of exactly the same rules — a restored launch must open notes
+    /// through the same door as a clicked one.
+    func resolvedDocument(for requestedURL: URL) throws -> OpenDocument {
         // Every open — Finder, a drop, a wikilink, a URL handed to the app —
         // arrives here, so this is where a location that is not a file on this
         // machine is refused. `String(contentsOf:)` will happily take an
@@ -397,6 +482,15 @@ public final class Workspace {
         return OpenDocument(url: url, text: text)
     }
 
+    /// Replaces every view of `document`, wherever it is open.
+    ///
+    /// The one public door onto ``propagate``: accepting an external version
+    /// of a note must reach every split showing it, which is the same rule
+    /// editing through a binding already follows.
+    public func replace(document: OpenDocument) {
+        propagate(document)
+    }
+
     /// Replaces every view of `document` so split panes can never drift.
     private func propagate(_ document: OpenDocument) {
         for pane in Array(panes.keys) {
@@ -414,6 +508,79 @@ public final class Workspace {
         panes.values.reduce(into: 0) { count, state in
             count += state.documents.lazy.filter { $0.id == document }.count
         }
+    }
+}
+
+extension Workspace {
+    /// What this window would come back as.
+    ///
+    /// Untitled documents are left out — see ``DocumentSnapshot`` — and a pane
+    /// holding only those restores with its pristine empty tab instead.
+    public func snapshot() -> WorkspaceSnapshot {
+        let panes = layout.panes.map { pane in
+            let state = self.panes[pane] ?? PaneState()
+            let documents = state.documents.compactMap { document in
+                document.url.map { DocumentSnapshot(url: $0.absoluteString) }
+            }
+            let selection = state.documents.first(where: { $0.id == state.selection })?
+                .url != nil ? state.selection : nil
+            return PaneSnapshot(pane: pane, documents: documents, selection: selection)
+        }
+        return WorkspaceSnapshot(
+            layout: layout,
+            panes: panes,
+            focusedPane: focusedPane,
+            vaultRoot: vaultRoot?.absoluteString)
+    }
+
+    /// Rebuilds this workspace from `snapshot`.
+    ///
+    /// Documents that no longer exist are skipped rather than fatal: a note
+    /// deleted while the app was closed must not cost the reader every other
+    /// tab they had open. A snapshot naming nothing restorable leaves the
+    /// workspace exactly as a fresh launch built it.
+    public func restore(from snapshot: WorkspaceSnapshot) {
+        // A layout whose tree survives encoding round-trips intact; panes not
+        // mentioned by it (an older format, or a hand-edited default) are
+        // dropped by the same rule the live window prunes orphans with.
+        layout = snapshot.layout
+        panes = [:]
+
+        for entry in snapshot.panes where layout.panes.contains(entry.pane) {
+            var documents: [OpenDocument] = []
+            var restoredSelection: UUID?
+            for document in entry.documents {
+                guard let url = URL(string: document.url),
+                    let resolved = try? resolvedDocument(for: url)
+                else { continue }
+                if documents.contains(where: { $0.id == resolved.id }) { continue }
+                documents.append(resolved)
+                if resolved.id == entry.selection { restoredSelection = resolved.id }
+            }
+            if documents.isEmpty {
+                let pristine = OpenDocument()
+                documents = [pristine]
+                restoredSelection = pristine.id
+            }
+            panes[entry.pane] = PaneState(
+                documents: documents,
+                selection: restoredSelection ?? documents.last?.id)
+        }
+
+        // Every pane the layout names must answer `state(for:)`, or the first
+        // render draws an empty pane the model does not know about.
+        for pane in layout.panes where panes[pane] == nil {
+            let pristine = OpenDocument()
+            panes[pane] = PaneState(documents: [pristine], selection: pristine.id)
+        }
+
+        if layout.panes.contains(snapshot.focusedPane) {
+            focusedPane = snapshot.focusedPane
+        } else {
+            focusedPane = layout.panes.first ?? focusedPane
+        }
+
+        vaultRoot = snapshot.vaultRoot.flatMap(URL.init(string:))?.standardizedFileURL
     }
 }
 

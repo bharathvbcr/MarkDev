@@ -8,6 +8,28 @@ import XCTest
 @testable import MarkDevKit
 
 final class WorkspaceFeatureTests: XCTestCase {
+    // MARK: - Palette content search
+
+    func testLineOffsetsResolveToUTF16LocationsForReveal() {
+        let text = "first\nsecond\nthird with Target\n"
+        XCTAssertEqual(Command.offset(ofLine: 1, in: text), 0)
+        XCTAssertEqual(Command.offset(ofLine: 2, in: text), 6)
+        // "first\nsecond\n" is 13 UTF-16 units; the third line starts there.
+        XCTAssertEqual(Command.offset(ofLine: 3, in: text), 13)
+        // A line past the document lands at the end rather than crashing.
+        XCTAssertEqual(Command.offset(ofLine: 99, in: text), text.utf16.count)
+    }
+
+    func testSearchResultCommandsCarryTheirLine() {
+        let url = URL(fileURLWithPath: "/vault/Note.md")
+        let command = Command(
+            title: "Note", subtitle: "…mentions it here",
+            symbol: "magnifyingglass", kind: .searchResult(url, line: 7))
+        guard case .searchResult(_, let line) = command.kind else {
+            return XCTFail("expected a search result")
+        }
+        XCTAssertEqual(line, 7)
+    }
     func testDocumentStatsCountReaderVisibleUnits() {
         let stats = DocumentStats("**Hello**, state-of-the-art café 🎉\nNext line\n")
 

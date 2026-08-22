@@ -176,6 +176,44 @@ final class FragmentRenderingTests: XCTestCase {
             "at least one fragment must carry the parsed code-block decoration")
     }
 
+    /// Labels are drawn with cached Core Text lines: a second draw of the
+    /// same fragment must not build another one. Repainting happens on every
+    /// hover tick and copy confirmation, and each used to rebuild the
+    /// attributed string, the line, and its metrics.
+    func testLabelLinesAreCachedAcrossDraws() throws {
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+        view.setMarkdown("Intro.\n\n```swift\nlet value = 42\n```\n")
+        // Park the caret off the fence so its syntax collapses and the
+        // language label is drawn at all — see the catalogue note about
+        // `setMarkdown` leaving the caret at the document's end.
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+
+        var labelled: [MarkdownLayoutFragment] = []
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location,
+            options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment,
+                fragment.blockLabel != nil
+            { labelled.append(fragment) }
+            return true
+        }
+        let fragment = try XCTUnwrap(
+            labelled.first, "expected a fragment carrying a block label")
+
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        for _ in 0..<3 {
+            view.cacheDisplay(in: view.bounds, to: rep)
+        }
+
+        XCTAssertEqual(
+            fragment.measuredLines.count, 1,
+            "repeated draws rebuilt the label's Core Text line instead of reusing it")
+    }
+
     /// Hue of a colour, in 0…1.
     private func hue(of colour: NSColor) -> CGFloat {
         var hue: CGFloat = 0

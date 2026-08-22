@@ -107,6 +107,39 @@ final class VaultGraphTests: XCTestCase {
         XCTAssertEqual(graph.nodes.count, 2)
     }
 
+    /// The off-main path is the *same* computation on another thread: the
+    /// layout is deterministic, so both answers must agree exactly.
+    func testTheOffMainGraphMatchesTheSynchronousOne() async throws {
+        let index = try vault([
+            "A.md": "[[B]]\n[[C]]\n",
+            "B.md": "[[C]]\n",
+            "C.md": "x\n",
+        ])
+
+        let sync = index.graph(depth: 3)
+        let async = await index.graphOffMain(depth: 3)
+
+        XCTAssertEqual(async.nodes.map(\.path), sync.nodes.map(\.path))
+        XCTAssertEqual(async.edges, sync.edges)
+        for (asyncNode, syncNode) in zip(async.nodes, sync.nodes) {
+            XCTAssertEqual(asyncNode.x, syncNode.x, accuracy: 0.0001)
+            XCTAssertEqual(asyncNode.y, syncNode.y, accuracy: 0.0001)
+        }
+    }
+
+    func testTheOffMainGraphSurvivesConcurrentIndexUpdates() async throws {
+        // The whole point of taking the lock: a layout running while the main
+        // actor re-indexes a note must neither crash nor corrupt either side.
+        let index = try vault([
+            "A.md": "[[B]]\n",
+            "B.md": "x\n",
+        ])
+        async let background: VaultGraph = index.graphOffMain(depth: 2)
+        index.update(path: "B.md", text: "[[A]]\n")
+        let graph = await background
+        XCTAssertFalse(graph.nodes.isEmpty)
+    }
+
     // MARK: - Geometry
 
     private func graph(_ points: [(String, Double, Double)]) -> VaultGraph {

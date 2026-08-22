@@ -8,20 +8,20 @@
 import Foundation
 
 /// Identifies one pane (a leaf of the split tree).
-public struct PaneID: Hashable, Sendable, Identifiable {
+public struct PaneID: Hashable, Sendable, Identifiable, Codable {
     public let id: UUID
     public init(id: UUID = UUID()) { self.id = id }
 }
 
 /// Identifies one split node, so a divider drag can address the split it
 /// belongs to without carrying a path through the view hierarchy.
-public struct SplitID: Hashable, Sendable, Identifiable {
+public struct SplitID: Hashable, Sendable, Identifiable, Codable {
     public let id: UUID
     public init(id: UUID = UUID()) { self.id = id }
 }
 
 /// Direction a split divides in.
-public enum SplitAxis: Sendable, Hashable {
+public enum SplitAxis: Sendable, Hashable, Codable {
     /// Children sit side by side; dividers move horizontally.
     case horizontal
     /// Children are stacked; dividers move vertically.
@@ -46,7 +46,7 @@ public enum SplitEdge: Sendable, Hashable {
 }
 
 /// A node in the pane tree.
-public indirect enum SplitNode: Sendable, Equatable, Identifiable {
+public indirect enum SplitNode: Sendable, Equatable, Identifiable, Codable {
     case leaf(PaneID)
     case split(SplitNodeGroup)
 
@@ -75,7 +75,7 @@ public indirect enum SplitNode: Sendable, Equatable, Identifiable {
 }
 
 /// A split with two or more children and the fractions they occupy.
-public struct SplitNodeGroup: Sendable, Equatable {
+public struct SplitNodeGroup: Sendable, Equatable, Codable {
     public let id: SplitID
     public var axis: SplitAxis
     public var children: [SplitNode]
@@ -97,7 +97,7 @@ public struct SplitNodeGroup: Sendable, Equatable {
 /// SwiftUI layer only reads it. Keeping the geometry rules here — rather than
 /// spread through view code — is what makes "no gaps, nothing collapses to
 /// zero" testable instead of something to eyeball.
-public struct SplitLayout: Sendable, Equatable {
+public struct SplitLayout: Sendable, Equatable, Codable {
     /// Smallest fraction a pane may shrink to, so a pane can never be dragged
     /// out of existence and become unrecoverable.
     public static let minimumFraction: Double = 0.08

@@ -7,6 +7,15 @@
 
 import Foundation
 
+/// Anything carrying a UTF-16 range that can be searched as a sorted,
+/// disjoint array.
+protocol RangedValue {
+    var range: NSRange { get }
+}
+
+extension StyleSpan: RangedValue {}
+extension BlockDescriptor: RangedValue {}
+
 /// An inline construct carrying character attributes.
 ///
 /// Raw values are the FFI contract shared with `SpanKind` in

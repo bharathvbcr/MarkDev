@@ -55,6 +55,69 @@ final class VaultIndexTests: XCTestCase {
         XCTAssertEqual(vault.backlinks(for: "Beta.md").map(\.path), ["Alpha.md"])
     }
 
+    // MARK: - Rename with link rewriting
+
+    func testRenameNoteMovesTheFileAndRewritesLinksAcrossTheVault() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Roadmap", to: root.appendingPathComponent("Roadmap.md"))
+        try write(
+            "See [[Roadmap]] and [file](Roadmap.md).\n",
+            to: root.appendingPathComponent("Diary.md"))
+
+        let vault = VaultIndex()
+        vault.open(root)
+
+        let outcome = try XCTUnwrap(vault.renameNote(from: "Roadmap.md", to: "Plans/Map.md"))
+
+        XCTAssertEqual(outcome.rewrittenNotes, 1)
+        XCTAssertEqual(outcome.rewrittenLinks, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Roadmap.md").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Plans/Map.md").path))
+
+        let diary = try String(contentsOf: root.appendingPathComponent("Diary.md"), encoding: .utf8)
+        XCTAssertEqual(diary, "See [[Map]] and [file](Plans/Map.md).\n")
+
+        // The index answers for the new path and not the old one.
+        XCTAssertEqual(vault.notePaths(), ["Diary.md", "Plans/Map.md"])
+        // The old *path* spelling is gone; the note's TITLE still resolves,
+        // which is correct — titles follow the note wherever it lives.
+        XCTAssertNil(vault.resolve(target: "Projects/Roadmap"))
+        XCTAssertEqual(vault.resolve(target: "Roadmap")?.path, "Plans/Map.md")
+        XCTAssertEqual(vault.resolve(target: "Map")?.path, "Plans/Map.md")
+    }
+
+    func testRenameNoteRefusesADestinationThatAlreadyExists() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# A", to: root.appendingPathComponent("A.md"))
+        try write("# B", to: root.appendingPathComponent("B.md"))
+
+        let vault = VaultIndex()
+        vault.open(root)
+
+        XCTAssertNil(vault.renameNote(from: "A.md", to: "B.md"))
+        // Nothing moved on disk either — the refusal is real.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("A.md").path))
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("B.md"), encoding: .utf8), "# B")
+    }
+
+    func testRemoveNoteForgetsANoteWithoutTouchingAnythingElse() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Alpha\n[[Beta]]", to: root.appendingPathComponent("Alpha.md"))
+        try write("# Beta", to: root.appendingPathComponent("Beta.md"))
+
+        let vault = VaultIndex()
+        vault.open(root)
+        vault.removeNote("Beta.md")
+
+        XCTAssertEqual(vault.notePaths(), ["Alpha.md"])
+        XCTAssertTrue(vault.backlinks(for: "Beta.md").isEmpty)
+        // The file itself is the caller's business; only the index changed.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Beta.md").path))
+    }
+
     func testRelativePathsRejectSiblingPrefixAndTraversal() throws {
         let root = try makeDirectory(named: "Vault")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

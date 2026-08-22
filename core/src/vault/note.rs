@@ -219,7 +219,7 @@ pub fn stem(path: &str) -> String {
 }
 
 /// UTF-16 offset of a byte offset.
-fn utf16_offset(source: &str, byte: usize) -> u32 {
+pub(super) fn utf16_offset(source: &str, byte: usize) -> u32 {
     source[..byte.min(source.len())].encode_utf16().count() as u32
 }
 

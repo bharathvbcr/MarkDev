@@ -62,6 +62,25 @@ public struct SearchHit: Codable, Identifiable, Sendable, Hashable {
     public var id: String { "\(path):\(line)" }
 }
 
+/// What a rename changed, so the UI can say "rewrote 3 links" instead of
+/// a bare success that reads like nothing happened.
+public struct RenameOutcome: Equatable, Sendable {
+    public let rewrittenNotes: Int
+    public let rewrittenLinks: Int
+
+    public init(rewrittenNotes: Int, rewrittenLinks: Int) {
+        self.rewrittenNotes = rewrittenNotes
+        self.rewrittenLinks = rewrittenLinks
+    }
+}
+
+/// The wire shape `md_vault_rename` answers with. Kept private: the decoded
+/// ``RenameOutcome`` above is the public spelling.
+private struct RenameOutcomePayload: Decodable {
+    let rewritten_notes: UInt32
+    let rewritten_links: UInt32
+}
+
 /// A heading, for the outline.
 public struct VaultHeading: Codable, Identifiable, Sendable, Hashable {
     public let level: UInt8
@@ -109,6 +128,13 @@ public final class VaultIndex {
     public private(set) var noteCount: Int = 0
 
     #if canImport(CMarkDev)
+        // Every dereference of `handle` — on the main actor or off it, via
+        // ``lockedGraph`` below — happens under ``coreLock``. That is what
+        // makes the cross-actor graph computation safe rather than merely
+        // hopeful: a layout running on a background thread and an index
+        // update on the main actor can interleave at the lock, never inside
+        // the Rust structure.
+        nonisolated(unsafe) private let coreLock = NSLock()
         // All mutation remains main-actor isolated. Deinitialization is
         // nonisolated in Swift 6, so this annotation permits only the final
         // ownership release there; it does not make query methods concurrent.
@@ -119,7 +145,12 @@ public final class VaultIndex {
 
     deinit {
         #if canImport(CMarkDev)
+            // A background layout may still hold ``coreLock``; taking it here
+            // means freeing waits for that compute to finish instead of
+            // pulling the pointer out from under it.
+            coreLock.lock()
             if let handle { md_vault_free(handle) }
+            coreLock.unlock()
         #endif
     }
 
@@ -130,10 +161,12 @@ public final class VaultIndex {
     public func open(_ root: URL) {
         let root = root.standardizedFileURL.resolvingSymlinksInPath()
         #if canImport(CMarkDev)
+            coreLock.lock()
             if let handle { md_vault_free(handle) }
             handle = root.path.withCString { md_vault_open($0) }
-            self.root = root
             noteCount = handle.map { Int(md_vault_note_count($0)) } ?? 0
+            coreLock.unlock()
+            self.root = root
         #else
             self.root = root
         #endif
@@ -143,6 +176,8 @@ public final class VaultIndex {
     /// so backlinks track what is on screen and not the last save.
     public func update(path: String, text: String) {
         #if canImport(CMarkDev)
+            coreLock.lock()
+            defer { coreLock.unlock() }
             guard let handle else { return }
             path.withCString { pathPointer in
                 text.withCString { textPointer in
@@ -200,8 +235,10 @@ public final class VaultIndex {
 
     public func tags() -> [TagCount] {
         #if canImport(CMarkDev)
-            guard let handle else { return [] }
-            return decode(md_vault_tags(handle)) ?? []
+            return coreLock.withLock {
+                guard let handle else { return [] }
+                return decode(md_vault_tags(handle)) ?? []
+            }
         #else
             return []
         #endif
@@ -209,9 +246,13 @@ public final class VaultIndex {
 
     public func search(_ text: String, limit: Int = 50) -> [SearchHit] {
         #if canImport(CMarkDev)
-            guard let handle, !text.isEmpty, limit > 0 else { return [] }
+            guard !text.isEmpty, limit > 0 else { return [] }
             let boundedLimit = UInt32(min(limit, Int(UInt32.max)))
-            return text.withCString { decode(md_vault_search(handle, $0, boundedLimit)) } ?? []
+            return coreLock.withLock {
+                guard let handle else { return [] }
+                return text.withCString { decode(md_vault_search(handle, $0, boundedLimit)) }
+                    ?? []
+            }
         #else
             return []
         #endif
@@ -219,6 +260,17 @@ public final class VaultIndex {
 
     /// Resolves a `[[wikilink]]` target and optional `#anchor`.
     public func resolve(target: String, anchor: String? = nil) -> LinkResolution? {
+        #if canImport(CMarkDev)
+            return coreLock.withLock { resolveLocked(handle, target: target, anchor: anchor) }
+        #else
+            return nil
+        #endif
+    }
+
+    /// The body of ``resolve(target:anchor:)``, called with ``coreLock`` held.
+    private nonisolated func resolveLocked(
+        _ handle: OpaquePointer?, target: String, anchor: String?
+    ) -> LinkResolution? {
         #if canImport(CMarkDev)
             guard let handle else { return nil }
             return target.withCString { targetPointer -> LinkResolution? in
@@ -228,6 +280,47 @@ public final class VaultIndex {
                 return anchor.withCString { anchorPointer in
                     decode(md_vault_resolve(handle, targetPointer, anchorPointer))
                 }
+            }
+        #else
+            return nil
+        #endif
+    }
+
+    /// Forgets a note whose file has left the disk.
+    ///
+    /// The caller owns the file operation — trashing or deleting — because
+    /// only it can put up a confirmation; this owns the index, which would
+    /// otherwise keep answering backlink questions about a note that is gone.
+    /// Unknown paths are silently fine: a watcher racing a manual delete is
+    /// the second of them.
+    public func removeNote(_ path: String) {
+        #if canImport(CMarkDev)
+            coreLock.lock()
+            defer { coreLock.unlock() }
+            guard let handle else { return }
+            path.withCString { md_vault_remove(handle, $0) }
+            noteCount = Int(md_vault_note_count(handle))
+        #endif
+    }
+
+    /// Moves a note and rewrites every link that resolved to it.
+    ///
+    /// - Returns: how many notes and individual links were rewritten, or
+    ///   `nil` when the move was refused (unknown source, destination taken,
+    ///   file error). `nil` means nothing happened on disk either.
+    public func renameNote(from: String, to: String) -> RenameOutcome? {
+        #if canImport(CMarkDev)
+            return coreLock.withLock {
+                guard let handle else { return nil }
+                let payload: RenameOutcomePayload? = from.withCString { fromPointer in
+                    to.withCString { toPointer in
+                        decode(md_vault_rename(handle, fromPointer, toPointer))
+                    }
+                }
+                guard let payload else { return nil }
+                return RenameOutcome(
+                    rewrittenNotes: Int(payload.rewritten_notes),
+                    rewrittenLinks: Int(payload.rewritten_links))
             }
         #else
             return nil
@@ -251,7 +344,42 @@ public final class VaultIndex {
         tag: String? = nil,
         folder: String? = nil
     ) -> VaultGraph {
+        lockedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
+    }
+
+    /// The laid-out graph, computed off the main actor.
+    ///
+    /// The layout is an all-pairs force simulation over up to
+    /// `MAX_NODES` notes — seconds of work for a vault at the cap, which is
+    /// exactly how a graph view becomes the reason an app feels slow. The
+    /// Rust handle is shared, so the compute takes ``coreLock``: it serialises
+    /// against index updates rather than racing them, and the main actor is
+    /// blocked only if it asks for work at the same instant.
+    ///
+    /// Determinism makes this safe to prefer over ``graph(focus:depth:tag:
+    /// folder:)`` wherever a caller can await: same inputs, same picture,
+    /// different thread.
+    public func graphOffMain(
+        focus: String? = nil,
+        depth: Int = 2,
+        tag: String? = nil,
+        folder: String? = nil
+    ) async -> VaultGraph {
+        await Task.detached(priority: .userInitiated) { [self] in
+            lockedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
+        }.value
+    }
+
+    /// The body of both graph entry points; called with ``coreLock`` held.
+    nonisolated private func lockedGraph(
+        focus: String?,
+        depth: Int,
+        tag: String?,
+        folder: String?
+    ) -> VaultGraph {
         #if canImport(CMarkDev)
+            coreLock.lock()
+            defer { coreLock.unlock() }
             guard let handle else { return .empty }
             let bounded = UInt32(max(0, min(depth, 16)))
             // Nested `withCString` rather than a helper: the pointers must all
@@ -275,8 +403,10 @@ public final class VaultIndex {
     /// Every note path, for the palette and link autocomplete.
     public func notePaths() -> [String] {
         #if canImport(CMarkDev)
-            guard let handle else { return [] }
-            return decode(md_vault_note_paths(handle)) ?? []
+            return coreLock.withLock {
+                guard let handle else { return [] }
+                return decode(md_vault_note_paths(handle)) ?? []
+            }
         #else
             return []
         #endif
@@ -289,8 +419,10 @@ public final class VaultIndex {
             _ path: String,
             _ call: (OpaquePointer, UnsafePointer<CChar>) -> UnsafePointer<CChar>?
         ) -> [T] {
-            guard let handle else { return [] }
-            return path.withCString { decode(call(handle, $0)) } ?? []
+            coreLock.withLock {
+                guard let handle else { return [] }
+                return path.withCString { decode(call(handle, $0)) } ?? []
+            }
         }
 
         /// Runs `body` with a C string for `value`, or with null when it is
@@ -300,7 +432,7 @@ public final class VaultIndex {
         /// would hand back memory that has already been freed, which is why
         /// the graph query nests three of these rather than calling a helper
         /// that returns pointers.
-        private func withOptionalCString<Result>(
+        private nonisolated func withOptionalCString<Result>(
             _ value: String?,
             _ body: (UnsafePointer<CChar>?) -> Result
         ) -> Result {
@@ -312,18 +444,30 @@ public final class VaultIndex {
         ///
         /// The pointer belongs to the Rust handle and is only valid until the
         /// next query on it, so it is decoded immediately and never stored.
-        private func decode<T: Decodable>(_ pointer: UnsafePointer<CChar>?) -> T? {
+        private nonisolated func decode<T: Decodable>(_ pointer: UnsafePointer<CChar>?) -> T? {
             guard let pointer else { return nil }
             let json = String(cString: pointer)
             guard let data = json.data(using: .utf8) else { return nil }
-            return try? JSONDecoder().decode(T.self, from: data)
+            // One decoder for the type, not one per query: these run on the
+            // keystroke path whenever backlinks and mentions refresh, and
+            // `JSONDecoder()` has no reason to be rebuilt each time.
+            return try? VaultIndex.decoder.decode(T.self, from: data)
         }
+
+        private nonisolated static let decoder = JSONDecoder()
     #else
         private func query<T: Decodable>(_ path: String, _ call: (Never, Never) -> Never?) -> [T] {
             []
         }
     #endif
 }
+
+/// Sendability is earned by the lock, not by the type: every dereference of
+/// the Rust handle happens under ``coreLock``, on whichever actor asks, so a
+/// reference handed to a detached task is a hand-off of *turns* rather than
+/// of unsynchronised memory. Everything else mutable (`root`, `noteCount`)
+/// stays main-actor isolated and is never read from the off-main path.
+extension VaultIndex: @unchecked Sendable {}
 
 /// A request to scroll an editor to a UTF-16 offset.
 ///

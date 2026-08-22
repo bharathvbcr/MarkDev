@@ -484,6 +484,50 @@ pub unsafe extern "C" fn md_vault_update(
     handle.vault.update(path, text);
 }
 
+/// Drops `path` from the index after its file has left the disk.
+///
+/// The caller deletes or trashes the file; this forgets the note so backlinks
+/// and search stop describing something that is no longer there. Unknown
+/// paths are accepted silently — removing what was never indexed is a no-op,
+/// which is what a watcher racing a manual delete wants.
+///
+/// # Safety
+///
+/// `handle` must be live; `path` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_remove(handle: *mut VaultHandle, path: *const c_char) {
+    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+        return;
+    };
+    handle.vault.remove(path);
+}
+
+/// Moves the note at `from` to `to`, rewriting every link that resolved to
+/// it, and answers JSON `{rewritten_notes, rewritten_links}`.
+///
+/// The file itself is moved by this call. Null comes back when the move was
+/// refused — unknown source, destination already taken, or a file error — so
+/// the caller can say "no" rather than guessing why.
+///
+/// # Safety
+///
+/// `handle` must be live; `from` and `to` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_rename(
+    handle: *mut VaultHandle,
+    from: *const c_char,
+    to: *const c_char,
+) -> *const c_char {
+    let (Some(handle), Some(from), Some(to)) = (handle.as_mut(), read_str(from), read_str(to))
+    else {
+        return ptr::null();
+    };
+    match handle.vault.rename_note(from, to) {
+        Some(outcome) => handle.serve(&outcome),
+        None => ptr::null(),
+    }
+}
+
 /// JSON array of backlinks for `path`.
 ///
 /// The returned pointer is owned by the handle and stays valid until the next

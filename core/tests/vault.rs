@@ -349,6 +349,38 @@ fn a_note_never_mentions_itself() {
     assert!(vault.unlinked_mentions("Roadmap.md").is_empty());
 }
 
+/// The editor indexes by UTF-16 code units, and the click on a mention jumps
+/// with this offset. A byte offset lands short once anything non-ASCII sits
+/// before the mention: "héllo " is 7 bytes but 6 units.
+#[test]
+fn unlinked_mention_offsets_are_utf16_not_bytes() {
+    let vault = vault(&[
+        ("Target.md", "# Target"),
+        ("other.md", "# Other\n\nhéllo Target world"),
+    ]);
+    let mentions = vault.unlinked_mentions("Target.md");
+    assert_eq!(mentions.len(), 1);
+    // "# Other\n\n" is ASCII (9 either way); "héllo " is 7 bytes but 6
+    // units — so the mention sits at unit 15 where its byte offset is 16.
+    assert_eq!(mentions[0].offset, 15);
+}
+
+/// Case folding can change length — 'İ' lowers to i plus a combining dot —
+/// so searching a lowercased copy shifts every offset after it onto the
+/// wrong character.
+#[test]
+fn unlinked_mention_offsets_survive_case_folding() {
+    // Bytes: prefix(9) + İ(2) stanbul(7) space(1) → "Roadmap" at byte 19;
+    // UTF-16: 9 + 1 + 7 + 1 → unit 18.
+    let vault = vault(&[
+        ("Roadmap.md", "# Roadmap"),
+        ("other.md", "# Other\n\nİstanbul Roadmap"),
+    ]);
+    let mentions = vault.unlinked_mentions("Roadmap.md");
+    assert_eq!(mentions.len(), 1);
+    assert_eq!(mentions[0].offset, 18);
+}
+
 // MARK: - Tags
 
 #[test]

@@ -28,7 +28,8 @@ pub struct UnlinkedMention {
     pub title: String,
     pub context: String,
     pub line: u32,
-    /// Byte offset of the mention, so it can be turned into a link.
+    /// UTF-16 offset of the mention in its note, so it can be turned into a
+    /// link — and jumped to, since the editor indexes by UTF-16.
     pub offset: u32,
 }
 
@@ -84,10 +85,13 @@ pub struct Resolution {
 /// An indexed vault.
 #[derive(Debug, Default)]
 pub struct Vault {
-    root: PathBuf,
-    notes: Vec<Note>,
+    // `pub(crate)`: rename.rs is part of this vault's own machinery — moving
+    // a note means touching its file, every link that resolved to it, and
+    // then the index, which no public accessor sequence can express.
+    pub(crate) root: PathBuf,
+    pub(crate) notes: Vec<Note>,
     /// Vault-relative path to index in `notes`.
-    by_path: HashMap<String, usize>,
+    pub(crate) by_path: HashMap<String, usize>,
     /// Lowercased name (stem, title, or alias) to the notes answering to it.
     by_name: HashMap<String, Vec<usize>>,
     /// Target note index to the links pointing at it.
@@ -148,7 +152,7 @@ impl Vault {
         self.reindex();
     }
 
-    fn reindex(&mut self) {
+    pub(crate) fn reindex(&mut self) {
         self.notes.sort_by(|a, b| a.path.cmp(&b.path));
 
         self.by_path = self
@@ -204,7 +208,7 @@ impl Vault {
     /// same rule Obsidian uses, so a vault moved between the two behaves the
     /// same way. Returning "the first match found" instead would make link
     /// resolution depend on directory iteration order.
-    fn lookup(&self, target: &str) -> Option<usize> {
+    pub(crate) fn lookup(&self, target: &str) -> Option<usize> {
         let key = target.trim().trim_start_matches("./").to_lowercase();
         if key.is_empty() {
             return None;
@@ -317,7 +321,8 @@ impl Vault {
                         title: note.title.clone(),
                         context: line_text(&note.text, line),
                         line,
-                        offset: offset as u32,
+                        // The editor consumes UTF-16; the search runs in bytes.
+                        offset: super::note::utf16_offset(&note.text, offset),
                     });
                     break;
                 }
@@ -436,40 +441,58 @@ fn line_number(text: &str, byte: usize) -> u32 {
 }
 
 /// Byte offset of `needle` in `haystack` as a whole word, case-insensitively.
+///
+/// The search cannot simply run on a lowercased copy: folding can change
+/// byte length ('İ' lowers to i plus a combining dot), which shifts every
+/// offset after it onto the wrong character — and the offset is the one
+/// thing this function exists to produce. It therefore lowercases once into
+/// a parallel string that remembers, for each of its own bytes, the byte of
+/// `haystack` it came from; matches are found in the copy and mapped back,
+/// and word boundaries are checked on the original.
 fn find_whole_word(haystack: &str, needle: &str) -> Option<usize> {
     if needle.is_empty() {
         return None;
     }
-    let lower_haystack = haystack.to_lowercase();
-    let lower_needle = needle.to_lowercase();
+    let mut lowered = String::with_capacity(haystack.len());
+    let mut origins: Vec<usize> = Vec::with_capacity(haystack.len() + 1);
+    for (byte, ch) in haystack.char_indices() {
+        for folded in ch.to_lowercase() {
+            // One entry per *byte* of the folded character: the map is
+            // indexed by `lowered`'s byte offsets, and a fold such as the
+            // combining dot above occupies two.
+            let mut encoded = [0u8; 4];
+            for _ in folded.encode_utf8(&mut encoded).as_bytes() {
+                origins.push(byte);
+            }
+            lowered.push(folded);
+        }
+    }
+    origins.push(haystack.len());
 
+    let lower_needle = needle.to_lowercase();
     let mut from = 0usize;
-    while let Some(found) = lower_haystack[from..].find(&lower_needle) {
+    while let Some(found) = lowered[from..].find(&lower_needle) {
         let start = from + found;
         let end = start + lower_needle.len();
+        let orig_start = origins[start];
+        let orig_end = origins[end];
 
-        let before_ok = start == 0
-            || !lower_haystack[..start]
+        let before_ok = orig_start == 0
+            || !haystack[..orig_start]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        let after_ok = end >= lower_haystack.len()
-            || !lower_haystack[end..]
+        let after_ok = orig_end >= haystack.len()
+            || !haystack[orig_end..]
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
 
         if before_ok && after_ok {
-            // Lowercasing can change byte length for some scripts, so the
-            // offset is only trustworthy when the two agree.
-            return if lower_haystack.len() == haystack.len() {
-                Some(start)
-            } else {
-                haystack.to_lowercase().find(&lower_needle).and(Some(start))
-            };
+            return Some(orig_start);
         }
         from = start + lower_needle.len().max(1);
-        if from >= lower_haystack.len() {
+        if from >= lowered.len() {
             break;
         }
     }

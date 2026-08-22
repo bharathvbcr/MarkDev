@@ -33,6 +33,29 @@ public struct ParsedDocument: Sendable, Equatable {
     /// Interned strings referenced by link-like spans' `data`.
     public let strings: [String]
 
+    /// The parse's GFM tables, in document order.
+    ///
+    /// Built once here rather than filtered by each asker: the layout delegate
+    /// asks "which table is this row in" once per row fragment, and scanning
+    /// every block to answer it is the quadratic this codebase has paid for
+    /// four times. Tables neither nest nor overlap, so the array is sorted by
+    /// start offset and disjoint — searchable.
+    public let tables: [BlockDescriptor]
+
+    /// The parse's table header rows, in document order.
+    ///
+    /// Kept apart from ``tables`` because "is this row the header" has to be
+    /// answered against *the row's own table*: taking the document's first
+    /// `.tableHead` shaded only the first table's header and left every later
+    /// one looking like body rows.
+    private let tableHeads: [BlockDescriptor]
+
+    /// The parse's task markers (`- [x]`), sorted and disjoint.
+    ///
+    /// The fragment delegate asks "does an item start on this line" once per
+    /// fragment; see ``tables`` for why the answer is searched, not scanned.
+    private let taskMarkerSpans: [StyleSpan]
+
     /// An empty result, used for empty documents and as a safe fallback when
     /// the source cannot be parsed.
     public static let empty = ParsedDocument(spans: [], markers: [], blocks: [])
@@ -47,6 +70,60 @@ public struct ParsedDocument: Sendable, Equatable {
         self.markers = markers
         self.blocks = blocks
         self.strings = strings
+
+        var tables: [BlockDescriptor] = []
+        var heads: [BlockDescriptor] = []
+        for block in blocks {
+            if block.kind == .table { tables.append(block) }
+            else if block.kind == .tableHead { heads.append(block) }
+        }
+        self.tables = tables
+        self.tableHeads = heads
+        self.taskMarkerSpans = spans.filter { $0.kind == .taskMarker }
+    }
+
+    /// The GFM table containing `range`, found by binary search.
+    ///
+    /// Tables are disjoint as well as sorted — a table never contains
+    /// another — so the first candidate whose end lies past `range.location`
+    /// is the only one that can intersect it.
+    public func table(containing range: NSRange) -> BlockDescriptor? {
+        Self.firstIntersecting(tables, range)
+    }
+
+    /// The header row belonging to `table`.
+    ///
+    /// Scoped to the table's own extent rather than taken from the head of the
+    /// document: with two tables on a page, the second's header answers for
+    /// itself.
+    func tableHead(ofTable table: BlockDescriptor) -> BlockDescriptor? {
+        Self.firstIntersecting(tableHeads, table.range)
+    }
+
+    /// The `- [x]` marker overlapping `range`, found by binary search.
+    func taskMarker(overlapping range: NSRange) -> StyleSpan? {
+        Self.firstIntersecting(taskMarkerSpans, range)
+    }
+
+    /// The first entry of a sorted, disjoint array that intersects `range`.
+    private static func firstIntersecting<T: RangedValue>(
+        _ entries: [T], _ range: NSRange
+    ) -> T? {
+        guard !entries.isEmpty else { return nil }
+        var low = 0
+        var high = entries.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if NSMaxRange(entries[mid].range) <= range.location {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        guard low < entries.count,
+            NSIntersectionRange(entries[low].range, range).length > 0
+        else { return nil }
+        return entries[low]
     }
 
     /// The markers overlapping `range`, as an index range into ``markers``.

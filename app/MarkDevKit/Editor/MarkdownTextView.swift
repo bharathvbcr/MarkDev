@@ -75,7 +75,7 @@ public final class MarkdownTextView: ScrollingTextView {
     public private(set) var parsed: ParsedDocument = .empty {
         didSet {
             listItems = parsed.blocks.filter { $0.kind == .listItem }
-            tableBlocks = parsed.blocks.filter { $0.kind == .table }
+            tableBlocks = parsed.tables
             codeBlocks = parsed.blocks.filter { Self.holdsCode($0.kind) }
             // The solved grids describe the previous parse's offsets, so they
             // go; the styled cells are keyed on their own source and stay.
@@ -92,10 +92,9 @@ public final class MarkdownTextView: ScrollingTextView {
 
     /// The parse's tables, in document order.
     ///
-    /// Kept for the same reason ``listItems`` is: the layout delegate asks
-    /// "which table is this row in" once per row fragment, and scanning every
-    /// block to answer it is the quadratic this codebase has paid for three
-    /// times already.
+    /// Mirrored from ``ParsedDocument/tables``, which builds it per parse;
+    /// kept here because `reresolveTableFragments` asks "are there any" before
+    /// walking fragments.
     private var tableBlocks: [BlockDescriptor] = []
 
     /// The parse's code-like blocks, in document order.
@@ -330,6 +329,15 @@ public final class MarkdownTextView: ScrollingTextView {
         isAutomaticDashSubstitutionEnabled = false
         isAutomaticTextReplacementEnabled = false
         isAutomaticSpellingCorrectionEnabled = false
+
+        // Misspellings are marked as the reader writes. Grammar checking
+        // deliberately stays off: it second-guesses constructions writers
+        // choose on purpose, and unlike a misspelling there is rarely one
+        // obvious right answer sitting in the suggestion menu. Code fences
+        // are checked along with prose — AppKit exposes no per-range opt-out
+        // — which is the bargain every writing app on this platform strikes;
+        // a reader who minds selects the fence and learns ⌘; toggles it.
+        isContinuousSpellCheckingEnabled = true
 
         // Find and replace over the document, using AppKit's own find bar
         // rather than a reimplementation. It searches text storage, which
@@ -1338,22 +1346,13 @@ extension MarkdownTextView {
         return max(bounds.width - theme.insets.width * 2 - inset, Metrics.narrowestTable)
     }
 
-    /// The table containing `range`, found by binary search.
+    /// The table containing `range`.
+    ///
+    /// Delegates to ``ParsedDocument/table(containing:)``, the one owner of
+    /// that question; this wrapper keeps the per-parse index story out of
+    /// call sites.
     private func table(containing range: NSRange) -> BlockDescriptor? {
-        var low = 0
-        var high = tableBlocks.count
-        while low < high {
-            let mid = low + (high - low) / 2
-            if NSMaxRange(tableBlocks[mid].range) <= range.location {
-                low = mid + 1
-            } else {
-                high = mid
-            }
-        }
-        guard low < tableBlocks.count,
-            NSIntersectionRange(tableBlocks[low].range, range).length > 0
-        else { return nil }
-        return tableBlocks[low]
+        parsed.table(containing: range)
     }
 
     enum Metrics {

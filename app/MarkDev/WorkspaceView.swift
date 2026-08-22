@@ -68,6 +68,7 @@ struct WorkspaceView: View {
     @State private var outline: [VaultHeading] = []
     @State private var backlinks: [Backlink] = []
     @State private var mentions: [UnlinkedMention] = []
+    @State private var outgoingLinks: [OutgoingLink] = []
 
     /// Surfaced rather than swallowed: opening and saving can fail for
     /// reasons the user can act on, and a silent no-op reads as a broken app.
@@ -100,6 +101,18 @@ struct WorkspaceView: View {
     /// Every open shell. Owned here, not by the drawer, so hiding the drawer
     /// does not kill a running build — see ``TerminalSessions``.
     @State private var terminals = TerminalSessions()
+
+    /// Watches the open vault for changes made anywhere else. `nil` while no
+    /// vault is open; started and stopped with it.
+    @State private var watcher: VaultWatcher?
+    /// Bumped on every watched change, into the navigator's re-scan trigger.
+    @State private var vaultRevision = 0
+    /// Watched paths coalescing toward one reaction; see ``handleWatchedPaths``.
+    @State private var watchedPathsTask: Task<Void, Never>?
+    /// Open documents whose file changed underneath them, awaiting the
+    /// reader's decision. Keyed by document identity; a split view showing
+    /// the same note twice shows the banner once per view but decides once.
+    @State private var externalConflicts: Set<OpenDocument.ID> = []
     /// Whether the drawer has ever been opened in this window.
     ///
     /// Once it has, it stays mounted — collapsed to nothing when hidden — so
@@ -266,7 +279,12 @@ struct WorkspaceView: View {
                         .transition(.opacity)
                         .accessibilityHidden(true)
 
-                    CommandPalette(isPresented: $showPalette, commands: commands) { run($0) }
+                    CommandPalette(
+                        isPresented: $showPalette,
+                        commands: commands,
+                        contentSearch: workspace.vaultRoot == nil
+                            ? nil : { contentSearchCommands(for: $0) }
+                    ) { run($0) }
                         .padding(.top, 90)
                         .transition(
                             reduceMotion
@@ -344,6 +362,7 @@ struct WorkspaceView: View {
         // window on screen instead of trusting whoever asked last.
         .onAppear {
             findHarness()
+            restoreSessionOnce()
             if let inboxRegistration { DocumentInbox.shared.unregister(inboxRegistration) }
             inboxRegistration = DocumentInbox.shared.register(
                 readiness: { surface.readiness },
@@ -368,6 +387,7 @@ struct WorkspaceView: View {
             // again in ``LiveShells`` for the case a window never closes,
             // which is Quit.
             terminals.endAllHosts()
+            stopWatching()
         }
     }
 
@@ -697,11 +717,18 @@ struct WorkspaceView: View {
 
             NavigatorView(
                 root: workspace.vaultRoot,
+                revision: vaultRevision,
                 onOpen: { openFile($0) },
                 onChooseVault: { openVault() },
                 onPeek: { peek = $0 },
-                onOpenTerminal: { openTerminal(in: $0) }
+                onOpenTerminal: { openTerminal(in: $0) },
+                onCreateNote: { createNote(in: $0) },
+                onRename: { renameNote(at: $0) },
+                onDelete: { trashVaultItem(at: $0) }
             )
+            .onChange(of: vaultRevision) { _, _ in
+                refreshVault()
+            }
         }
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
         .padding(GlassTheme.Spacing.snug)
@@ -724,11 +751,22 @@ struct WorkspaceView: View {
                 onSelect: {
                     workspace.select($0, in: pane)
                     if pane == workspace.focusedPane { refreshVault() }
+                    persistSession()
                 },
                 onClose: { closeDocument($0, in: pane) },
-                onSplit: { workspace.split(pane, edge: $0) },
+                onSplit: {
+                    workspace.split(pane, edge: $0)
+                    persistSession()
+                },
                 onClosePane: { closePane(pane) }
             )
+
+            // Surfaced the moment the watcher sees it, not at save time when
+            // it can only be an error: the reader chooses between versions
+            // while both still make sense.
+            if let document, externalConflicts.contains(document.id) {
+                conflictBar(document)
+            }
 
             MarkdownEditorView(
                 text: Binding(
@@ -736,6 +774,7 @@ struct WorkspaceView: View {
                     set: {
                         workspace.updateText($0, in: pane)
                         if pane == workspace.focusedPane { refreshVault() }
+                        scheduleAutosave()
                     }
                 ),
                 mode: mode,
@@ -817,6 +856,7 @@ struct WorkspaceView: View {
             outline: outline,
             backlinks: backlinks,
             mentions: mentions,
+            outgoing: outgoingLinks,
             assistant: writingTools.document,
             harness: writingTools.harness,
             terminal: terminalPlacement == .inspector
@@ -845,7 +885,9 @@ struct WorkspaceView: View {
     private func openFile(_ url: URL) {
         do {
             try workspace.open(url, in: workspace.focusedPane)
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
             refreshVault()
+            persistSession()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -944,13 +986,357 @@ struct WorkspaceView: View {
         guard let destination else { return false }
         workspace.focusedPane = destination
         refreshVault()
+        persistSession()
         return true
     }
 
     private func openVaultRoot(_ url: URL) {
         workspace.vaultRoot = url
         vault.open(url)
+        startWatching(url)
         refreshVault()
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        persistSession()
+    }
+
+    /// Starts the file-system watch for an open vault.
+    private func startWatching(_ root: URL) {
+        let stream = watcher ?? VaultWatcher()
+        stream.onEvents = { paths in
+            handleWatchedPaths(paths)
+        }
+        stream.start(at: root)
+        watcher = stream
+    }
+
+    private func stopWatching() {
+        watcher?.stop()
+        watcher = nil
+    }
+
+    // MARK: - Vault file operations
+
+    /// Creates `Untitled.md` (numbered as needed) in `folder` and opens it.
+    private func createNote(in folder: URL) {
+        let base = folder.appendingPathComponent("Untitled")
+        var candidate = base.appendingPathExtension("md")
+        var counter = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = URL(fileURLWithPath: base.path + " \(counter)")
+                .appendingPathExtension("md")
+            counter += 1
+        }
+        do {
+            try "".write(to: candidate, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
+        openFile(candidate)
+    }
+
+    /// Asks for a new name, then moves the note and rewrites its links.
+    ///
+    /// The rewrite is the core's to do — it is the only place that knows how
+    /// a target resolves — and open documents are retargeted afterwards, so
+    /// a note being edited keeps its buffer instead of fighting the watcher
+    /// over which version is real.
+    private func renameNote(at url: URL) {
+        guard let name = prompt(
+            "Rename", field: url.deletingPathExtension().lastPathComponent)
+        else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard let from = workspace.vaultRoot.map({ relativePath(of: url, from: $0) }) else {
+            return
+        }
+        let destinationFolder = url.deletingLastPathComponent()
+        let destination = destinationFolder
+            .appendingPathComponent(trimmed)
+            .appendingPathExtension("md")
+
+        Task { @MainActor in
+            guard let outcome = self.vault.renameNote(
+                from: from,
+                to: self.relativePath(of: destination, from: self.workspace.vaultRoot!))
+            else {
+                self.errorMessage = "Could not rename \(url.lastPathComponent)."
+                return
+            }
+
+            // Every view of the moved note follows it; its bytes did not
+            // change, so the persisted baseline carries over untouched.
+            let oldURL = url.standardizedFileURL
+            let newURL = destination.standardizedFileURL
+            for pane in self.workspace.layout.panes {
+                let state = self.workspace.state(for: pane)
+                for document in state.documents
+                where document.url?.standardizedFileURL == oldURL {
+                    self.workspace.replace(document: document.retargeted(to: newURL))
+                }
+            }
+
+            _ = outcome
+            self.vaultRevision += 1
+            self.refreshVault()
+            self.persistSession()
+        }
+    }
+
+    /// Trash a file or folder after refusing when an open note inside still
+    /// has unsaved work — deleting that work needs the reader's own hands.
+    private func trashVaultItem(at url: URL) {
+        let doomed = url.standardizedFileURL
+        var dirtyTitle: String?
+        for pane in workspace.layout.panes {
+            for document in workspace.state(for: pane).documents
+            where document.url?.standardizedFileURL == doomed {
+                if document.hasUnsavedChanges {
+                    dirtyTitle = document.title
+                }
+            }
+        }
+        if let dirtyTitle {
+            errorMessage = "\(dirtyTitle) has unsaved changes. Save or discard them first."
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Move \(url.lastPathComponent) to the Trash?"
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
+
+        // Close every tab showing something inside what was trashed, then
+        // forget the index entries. The watcher will also have seen this;
+        // both paths are idempotent.
+        for pane in workspace.layout.panes {
+            for document in workspace.state(for: pane).documents {
+                if document.url?.standardizedFileURL.path.hasPrefix(doomed.path) == true {
+                    closeDocument(document.id, in: pane)
+                }
+            }
+        }
+        if let root = workspace.vaultRoot, !url.hasDirectoryPath {
+            vault.removeNote(relativePath(of: url, from: root))
+        }
+        vaultRevision += 1
+        refreshVault()
+    }
+
+    private func relativePath(of url: URL, from root: URL) -> String {
+        let rootComponents = root.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let components = url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard components.count > rootComponents.count else { return url.lastPathComponent }
+        return components.dropFirst(rootComponents.count).joined(separator: "/")
+    }
+
+    /// One text prompt with a prefilled field. Shared by rename today; new-
+    /// folder and similar asks belong here too rather than growing their own
+    /// alert plumbing.
+    @discardableResult
+    private func prompt(_ title: String, field prefill: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.stringValue = prefill
+        alert.accessoryView = input
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return input.stringValue
+    }
+
+    /// Reacts to a batch of watched changes, coalesced.
+    ///
+    /// Three consumers, one event stream. The navigator re-scans on anything;
+    /// the index is fed only Markdown *not* open in an editor, because for
+    /// those the editor's buffer is authoritative — indexing disk text under
+    /// it would make backlinks describe a version the reader cannot see and
+    /// is about to overwrite.
+    private func handleWatchedPaths(_ changedPaths: [String]) {
+        let paths = changedPaths.map { URL(fileURLWithPath: $0) }
+        guard workspace.vaultRoot != nil else { return }
+        watchedPathsTask?.cancel()
+        watchedPathsTask = Task {
+            // A save from another tool often lands as several events over a
+            // few milliseconds; reacting per event would rescan and reindex
+            // that many times for one edit.
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+
+            vaultRevision += 1
+
+            var conflicts: [OpenDocument.ID] = []
+            for url in Set(paths.map(\.standardizedFileURL))
+                .sorted(by: { $0.path < $1.path })
+            {
+                guard FileTree.isMarkdown(url), !url.hasDirectoryPath else { continue }
+                let relative = vault.relativePath(for: url)
+
+                if let document = workspaceOpenDocument(matching: url) {
+                    if await externalEditConflicts(document: document, at: url) {
+                        conflicts.append(document.id)
+                    }
+                } else if let path = relative,
+                    let text = try? String(contentsOf: url, encoding: .utf8)
+                {
+                    vault.update(path: path, text: text)
+                }
+            }
+            if !conflicts.isEmpty {
+                externalConflicts.formUnion(conflicts)
+            }
+        }
+    }
+
+    /// The workspace's identity for `url`, if it is open anywhere here.
+    private func workspaceOpenDocument(matching url: URL) -> OpenDocument? {
+        for pane in workspace.layout.panes {
+            for document in workspace.state(for: pane).documents
+            where document.url?.standardizedFileURL == url.standardizedFileURL {
+                return document
+            }
+        }
+        return nil
+    }
+
+    /// Whether `url`'s bytes differ from what this document was last read or
+    /// written as — the same exact-content question a manual save asks, asked
+    /// early enough to be information instead of an error.
+    private func externalEditConflicts(document: OpenDocument, at url: URL) -> Bool {
+        guard let disk = try? String(contentsOf: url, encoding: .utf8) else {
+            // Deleted underneath us counts as a conflict only when saving
+            // would refuse; a missing file is handled there. Not conflicted:
+            // the navigator already shows it gone.
+            return false
+        }
+        // Unsaved work means the reader's version is already ahead of the
+        // baseline; the save-time review owns that case, not the banner.
+        return !document.hasUnsavedChanges && !document.matchesPersisted(disk)
+    }
+
+    /// Re-reads a note whose file changed elsewhere, discarding the local view.
+    private func acceptExternalVersion(of documentID: OpenDocument.ID) {
+        externalConflicts.remove(documentID)
+        for pane in workspace.layout.panes {
+            let state = workspace.state(for: pane)
+            guard
+                let index = state.documents.firstIndex(where: { $0.id == documentID }),
+                let url = state.documents[index].url,
+                let text = try? String(contentsOf: url, encoding: .utf8)
+            else { continue }
+            workspace.replace(document: state.documents[index].reloaded(from: text))
+            if pane == workspace.focusedPane { refreshVault() }
+        }
+    }
+
+    /// The bar over an editor whose file changed underneath it.
+    private func conflictBar(_ document: OpenDocument) -> some View {
+        HStack(spacing: GlassTheme.Spacing.snug) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(.secondary)
+            Text("\(document.title) changed on disk.")
+                .font(.callout)
+                .lineLimit(1)
+            Spacer(minLength: GlassTheme.Spacing.snug)
+            Button("Keep Mine") { keepLocalVersion(of: document.id) }
+                .controlSize(.small)
+            Button("Reload") { acceptExternalVersion(of: document.id) }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, GlassTheme.Spacing.regular)
+        .padding(.vertical, 6)
+        .background(.yellow.opacity(0.14))
+    }
+
+    /// Keeps the local view, adopting it as the baseline: the next save will
+    /// write this text, which is what "keep mine" means and why it is a
+    /// button rather than a default.
+    private func keepLocalVersion(of documentID: OpenDocument.ID) {
+        externalConflicts.remove(documentID)
+        for pane in workspace.layout.panes {
+            let state = workspace.state(for: pane)
+            guard let index = state.documents.firstIndex(where: { $0.id == documentID })
+            else { continue }
+            workspace.replace(document: state.documents[index].keepingLocal())
+        }
+    }
+
+    // MARK: - Session
+
+    /// Whether this window has already read the stored session.
+    ///
+    /// SwiftUI re-runs `onAppear` when a view re-enters the hierarchy; without
+    /// the guard, a later pass would rebuild the window over work the reader
+    /// has done since launch.
+    @State private var sessionRestored = false
+    /// Coalesces session writes; see ``persistSession()``.
+    @State private var sessionPersistTask: Task<Void, Never>?
+    /// Debounces autosave behind typing; see ``scheduleAutosave()``.
+    @State private var autosaveTask: Task<Void, Never>?
+
+    /// Restores the last window shape, once.
+    ///
+    /// Runs *before* the inbox registration so a file arriving at launch opens
+    /// into the restored layout rather than racing it. A snapshot naming a
+    /// vault that has since been renamed or removed restores its tabs anyway —
+    /// they are absolute paths — and simply leaves the navigator empty, which
+    /// is the honest picture of a missing folder.
+    private func restoreSessionOnce() {
+        guard !sessionRestored else { return }
+        sessionRestored = true
+        guard let snapshot = SessionStore.load() else { return }
+        workspace.restore(from: snapshot)
+        if let root = workspace.vaultRoot {
+            vault.open(root)
+            startWatching(root)
+        }
+        refreshVault()
+    }
+
+    /// Records the window's shape, coalesced.
+    ///
+    /// Called from every mutation that changes what a relaunch should bring
+    /// back — opening, closing, splitting, saving, choosing a vault. Debounced
+    /// because several of those arrive together (a drop opens five tabs and
+    /// splits a pane), and only the final shape is worth writing.
+    private func persistSession() {
+        sessionPersistTask?.cancel()
+        sessionPersistTask = Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            SessionStore.save(workspace.snapshot())
+        }
+    }
+
+    /// Writes dirty documents a moment after typing stops.
+    ///
+    /// Autosave is deliberately not per keystroke and not on a fixed clock:
+    /// one debounced write after the reader pauses buys the crash safety
+    /// without touching the disk mid-sentence. Failures are silent here by
+    /// design — the document stays dirty, so the truth is still on screen and
+    /// the next explicit save will surface whatever went wrong.
+    private func scheduleAutosave() {
+        autosaveTask?.cancel()
+        autosaveTask = Task {
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            if workspace.autosave() > 0 {
+                persistSession()
+            }
+        }
     }
 
     /// Recomputes the panels for whatever the focused pane is showing.
@@ -962,6 +1348,7 @@ struct WorkspaceView: View {
             outline = []
             backlinks = []
             mentions = []
+            outgoingLinks = []
             warmer.cancel()
             return
         }
@@ -981,6 +1368,7 @@ struct WorkspaceView: View {
         guard let url = document.url, let path = vault.relativePath(for: url) else {
             backlinks = []
             mentions = []
+            outgoingLinks = []
             warmer.cancel()
             return
         }
@@ -988,6 +1376,7 @@ struct WorkspaceView: View {
         vault.update(path: path, text: document.text)
         backlinks = vault.backlinks(for: path)
         mentions = vault.unlinkedMentions(for: path)
+        outgoingLinks = vault.links(for: path)
         // After the update, so a link typed a moment ago is one this can see.
         // Debounced inside the warmer: this runs on every keystroke.
         warmer.warm(from: url, in: vault)
@@ -1189,10 +1578,35 @@ struct WorkspaceView: View {
         return list
     }
 
+    /// Full-text hits for the palette, from the vault's own search index.
+    ///
+    /// The context line is the snippet the core scored, trimmed of the
+    /// Markdown it is dressed in so a row reads at palette size.
+    private func contentSearchCommands(for query: String) -> [Command] {
+        vault.search(query, limit: 8).compactMap { hit in
+            guard let url = vault.url(for: hit.path) else { return nil }
+            var context = hit.context.trimmingCharacters(in: .whitespacesAndNewlines)
+            if context.count > 80 {
+                context = String(context.prefix(80)) + "…"
+            }
+            return Command(
+                title: hit.title,
+                subtitle: context.isEmpty ? hit.path : context,
+                symbol: "magnifyingglass",
+                kind: .searchResult(url, line: hit.line))
+        }
+    }
+
     private func run(_ command: Command) {
         switch command.kind {
         case .file(let url):
             openFile(url)
+        case .searchResult(let url, let line):
+            openFile(url)
+            if let text = workspace.document(in: workspace.focusedPane)?.text {
+                reveals[workspace.focusedPane] = RevealRequest(
+                    offset: Command.offset(ofLine: line, in: text))
+            }
         case .action(let action):
             run(action)
         }
@@ -1212,8 +1626,12 @@ struct WorkspaceView: View {
         case .toggleInspector: showInspector.toggle()
         case .toggleTerminal: setTerminal(visible: !isTerminalVisible)
         case .toggleGraph: showGraph.toggle()
-        case .splitRight: workspace.split(workspace.focusedPane, edge: .trailing)
-        case .splitDown: workspace.split(workspace.focusedPane, edge: .bottom)
+        case .splitRight:
+            workspace.split(workspace.focusedPane, edge: .trailing)
+            persistSession()
+        case .splitDown:
+            workspace.split(workspace.focusedPane, edge: .bottom)
+            persistSession()
         case .closePane: closePane(workspace.focusedPane)
         case .focusNextPane: workspace.focusPane(offset: 1)
         case .focusPreviousPane: workspace.focusPane(offset: -1)
@@ -1291,6 +1709,7 @@ struct WorkspaceView: View {
         do {
             try workspace.save(in: pane)
             refreshVault()
+            persistSession()
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -1311,7 +1730,9 @@ struct WorkspaceView: View {
         do {
             // NSSavePanel has already obtained explicit overwrite consent.
             try workspace.save(in: pane, to: url, overwrite: true)
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
             refreshVault()
+            persistSession()
             return true
         } catch {
             errorMessage = error.localizedDescription
@@ -1323,6 +1744,7 @@ struct WorkspaceView: View {
         guard confirmClosing(document, in: pane) else { return }
         workspace.close(document, in: pane)
         if pane == workspace.focusedPane { refreshVault() }
+        persistSession()
     }
 
     private func closePane(_ pane: PaneID) {
@@ -1335,6 +1757,7 @@ struct WorkspaceView: View {
         guard documents.allSatisfy({ confirmClosing($0.id, in: pane) }) else { return }
         workspace.closePane(pane)
         refreshVault()
+        persistSession()
     }
 
     private func confirmClosing(_ documentID: OpenDocument.ID, in pane: PaneID) -> Bool {

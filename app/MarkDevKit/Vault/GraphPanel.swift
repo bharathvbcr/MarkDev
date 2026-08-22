@@ -24,6 +24,14 @@ public struct GraphPanel: View {
     @State private var scope: Scope = .local
     @State private var depth = 2
     @State private var tag: String?
+    /// Solved graphs by ``rebuildKey``, so flipping scope or hopping depth —
+    /// the two controls a reader actually works — answers from memory instead
+    /// of re-running the force simulation they already watched finish.
+    @State private var solved: [String: VaultGraph] = [:]
+    /// Insertion order for ``solved``'s eviction, which a dictionary cannot
+    /// remember on its own.
+    @State private var solvedOrder: [String] = []
+    @State private var isComputing = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// How much of the vault to draw.
@@ -63,8 +71,9 @@ public struct GraphPanel: View {
         .padding(GlassTheme.Spacing.loose)
         // Rebuilt whenever anything it depends on changes, including the open
         // note: a local graph that kept pointing at the note you left is worse
-        // than no graph.
-        .task(id: rebuildKey) { rebuild() }
+        // than no graph. The rebuild awaits, so a slower scope change cancels
+        // the layout of the faster one it replaced instead of racing it.
+        .task(id: rebuildKey) { await rebuild() }
         .onKeyPress(.escape) {
             onDismiss()
             return .handled
@@ -137,7 +146,17 @@ public struct GraphPanel: View {
 
     @ViewBuilder
     private var content: some View {
-        if graph.isEmpty {
+        if isComputing && graph.isEmpty {
+            VStack(spacing: GlassTheme.Spacing.tight) {
+                ProgressView()
+                    .controlSize(.large)
+                Text("Laying out \(vault.noteCount) notes…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(GlassTheme.Spacing.loose)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if graph.isEmpty {
             VStack(spacing: GlassTheme.Spacing.tight) {
                 Image(systemName: "point.3.connected.trianglepath.dotted")
                     .font(.largeTitle)
@@ -168,8 +187,33 @@ public struct GraphPanel: View {
         return "Nothing linked yet — use [[wikilinks]] to connect notes."
     }
 
-    private func rebuild() {
+    private func rebuild() async {
+        let key = rebuildKey
+        if let solved = solved[key] {
+            graph = solved
+            return
+        }
+
+        isComputing = true
+        defer { isComputing = false }
+
         let focus = scope == .local ? current : nil
-        graph = vault.graph(focus: focus, depth: depth, tag: tag)
+        let computed = await vault.graphOffMain(focus: focus, depth: depth, tag: tag)
+        guard !computed.isEmpty else { return }
+
+        // The key changed mid-flight: a newer rebuild owns the canvas now,
+        // and assigning would flash this graph over theirs before that one
+        // lands. The solve is still cached under its own key either way.
+        if !Task.isCancelled { graph = computed }
+        if solved[key] == nil { solvedOrder.append(key) }
+        solved[key] = computed
+
+        // A handful of solves at most: every scope × depth × tag combination
+        // a session has actually shown, evicted least-recently-added once it
+        // grows past what any reader will flip between.
+        while solvedOrder.count > 12 {
+            let stale = solvedOrder.removeFirst()
+            solved.removeValue(forKey: stale)
+        }
     }
 }

@@ -54,7 +54,7 @@ public final class SyntaxHighlighter {
     }
 
     private var cache: [Key: [HighlightSpan]] = [:]
-    /// Insertion order, for evicting the oldest entries.
+    /// Recency order, least recently used first; see ``touch``.
     private var order: [Key] = []
     /// Bounded so a long session cannot accumulate every code block ever
     /// scrolled past.
@@ -82,12 +82,23 @@ public final class SyntaxHighlighter {
         #endif
     }
 
+    /// Whether `spans` would answer from the cache.
+    ///
+    /// Only measurements need this; it deliberately does not count as a use,
+    /// so a test can probe without changing who eviction would take.
+    func isCached(language: String, code: String) -> Bool {
+        cache[Key(language: language, code: code)] != nil
+    }
+
     /// Highlights `code`, or returns empty when the language is unknown.
     public func spans(language: String?, code: String) -> [HighlightSpan] {
         guard let language, !language.isEmpty, !code.isEmpty else { return [] }
 
         let key = Key(language: language, code: code)
-        if let cached = cache[key] { return cached }
+        if let cached = cache[key] {
+            touch(key)
+            return cached
+        }
 
         let computed = compute(language: language, code: code)
         cache[key] = computed
@@ -97,6 +108,19 @@ public final class SyntaxHighlighter {
             cache.removeValue(forKey: evicted)
         }
         return computed
+    }
+
+    /// Moves `key` to the most recently used end of ``order``.
+    ///
+    /// Eviction takes the least *recently used* entry, not the oldest
+    /// inserted one: scrolling back over early fences is use, and those
+    /// blocks stay warm — where insertion-order eviction re-ran tree-sitter
+    /// on every pass back through a long document. With 256 entries at most,
+    /// the linear scan costs far less than the parse it prevents.
+    private func touch(_ key: Key) {
+        guard let index = order.firstIndex(of: key) else { return }
+        order.remove(at: index)
+        order.append(key)
     }
 
     private func compute(language: String, code: String) -> [HighlightSpan] {

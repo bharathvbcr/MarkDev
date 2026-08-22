@@ -241,8 +241,6 @@ impl Document {
             shift_pair(&mut marker.start, &mut marker.end);
         }
 
-        let removed_bytes = (edit_byte as i64 - delta_bytes).max(0) as usize;
-        let _ = removed_bytes;
         for range in &mut self.result.top_level {
             if range.end <= edit_byte {
                 continue;

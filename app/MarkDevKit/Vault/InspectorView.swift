@@ -29,6 +29,11 @@ public struct InspectorView: View {
     public let outline: [VaultHeading]
     public let backlinks: [Backlink]
     public let mentions: [UnlinkedMention]
+    /// Where this note points *out*, each carrying its resolution — including
+    /// the broken ones, which are shown rather than dropped: a note linking at
+    /// something that does not exist yet is ordinary in a vault, and invisible
+    /// breakage is how a link graph quietly rots.
+    public let outgoing: [OutgoingLink]
     /// The window's writing-tools state, for the Assist tab.
     public let assistant: DocumentAssistant
     /// The local harness, shown beside it under the same tab.
@@ -56,6 +61,7 @@ public struct InspectorView: View {
         outline: [VaultHeading],
         backlinks: [Backlink],
         mentions: [UnlinkedMention],
+        outgoing: [OutgoingLink] = [],
         assistant: DocumentAssistant,
         harness: HarnessAssistant,
         terminal: AnyView?,
@@ -68,6 +74,7 @@ public struct InspectorView: View {
         self.outline = outline
         self.backlinks = backlinks
         self.mentions = mentions
+        self.outgoing = outgoing
         self.assistant = assistant
         self.harness = harness
         self.terminal = terminal
@@ -203,13 +210,21 @@ public struct InspectorView: View {
 
     @ViewBuilder
     private var linksSection: some View {
-        if backlinks.isEmpty && mentions.isEmpty {
+        if backlinks.isEmpty && mentions.isEmpty && outgoing.isEmpty {
             empty(
                 "No connections", symbol: "link",
                 hint: "Link to this note with [[its name]] from anywhere in the vault.")
         } else {
+            if !outgoing.isEmpty {
+                sectionHeader("Outgoing links", count: outgoing.count)
+                ForEach(outgoing) { link in
+                    outgoingLink(link)
+                }
+            }
+
             if !backlinks.isEmpty {
                 sectionHeader("Linked mentions", count: backlinks.count)
+                    .padding(.top, GlassTheme.Spacing.snug)
                 ForEach(backlinks) { backlink in
                     reference(
                         title: backlink.title,
@@ -224,7 +239,7 @@ public struct InspectorView: View {
 
             if !mentions.isEmpty {
                 sectionHeader("Unlinked mentions", count: mentions.count)
-                    .padding(.top, backlinks.isEmpty ? 0 : GlassTheme.Spacing.snug)
+                    .padding(.top, GlassTheme.Spacing.snug)
                 ForEach(mentions) { mention in
                     reference(
                         title: mention.title,
@@ -236,6 +251,55 @@ public struct InspectorView: View {
                     }
                 }
             }
+        }
+    }
+
+    /// One outbound link. A resolved one opens its target; a broken one says
+    /// so and offers nothing, because the only place to go is the text itself.
+    @ViewBuilder
+    private func outgoingLink(_ link: OutgoingLink) -> some View {
+        if let path = link.path {
+            Button {
+                onOpenNote(path, link.offset)
+            } label: {
+                HStack(spacing: GlassTheme.Spacing.tight) {
+                    Image(systemName: "arrow.turn.up.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(link.display)
+                            .font(.callout)
+                            .lineLimit(1)
+                        Text(path)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } else {
+            HStack(spacing: GlassTheme.Spacing.tight) {
+                Image(systemName: "link.badge.plus")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(link.display)
+                        .font(.callout)
+                        .lineLimit(1)
+                    Text("Broken — no note named \(link.target)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 2)
         }
     }
 

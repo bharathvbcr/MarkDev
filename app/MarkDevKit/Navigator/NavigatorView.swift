@@ -11,6 +11,15 @@ import SwiftUI
 /// Browsable file tree for the vault, with a fuzzy filter.
 public struct NavigatorView: View {
     public let root: URL?
+    /// Bumped whenever something outside this window may have changed the
+    /// vault's contents — a file-system event most of all.
+    ///
+    /// The tree loads once per ``root`` otherwise, which made every note
+    /// another tool created invisible until the vault was reopened. An
+    /// integer rather than a callback keeps the navigator dumb about *why*
+    /// it should re-scan; SwiftUI delivers the change wherever this value
+    /// flows.
+    public var revision: Int = 0
     /// Called when a file is chosen.
     public let onOpen: (URL) -> Void
     /// Called when the reader asks for a vault. The navigator raises the
@@ -27,6 +36,14 @@ public struct NavigatorView: View {
     /// folder holding it, since that is what a shell can be started in and
     /// what someone means by "a terminal here" while pointing at a note.
     public var onOpenTerminal: ((URL) -> Void)?
+    /// Called with the folder a new note should be created in. A file row
+    /// resolves to its own folder, like ``onOpenTerminal``.
+    public var onCreateNote: ((URL) -> Void)?
+    /// Called with the file to rename. The navigator raises the request; the
+    /// workspace owns naming, disk effects, and link rewriting together.
+    public var onRename: ((URL) -> Void)?
+    /// Called with the file or folder to move to the Trash.
+    public var onDelete: ((URL) -> Void)?
 
     @State private var nodes: [FileNode] = []
     @State private var expanded: Set<URL> = []
@@ -37,16 +54,24 @@ public struct NavigatorView: View {
 
     public init(
         root: URL?,
+        revision: Int = 0,
         onOpen: @escaping (URL) -> Void,
         onChooseVault: (() -> Void)? = nil,
         onPeek: ((URL?) -> Void)? = nil,
-        onOpenTerminal: ((URL) -> Void)? = nil
+        onOpenTerminal: ((URL) -> Void)? = nil,
+        onCreateNote: ((URL) -> Void)? = nil,
+        onRename: ((URL) -> Void)? = nil,
+        onDelete: ((URL) -> Void)? = nil
     ) {
         self.root = root
+        self.revision = revision
         self.onOpen = onOpen
         self.onChooseVault = onChooseVault
         self.onPeek = onPeek
         self.onOpenTerminal = onOpenTerminal
+        self.onCreateNote = onCreateNote
+        self.onRename = onRename
+        self.onDelete = onDelete
     }
 
     public var body: some View {
@@ -61,6 +86,10 @@ public struct NavigatorView: View {
         }
         .padding(GlassTheme.Spacing.snug)
         .task(id: root) { reload() }
+        // A change arriving while the reader is mid-filter re-runs the same
+        // scan the filter already sees; expansion survives because it lives
+        // here rather than in the scanned nodes.
+        .onChange(of: revision) { _, _ in reload() }
     }
 
     /// Which vault is open, and a way out of it.
@@ -209,13 +238,31 @@ public struct NavigatorView: View {
                             }
                             .id(row.node.url)
                             .contextMenu {
+                                if let onCreateNote {
+                                    Button("New Note…") {
+                                        onCreateNote(
+                                            NavigatorTerminalTarget.directory(for: row.node))
+                                    }
+                                }
+                                if row.node.isDirectory || onRename != nil {
+                                    Divider()
+                                }
+                                if !row.node.isDirectory, let onRename {
+                                    Button("Rename…") { onRename(row.node.url) }
+                                }
+                                if let onDelete {
+                                    Button("Move to Trash", role: .destructive) {
+                                        onDelete(row.node.url)
+                                    }
+                                }
                                 if let onOpenTerminal {
+                                    Divider()
                                     Button("Open Terminal Here") {
                                         onOpenTerminal(
                                             NavigatorTerminalTarget.directory(for: row.node))
                                     }
-                                    Divider()
                                 }
+                                Divider()
                                 Button("Reveal in Finder") {
                                     NSWorkspace.shared.activateFileViewerSelecting([row.node.url])
                                 }

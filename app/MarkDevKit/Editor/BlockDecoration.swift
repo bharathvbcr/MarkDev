@@ -203,10 +203,7 @@ extension BlockDecoration {
     private static func taskItem(
         for range: NSRange, in document: ParsedDocument
     ) -> BlockDecoration? {
-        let marker = document.spans.first { span in
-            span.kind == .taskMarker && NSIntersectionRange(span.range, range).length > 0
-        }
-        guard let marker else { return nil }
+        guard let marker = document.taskMarker(overlapping: range) else { return nil }
         return .task(checked: marker.data == 1)
     }
 
@@ -214,16 +211,17 @@ extension BlockDecoration {
     ///
     /// Resolved per row rather than per table: TextKit lays out one fragment
     /// per line, so the table's shading and rules have to be drawn a row at a
-    /// time, and only the row knows whether it is the header.
+    /// time, and only the row knows whether it is the header. Both lookups are
+    /// binary searches over per-parse indexes — and the head is asked of *the
+    /// row's own table*, because taking the document's first `.tableHead`
+    /// shaded only the first table on the page.
     private static func tableRow(
         for range: NSRange, in document: ParsedDocument
     ) -> BlockDecoration? {
-        guard let table = document.blocks.first(where: {
-            $0.kind == .table && NSIntersectionRange($0.range, range).length > 0
-        }) else { return nil }
+        guard let table = document.table(containing: range) else { return nil }
 
-        let head = document.blocks.first { $0.kind == .tableHead }
-        let isHeader = head.map { NSIntersectionRange($0.range, range).length > 0 } ?? false
+        let isHeader = document.tableHead(ofTable: table)
+            .map { NSIntersectionRange($0.range, range).length > 0 } ?? false
         let tableEnd = table.range.location + table.range.length
         let isLast = range.location + range.length >= tableEnd
 
