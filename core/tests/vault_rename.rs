@@ -140,10 +140,136 @@ fn renaming_to_an_existing_path_is_refused() {
     assert!(std::fs::exists(vault.root().join("A.md")).unwrap());
 }
 
+/// On a case-insensitive filesystem the destination check must ask the disk,
+/// not just the index: `Work/a.md` exists even when only `work/A.md` was
+/// indexed, and renaming over it would destroy a note the index still
+/// believes it holds. This test is meaningful on both filesystem flavours —
+/// on a case-sensitive volume it passes trivially, and on APFS (this
+/// machine) it is the guard that keeps a silent overwrite from happening.
+#[test]
+fn renaming_onto_a_case_variant_of_an_existing_file_is_refused() {
+    let mut vault = vault(&[
+        ("Work/plan.md", "# real work"),
+        ("Notes/Plan.md", "# mover"),
+    ]);
+    assert!(vault.rename_note("Notes/Plan.md", "Work/Plan.md").is_none());
+
+    // The untouched file kept its bytes; the mover stayed put.
+    assert_eq!(
+        std::fs::read_to_string(vault.root().join("Work/plan.md")).unwrap(),
+        "# real work"
+    );
+    assert!(std::fs::exists(vault.root().join("Notes/Plan.md")).unwrap());
+}
+
+/// A case-only rename of a file onto itself is legitimate — same directory
+/// entry, nothing to lose — and must not be caught by the collision guard.
+#[test]
+fn a_case_only_rename_of_the_same_file_is_allowed() {
+    let mut vault = vault(&[("Roadmap.md", "# Roadmap")]);
+    let outcome = vault.rename_note("Roadmap.md", "roadmap.md");
+    // On case-insensitive volumes this succeeds as a spelling change; on
+    // case-sensitive ones the destination simply does not exist and it
+    // succeeds as an ordinary rename. Either way: not refused.
+    assert!(outcome.is_some(), "case-only self-rename was refused");
+}
+
 #[test]
 fn renaming_an_unknown_path_is_refused() {
     let mut vault = vault(&[("A.md", "# A")]);
     assert!(vault.rename_note("Missing.md", "X.md").is_none());
+}
+
+// MARK: - Code is never rewritten
+
+/// A fenced code block holds literal content the reader marked as code —
+/// sample commands, embedded Markdown, documentation. A rename that edits
+/// inside it corrupts bytes the reader never offered up as links. Obsidian
+/// skips these too.
+#[test]
+fn links_inside_a_fenced_code_block_are_left_alone() {
+    let mut vault = vault(&[
+        ("Guide.md", "# Guide"),
+        (
+            "Doc.md",
+            concat!(
+                "Live [[Guide]] and [live](Guide.md).\n",
+                "\n",
+                "```md\n",
+                "Frozen [sample](Guide.md) and [[Guide]] here\n",
+                "```\n",
+            ),
+        ),
+    ]);
+
+    vault.rename_note("Guide.md", "Docs/Guide.md").unwrap();
+
+    let doc = vault.note("Doc.md").unwrap().text.clone();
+    assert!(
+        doc.contains("(Docs/Guide.md)"),
+        "the live links follow the move: {doc}"
+    );
+    assert!(
+        !doc.contains("```md\nFrozen [sample](Docs/Guide.md)"),
+        "the fenced sample was rewritten: {doc}"
+    );
+    assert!(
+        doc.contains("Frozen [sample](Guide.md) and [[Guide]] here"),
+        "the fenced block must be byte-identical: {doc}"
+    );
+}
+
+#[test]
+fn link_targets_inside_inline_code_are_left_alone() {
+    let mut vault = vault(&[
+        ("Guide.md", "# Guide"),
+        (
+            "Doc.md",
+            "Run `[x](Guide.md)` verbatim, but read [the real one](Guide.md).\n",
+        ),
+    ]);
+
+    vault.rename_note("Guide.md", "Docs/Guide.md").unwrap();
+
+    let doc = vault.note("Doc.md").unwrap().text.clone();
+    assert!(
+        doc.contains("`[x](Guide.md)`"),
+        "inline code was rewritten: {doc}"
+    );
+    assert!(doc.contains("[the real one](Docs/Guide.md)"), "{doc}");
+}
+
+/// Math, Mermaid, and frontmatter are rendered or machine-read, never
+/// clicked; their source must survive a rename untouched. The fixture leads
+/// with non-ASCII so the protection ranges have to cross the UTF-16/byte
+/// offset boundary correctly to land where they claim.
+#[test]
+fn math_mermaid_and_frontmatter_sources_survive_a_rename() {
+    let mut vault = vault(&[
+        ("Note.md", "# Note"),
+        (
+            "Doc.md",
+            concat!(
+                "---\n",
+                "ref: \"see [x](Note.md)\"\n",
+                "---\n",
+                "中文 中文 [live](Note.md)\n",
+                "$$x = [y](Note.md)$$\n",
+                "```mermaid\n",
+                "flowchart LR\n",
+                "A[[B [link](Note.md)]]\n",
+                "```\n",
+            ),
+        ),
+    ]);
+
+    vault.rename_note("Note.md", "Elsewhere/Note.md").unwrap();
+
+    let doc = vault.note("Doc.md").unwrap().text.clone();
+    assert!(doc.contains("中文 中文 [live](Elsewhere/Note.md)"), "{doc}");
+    assert!(doc.contains("ref: \"see [x](Note.md)\""), "{doc}");
+    assert!(doc.contains("$$x = [y](Note.md)$$"), "{doc}");
+    assert!(doc.contains("A[[B [link](Note.md)]]"), "{doc}");
 }
 
 #[test]
@@ -151,6 +277,7 @@ fn unclosed_brackets_are_left_as_prose() {
     let source = "an [[unclosed thing and [[Real]] after";
     let (rewritten, count) = markdev::vault::rename::rewrite_links_in(
         source,
+        &markdev::vault::rename::ProtectedRanges::none(),
         &mut |target| (target == "Real").then(|| "Moved".to_string()),
         &mut |_| None,
     );
@@ -162,6 +289,7 @@ fn unclosed_brackets_are_left_as_prose() {
     let source = "[[Nope]] then [[Real]]";
     let (rewritten, count) = markdev::vault::rename::rewrite_links_in(
         source,
+        &markdev::vault::rename::ProtectedRanges::none(),
         &mut |target| (target == "Real").then(|| "Moved".to_string()),
         &mut |_| None,
     );
@@ -172,10 +300,12 @@ fn unclosed_brackets_are_left_as_prose() {
 #[test]
 fn markdown_suffix_and_alias_shapes_survive_a_rewrite() {
     let source = "a [x](Real.md) b [y](real) c [d](Real.md#anchor)";
-    let (rewritten, count) =
-        markdev::vault::rename::rewrite_links_in(source, &mut |_| None, &mut |target| {
-            (target.eq_ignore_ascii_case("Real")).then(|| "New/Spot".to_string())
-        });
+    let (rewritten, count) = markdev::vault::rename::rewrite_links_in(
+        source,
+        &markdev::vault::rename::ProtectedRanges::none(),
+        &mut |_| None,
+        &mut |target| (target.eq_ignore_ascii_case("Real")).then(|| "New/Spot".to_string()),
+    );
     assert_eq!(count, 3, "{rewritten}");
     assert!(rewritten.contains("(New/Spot.md)"), "{rewritten}");
     assert!(rewritten.contains("(New/Spot) "), "{rewritten}");

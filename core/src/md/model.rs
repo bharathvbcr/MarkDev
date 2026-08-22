@@ -235,6 +235,24 @@ impl Utf16Mapper {
         }
     }
 
+    /// Maps a UTF-16 offset back to a byte offset.
+    ///
+    /// The inverse of [`Utf16Mapper::to_utf16`], for callers that work in
+    /// bytes over spans the parser reports in UTF-16. Offsets past the end
+    /// clamp, so a stale range can only ever name a smaller slice.
+    pub fn to_byte(&self, utf16: u32) -> usize {
+        let Some(checkpoints) = &self.checkpoints else {
+            return (utf16 as usize).min(self.len_utf16 as usize);
+        };
+        match checkpoints.binary_search_by_key(&utf16, |&(_, u)| u) {
+            Ok(i) => checkpoints[i].0 as usize,
+            // Mid-character: the character containing this code unit
+            // starts at the previous checkpoint.
+            Err(0) => 0,
+            Err(i) => checkpoints[i - 1].0 as usize,
+        }
+    }
+
     /// Total length of the source in UTF-16 code units.
     pub fn len_utf16(&self) -> u32 {
         self.len_utf16

@@ -59,7 +59,17 @@ struct WorkspaceView: View {
     /// Apple Intelligence for this window.
     @State private var writingTools = WritingTools()
 
-    /// The vault's link graph. Owned here so every pane shares one index.
+    /// Each pane's live editor, registered as the views are built.
+    ///
+    /// "Focus next pane" has to move the *keyboard*, not just a stored
+    /// value — the tab strip used to brighten while typing kept landing in
+    /// the pane that was never left, which reads as the shortcut doing
+    /// nothing. The registry is what makes first responder reachable by pane.
+    @State private var editorSurfaces: [PaneID: MarkdownTextView] = [:]
+
+    /// The vault's link graph — shared process-wide, not owned here: two
+    /// windows on one folder used to re-walk and hold the whole corpus twice.
+    /// Swapped when the open vault changes; every reader below keeps working.
     @State private var vault = VaultIndex()
 
     /// Reads ahead along the focused note's links. Owned beside the index it
@@ -102,13 +112,17 @@ struct WorkspaceView: View {
     /// does not kill a running build — see ``TerminalSessions``.
     @State private var terminals = TerminalSessions()
 
-    /// Watches the open vault for changes made anywhere else. `nil` while no
-    /// vault is open; started and stopped with it.
-    @State private var watcher: VaultWatcher?
+    /// Watches the open vault via the shared coordinator, which keeps one
+    /// FSEvent stream per folder no matter how many windows are open on it.
+    /// Held so *this* subscription is the one cancelled on disappear.
+    @State private var watchToken: UUID?
+    @State private var watchedRoot: URL?
     /// Bumped on every watched change, into the navigator's re-scan trigger.
     @State private var vaultRevision = 0
     /// Watched paths coalescing toward one reaction; see ``handleWatchedPaths``.
     @State private var watchedPathsTask: Task<Void, Never>?
+    /// The one-shot post-subscribe catch-up; see ``startWatching``.
+    @State private var watchCatchUpTask: Task<Void, Never>?
     /// Open documents whose file changed underneath them, awaiting the
     /// reader's decision. Keyed by document identity; a split view showing
     /// the same note twice shows the banner once per view but decides once.
@@ -121,6 +135,7 @@ struct WorkspaceView: View {
     @State private var terminalMounted = false
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openWindow) private var openWindow
     @Namespace private var glass
 
     /// Vertical space the floating toolbar occupies, so content can clear it.
@@ -254,6 +269,7 @@ struct WorkspaceView: View {
         .focusedSceneValue(
             \.workspaceCommandHandler,
             WorkspaceCommandHandler { run($0) })
+        .focusedSceneValue(\.tabSwitcher, makeTabSwitcher())
         .alert(
             "Couldn’t Complete Action",
             isPresented: Binding(
@@ -353,7 +369,10 @@ struct WorkspaceView: View {
             if bottom > 0 { sidebarHeaderBottom = bottom }
         }
         .onChange(of: workspace.layout) { _, _ in pruneOrphanedState() }
-        .onChange(of: workspace.focusedPane) { _, _ in refreshVault() }
+        .onChange(of: workspace.focusedPane) { _, pane in
+            refreshVault()
+            moveKeyboard(to: pane)
+        }
         .onOpenURL(perform: openFile)
         // Files from Finder, the Dock, or `open`. Registered rather than
         // drained: a double-click that launches the app delivers its request
@@ -388,6 +407,10 @@ struct WorkspaceView: View {
             // which is Quit.
             terminals.endAllHosts()
             stopWatching()
+            // A harness turn outliving its window would keep burning the
+            // local model with nobody watching — and its panel gone, no way
+            // to stop it. The shells taught this lesson first.
+            writingTools.harness.stop()
         }
     }
 
@@ -724,7 +747,8 @@ struct WorkspaceView: View {
                 onOpenTerminal: { openTerminal(in: $0) },
                 onCreateNote: { createNote(in: $0) },
                 onRename: { renameNote(at: $0) },
-                onDelete: { trashVaultItem(at: $0) }
+                onDelete: { trashVaultItem(at: $0) },
+                onDropNotes: { urls, folder in dropNotes(urls, into: folder) }
             )
             .onChange(of: vaultRevision) { _, _ in
                 refreshVault()
@@ -792,6 +816,7 @@ struct WorkspaceView: View {
                     // surface is also the focused pane by definition.
                     workspace.focusedPane = pane
                     writingTools.attach(to: surface)
+                    editorSurfaces[pane] = surface
                 }
             )
             .onTapGesture { workspace.focusedPane = pane }
@@ -803,6 +828,7 @@ struct WorkspaceView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { workspace.focusedPane = pane }
+
         .overlay {
             if dropTargetPane == pane {
                 ZStack {
@@ -992,26 +1018,65 @@ struct WorkspaceView: View {
 
     private func openVaultRoot(_ url: URL) {
         workspace.vaultRoot = url
-        vault.open(url)
+        vault = VaultIndexRegistry.shared.index(for: url)
         startWatching(url)
         refreshVault()
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
         persistSession()
     }
 
-    /// Starts the file-system watch for an open vault.
+    /// Starts (or joins) the shared watch for an open vault.
+    ///
+    /// Subscribing alone is not enough to make this window correct: FSEvents
+    /// drops writes that race a stream's birth, and every note changed
+    /// between ``VaultIndex/open``'s scan and this subscription sits outside
+    /// any event by construction. One catch-up sweep — debounced past both
+    /// windows — walks the vault and reconciles whatever slipped through,
+    /// additions and deletions alike. It re-reads files ``open`` already
+    /// parsed microseconds ago; idempotent, and cheap next to being wrong.
     private func startWatching(_ root: URL) {
-        let stream = watcher ?? VaultWatcher()
-        stream.onEvents = { paths in
+        // Re-subscribing over the same root must not orphan the old token:
+        // cancel it first or the coordinator would fan out twice to here.
+        stopWatching()
+        watchToken = VaultWatchCoordinator.shared.subscribe(to: root) { paths in
             handleWatchedPaths(paths)
         }
-        stream.start(at: root)
-        watcher = stream
+        watchedRoot = root.standardizedFileURL
+
+        let index = vault
+        watchCatchUpTask?.cancel()
+        watchCatchUpTask = Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else { return }
+            let changed = await index.reconcileWithDisk(excluding: openDocumentURLs)
+            if changed > 0 {
+                vaultRevision += 1
+            }
+        }
     }
 
     private func stopWatching() {
-        watcher?.stop()
-        watcher = nil
+        watchCatchUpTask?.cancel()
+        if let watchToken, let watchedRoot {
+            VaultWatchCoordinator.shared.unsubscribe(watchToken, root: watchedRoot)
+        }
+        watchToken = nil
+        watchedRoot = nil
+    }
+
+    /// Files currently held by an editor anywhere in this window; their
+    /// buffers outrank the disk during reconciliation, exactly as in
+    /// ``handleWatchedPaths``.
+    private var openDocumentURLs: Set<URL> {
+        var urls = Set<URL>()
+        for pane in workspace.layout.panes {
+            for document in workspace.state(for: pane).documents {
+                if let url = document.url {
+                    urls.insert(url.standardizedFileURL)
+                }
+            }
+        }
+        return urls
     }
 
     // MARK: - Vault file operations
@@ -1046,55 +1111,127 @@ struct WorkspaceView: View {
             "Rename", field: url.deletingPathExtension().lastPathComponent)
         else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // A name is one path component: separators would invent folders and
+        // `..` would walk out of them. Refused here rather than "handled"
+        // downstream, because a rename that lands somewhere unexpected reads
+        // as the note having vanished.
+        guard !trimmed.isEmpty, !trimmed.contains("/"), trimmed != ".", trimmed != "..",
+            !trimmed.hasPrefix(".")
+        else { return }
 
-        guard let from = workspace.vaultRoot.map({ relativePath(of: url, from: $0) }) else {
-            return
-        }
-        let destinationFolder = url.deletingLastPathComponent()
-        let destination = destinationFolder
+        guard let root = workspace.vaultRoot,
+            !workspace.isOutsideVault(url)
+        else { return }
+        let from = relativePath(of: url, from: root)
+        let destination = url.deletingLastPathComponent()
             .appendingPathComponent(trimmed)
             .appendingPathExtension("md")
+        let to = relativePath(of: destination, from: root)
+
+        applyRename(from: url, to: destination)
+    }
+
+    /// Moves a note within the vault and settles every consequence: open
+    /// views follow it, bystander rewrites are rebased so no phantom banner
+    /// appears for this app's own edit, and the session is re-recorded.
+    ///
+    /// One body for both entries — the Rename… command and a note dragged
+    /// onto a folder — because "what a rename means" must not depend on how
+    /// it was asked for.
+    private func applyRename(from url: URL, to destination: URL) {
+        guard let root = workspace.vaultRoot else { return }
+        let from = relativePath(of: url, from: root)
+        let to = relativePath(of: destination, from: root)
 
         Task { @MainActor in
-            guard let outcome = self.vault.renameNote(
-                from: from,
-                to: self.relativePath(of: destination, from: self.workspace.vaultRoot!))
-            else {
-                self.errorMessage = "Could not rename \(url.lastPathComponent)."
+            guard self.vault.renameNote(from: from, to: to) != nil else {
+                self.errorMessage = "Could not move \(url.lastPathComponent)."
                 return
             }
 
-            // Every view of the moved note follows it; its bytes did not
-            // change, so the persisted baseline carries over untouched.
             let oldURL = url.standardizedFileURL
             let newURL = destination.standardizedFileURL
+
+            var rebased: [OpenDocument] = []
             for pane in self.workspace.layout.panes {
                 let state = self.workspace.state(for: pane)
-                for document in state.documents
-                where document.url?.standardizedFileURL == oldURL {
-                    self.workspace.replace(document: document.retargeted(to: newURL))
+                for document in state.documents {
+                    guard let documentURL = document.url?.standardizedFileURL else { continue }
+                    if documentURL == oldURL {
+                        rebased.append(document.retargeted(to: newURL))
+                    } else if self.workspace.isInsideVault(documentURL),
+                        let disk = try? String(contentsOf: documentURL, encoding: .utf8),
+                        !document.matchesPersisted(disk)
+                    {
+                        rebased.append(document.rebased(on: disk))
+                    }
                 }
             }
+            for document in rebased {
+                self.workspace.replace(document: document)
+            }
 
-            _ = outcome
             self.vaultRevision += 1
             self.refreshVault()
             self.persistSession()
         }
     }
 
+    /// Notes dropped on a folder: one move per dropped note, failures named
+    /// rather than swallowed. A drag routinely carries several files; only
+    /// Markdown inside this vault is claimed.
+    private func dropNotes(_ urls: [URL], into folder: URL) {
+        var movedAny = false
+        var refused: [String] = []
+        for url in urls {
+            let fileURL = url.standardizedFileURL
+            guard FileTree.isMarkdown(fileURL), !fileURL.hasDirectoryPath,
+                workspace.isInsideVault(fileURL), workspace.vaultRoot != nil
+            else { continue }
+
+            // Dropping onto the note's own folder is a no-op, not an error.
+            let destination = folder.appendingPathComponent(
+                fileURL.deletingPathExtension().lastPathComponent)
+                .appendingPathExtension("md")
+            if destination.standardizedFileURL == fileURL { continue }
+
+            let destinationPath = relativePath(
+                of: destination, from: workspace.vaultRoot!)
+            if vault.contains(destinationPath) {
+                refused.append(destination.lastPathComponent)
+                continue
+            }
+            movedAny = true
+            applyRename(from: fileURL, to: destination)
+        }
+        if !refused.isEmpty {
+            errorMessage =
+                "Not moved — \(refused.joined(separator: ", ")) already exists."
+        }
+        _ = movedAny
+    }
+
     /// Trash a file or folder after refusing when an open note inside still
     /// has unsaved work — deleting that work needs the reader's own hands.
     private func trashVaultItem(at url: URL) {
         let doomed = url.standardizedFileURL
+        // Containment compares components, never string prefixes — trashing
+        // `Notes` must not reach into `Notes-copy`. This is the same rule
+        // ``VaultIndex/relativePath(for:)`` enforces, restated here because
+        // this function once violated it and closed sibling folders' tabs.
+        func isInside(_ candidate: URL) -> Bool {
+            let home = doomed.pathComponents
+            let theirs = candidate.pathComponents
+            return theirs.count > home.count && Array(theirs.prefix(home.count)) == home
+        }
+
         var dirtyTitle: String?
         for pane in workspace.layout.panes {
-            for document in workspace.state(for: pane).documents
-            where document.url?.standardizedFileURL == doomed {
-                if document.hasUnsavedChanges {
-                    dirtyTitle = document.title
-                }
+            for document in workspace.state(for: pane).documents {
+                guard let documentURL = document.url?.standardizedFileURL else { continue }
+                let hit = documentURL == doomed || isInside(documentURL)
+                guard hit, document.hasUnsavedChanges else { continue }
+                dirtyTitle = document.title
             }
         }
         if let dirtyTitle {
@@ -1121,9 +1258,10 @@ struct WorkspaceView: View {
         // both paths are idempotent.
         for pane in workspace.layout.panes {
             for document in workspace.state(for: pane).documents {
-                if document.url?.standardizedFileURL.path.hasPrefix(doomed.path) == true {
-                    closeDocument(document.id, in: pane)
-                }
+                guard let documentURL = document.url?.standardizedFileURL,
+                    documentURL == doomed || isInside(documentURL)
+                else { continue }
+                closeDocument(document.id, in: pane)
             }
         }
         if let root = workspace.vaultRoot, !url.hasDirectoryPath {
@@ -1185,7 +1323,7 @@ struct WorkspaceView: View {
                 let relative = vault.relativePath(for: url)
 
                 if let document = workspaceOpenDocument(matching: url) {
-                    if await externalEditConflicts(document: document, at: url) {
+                    if externalEditConflicts(document: document, at: url) {
                         conflicts.append(document.id)
                     }
                 } else if let path = relative,
@@ -1287,6 +1425,47 @@ struct WorkspaceView: View {
     /// Debounces autosave behind typing; see ``scheduleAutosave()``.
     @State private var autosaveTask: Task<Void, Never>?
 
+    /// What the Go-to-Tab menu shows for the focused pane.
+    ///
+    /// Capped at nine because ⌘0 is not on offer; a tenth tab still exists
+    /// everywhere else (tabs strip, palette), it just has no digit.
+    private func makeTabSwitcher() -> TabSwitcher {
+        let state = workspace.state(for: workspace.focusedPane)
+        return TabSwitcher(
+            tabs: state.documents.prefix(9).map { document in
+                TabSwitcher.Entry(
+                    id: document.id,
+                    title: document.title,
+                    isCurrent: document.id == state.selection)
+            },
+            select: { selectTab(at: $0) })
+    }
+
+    /// Selects the focused pane's `index`th tab; a no-op past the last one.
+    private func selectTab(at index: Int) {
+        let documents = workspace.state(for: workspace.focusedPane).documents
+        guard documents.indices.contains(index) else { return }
+        workspace.select(documents[index].id, in: workspace.focusedPane)
+        refreshVault()
+        persistSession()
+    }
+
+    /// Makes the pane's editor first responder, so ⌥⌘→/← moves the keyboard
+    /// and not only the highlighted tab.
+    ///
+    /// A pane whose editor has not been built yet (a split created this same
+    /// turn) simply keeps its stored selection; SwiftUI builds the view, the
+    /// reader's next onSurface registration lands, and nothing is lost.
+    private func moveKeyboard(to pane: PaneID) {
+        guard let surface = editorSurfaces[pane], surface.window != nil else { return }
+        windowForFocus?.makeFirstResponder(surface)
+    }
+
+    /// This workspace's hosting window, when it is on screen.
+    private var windowForFocus: NSWindow? {
+        surface.window ?? editorSurfaces.values.first?.window
+    }
+
     /// Restores the last window shape, once.
     ///
     /// Runs *before* the inbox registration so a file arriving at launch opens
@@ -1297,10 +1476,12 @@ struct WorkspaceView: View {
     private func restoreSessionOnce() {
         guard !sessionRestored else { return }
         sessionRestored = true
-        guard let snapshot = SessionStore.load() else { return }
+        // Claimed, not merely loaded: a second window must start empty rather
+        // than open the first window's tabs over its own.
+        guard let snapshot = SessionStore.claimRestore() else { return }
         workspace.restore(from: snapshot)
         if let root = workspace.vaultRoot {
-            vault.open(root)
+            vault = VaultIndexRegistry.shared.index(for: root)
             startWatching(root)
         }
         refreshVault()
@@ -1429,6 +1610,9 @@ struct WorkspaceView: View {
             statsTasks[id]?.cancel()
             statsTasks[id] = nil
         }
+        // Editors of closed panes would otherwise hand a dead view to
+        // ``moveKeyboard(to:)`` on the next ⌥⌘→.
+        editorSurfaces = editorSurfaces.filter { workspace.layout.panes.contains($0.key) }
     }
 
     /// Follows a `[[wikilink]]` from the editor.
@@ -1463,6 +1647,9 @@ struct WorkspaceView: View {
             Command(
                 title: "New Document", symbol: "doc.badge.plus",
                 kind: .action(.newDocument), shortcut: "⌘N"),
+            Command(
+                title: "New Window", symbol: "macwindow.on.rectangle",
+                kind: .action(.newWindow)),
             Command(
                 title: "Open File…", symbol: "doc",
                 kind: .action(.openFile), shortcut: "⌘O"),
@@ -1565,14 +1752,21 @@ struct WorkspaceView: View {
                     kind: .file(url)))
         }
         for pane in workspace.layout.panes {
-            for document in workspace.state(for: pane).documents {
+            for (position, document) in workspace.state(for: pane).documents.enumerated() {
                 guard let url = document.url, seen.insert(url).inserted else { continue }
+                // The focused pane's tabs carry their ⌘N shortcut here, so
+                // the palette is where a reader can *see* that ⌘3 means
+                // anything — the menu shows it too, but only once looked at.
+                let shortcut =
+                    pane == workspace.focusedPane && position < 9
+                    ? "⌘\(position + 1)" : nil
                 list.append(
                     Command(
                         title: document.title,
                         subtitle: url.deletingLastPathComponent().path,
                         symbol: "doc.text",
-                        kind: .file(url)))
+                        kind: .file(url),
+                        shortcut: shortcut))
             }
         }
         return list
@@ -1617,6 +1811,8 @@ struct WorkspaceView: View {
         case .newDocument:
             workspace.newDocument(in: workspace.focusedPane)
             refreshVault()
+        case .newWindow:
+            openWindow(id: MarkDevApp.workspaceWindowID)
         case .toggleCommandPalette: showPalette.toggle()
         case .openFile: openFilePanel()
         case .openVault: openVault()
@@ -1742,6 +1938,7 @@ struct WorkspaceView: View {
 
     private func closeDocument(_ document: OpenDocument.ID, in pane: PaneID) {
         guard confirmClosing(document, in: pane) else { return }
+        externalConflicts.remove(document)
         workspace.close(document, in: pane)
         if pane == workspace.focusedPane { refreshVault() }
         persistSession()
@@ -1785,6 +1982,11 @@ struct WorkspaceView: View {
     }
 
     private func reviewClosing(_ document: OpenDocument, in pane: PaneID) -> Bool {
+        // `runModal` services the main queue, so a pending autosave would
+        // fire mid-dialog and quietly write the very changes the reader is
+        // being asked about — turning "Don't Save" into a lie. Cancelled,
+        // not paused: the next keystroke reschedules it.
+        autosaveTask?.cancel()
 
         let alert = NSAlert()
         alert.messageText = "Save changes to \(document.title)?"

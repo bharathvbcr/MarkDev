@@ -135,3 +135,19 @@ public struct VaultGraph: Codable, Sendable, Hashable {
         return best?.node
     }
 }
+
+
+public extension VaultGraph {
+    /// The nodes VoiceOver should walk, most-connected first.
+    ///
+    /// Degree decides; alphabetical breaks ties; the list is capped so an
+    /// enormous vault stays narravigable. Pure and deterministic, which is
+    /// what makes it assertable without a screen.
+    func accessibilityNodes(limit: Int) -> [VaultGraphNode] {
+        let sorted = nodes.sorted { lhs, rhs in
+            if lhs.degree != rhs.degree { return lhs.degree > rhs.degree }
+            return lhs.path < rhs.path
+        }
+        return Array(sorted.prefix(max(0, limit)))
+    }
+}

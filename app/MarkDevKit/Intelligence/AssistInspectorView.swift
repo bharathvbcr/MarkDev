@@ -206,9 +206,10 @@ public struct AssistInspectorView: View {
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
-                    Button("Fix") { assistant.fix(issue) }
-                        .controlSize(.mini)
-                        .buttonStyle(.bordered)
+                    // Overlaid rather than nested: a Button inside another
+                    // Button's label misroutes clicks near itself and folds
+                    // both into one AX element.
+                    
                 }
                 HStack(spacing: 4) {
                     Text(issue.original)
@@ -235,6 +236,17 @@ public struct AssistInspectorView: View {
         .buttonStyle(.plain)
         .accessibilityLabel(
             "\(issue.kind.label): replace \(issue.original) with \(issue.replacement)")
+        // A sibling of the reveal button, not a child of its label: a
+        // Button nested inside another Button's label misroutes clicks near
+        // itself and folds both into one accessibility element.
+        .overlay(alignment: .topTrailing) {
+            Button("Fix") { assistant.fix(issue) }
+                .controlSize(.mini)
+                .buttonStyle(.bordered)
+                .padding(4)
+                .accessibilityLabel(
+                    "Fix: replace \(issue.original) with \(issue.replacement)")
+        }
     }
 
     // MARK: - The note, read

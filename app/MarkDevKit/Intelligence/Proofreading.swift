@@ -180,8 +180,10 @@ public struct ProofreadingIssues: Equatable, Sendable {
         within scope: NSRange
     ) -> (issues: ProofreadingIssues, unplaced: Int) {
         let bounds = NSIntersectionRange(scope, NSRange(location: 0, length: text.length))
-        var cursor = bounds.location
         var located: [ProofreadingIssue] = []
+        // Spans already matched by an earlier finding; later ones must claim
+        // fresh text rather than stacking onto the same words.
+        var claimed: [NSRange] = []
         var unplaced = 0
 
         for finding in findings {
@@ -196,14 +198,28 @@ public struct ProofreadingIssues: Equatable, Sendable {
                 continue
             }
 
-            let remaining = NSRange(
-                location: cursor, length: max(0, bounds.location + bounds.length - cursor))
-            guard remaining.length > 0 else {
-                unplaced += 1
-                continue
+            // Searched across the whole scope rather than behind a cursor:
+            // the schema asks for findings in document order but nothing can
+            // enforce it, and one finding returned early used to strand every
+            // *earlier* occurrence behind it as unplaceable — discarded work
+            // a retry would have placed. Occurrences that collide with what
+            // is already claimed are stepped past.
+            var search = bounds
+            var found = NSRange(location: NSNotFound, length: 0)
+            while search.length > 0 {
+                let candidate = text.range(of: original, options: [.literal], range: search)
+                guard candidate.location != NSNotFound else { break }
+                let collides = claimed.contains {
+                    NSIntersectionRange($0, candidate).length > 0
+                }
+                if !collides {
+                    found = candidate
+                    break
+                }
+                let next = candidate.location + candidate.length
+                guard next < NSMaxRange(bounds) else { break }
+                search = NSRange(location: next, length: NSMaxRange(bounds) - next)
             }
-
-            let found = text.range(of: original, options: [.literal], range: remaining)
             guard found.location != NSNotFound else {
                 unplaced += 1
                 continue
@@ -216,7 +232,7 @@ public struct ProofreadingIssues: Equatable, Sendable {
                     replacement: finding.replacement,
                     kind: finding.kind,
                     explanation: finding.explanation))
-            cursor = found.location + found.length
+            claimed.append(found)
         }
         return (ProofreadingIssues(issues: located), unplaced)
     }
@@ -348,13 +364,17 @@ public enum ProofreadingPrompt {
         found inside it.
         """
 
+    /// Tags rather than a dash line: `-----` is also a CommonMark thematic
+    /// break, a setext underline, and a frontmatter closer, and a note
+    /// containing one used to sit inside its own frame's boundary. See
+    /// ``WritingPrompt`` for the same change on the rewrite side.
     public static func prompt(for text: String) -> String {
         """
-        Proofread the Markdown between the ----- lines.
+        Proofread the Markdown between the <author-text> and </author-text> markers.
 
-        -----
+        <author-text>
         \(text)
-        -----
+        </author-text>
         """
     }
 }

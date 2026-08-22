@@ -7,6 +7,7 @@
 
 @preconcurrency import AppKit
 @preconcurrency import CoreText
+import os
 
 /// Immutable, concurrency-safe drawing values captured from `EditorTheme` on
 /// the main actor. TextKit's fragment callbacks predate actor annotations and
@@ -78,6 +79,54 @@ struct BlockDecorationPalette: Sendable {
     }
 }
 
+/// One palette per text view, shared by all of its fragments, replaced whole.
+///
+/// The palette is a snapshot of fixed `CGColor`s — that part is right, because
+/// a fragment may be asked to draw from anywhere. What must not happen is each
+/// fragment holding its *own* copy: TextKit caches fragments against their
+/// text element and reuses them across an appearance change, so a copy can
+/// outlive the appearance it was resolved under, and no walk that hands out
+/// replacements can be trusted to reach every survivor. Sharing one instance
+/// and swapping its contents leaves nothing to go stale: every fragment,
+/// on screen or not, reads the same value the moment it draws.
+///
+/// Reads are guarded by a lock rather than left to the main actor because
+/// TextKit's fragment callbacks predate actor annotations; writes happen only
+/// from the main actor (the view capturing a new palette).
+final class BlockDecorationPaletteStore: @unchecked Sendable {
+    private struct Snapshot {
+        var palette: BlockDecorationPalette
+        /// Bumped with every replacement. Fragments stamp this when their
+        /// rendered content is resolved, so a bitmap drawn for a superseded
+        /// generation knows to ask again before it draws. Starts at 1 so an
+        /// unstamped fragment's 0 never looks current.
+        var generation: Int = 1
+    }
+
+    private let lock = OSAllocatedUnfairLock<Snapshot>(
+        initialState: Snapshot(palette: BlockDecorationPalette(theme: .standard)))
+
+    /// The palette every fragment of one view should draw with right now.
+    var current: BlockDecorationPalette {
+        lock.withLock { $0.palette }
+    }
+
+    var generation: Int {
+        lock.withLock { $0.generation }
+    }
+
+    /// Installs `palette` as the one answer for every fragment of the view.
+    ///
+    /// Main actor: callers are the view's theme and appearance hooks.
+    @MainActor
+    func replace(_ palette: BlockDecorationPalette) {
+        lock.withLock { snapshot in
+            snapshot.palette = palette
+            snapshot.generation += 1
+        }
+    }
+}
+
 /// A layout fragment that paints block decoration behind its text.
 ///
 /// This is the Apple-sanctioned extension point for custom block rendering in
@@ -90,15 +139,48 @@ struct BlockDecorationPalette: Sendable {
 /// layout, which is precisely what TextKit already does correctly.
 final class MarkdownLayoutFragment: NSTextLayoutFragment {
     var decoration: BlockDecoration = .none
-    var palette: BlockDecorationPalette?
+
+    /// The view whose palette store this fragment draws from.
+    ///
+    /// Weak, mirroring ``MarkdownTextView/controlFragments``: TextKit owns
+    /// fragment lifetime, and nothing here may extend a view's. Set at
+    /// creation by the delegate, which is also where every other
+    /// view-derived answer is resolved.
+    weak var textView: MarkdownTextView?
+
+    /// The view's shared palette. One instance per text view, handed to every
+    /// fragment at creation and replaced whole on an appearance change — see
+    /// ``BlockDecorationPaletteStore``.
+    var paletteStore: BlockDecorationPaletteStore?
+
+    /// The palette this fragment draws with, read at draw time.
+    ///
+    /// Deliberately not a stored copy: a stored one survives the appearance
+    /// it was resolved under on any fragment TextKit keeps alive, which is
+    /// exactly how bullets ended up drawn in light ink on a dark page.
+    private var palette: BlockDecorationPalette? { paletteStore?.current }
 
     /// Content standing in for the block's text, resolved by the delegate.
     ///
     /// Rendering runs on the main actor — it typesets, lays out graphs, and
     /// reads files — while TextKit may call a fragment's metrics and drawing
     /// from anywhere. Resolving up front, like the palette does, keeps the
-    /// fragment itself free of isolation concerns.
+    /// fragment itself free of isolation concerns — with one gap: nothing
+    /// re-runs it when the answer goes stale, because TextKit reuses this
+    /// fragment object across an appearance change and never asks the
+    /// delegate again. ``stampedGeneration`` and
+    /// ``refreshRenderedContentIfStale(using:)`` close that gap.
     var renderedContent: RenderedContent?
+
+    /// The ``BlockDecorationPaletteStore`` generation this fragment's rendered
+    /// content was resolved under.
+    ///
+    /// A bitmap is rasterised for one appearance; the store's generation
+    /// advances whenever the view recaptures its palette. A stamp behind the
+    /// store means the bitmap was drawn for a superseded answer, and the
+    /// fragment must ask again before painting it. Zero means never stamped —
+    /// a state only a hand-built fragment can be in, and treated as stale.
+    var stampedGeneration: Int = 0
     /// Why rendering failed, when it did.
     var renderFailure: RenderFailure?
 
@@ -394,7 +476,42 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
 
     // MARK: - Drawing
 
+    /// Re-resolves this fragment's rendered content if it was built for a
+    /// superseded generation.
+    ///
+    /// The eager walk in the view's appearance hook covers what is currently
+    /// laid out; this covers everything else — a fragment TextKit kept cached
+    /// below the fold is drawn with this check as its only chance to notice
+    /// that the appearance changed while it was out of sight.
+    ///
+    /// Called from `draw(at:in:)` and from mouse hit-testing, both of which
+    /// AppKit runs on the main thread, which is what lets it call back into
+    /// the view's main-actor resolver.
+    ///
+    /// A re-render can change the content's height — a theme change alters
+    /// `mathFontSize`, where an appearance change does not. The frame TextKit
+    /// measured may then be stale by one pass; flagging the view for layout
+    /// converges on the next cycle rather than drawing inside the display
+    /// call that is already in flight.
+    func refreshRenderedContentIfStale(using view: MarkdownTextView) {
+        guard let store = paletteStore else { return }
+        let generation = store.generation
+        guard stampedGeneration != generation else { return }
+
+        // Drawing runs on the main thread — AppKit's display and event paths
+        // both — but the override is formally nonisolated, so the hop into
+        // the view's actor is stated rather than implied. Same pattern as
+        // DocumentSurface and VaultWatcher.
+        let heightBefore = contentHeight
+        MainActor.assumeIsolated {
+            view.resolveRenderedContent(for: self)
+            if contentHeight != heightBefore { view.needsLayout = true }
+        }
+        stampedGeneration = generation
+    }
+
     override func draw(at point: CGPoint, in context: CGContext) {
+        if let textView { refreshRenderedContentIfStale(using: textView) }
         switch decoration {
         case .none:
             break

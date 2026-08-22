@@ -49,6 +49,16 @@ public struct PeekPanel: View {
         // Loading is keyed on the URL so arrowing through the sidebar with
         // Space held swaps the note rather than showing the first one forever.
         .task(id: url) { await load() }
+        // Every other floating panel answers Escape; a peek whose exit
+        // depended on releasing a key the reader may have already let go of
+        // was a trap with no handle.
+        .onKeyPress(.escape) {
+            if let onDismiss {
+                onDismiss()
+                return .handled
+            }
+            return .ignored
+        }
         .accessibilityLabel("Preview of \(url.lastPathComponent)")
     }
 

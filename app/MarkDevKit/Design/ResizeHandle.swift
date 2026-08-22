@@ -138,6 +138,17 @@ public struct ResizeHandle: View {
             .accessibilityElement()
             .accessibilityLabel(label)
             .accessibilityHint("Drag to resize. Double-tap to reset.")
+            // Adjustable, not just labelled: a divider a screen reader can
+            // describe but not move is a wall with a sign on it. The step is
+            // coarse because VoiceOver adjustments repeat while held.
+            .accessibilityAdjustableAction { direction in
+                let step: CGFloat = 24
+                switch direction {
+                case .increment: onDrag(step)
+                case .decrement: onDrag(-step)
+                @unknown default: break
+                }
+            }
     }
 
     private func pushCursor() {

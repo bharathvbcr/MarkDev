@@ -68,6 +68,20 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
         return copy
     }
 
+    /// The document with its baseline moved to what the disk holds now.
+    ///
+    /// Used when *this app* changed a file out from under an open view —
+    /// rename's link rewrites are the case — so autosave keeps covering the
+    /// note and no phantom "changed on disk" banner appears for our own
+    /// edit. Dirty state survives: text is untouched, and "unsaved" still
+    /// means "differs from disk".
+    public func rebased(on diskText: String) -> OpenDocument {
+        var copy = self
+        copy.persistedText = diskText
+        copy.hasUnsavedChanges = copy.text != diskText
+        return copy
+    }
+
     /// Title for the tab. Untitled documents still need a stable label.
     public var title: String {
         url?.deletingPathExtension().lastPathComponent ?? "Untitled"
@@ -375,6 +389,23 @@ public final class Workspace {
             state.selection = state.documents.last?.id
         }
         panes[pane] = state
+    }
+
+    /// Whether `url` sits inside the open vault.
+    ///
+    /// Component comparison, never string prefixes — `Notes-copy` is not
+    /// inside `Notes`. The single owner of that rule; the watcher and the
+    /// trash path both ask here rather than restating it.
+    public func isInsideVault(_ url: URL) -> Bool {
+        guard let root = vaultRoot else { return false }
+        let home = root.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let theirs = url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        return theirs.count > home.count && Array(theirs.prefix(home.count)) == home
+    }
+
+    /// The inverse of ``isInsideVault(_:)``.
+    public func isOutsideVault(_ url: URL) -> Bool {
+        !isInsideVault(url)
     }
 
     /// Whether closing this tab would discard the last in-memory view of a

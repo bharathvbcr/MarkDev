@@ -151,6 +151,17 @@ public final class ContentZoomViewer {
 
     public init() {}
 
+    /// Where a re-render reads its ink and appearance from.
+    ///
+    /// A closure rather than two values because the answer can change while
+    /// the window is open: the system flips appearance under it, and a bitmap
+    /// rendered for light stays black-on-dark after one — the same failure
+    /// the editor's fragments carry generation stamps for. The provider lets
+    /// ``rerenderForCurrentAppearance()`` ask again at flip time; the editor
+    /// answers through its own `resolvedInk`, so there is exactly one place
+    /// ink meets an appearance.
+    public typealias InkProvider = () -> (textColor: NSColor, dark: Bool)
+
     /// Opens `block` at viewing size, or reports why it cannot be shown.
     @discardableResult
     public func present(
@@ -159,7 +170,20 @@ public final class ContentZoomViewer {
         textColor: NSColor,
         dark: Bool
     ) -> Bool {
+        present(block, documentDirectory: documentDirectory) { (textColor, dark) }
+    }
+
+    /// Opens `block` at viewing size, with ink that can be asked again when
+    /// the appearance changes underneath an open window.
+    @discardableResult
+    public func present(
+        _ block: RenderedBlock,
+        documentDirectory: URL?,
+        ink: @escaping InkProvider
+    ) -> Bool {
+        current = (block, documentDirectory, ink)
         let title = ZoomedContent.title(for: block)
+        let (textColor, dark) = ink()
         switch ZoomedContent.render(
             block, documentDirectory: documentDirectory, textColor: textColor, dark: dark)
         {
@@ -175,6 +199,55 @@ public final class ContentZoomViewer {
         }
     }
 
+    /// What is on show, so an appearance change under an open window can
+    /// render it again.
+    private var current: (
+        block: RenderedBlock, directory: URL?, ink: InkProvider
+    )?
+
+    /// Re-renders what is on show for the appearance the window now has.
+    ///
+    /// Called from the scroll view's appearance hook. Failure keeps the old
+    /// picture on screen — a stale-but-visible diagram beats a blank window,
+    /// and the reader can always close and reopen.
+    private func rerenderForCurrentAppearance() {
+        guard isPresented, let current else { return }
+        let (textColor, dark) = current.ink()
+        switch ZoomedContent.render(
+            current.block, documentDirectory: current.directory,
+            textColor: textColor, dark: dark)
+        {
+        case .success(let content) where content.cgImage != nil:
+            swapImage(to: content)
+        default:
+            break
+        }
+    }
+
+    /// Swaps the bitmap without disturbing zoom or reading position.
+    ///
+    /// Heights are stable across an appearance change — the same typeset
+    /// metrics, different ink — so magnification carries over untouched.
+    private func swapImage(to content: RenderedContent) {
+        let oldFrame = imageView.frame
+        let magnification = scrollView?.magnification
+        let offset = scrollView?.contentView.bounds.origin
+
+        imageView.image = content.image
+        imageView.frame = CGRect(origin: .zero, size: content.size)
+
+        if content.size != oldFrame.size {
+            // Only where the picture itself changed size does the fit need
+            // rethinking; same-size swaps keep whatever the reader had.
+            scrollView?.documentView = imageView
+            if let magnification { scrollView?.magnification = magnification }
+        } else if let offset, let scrollView {
+            scrollView.contentView.scroll(to: offset)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+        contentSize = content.size
+    }
+
     /// Closes the viewer, if it is open.
     public func dismiss() {
         window?.close()
@@ -185,6 +258,12 @@ public final class ContentZoomViewer {
 
     /// The size of what is currently on show, for tests and for sizing.
     private(set) var contentSize: CGSize = .zero
+
+    /// The bitmap on show, for tests.
+    var shownImageForTesting: NSImage? { imageView.image }
+
+    /// The appearance the viewer window currently resolves to, for tests.
+    var effectiveAppearanceForTesting: NSAppearance? { scrollView?.effectiveAppearance }
 
     private func show(_ content: RenderedContent, title: String) {
         let host = prepareWindow(titled: title)
@@ -265,6 +344,9 @@ public final class ContentZoomViewer {
 
         scroll.onClose = { [weak host] in host?.close() }
         scroll.onFit = { [weak self] in self?.fitToWindow() }
+        scroll.onAppearanceChange = { [weak self] in
+            self?.rerenderForCurrentAppearance()
+        }
 
         window = host
         scrollView = scroll
@@ -289,8 +371,16 @@ public final class ContentZoomViewer {
 final class ZoomScrollView: NSScrollView {
     var onClose: (() -> Void)?
     var onFit: (() -> Void)?
+    /// Fired when the appearance this window resolves to has changed, so the
+    /// bitmap on show can be rendered again for it.
+    var onAppearanceChange: (() -> Void)?
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
+    }
 
     override func keyDown(with event: NSEvent) {
         guard handle(event.charactersIgnoringModifiers) else {

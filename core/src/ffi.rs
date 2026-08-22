@@ -420,6 +420,33 @@ impl VaultHandle {
     }
 }
 
+/// A private copy of the indexed vault, for off-thread computation.
+///
+/// Graph layout runs for seconds at vault scale; holding the shared index's
+/// lock across it would freeze every keystroke-path query behind the
+/// simulation. The caller takes this clone under the lock — cheap: the notes
+/// plus a re-index, microseconds at personal-vault scale — and computes
+/// against the copy without the lock. Null when `handle` is dead.
+///
+/// # Safety
+///
+/// `handle` must be live. The returned handle is owned by the caller and must
+/// be released with `md_vault_free`.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_clone(handle: *const VaultHandle) -> *mut VaultHandle {
+    let Some(handle) = handle.as_ref() else {
+        return ptr::null_mut();
+    };
+    let clone = Vault::build(
+        handle.vault.root().to_path_buf(),
+        handle.vault.notes().to_vec(),
+    );
+    Box::into_raw(Box::new(VaultHandle {
+        vault: clone,
+        scratch: None,
+    }))
+}
+
 /// Reads a C string argument, or `None` when null or not UTF-8.
 unsafe fn read_str<'a>(pointer: *const c_char) -> Option<&'a str> {
     if pointer.is_null() {

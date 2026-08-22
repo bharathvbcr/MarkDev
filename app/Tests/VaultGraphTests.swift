@@ -140,6 +140,31 @@ final class VaultGraphTests: XCTestCase {
         XCTAssertFalse(graph.nodes.isEmpty)
     }
 
+// MARK: - Accessibility children
+
+/// The nodes VoiceOver walks: hubs first, ties alphabetical, capped.
+func testAccessibilityNodesOrderHubsFirstAndCapTheList() {
+    let graph = VaultGraph(
+        nodes: [
+            node("leaf.md", degree: 1),
+            node("hub.md", degree: 9),
+            node("alpha.md", degree: 9),
+            node("mid.md", degree: 4),
+        ],
+        edges: [], totalNotes: 4, truncated: false)
+
+    let all = graph.accessibilityNodes(limit: 100)
+    XCTAssertEqual(all.map(\.path), ["alpha.md", "hub.md", "mid.md", "leaf.md"])
+
+    let capped = graph.accessibilityNodes(limit: 2)
+    XCTAssertEqual(capped.map(\.path), ["alpha.md", "hub.md"])
+    XCTAssertTrue(graph.accessibilityNodes(limit: 0).isEmpty)
+}
+
+private func node(_ path: String, degree: Int) -> VaultGraphNode {
+    VaultGraphNode(path: path, title: path, tags: [], degree: degree, depth: 0, x: 0, y: 0)
+}
+
     // MARK: - Geometry
 
     private func graph(_ points: [(String, Double, Double)]) -> VaultGraph {

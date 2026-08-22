@@ -143,7 +143,16 @@ public final class DocumentAssistant {
             var unplaced = 0
 
             for (index, chunk) in chunks.enumerated() {
-                guard let surface = self.surface else { return }
+                guard let surface = self.surface else {
+                    // The editor detached mid-pass (pane closed, focus moved).
+                    // Ending without a terminal state left the panel showing
+                    // progress forever — every other exit writes one, so this
+                    // one does too, reporting what was actually checked.
+                    self.review = .done(
+                        checked: index, total: planned.count, found: found.count,
+                        unplaced: unplaced)
+                    return
+                }
                 // The offsets in `found` are only meaningful against the text
                 // they were located in. Rather than try to carry them across
                 // an edit made mid-pass, stop and say so — a half-shifted set

@@ -158,6 +158,8 @@ public final class HarnessAssistant {
 
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var nextActivityID = 0
+    /// Which availability search is the newest; see ``refreshAvailability()``.
+    @ObservationIgnored private var searchSerial = 0
     /// Tool rows still waiting for a result, oldest first.
     ///
     /// A result is matched to the *newest* of them rather than by name, because
@@ -195,11 +197,20 @@ public final class HarnessAssistant {
     /// MANVI, or corrected the path, should not have to relaunch MarkDev to be
     /// believed.
     public func refreshAvailability() {
+        // Two overlapping searches must not race last-writer-wins: a stale
+        // `.found` answering after a fresh `.missing` (or the reverse) would
+        // make the panel claim whatever finished last rather than whatever
+        // was asked for most recently. Each search carries its number, and
+        // only the newest may speak.
+        searchSerial += 1
+        let serial = searchSerial
+
         availability = .searching
         let configured = settings.binaryPath
         Task { [weak self] in
             let found = await HarnessLocator.locate(configured: configured)
             guard let self else { return }
+            guard serial == self.searchSerial else { return }
             if let found {
                 self.availability = .found(found)
             } else if !configured.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -382,6 +393,12 @@ public final class HarnessAssistant {
 
     // MARK: - Applying
 
+    /// Deliberately **not** gated on `outcome.isComplete`: a run stopped by
+    /// the step ceiling or the output cap still produced real text, and
+    /// taking a partial rewrite is often exactly what the reader wants. The
+    /// truncation is shown as a warning beside the button rather than hidden
+    /// behind a disabled one — unfinished work offered honestly, per this
+    /// codebase's standing rule that a cap must be *reported*, not enforced.
     public var canApply: Bool {
         guard let task = finishedTask, let surface, surface.acceptsAssistedEdits else {
             return false

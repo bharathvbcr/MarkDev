@@ -73,9 +73,25 @@ final class WritingPromptTests: XCTestCase {
     /// prompt.
     func testTheAuthorsTextIsDelimited() {
         let prompt = WritingPrompt.prompt(for: .rewrite, text: "# Heading\n\nBody")
-        let fenceLines = prompt.components(separatedBy: "\n").filter { $0 == "-----" }
+        let fenceLines = prompt.components(separatedBy: "\n").filter {
+            $0 == "<author-text>" || $0 == "</author-text>"
+        }
         XCTAssertEqual(fenceLines.count, 2, "the text must be enclosed on both sides")
-        XCTAssertTrue(prompt.contains("-----\n# Heading\n\nBody\n-----"))
+        XCTAssertTrue(prompt.contains("<author-text>\n# Heading\n\nBody\n</author-text>"))
+    }
+
+    /// `-----` was the delimiter once — and is also a thematic break, a
+    /// setext underline, and a frontmatter closer. A note containing one drew
+    /// the frame's boundary inside its own framed text.
+    func testTheDelimiterIsNotItselfMarkdown() {
+        for text in ["---\ntitle: x\n---", "# Headed\n-----"] {
+            let writing = WritingPrompt.prompt(for: .rewrite, text: text)
+            XCTAssertTrue(
+                writing.contains("<author-text>\n\(text)\n</author-text>"),
+                "\(text) collided with the old dash fence: \(writing)")
+            let proofread = ProofreadingPrompt.prompt(for: text)
+            XCTAssertTrue(proofread.contains("<author-text>\n\(text)\n</author-text>"))
+        }
     }
 
     func testInstructionsForbidFollowingTheDocument() {
@@ -360,6 +376,42 @@ final class ProofreadingIssuesTests: XCTestCase {
         XCTAssertEqual(issues.count, 2)
         XCTAssertEqual(issues.issues[0].range.location, 0)
         XCTAssertEqual(issues.issues[1].range.location, 16)
+    }
+
+    /// Nothing enforces the schema's "in document order". A finding returned
+    /// for the *later* occurrence must not strand every earlier one behind a
+    /// spent cursor — that was discarded work a placement pass could have
+    /// kept, honestly reported but needlessly lost.
+    func testFindingsReturnedOutOfOrderAreStillAllPlaced() {
+        let text = "alpha was here. beta was there."
+        // The model reported `beta`'s mistake FIRST.
+        let placed = placement(
+            [finding("beta was", "beta had been"), finding("alpha was", "alpha had been")],
+            in: text)
+
+        XCTAssertEqual(placed.issues.count, 2, "\(placed)")
+        XCTAssertEqual(placed.unplaced, 0)
+        // Both landed where their text actually is.
+        XCTAssertEqual(
+            (text as NSString).range(of: "alpha was").location,
+            placed.issues.issues.first { $0.original == "alpha was" }?.range.location)
+        XCTAssertEqual(
+            (text as NSString).range(of: "beta was").location,
+            placed.issues.issues.first { $0.original == "beta was" }?.range.location)
+    }
+
+    /// Two findings quoting the same words claim successive occurrences, even
+    /// when the whole scope is searched for each — claimed spans are stepped
+    /// past rather than stacked on.
+    func testDuplicateQuotesClaimDistinctOccurrencesFromAnyOrder() {
+        let text = "we was here and we was there"
+        let placed = placement(
+            [finding("we was", "we were"), finding("we was", "we were"),
+             finding("we was", "we were")],
+            in: text)
+
+        XCTAssertEqual(placed.issues.count, 2, "only two occurrences exist")
+        XCTAssertEqual(placed.unplaced, 1, "the third quote is discarded and counted")
     }
 
     func testLocatedIssuesNeverOverlap() {

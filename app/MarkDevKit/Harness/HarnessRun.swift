@@ -77,6 +77,21 @@ public struct HarnessRunResult: Sendable {
 /// It also keeps the main actor unblocked. `waitUntilExit()` is a blocking
 /// call, and waiting on a local 27B for ten minutes with it would freeze the
 /// window; ``waitForExit()`` suspends on `terminationHandler` instead.
+/// Single-use writer for the run's stdin pipe.
+///
+/// `FileHandle` is not `Sendable`, and this is the honest way past that: the
+/// handle has exactly one writer, which writes once and closes, and never
+/// touches anything else. The wrapper exists to say so in types rather than
+/// in a comment nobody can enforce.
+private struct StdinWriter: @unchecked Sendable {
+    let handle: FileHandle
+
+    func write(_ data: Data) {
+        try? handle.write(contentsOf: data)
+        try? handle.close()
+    }
+}
+
 @MainActor
 final class HarnessProcess {
     private let process = Process()
@@ -205,8 +220,16 @@ public enum HarnessRun {
         // — and every quoting question disappears with it. The handle is closed
         // straight away: `manvi run` reads stdin to EOF when no `-p` is given,
         // so leaving it open is a run that never starts.
-        try? input.fileHandleForWriting.write(contentsOf: Data(request.prompt.utf8))
-        try? input.fileHandleForWriting.close()
+        // Written off the main actor: a prompt up to the cap is several
+        // times a pipe buffer, so this write blocks until the child drains —
+        // which a slow-starting binary turns into a beachball before the run
+        // even begins. Awaiting keeps the ordering (stdin closed before the
+        // read loop cares) without holding the actor hostage.
+        let writer = StdinWriter(handle: input.fileHandleForWriting)
+        let payload = Data(request.prompt.utf8)
+        await Task.detached(priority: .userInitiated) {
+            writer.write(payload)
+        }.value
 
         // Drained on its own task so stderr is emptied while stdout is read.
         // Two pipes and one reader is a deadlock waiting for a verbose run: the
@@ -274,11 +297,18 @@ public enum HarnessRun {
         let outcome: HarnessOutcome
         if Task.isCancelled {
             outcome = .cancelled
-        } else if child.wasEndedByUs || child.endedBySignal {
-            // The only signal MarkDev sends is the backstop's, and the backstop
-            // only fires past the harness's own timeout. Reported as the
-            // timeout it is rather than as a generic failure: one says "the
-            // model is slow, give it longer", the other says nothing.
+        } else if child.wasEndedByUs && child.endedBySignal {
+            // The only signal MarkDev sends is the backstop's, and the
+            // backstop only fires past the harness's own timeout. Reported as
+            // the timeout it is rather than as a generic failure: one says
+            // "the model is slow, give it longer", the other says nothing.
+            //
+            // Both halves matter. Intent alone (`wasEndedByUs`) could be
+            // stale — `markExited` reaches the main actor one hop behind the
+            // child's real exit, and a backstop firing in that gap would
+            // brand an on-time, complete run as timed out. Requiring the
+            // signal to have actually landed ties the verdict to what
+            // happened, not to what we asked for.
             outcome = .timedOut
         } else {
             outcome = HarnessOutcome(exitStatus: child.status, notes: notes)

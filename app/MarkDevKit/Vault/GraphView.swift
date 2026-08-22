@@ -62,8 +62,31 @@ public struct GraphView: View {
                 onOpen(node.path)
             }
             .accessibilityLabel(accessibilitySummary)
+            // The nodes themselves, spoken and activatable. A picture with a
+            // one-line summary left every note unreachable to VoiceOver; the
+            // synthetic children below are the same buttons the pointer
+            // gets, ordered most-connected first so the hubs come early.
+            .accessibilityChildren {
+                GraphNodeAccessibility(nodes: accessibleNodes, onOpen: onOpen)
+            }
         }
         .overlay(alignment: .bottomLeading) { legend }
+    }
+
+    /// The nodes exposed as accessible children, deterministically ordered.
+    ///
+    /// Capped: a vault at `MAX_NODES` would otherwise hand VoiceOver fifteen
+    /// hundred elements it has to walk, and nobody navigates a hairball by
+    /// reading all of it. The cap is stated in the summary rather than
+    /// silently applied.
+    private var accessibleNodes: [VaultGraphNode] {
+        graph.accessibilityNodes(limit: Self.accessibilityNodeLimit)
+    }
+
+    static let accessibilityNodeLimit = 100
+
+    private var accessibilitySummary: String {
+        graph.isEmpty ? "Link graph, empty" : "Link graph: \(countSummary)"
     }
 
     // MARK: - Drawing
@@ -203,9 +226,28 @@ public struct GraphView: View {
         return "\(notes) of \(graph.totalNotes), \(links)"
     }
 
-    private var accessibilitySummary: String {
-        graph.isEmpty
-            ? "Link graph, empty"
-            : "Link graph: \(countSummary)"
+}
+
+/// The canvas's synthetic accessibility children.
+///
+/// `accessibilityChildren(viewType:)` asks for a *view type*; its body is
+/// never rendered — SwiftUI lifts each element into the accessibility tree
+/// under the canvas. A button per node means activation opens the note,
+/// which is exactly what a click does for the pointer.
+private struct GraphNodeAccessibility: View {
+    let nodes: [VaultGraphNode]
+    let onOpen: (String) -> Void
+
+    var body: some View {
+        ForEach(nodes) { node in
+            Button {
+                onOpen(node.path)
+            } label: {
+                // Never drawn; the labels below are what VoiceOver speaks.
+                EmptyView()
+            }
+            .accessibilityLabel(
+                "\(node.displayName), \(node.degree == 1 ? "1 link" : "\(node.degree) links")")
+        }
     }
 }

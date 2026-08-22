@@ -223,19 +223,24 @@ public enum WritingPrompt {
     ///
     /// A visible fence beats "the text below" because the text below is
     /// frequently itself a document full of headings that read like new
-    /// sections of the prompt.
-    private static let fence = "-----"
+    /// sections of the prompt. Tags rather than a dash line: `-----` is also
+    /// a CommonMark thematic break, a setext underline, and a frontmatter
+    /// closer — a note containing one used to draw the frame's boundary in
+    /// the middle of its own framed text.
+    private static let openFence = "<author-text>"
+    private static let closeFence = "</author-text>"
 
     /// The prompt for `task` applied to `text`.
     public static func prompt(for task: WritingTask, text: String) -> String {
         """
         \(task.directive)
 
-        Apply that to the Markdown between the \(fence) lines.
+        Apply that to the Markdown between the \(openFence) and \
+        \(closeFence) markers.
 
-        \(fence)
+        \(openFence)
         \(text)
-        \(fence)
+        \(closeFence)
         """
     }
 }

@@ -44,6 +44,10 @@ public struct NavigatorView: View {
     public var onRename: ((URL) -> Void)?
     /// Called with the file or folder to move to the Trash.
     public var onDelete: ((URL) -> Void)?
+    /// Called with note URLs dropped on a *folder*: a move within the vault,
+    /// which is a rename to the core and so rewrites every link that
+    /// pointed through the old path.
+    public var onDropNotes: (([URL], URL) -> Void)?
 
     @State private var nodes: [FileNode] = []
     @State private var expanded: Set<URL> = []
@@ -61,7 +65,8 @@ public struct NavigatorView: View {
         onOpenTerminal: ((URL) -> Void)? = nil,
         onCreateNote: ((URL) -> Void)? = nil,
         onRename: ((URL) -> Void)? = nil,
-        onDelete: ((URL) -> Void)? = nil
+        onDelete: ((URL) -> Void)? = nil,
+        onDropNotes: (([URL], URL) -> Void)? = nil
     ) {
         self.root = root
         self.revision = revision
@@ -72,6 +77,7 @@ public struct NavigatorView: View {
         self.onCreateNote = onCreateNote
         self.onRename = onRename
         self.onDelete = onDelete
+        self.onDropNotes = onDropNotes
     }
 
     public var body: some View {
@@ -231,7 +237,8 @@ public struct NavigatorView: View {
                                 subtitle: row.subtitle,
                                 isExpanded: expanded.contains(row.node.url),
                                 isSelected: selection == row.node.url,
-                                reduceMotion: reduceMotion
+                                reduceMotion: reduceMotion,
+                                onDropNotes: onDropNotes
                             ) {
                                 listFocused = true
                                 activate(row.node)
@@ -532,6 +539,10 @@ private struct NavigatorRow: View {
     let isExpanded: Bool
     let isSelected: Bool
     let reduceMotion: Bool
+    /// Called with notes dropped on this row, when it is a folder. `nil`
+    /// leaves the row neither draggable nor a drop target.
+    var onDropNotes: (([URL], URL) -> Void)?
+
     let action: () -> Void
 
     @State private var isHovering = false
@@ -589,6 +600,7 @@ private struct NavigatorRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .modifier(NoteDragAndDrop(node: node, onDropNotes: onDropNotes))
         .onHover { isHovering = $0 }
         .animation(
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
@@ -599,12 +611,76 @@ private struct NavigatorRow: View {
         .animation(
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
             value: isSelected)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(node.name)
+        // A folder's open state exists only as a chevron rotation otherwise;
+        // spoken here so a screen-reader reader can tell an expanded folder
+        // from a collapsed one or from a file.
+        .accessibilityValue(node.isDirectory ? (isExpanded ? "expanded" : "collapsed") : "")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
     }
 
     private var background: Color {
         if isSelected { return Color.accentColor.opacity(0.22) }
         if isHovering { return Color.primary.opacity(0.07) }
         return .clear
+    }
+}
+
+
+/// Drag source for note rows, drop target for folder rows — one modifier so
+/// the two sides of a move cannot drift apart.
+///
+/// A drop is a rename to the core (`renameNote` rewrites every link that
+/// resolved through the old path), which is what makes dragging a note into
+/// a folder behave exactly like renaming it in place.
+struct NoteDragAndDrop: ViewModifier {
+    let node: FileNode
+    let onDropNotes: (([URL], URL) -> Void)?
+
+    func body(content: Content) -> some View {
+        content
+            .modifier(NoteDragSource(node: node))
+            .modifier(NoteDropTarget(node: node, onDropNotes: onDropNotes))
+    }
+}
+
+/// Notes are draggable; folders and anything unreadable are not.
+struct NoteDragSource: ViewModifier {
+    let node: FileNode
+
+    func body(content: Content) -> some View {
+        if node.isDirectory {
+            content
+        } else {
+            content.draggable(node.url)
+        }
+    }
+}
+
+/// Folders accept note URLs. The handler decides vault membership, same-name
+/// collisions, and everything else; the row only recognises the gesture.
+struct NoteDropTarget: ViewModifier {
+    let node: FileNode
+    let onDropNotes: (([URL], URL) -> Void)?
+
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        if node.isDirectory, let onDropNotes {
+            content
+                .dropDestination(for: URL.self) { urls, _ in
+                    onDropNotes(urls, node.url)
+                    return true
+                } isTargeted: { targeted in
+                    isTargeted = targeted
+                }
+                .background {
+                    RoundedRectangle(cornerRadius: GlassTheme.Radius.small)
+                        .fill(Color.accentColor.opacity(isTargeted ? 0.16 : 0))
+                }
+        } else {
+            content
+        }
     }
 }

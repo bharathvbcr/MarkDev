@@ -61,16 +61,35 @@ public struct WorkspaceSnapshot: Codable, Equatable, Sendable {
 /// value per window shape change, and `NSWindow` restoration would also want
 /// to own the window frames it has no opinion about here.
 ///
-/// Keyed per window *role* rather than globally: two windows each remember
-/// their last shape, last writer wins on the shared defaults domain, and a
-/// single-window launch reads the most recent one. That is deliberately the
-/// simplest behaviour that makes reopening the app return to work.
+/// One slot, last writer wins — the shape the app was last seen with is what
+/// a relaunch brings back. The load side is where windows differ, and
+/// ``claimRestore`` is the rule: exactly **one** window per launch may read
+/// the snapshot. Without that claim, a second window (⌘N, a Finder
+/// double-click) restored the first window's tabs over its own, which read
+/// as the app opening somebody else's work.
 public enum SessionStore {
     static let key = "session.workspace"
+
+    /// Process-wide, so the claim survives SwiftUI building several
+    /// workspaces in one launch; guarded, because claims can race only
+    /// across threads that are already racing to be first anyway.
+    nonisolated(unsafe) private static var restoreClaimed = false
 
     public static func save(_ snapshot: WorkspaceSnapshot) {
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// Reads the stored session, once per process.
+    ///
+    /// The first caller wins and later callers get `nil` — which is what
+    /// makes a newly opened *window* start empty instead of cloned. Returns
+    /// nil for corrupt or missing data either way; both mean "nothing to
+    /// restore", and neither is worth an alert.
+    public static func claimRestore() -> WorkspaceSnapshot? {
+        guard !restoreClaimed else { return nil }
+        restoreClaimed = true
+        return load()
     }
 
     public static func load() -> WorkspaceSnapshot? {

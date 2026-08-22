@@ -91,6 +91,42 @@ public enum FileTree {
     public static func isMarkdown(_ url: URL) -> Bool {
         markdownExtensions.contains(url.pathExtension.lowercased())
     }
+
+    /// Every Markdown file under `root`, recursively.
+    ///
+    /// The catch-up sweep's input: FSEvents is lossy around stream birth
+    /// (writes racing registration can be dropped outright, measured rather
+    /// than assumed), so the watcher needs one full walk to backstop what it
+    /// never heard about. Honours ``ignoredDirectories`` and skips hidden
+    /// entries, exactly as ``children(of:)`` does — one set of visibility
+    /// rules, not two that drift.
+    ///
+    /// Directory symlinks are followed but never twice: a loop (`link -> ..`)
+    /// would otherwise walk forever. A depth cap backs the same guarantee up
+    /// for filesystems where canonicalisation is unreliable.
+    public static func markdownFiles(under root: URL) -> [URL] {
+        var found: [URL] = []
+        var visited: Set<String> = []
+        walk(root, depth: 0, visited: &visited, into: &found)
+        return found
+    }
+
+    private static func walk(
+        _ directory: URL, depth: Int, visited: inout Set<String>, into found: inout [URL]
+    ) {
+        let maxDepth = 48
+        guard depth <= maxDepth else { return }
+        let identity = (try? directory.resolvingSymlinksInPath().path) ?? directory.path
+        guard visited.insert(identity).inserted else { return }
+
+        for node in children(of: directory) {
+            if node.isDirectory {
+                walk(node.url, depth: depth + 1, visited: &visited, into: &found)
+            } else {
+                found.append(node.url)
+            }
+        }
+    }
 }
 
 /// Subsequence matching for the navigator filter and the command palette.

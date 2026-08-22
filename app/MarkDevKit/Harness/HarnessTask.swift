@@ -196,8 +196,10 @@ public enum HarnessPrompt {
     ///
     /// A visible fence beats "the text below", because the text below is
     /// frequently a document full of headings that read like new sections of
-    /// the prompt.
-    private static let fence = "-----"
+    /// the prompt. Tags rather than a dash line — `-----` is also ordinary
+    /// Markdown, so a note could draw the frame's boundary inside itself.
+    private static let openFence = "<author-text>"
+    private static let closeFence = "</author-text>"
 
     /// The prompt for `task`, and whether the note had to be shortened.
     public static func prompt(
@@ -214,8 +216,9 @@ public enum HarnessPrompt {
         if let documentPath {
             context += "\nThis note is the file `\(documentPath)`. "
             context +=
-                "The copy between the \(fence) lines is the editor's live buffer and is "
-                + "authoritative — it may differ from what is on disk. Do not read that file.\n"
+                "The copy between the \(openFence) and \(closeFence) markers is the "
+                + "editor's live buffer and is authoritative — it may differ from what is "
+                + "on disk. Do not read that file.\n"
         }
         if let vaultPath {
             context +=
@@ -233,11 +236,12 @@ public enum HarnessPrompt {
 
             \(task.directive)
             \(context)
-            Apply that to the Markdown between the \(fence) lines.
+            Apply that to the Markdown between the \(openFence) and \
+            \(closeFence) markers.
 
-            \(fence)
+            \(openFence)
             \(body)
-            \(fence)
+            \(closeFence)
             """
         return (text, truncated)
     }

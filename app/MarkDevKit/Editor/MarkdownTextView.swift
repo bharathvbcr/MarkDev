@@ -51,7 +51,15 @@ public final class MarkdownTextView: ScrollingTextView {
             // belongs to the theme just replaced. Forgotten rather than
             // re-queued here: `restyle` leads to a draw, and the draw asks.
             warmedGeometry = nil
+            // The palette is captured from the theme (colours, and the marker
+            // fonts sized from `bodyFont`), so it is recaptured whole. TextKit
+            // reuses fragments across a restyle, which is why this must go
+            // through the shared store: handing out copies reaches only what
+            // an enumeration happens to find.
+            paletteStore.replace(makePalette())
+            reresolveRenderedContentInView()
             restyle()
+            needsDisplay = true
         }
     }
 
@@ -252,6 +260,13 @@ public final class MarkdownTextView: ScrollingTextView {
     /// The chip under the pointer, and the fragment drawing it.
     var hoveredControl: BlockControl?
     weak var hoveredControlFragment: MarkdownLayoutFragment?
+
+    /// The palette every fragment of this view draws with, and the generation
+    /// its rendered content was resolved under.
+    ///
+    /// One instance for the view's whole life; replaced in place on an
+    /// appearance or theme change. See ``BlockDecorationPaletteStore``.
+    let paletteStore = BlockDecorationPaletteStore()
 
     /// Tracks the pointer for the hover state above.
     var controlTracking: NSTrackingArea?
@@ -786,6 +801,16 @@ public final class MarkdownTextView: ScrollingTextView {
         // ordinary input path, so undo, the change notification, and the
         // document binding all behave exactly as they do for typing.
         insertText(replacement, replacementRange: marker.range)
+        // The box is drawn, not a real NSButton, so nothing announces the
+        // flip on its own — a screen-reader reader ticks it into silence.
+        NSAccessibility.post(
+            element: self, notification: .announcementRequested,
+            userInfo: [
+                NSAccessibility.NotificationUserInfoKey.announcement:
+                    replacement == "[x]" ? "Checked" : "Unchecked",
+                NSAccessibility.NotificationUserInfoKey.priority:
+                    NSAccessibilityPriorityLevel.high.rawValue,
+            ])
         return true
     }
 
@@ -1157,14 +1182,40 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
 
     /// Recaptures the palette when the system flips between light and dark.
     ///
-    /// Fragments hold the colours they were built with, so the ones already
-    /// laid out have to be handed the new palette — otherwise a switch to dark
-    /// mode leaves every panel painted for the light one until the text
-    /// happens to change.
-    public override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        resolveTablesIfWidthChanged()
+    /// The palette lives in one shared store, so replacing it reaches every
+    /// fragment at once — including the ones TextKit keeps cached off screen,
+    /// which no walk can reliably enumerate. Rendered bitmaps are a different
+    /// story: they are per-fragment state, so they are re-resolved here for
+    /// what is on screen, and by the fragments themselves (a generation
+    /// stamp compared at draw time) for everything else.
+    public override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Diagrams are rasterised per appearance, so the warmed set belongs to
+        // the palette that has just been replaced.
         prefetchRenderedContent()
+        // Table cells are styled into attributed strings, which bake their
+        // colours in — unlike the palette, they cannot be swapped on a
+        // fragment already laid out, so they are rebuilt from scratch.
+        tableLayout.flush()
+        reresolveTableFragments()
+        paletteStore.replace(makePalette())
+        reresolveRenderedContentInView()
+        needsDisplay = true
+    }
+
+    /// Re-resolves rendered content on every fragment in the current layout.
+    ///
+    /// The eager half of appearance handling: fragments on screen redraw
+    /// immediately. Fragments TextKit has cached but is not drawing are caught
+    /// by the generation stamp each carries — see
+    /// ``MarkdownLayoutFragment/refreshRenderedContentIfStale()``.
+    func reresolveRenderedContentInView() {
+        guard let manager = textLayoutManager else { return }
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment else { return true }
+            fragment.refreshRenderedContentIfStale(using: self)
+            return true
+        }
     }
 
     /// Re-solves tables once the geometry has settled.
@@ -1176,6 +1227,12 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     /// to draw are the frame, the container and the fragments all settled.
     /// Each is guarded by the width last solved for, so whichever runs second
     /// and third does nothing.
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        resolveTablesIfWidthChanged()
+        prefetchRenderedContent()
+    }
+
     public override func layout() {
         super.layout()
         resolveTablesIfWidthChanged()
@@ -1192,26 +1249,6 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         prefetchRenderedContent()
     }
 
-    public override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        // Diagrams are rasterised per appearance, so the warmed set belongs to
-        // the palette that has just been replaced.
-        prefetchRenderedContent()
-        // Table cells are styled into attributed strings, which bake their
-        // colours in — unlike the palette, they cannot be swapped on a
-        // fragment already laid out, so they are rebuilt from scratch.
-        tableLayout.flush()
-        reresolveTableFragments()
-        let captured = makePalette()
-        textLayoutManager?.enumerateTextLayoutFragments(
-            from: textLayoutManager?.documentRange.location
-        ) { fragment in
-            (fragment as? MarkdownLayoutFragment)?.palette = captured
-            return true
-        }
-        needsDisplay = true
-    }
-
     public func textLayoutManager(
         _ textLayoutManager: NSTextLayoutManager,
         textLayoutFragmentFor location: any NSTextLocation,
@@ -1219,7 +1256,8 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     ) -> NSTextLayoutFragment {
         let fragment = MarkdownLayoutFragment(
             textElement: textElement, range: textElement.elementRange)
-        fragment.palette = makePalette()
+        fragment.paletteStore = paletteStore
+        fragment.textView = self
 
         guard let documentStart = textLayoutManager.documentRange.location as NSTextLocation?,
             let elementRange = textElement.elementRange
@@ -1238,6 +1276,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         // Last: a zoom chip is offered only where there is a picture to open,
         // which is not known until the content above has been resolved.
         resolveControls(for: fragment, at: range)
+        fragment.stampedGeneration = paletteStore.generation
         return fragment
     }
 }
@@ -1550,9 +1589,21 @@ extension MarkdownTextView {
             guard let block = fragment.decoration.rendered else { return }
             ContentZoomViewer.shared.present(
                 block,
-                documentDirectory: documentDirectory,
-                textColor: theme.textColor,
-                dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+                documentDirectory: documentDirectory
+            ) { [weak self] in
+                // Asked again if the system flips while the viewer is open —
+                // a bitmap rendered for one appearance is black-on-dark after
+                // the other, which is exactly what the reader would report.
+                guard let self else {
+                    return (NSColor.labelColor,
+                        NSApp?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua])
+                            == .darkAqua)
+                }
+                return (
+                    self.resolvedInk,
+                    self.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                )
+            }
         }
     }
 
@@ -1868,7 +1919,26 @@ extension MarkdownTextView {
             width: Self.renderWidth(for: bounds.width - theme.insets.width * 2 - 32),
             dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua,
             mathFontSize: theme.bodyFont.pointSize * 1.25,
-            textColor: theme.textColor)
+            textColor: resolvedInk)
+    }
+
+    /// The document's ink, resolved to a concrete colour *against this view's
+    /// appearance*.
+    ///
+    /// Rendering must never see the dynamic `theme.textColor`. A bitmap is
+    /// typeset during a layout pass — where `NSAppearance.current` is
+    /// whatever AppKit last set, at launch often nothing — or inside a
+    /// throwaway label that inherits the *process* appearance. Both are only
+    /// ever coincidentally this view's answer; measured here, an aqua view
+    /// under a dark process baked white ink into its formulas. Resolving once
+    /// here also makes the render cache key deterministic, since it packs
+    /// exactly these components.
+    var resolvedInk: NSColor {
+        var ink = theme.textColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            if let resolved = theme.textColor.usingColorSpace(.sRGB) { ink = resolved }
+        }
+        return ink
     }
 
     /// The width pictures are rendered against, for a column of `column`.

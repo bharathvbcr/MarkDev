@@ -349,6 +349,49 @@ fn a_note_never_mentions_itself() {
     assert!(vault.unlinked_mentions("Roadmap.md").is_empty());
 }
 
+/// Whatever the script around it, the offset must land *on* the mention:
+/// folding that changes byte length, astral-plane emoji, combining marks,
+/// and zero-width characters all shift naive arithmetic. The oracle is the
+/// document itself — decode at the reported UTF-16 offset and demand the
+/// name be there.
+#[test]
+fn mention_offsets_survive_hostile_scripts() {
+    let cases = [
+        "İstanbul Roadmap",
+        "ﬁat Roadmap",
+        "Straße ROADMAP",
+        "🎉🎊 Roadmap",
+        "e\u{0301} Roadmap",
+        "\u{200B}Roadmap",
+        "Ｒｏａｄｍａｐ Roadmap",
+        "中文 Roadmap 中文",
+    ];
+    for text in cases {
+        let owned = format!("# Other\n\n{text}");
+        let vault = vault(&[("Roadmap.md", "# Roadmap"), ("other.md", &owned)]);
+        let mentions = vault.unlinked_mentions("Roadmap.md");
+        assert_eq!(mentions.len(), 1, "{text:?}");
+        let mention = &mentions[0];
+
+        // The oracle decodes the WHOLE note body — the fixture wraps every
+        // case in a heading, and forgetting that prefix misjudges perfectly
+        // good offsets (the first run of this test did exactly that).
+        let units: Vec<u16> = owned.encode_utf16().collect();
+        assert!(
+            (mention.offset as usize) < units.len(),
+            "{text:?}: offset {} past end {}",
+            mention.offset,
+            units.len()
+        );
+        let tail = String::from_utf16_lossy(&units[mention.offset as usize..]).to_lowercase();
+        assert!(
+            tail.starts_with("roadmap"),
+            "{text:?}: offset {} landed on {tail:?}",
+            mention.offset
+        );
+    }
+}
+
 /// The editor indexes by UTF-16 code units, and the click on a mention jumps
 /// with this offset. A byte offset lands short once anything non-ASCII sits
 /// before the mention: "héllo " is 7 bytes but 6 units.
@@ -441,6 +484,66 @@ fn search_ranks_title_matches_first() {
     ]);
     let hits = vault.search("architecture", 10);
     assert_eq!(hits[0].path, "Architecture.md");
+}
+
+/// An exact vocabulary hit must not blind the index to its own neighbours:
+/// this used to return *only* the literal "note" postings once the prefix
+/// grew past three letters, hiding every note that says "notes".
+#[test]
+fn search_prefixes_still_expand_when_an_exact_hit_exists() {
+    let vault = vault(&[
+        ("singular.md", "# Singular\n\nthe note itself"),
+        ("plural.md", "# Plural\n\nall my notes are here"),
+    ]);
+    let paths: Vec<String> = vault
+        .search("note", 10)
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    assert!(paths.contains(&"singular.md".to_string()));
+    assert!(paths.contains(&"plural.md".to_string()), "{paths:?}");
+}
+
+/// CJK text has no spaces, so whole paragraphs used to index as one token
+/// and only full-paragraph queries could ever match. Overlapping bigrams fix
+/// that; mixed-script words must survive too.
+#[test]
+fn search_finds_cjk_words_inside_unspaced_prose() {
+    let vault = vault(&[
+        ("cjk.md", "# 日记\n\n今天天气很好，我们不去公园。"),
+        ("mixed.md", "# Mixed\n\n用 rust 写的解析器"),
+    ]);
+
+    let weather: Vec<String> = vault
+        .search("天气", 10)
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    assert!(weather.contains(&"cjk.md".to_string()), "{weather:?}");
+
+    let we: Vec<String> = vault
+        .search("我们", 10)
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    assert!(we.contains(&"cjk.md".to_string()), "{we:?}");
+
+    let rust: Vec<String> = vault
+        .search("rust", 10)
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    assert!(rust.contains(&"mixed.md".to_string()), "{rust:?}");
+}
+
+/// The snippet should show where the query's terms come together, not the
+/// first line that happens to mention any one of them.
+#[test]
+fn snippet_prefers_the_line_that_ties_the_terms_together() {
+    let vault = vault(&[("a.md", "# A\n\nrust is fast.\nrust parser design here.\n")]);
+    let hit = &vault.search("rust parser", 10)[0];
+    assert_eq!(hit.line, 4, "second body line ties both terms: {hit:?}");
+    assert!(hit.context.contains("parser"), "{hit:?}");
 }
 
 #[test]

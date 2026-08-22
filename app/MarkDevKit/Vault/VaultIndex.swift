@@ -286,6 +286,14 @@ public final class VaultIndex {
         #endif
     }
 
+    /// Whether `path` is a note this index knows.
+    ///
+    /// The drag-and-drop move asks before renaming into a folder: refusing
+    /// with a name beats letting the core refuse with none.
+    public func contains(_ path: String) -> Bool {
+        notePaths().contains(path)
+    }
+
     /// Forgets a note whose file has left the disk.
     ///
     /// The caller owns the file operation — trashing or deleting — because
@@ -301,6 +309,73 @@ public final class VaultIndex {
             path.withCString { md_vault_remove(handle, $0) }
             noteCount = Int(md_vault_note_count(handle))
         #endif
+    }
+
+    /// Brings the index back in line with the disk, once, wholesale.
+    ///
+    /// FSEvents is lossy around stream birth — writes racing registration can
+    /// be dropped outright rather than delivered late (measured against a
+    /// plain harness, not assumed) — and a vault opened moments before the
+    /// watch began has a scan-to-subscribe gap besides. Whatever the cause,
+    /// an event that never arrives leaves the index describing a world that
+    /// no longer exists: backlinks to deleted notes, search missing new ones.
+    /// One full sweep after subscribing closes every such gap at once.
+    ///
+    /// The walk and the reads run off the main actor; only the application of
+    /// their results touches the core. Notes whose URL is in `excluding` are
+    /// skipped entirely — for callers hosting editors, whose buffers are
+    /// authoritative over what any file says (the same rule
+    /// per-event handling follows).
+    ///
+    /// - Returns: how many notes were added, changed or removed.
+    @discardableResult
+    public func reconcileWithDisk(excluding: Set<URL> = []) async -> Int {
+        guard let root else { return 0 }
+        let excluded = Set(excluding.map(\.standardizedFileURL.path))
+
+        // Read off the main actor. The snapshot carries bytes, not parsed
+        // results, so the apply step below cannot mistake a stale read for a
+        // fresh one.
+        struct DiskNote {
+            let path: String
+            let url: URL
+            let text: String?
+        }
+        let snapshot: [DiskNote] = await Task.detached(priority: .utility) {
+            FileTree.markdownFiles(under: root).compactMap { url in
+                let standardized = url.standardizedFileURL.path
+                guard !excluded.contains(standardized) else { return nil }
+                return DiskNote(
+                    path: standardized,
+                    url: url,
+                    text: try? String(contentsOf: url, encoding: .utf8))
+            }
+        }.value
+
+        var touched = 0
+        var onDisk = Set<String>()
+        for note in snapshot {
+            onDisk.insert(note.path)
+            guard let text = note.text else { continue }  // unreadable: keep what we have
+            if let relative = relativePath(for: note.url) {
+                update(path: relative, text: text)
+                touched += 1
+            }
+        }
+
+        // A note gone from the disk is gone from the index — but only on
+        // proven absence. A read that failed for permission reasons must not
+        // masquerade as a deletion.
+        for path in notePaths() {
+            guard let url = url(for: path) else { continue }
+            if !onDisk.contains(url.standardizedFileURL.path),
+                !FileManager.default.fileExists(atPath: url.path)
+            {
+                removeNote(path)
+                touched += 1
+            }
+        }
+        return touched
     }
 
     /// Moves a note and rewrites every link that resolved to it.
@@ -338,23 +413,22 @@ public final class VaultIndex {
     ///     Accepts either a vault-relative path or a wikilink-style name.
     ///   - tag: keeps only notes carrying this tag; the leading `#` is optional.
     ///   - folder: keeps only notes under this vault-relative folder.
-    public func graph(
-        focus: String? = nil,
-        depth: Int = 2,
-        tag: String? = nil,
-        folder: String? = nil
-    ) -> VaultGraph {
-        lockedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
-    }
 
     /// The laid-out graph, computed off the main actor.
     ///
-    /// The layout is an all-pairs force simulation over up to
-    /// `MAX_NODES` notes — seconds of work for a vault at the cap, which is
-    /// exactly how a graph view becomes the reason an app feels slow. The
-    /// Rust handle is shared, so the compute takes ``coreLock``: it serialises
-    /// against index updates rather than racing them, and the main actor is
-    /// blocked only if it asks for work at the same instant.
+    /// The layout is an all-pairs force simulation over up to `MAX_NODES`
+    /// notes — seconds of work for a vault at the cap. Running it against the
+    /// shared handle would hold ``coreLock`` the whole time, and every
+    /// keystroke-path query takes that lock: typing would freeze behind a
+    /// picture. The compute therefore runs against a **clone** taken under
+    /// the lock (see `md_vault_clone`) — microseconds — and holds nothing
+    /// while it simulates.
+    ///
+    /// Cancellation is honoured at the boundary: a rebuild superseded by a
+    /// newer one cancels this work before the clone is made. A simulation
+    /// already in flight runs to completion — Rust cannot be interrupted
+    /// mid-loop — but it now costs only its own thread, never the reader's
+    /// keystrokes.
     ///
     /// Determinism makes this safe to prefer over ``graph(focus:depth:tag:
     /// folder:)`` wherever a caller can await: same inputs, same picture,
@@ -365,12 +439,68 @@ public final class VaultIndex {
         tag: String? = nil,
         folder: String? = nil
     ) async -> VaultGraph {
-        await Task.detached(priority: .userInitiated) { [self] in
-            lockedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
-        }.value
+        await withTaskCancellationHandler {
+            await Task.detached(priority: .userInitiated) { [self] in
+                clonedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
+            }.value
+        } onCancel: {
+            // Nothing to do here on purpose: the inner task checks
+            // `Task.isCancelled` before starting, and cancellation of *that*
+            // task is what this handler's absence used to drop entirely.
+            // Marking the outer cancelled is enough for a not-yet-started
+            // clone to be skipped.
+        }
     }
 
-    /// The body of both graph entry points; called with ``coreLock`` held.
+    /// The synchronous path, against the shared index under ``coreLock``.
+    ///
+    /// Kept for tests and for callers that want the answer against exactly
+    /// the live index; UI code should use ``graphOffMain``.
+    public func graph(
+        focus: String? = nil,
+        depth: Int = 2,
+        tag: String? = nil,
+        folder: String? = nil
+    ) -> VaultGraph {
+        lockedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
+    }
+
+    /// Graph layout against a private clone, holding nothing but itself.
+    nonisolated private func clonedGraph(
+        focus: String?,
+        depth: Int,
+        tag: String?,
+        folder: String?
+    ) -> VaultGraph {
+        #if canImport(CMarkDev)
+            guard !Task.isCancelled else { return .empty }
+
+            coreLock.lock()
+            let snapshot = handle.map { md_vault_clone($0) }
+            coreLock.unlock()
+            guard let snapshot else { return .empty }
+            defer { md_vault_free(snapshot) }
+
+            let bounded = UInt32(max(0, min(depth, 16)))
+            // Nested `withCString` rather than a helper: the pointers must all
+            // stay alive across the single call, and a helper returning them
+            // would hand back memory already freed.
+            return withOptionalCString(focus) { focusPointer in
+                withOptionalCString(tag) { tagPointer in
+                    withOptionalCString(folder) { folderPointer in
+                        decode(
+                            md_vault_graph(
+                                snapshot, focusPointer, bounded, tagPointer, folderPointer))
+                            ?? .empty
+                    }
+                }
+            }
+        #else
+            return .empty
+        #endif
+    }
+
+    /// The body of the synchronous graph path; called with ``coreLock`` held.
     nonisolated private func lockedGraph(
         focus: String?,
         depth: Int,

@@ -10,6 +10,10 @@ import SwiftUI
 /// Stable command identity, independent of the user-facing title.
 public enum CommandAction: Sendable, Equatable {
     case newDocument
+    /// A second window. The palette offers it because ⌘K is where a reader
+    /// looks for "open something", and the menu's New Window sits one level
+    /// deeper than that habit.
+    case newWindow
     case toggleCommandPalette
     case openFile
     case openVault
@@ -150,6 +154,22 @@ public struct CommandPalette: View {
         self.onRun = onRun
     }
 
+    /// The expensive half of ``results``, asked at most once per query.
+    ///
+    /// `results` is computed several times per body evaluation, and every
+    /// call used to re-run the vault's full-text search — an FFI round trip
+    /// under the index lock — for the same query. One memo keyed on the
+    /// query turns the repeats into dictionary hits; a new query replaces
+    /// it. Bounded to one entry by construction.
+    @State private var contentMemo: (query: String, hits: [Command])?
+
+    private func contentHits(for query: String) -> [Command] {
+        if let contentMemo, contentMemo.query == query { return contentMemo.hits }
+        let hits = Array(contentSearch?(query).prefix(Self.maximumContentHits) ?? [])
+        contentMemo = (query, hits)
+        return hits
+    }
+
     private var results: [Command] {
         let matched = Array(FuzzyMatch.rank(commands, query: query) { command in
             // Match on the subtitle too, so a file can be found by its folder.
@@ -170,8 +190,7 @@ public struct CommandPalette: View {
             case .action: nil
             }
         })
-        let hits = contentSearch(query).prefix(Self.maximumContentHits)
-        return matched + hits.filter { command in
+        return matched + contentHits(for: query).filter { command in
             switch command.kind {
             case .file(let url), .searchResult(let url, _):
                 seenURLs.insert(url).inserted
