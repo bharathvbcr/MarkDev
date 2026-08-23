@@ -56,6 +56,13 @@ public struct ParsedDocument: Sendable, Equatable {
     /// fragment; see ``tables`` for why the answer is searched, not scanned.
     private let taskMarkerSpans: [StyleSpan]
 
+    /// Inline formulae, sorted and disjoint.
+    ///
+    /// Styling asks for these on every caret-driven restyle. Keeping the
+    /// index with the parse avoids filtering every emphasis/link/code span in
+    /// a large document just to find the usually tiny formula set.
+    public let inlineMathSpans: [StyleSpan]
+
     /// An empty result, used for empty documents and as a safe fallback when
     /// the source cannot be parsed.
     public static let empty = ParsedDocument(spans: [], markers: [], blocks: [])
@@ -80,6 +87,7 @@ public struct ParsedDocument: Sendable, Equatable {
         self.tables = tables
         self.tableHeads = heads
         self.taskMarkerSpans = spans.filter { $0.kind == .taskMarker }
+        self.inlineMathSpans = spans.filter { $0.kind == .inlineMath }
     }
 
     /// The GFM table containing `range`, found by binary search.

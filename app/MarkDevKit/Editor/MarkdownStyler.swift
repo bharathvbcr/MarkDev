@@ -18,6 +18,210 @@ extension NSAttributedString.Key {
     /// knows is still expressed as an attribute, so the drawing layer stays a
     /// pure function of text storage.
     public static let inlineCodeRun = NSAttributedString.Key("dev.markdev.inlineCode")
+
+    /// Carries the bitmap drawn in place of a collapsed inline formula.
+    ///
+    /// This is deliberately not `.attachment`: AppKit requires an object-
+    /// replacement character for a real text attachment and strips the
+    /// attribute from ordinary source. Replacing a character would corrupt
+    /// plain-text copy and persistence, so the layout fragment draws this run
+    /// over transparent source instead.
+    public static let inlineMathRun = NSAttributedString.Key("dev.markdev.inlineMath")
+
+    /// Marks renderer diagnostics so a later successful refresh can remove
+    /// only its own underline without disturbing proofreading or link style.
+    public static let inlineMathFailure = NSAttributedString.Key("dev.markdev.inlineMathFailure")
+}
+
+/// Immutable payload stored on an attributed inline-math anchor.
+final class InlineMathRun: NSObject, NSCopying, @unchecked Sendable {
+    let image: CGImage
+    let size: CGSize
+    let fontSize: CGFloat
+    /// SwiftMath's baseline measured upward from the bitmap's bottom edge.
+    /// The layout fragment aligns this with TextKit's surrounding baseline.
+    let baselineFromBottom: CGFloat
+    /// Inputs that determine the bitmap's visible content. Retaining these
+    /// gives the custom attributed-string value stable semantics even after
+    /// the renderer evicts and recreates an equivalent raster.
+    private let source: String
+    private let ink: NSColor
+    init(
+        image: CGImage, size: CGSize, source: String, ink: NSColor,
+        fontSize: CGFloat, baselineFromBottom: CGFloat
+    ) {
+        self.image = image
+        self.size = size
+        self.source = source
+        self.ink = ink
+        self.fontSize = fontSize
+        self.baselineFromBottom = baselineFromBottom
+    }
+
+    func copy(with zone: NSZone? = nil) -> Any { self }
+
+    /// Attributed-string values are compared during incremental-style
+    /// validation. Two wrappers around the same cached raster are the same
+    /// attribute even when separate restyles allocated the wrappers.
+    override func isEqual(_ object: Any?) -> Bool {
+        guard let other = object as? InlineMathRun else { return false }
+        return source == other.source && ink.isEqual(other.ink)
+            && size == other.size && fontSize == other.fontSize
+            && baselineFromBottom == other.baselineFromBottom
+    }
+
+    override var hash: Int {
+        var hasher = Hasher()
+        hasher.combine(source)
+        hasher.combine(ink.hash)
+        hasher.combine(size.width)
+        hasher.combine(size.height)
+        hasher.combine(fontSize)
+        hasher.combine(baselineFromBottom)
+        return hasher.finalize()
+    }
+}
+
+/// Resolves collapsed inline-math spans into source-preserving bitmap runs.
+///
+/// Both the document text view and the separately drawn table-cell grid use
+/// this owner. Tables cannot delegate to the document's attributed storage:
+/// their source rows are intentionally collapsed before a clean CoreText grid
+/// is drawn, so reading that storage yields the hidden-marker font and no
+/// visible formula. Keeping the transformation here makes ordinary prose and
+/// table cells agree on validation, failure behaviour, geometry, and cache
+/// keys.
+@MainActor
+enum InlineMathTypesetter {
+    static func apply(
+        document: ParsedDocument,
+        hidden: HiddenRanges,
+        to storage: NSTextStorage,
+        theme: EditorTheme,
+        scope: NSRange? = nil,
+        maxWidth: CGFloat? = nil,
+        ink: NSColor,
+        renderer: RichContentRenderer = .shared
+    ) {
+        guard !document.inlineMathSpans.isEmpty, storage.length > 0 else { return }
+        let full = NSRange(location: 0, length: storage.length)
+        let target = scope ?? full
+        let text = storage.string as NSString
+
+        for span in document.inlineMathSpans {
+            let body = NSIntersectionRange(span.range, full)
+            guard body.length > 0 else { continue }
+            if NSMaxRange(body) <= target.location { continue }
+            if body.location >= NSMaxRange(target) { break }
+
+            let close = NSMaxRange(body)
+            guard body.location > 0, close < text.length,
+                text.character(at: body.location - 1) == 0x24,
+                text.character(at: close) == 0x24
+            else { continue }
+
+            let openingMarker = NSRange(location: body.location - 1, length: 1)
+            let closingMarker = NSRange(location: close, length: 1)
+            let collapsed = hidden.covers(openingMarker) && hidden.covers(closingMarker)
+            let previousRun = storage.attribute(
+                .inlineMathRun, at: body.location, effectiveRange: nil) as? InlineMathRun
+            let inherited = storage.attribute(.font, at: body.location, effectiveRange: nil)
+                as? NSFont ?? theme.bodyFont
+
+            // A collapsed table row is replaced as a whole by TableRowLayout.
+            // Its 0.01pt source is not a semantic formula size and must never
+            // be sent to SwiftMath. The table cell's independently styled copy
+            // comes through this same function with a real body font.
+            guard previousRun != nil
+                    || inherited.pointSize > EditorTheme.hiddenMarkerFontSize + 0.001
+            else { continue }
+
+            // A refresh starts from the transparent anchor font installed by
+            // the previous render. Preserve the semantic size instead of
+            // feeding that enlarged reserve font back into SwiftMath.
+            let fontSize = previousRun?.fontSize ?? inherited.pointSize
+            let sourceFont = NSFont(
+                descriptor: theme.monoFont.fontDescriptor, size: fontSize)
+                ?? theme.monoFont
+
+            // Establish the visible fail-open state before attempting the
+            // raster. This clears stale geometry and only removes an underline
+            // when an earlier math failure installed it.
+            storage.removeAttribute(.inlineMathRun, range: body)
+            storage.removeAttribute(.kern, range: body)
+            if storage.attribute(.inlineMathFailure, at: body.location, effectiveRange: nil)
+                != nil
+            {
+                storage.removeAttribute(.inlineMathFailure, range: body)
+                storage.removeAttribute(.underlineStyle, range: body)
+                storage.removeAttribute(.underlineColor, range: body)
+                storage.removeAttribute(.toolTip, range: body)
+            }
+            storage.addAttributes(
+                [.font: sourceFont, .foregroundColor: theme.accentColor], range: body)
+
+            guard collapsed else { continue }
+
+            let latex = text.substring(with: body)
+            switch renderer.math(
+                latex, fontSize: fontSize, color: ink, display: false,
+                maxWidth: maxWidth)
+            {
+            case .success(let content):
+                // One anchor for one grapheme. A single UTF-16 code unit could
+                // split an astral leading symbol and corrupt run boundaries.
+                let anchor = text.rangeOfComposedCharacterSequence(at: body.location)
+                guard anchor.length > 0, NSMaxRange(anchor) <= NSMaxRange(body),
+                    let image = content.cgImage,
+                    let baselineFromBottom = content.baselineFromBottom,
+                    baselineFromBottom.isFinite, baselineFromBottom >= 0,
+                    baselineFromBottom <= content.size.height
+                else { continue }
+
+                // Transparent text reserves the formula's exact dimensions;
+                // layout fragments and table cells paint the bitmap over it.
+                let reserveFont = NSFont.systemFont(
+                    ofSize: max(fontSize, content.size.height))
+                let anchorText = text.substring(with: anchor)
+                let glyphWidth = (anchorText as NSString).size(
+                    withAttributes: [.font: reserveFont]).width
+                let spacing = content.size.width - glyphWidth
+                let run = InlineMathRun(
+                    image: image, size: content.size, source: latex, ink: ink,
+                    fontSize: fontSize, baselineFromBottom: baselineFromBottom)
+
+                storage.addAttributes(
+                    [
+                        .font: theme.hiddenMarkerFont,
+                        .foregroundColor: NSColor.clear,
+                        .kern: 0,
+                    ],
+                    range: body)
+                storage.addAttributes(
+                    [
+                        .font: reserveFont,
+                        .foregroundColor: NSColor.clear,
+                        .kern: spacing,
+                        .inlineMathRun: run,
+                    ],
+                    range: anchor)
+
+            case .failure(let failure):
+                // Fail open and visibly: malformed or bounded-out LaTeX stays
+                // readable source instead of becoming a silent blank.
+                storage.addAttributes(
+                    [
+                        .font: sourceFont,
+                        .foregroundColor: theme.accentColor,
+                        .underlineStyle: NSUnderlineStyle([.thick, .patternDot]).rawValue,
+                        .underlineColor: NSColor.systemRed,
+                        .toolTip: failure.reason,
+                        .inlineMathFailure: true,
+                    ],
+                    range: body)
+            }
+        }
+    }
 }
 
 /// Turns a ``ParsedDocument`` into text attributes.
@@ -107,6 +311,9 @@ public enum MarkdownStyler {
             document, hidden: hidden, to: storage, limit: full, scope: target, theme: theme)
         // After the markers, because it asks what they left visible.
         collapseFullyHiddenLines(hidden: hidden, in: storage, limit: full, scope: target)
+        collapseReplacedBlockSeparators(
+            hidden: hidden, in: storage, limit: full, scope: target,
+            spacing: theme.paragraphSpacing)
         return target
     }
 
@@ -498,8 +705,12 @@ public enum MarkdownStyler {
                 storage.addAttribute(
                     .backgroundColor, value: theme.highlightBackground, range: range)
             case .inlineMath:
-                storage.addAttributes(
-                    [.font: theme.monoFont, .foregroundColor: theme.accentColor], range: range)
+                // Resolved after the marker pass by `MarkdownTextView`: the
+                // same span is source text while its block is revealed and a
+                // source-preserving attachment while collapsed. Leaving the
+                // inherited font here also lets a formula in a heading be
+                // typeset at that heading's size.
+                break
             case .image:
                 storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
             case .footnoteReference, .taskMarker, .inlineHTML:
@@ -622,8 +833,73 @@ public enum MarkdownStyler {
 
                 // The same question the editor asks before drawing a label in
                 // the line's place, asked in the one place that answers it.
-                guard hidden.hidesWholeLine(at: line.location, in: text) else { continue }
+                let content = HiddenRanges.contentRange(of: line, in: text)
+                let isHiddenLine = content.length > 0
+                    ? hidden.covers(content)
+                    : hidden.covers(line)
+                guard isHiddenLine else { continue }
                 collapse(line: line, in: storage, font: font)
+            }
+        }
+    }
+
+    /// Replaces a read-only block's adjacent authored blank separators with
+    /// semantic paragraph spacing.
+    ///
+    /// A rendered panel already owns bottom padding. Keeping the full body
+    /// font on the otherwise empty source line beside it pays that padding and
+    /// another 23pt line, producing conspicuous bands around diagrams and
+    /// tables. The source line remains in storage; only reading mode opts into
+    /// compacting its metrics, so live preview keeps a normal click target.
+    @MainActor
+    private static func collapseReplacedBlockSeparators(
+        hidden: HiddenRanges,
+        in storage: NSTextStorage,
+        limit: NSRange,
+        scope: NSRange,
+        spacing: CGFloat
+    ) {
+        guard hidden.compactsReplacedBlockSeparators, !hidden.ranges.isEmpty else { return }
+        let text = storage.string as NSString
+        let font = NSFont.systemFont(ofSize: EditorTheme.hiddenMarkerFontSize)
+        var collapsed = IndexSet()
+
+        func collapseSeparator(_ separator: NSRange) {
+            guard HiddenRanges.contentRange(of: separator, in: text).length == 0,
+                !hidden.covers(separator),
+                NSIntersectionRange(separator, scope).length == separator.length,
+                !collapsed.contains(separator.location)
+            else { return }
+
+            storage.addAttributes(
+                [.font: font, .foregroundColor: NSColor.clear, .kern: 0], range: separator)
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.paragraphSpacing = max(spacing, 0)
+            storage.addAttribute(.paragraphStyle, value: paragraph, range: separator)
+            collapsed.insert(separator.location)
+        }
+
+        for range in hidden.ranges {
+            let clamped = clamp(range, to: limit)
+            guard clamped.length > 0 else { continue }
+            var cursor = clamped.location
+            while cursor < NSMaxRange(clamped) {
+                let line = text.lineRange(for: NSRange(location: cursor, length: 0))
+                cursor = max(NSMaxRange(line), cursor + 1)
+                let content = HiddenRanges.contentRange(of: line, in: text)
+                let isHiddenLine = content.length > 0
+                    ? hidden.covers(content)
+                    : hidden.covers(line)
+                guard isHiddenLine else { continue }
+                if line.location > 0 {
+                    collapseSeparator(
+                        text.lineRange(for: NSRange(location: line.location - 1, length: 0)))
+                }
+                if NSMaxRange(line) < text.length {
+                    collapseSeparator(
+                        text.lineRange(
+                            for: NSRange(location: NSMaxRange(line), length: 0)))
+                }
             }
         }
     }

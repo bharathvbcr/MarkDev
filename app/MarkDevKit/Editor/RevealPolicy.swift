@@ -208,6 +208,12 @@ extension HiddenRanges {
                         integersIn: candidate.location..<(candidate.location + candidate.length))
             }
 
-        self.init(merging: Array(hideable) + replaced)
+        self.init(
+            merging: Array(hideable) + replaced,
+            // Only the explicit read-only surface may make an authored blank
+            // separator non-clickable. An unfocused live editor borrows
+            // reading reveal policy, but it must restore an ordinary line as
+            // soon as the writer clicks back into it.
+            compactsReplacedBlockSeparators: mode == .reading)
     }
 }

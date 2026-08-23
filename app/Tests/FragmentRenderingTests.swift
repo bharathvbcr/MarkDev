@@ -423,6 +423,118 @@ final class FragmentRenderingTests: XCTestCase {
         XCTAssertGreaterThan(diagrams, 0, "a mermaid fence should render as a diagram")
     }
 
+    func testRenderedMermaidReplacesItsCollapsedSourceWithoutBlankBands() throws {
+        let view = MarkdownTextView.make()
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 700)
+        view.setMarkdown(
+            "Before.\n\n```mermaid\nflowchart TD\n\nA[Start] --> B[Finish]\n```\n\nAfter.\n")
+
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+        let beforeRange = (view.markdown as NSString).range(of: "Before.")
+        let afterRange = (view.markdown as NSString).range(of: "After.")
+        let diagramRange = try XCTUnwrap(
+            view.parsed.blocks.first { $0.kind == .mermaidBlock }).range
+        let documentStart = manager.documentRange.location
+        var owner: MarkdownLayoutFragment?
+        var beforeFrame: CGRect?
+        var afterFrame: CGRect?
+        var collapsedSourceHeights: [CGFloat] = []
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment else { return true }
+            if case .diagram = fragment.decoration.rendered?.kind,
+                fragment.renderedContent != nil
+            {
+                owner = fragment
+            }
+            if let element = fragment.textElement?.elementRange {
+                let from = manager.offset(from: documentStart, to: element.location)
+                let to = manager.offset(from: documentStart, to: element.endLocation)
+                let range = NSRange(location: max(from, 0), length: max(to - from, 0))
+                if NSIntersectionRange(range, diagramRange).length > 0,
+                    fragment.renderedContent == nil
+                {
+                    collapsedSourceHeights.append(fragment.layoutFragmentFrame.height)
+                }
+                if NSIntersectionRange(range, beforeRange).length > 0 {
+                    beforeFrame = fragment.layoutFragmentFrame
+                }
+                if from >= 0, to >= from,
+                    NSIntersectionRange(
+                        NSRange(location: from, length: to - from), afterRange).length > 0
+                {
+                    afterFrame = fragment.layoutFragmentFrame
+                }
+            }
+            return owner == nil || beforeFrame == nil || afterFrame == nil
+        }
+
+        let fragment = try XCTUnwrap(owner)
+        let previous = try XCTUnwrap(beforeFrame)
+        let content = try XCTUnwrap(fragment.renderedContentRect)
+        XCTAssertEqual(
+            content.minY, MarkdownLayoutFragment.Metrics.blockPadding, accuracy: 0.5,
+            "collapsed Mermaid source must be replaced, not left as a blank band above the image")
+        XCTAssertLessThanOrEqual(
+            fragment.layoutFragmentFrame.height - content.maxY,
+            MarkdownLayoutFragment.Metrics.blockPadding + 0.5,
+            "collapsed source must not survive as a blank band below the image either")
+        let next = try XCTUnwrap(afterFrame)
+        let contentTop = fragment.layoutFragmentFrame.minY + content.minY
+        let contentBottom = fragment.layoutFragmentFrame.minY + content.maxY
+        XCTAssertTrue(
+            collapsedSourceHeights.allSatisfy { $0 <= 0.5 },
+            "blank and nonblank source lines inside a rendered diagram must all collapse")
+        XCTAssertLessThanOrEqual(
+            contentTop - previous.maxY,
+            EditorTheme.standard.paragraphSpacing
+                + MarkdownLayoutFragment.Metrics.blockPadding + 1,
+            "collapsed fence lines must not leave extra blank paragraphs above a diagram")
+        XCTAssertLessThanOrEqual(
+            next.minY - contentBottom,
+            EditorTheme.standard.paragraphSpacing
+                + MarkdownLayoutFragment.Metrics.blockPadding + 1,
+            "collapsed fence lines must not leave extra blank paragraphs after a diagram")
+    }
+
+    func testLivePreviewKeepsTheSeparatorAfterMermaidEditable() throws {
+        let source = "Before.\n\n```mermaid\nflowchart TD\nA --> B\n```\n\nAfter.\n"
+        let view = MarkdownTextView.make()
+        view.mode = .livePreview
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 700)
+        view.setMarkdown(source)
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+
+        let manager = try XCTUnwrap(view.textLayoutManager)
+        manager.ensureLayout(for: manager.documentRange)
+        let separator = (source as NSString).range(of: "```\n\nAfter.")
+        let separatorRange = NSRange(location: separator.location + 4, length: 1)
+        let documentStart = manager.documentRange.location
+        var separatorHeight: CGFloat?
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            guard let element = fragment.textElement?.elementRange else { return true }
+            let from = manager.offset(from: documentStart, to: element.location)
+            let to = manager.offset(from: documentStart, to: element.endLocation)
+            guard from >= 0, to >= from else { return true }
+            if NSIntersectionRange(
+                NSRange(location: from, length: to - from), separatorRange).length > 0
+            {
+                separatorHeight = fragment.layoutFragmentFrame.height
+                return false
+            }
+            return true
+        }
+
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(separatorHeight), EditorTheme.standard.bodyFont.pointSize,
+            "live preview must retain a full-height line the writer can click and edit")
+    }
+
     func testAMultiLineRenderedBlockDrawsItsPictureExactlyOnce() throws {
         // TextKit lays out one fragment per line. Every fragment answering
         // `.rendered` both draws the whole picture and reserves its full

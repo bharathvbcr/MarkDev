@@ -54,6 +54,38 @@ fn has_block(source: &str, kind: BlockKind) -> bool {
     parse(source).blocks.iter().any(|b| b.kind == kind as u16)
 }
 
+#[test]
+fn scientific_table_math_keeps_both_formula_bodies_out_of_table_syntax() {
+    let src = "| Bound | Learning rule |\n\
+               |---|---|\n\
+               | $\\le&#x20;$ | Online 3-factor plasticity ($\\Delta w = \\eta e M - \\lambda w$), STDP eligibility, DFA/e-prop/BPTT reference baselines |\n\
+               \n\
+               ---\n";
+    let result = parse(src);
+    assert_eq!(
+        math_spans(src),
+        vec!["\\le&#x20;", "\\Delta w = \\eta e M - \\lambda w"]
+    );
+    assert!(has_block(src, BlockKind::Table));
+    assert!(has_block(src, BlockKind::Rule));
+
+    for span in result
+        .spans
+        .iter()
+        .filter(|span| span.kind == SpanKind::InlineMath as u16)
+    {
+        assert!(
+            result
+                .markers
+                .iter()
+                .all(|marker| marker.end <= span.start || marker.start >= span.end),
+            "a table marker swallowed formula body {}..{}",
+            span.start,
+            span.end
+        );
+    }
+}
+
 // MARK: - Prose that must never become math
 
 #[test]
@@ -180,6 +212,34 @@ fn inline_math_still_recognised() {
 }
 
 #[test]
+fn markdown_escaped_latex_punctuation_is_inline_math() {
+    // The note plainly spells one dollar-delimited formula. Its indexed
+    // function notation includes `](`, which must not be confused with a
+    // Markdown link destination separator.
+    let src = r"branches $v\_{\text{dend}}[i](t)$ stay charged";
+    assert_eq!(math_spans(src), vec![r"v\_{\text{dend}}[i](t)"]);
+    assert_eq!(
+        revealed(src),
+        r"branches v\_{\text{dend}}[i](t) stay charged"
+    );
+}
+
+#[test]
+fn escaped_dollars_and_verbatim_source_never_become_math() {
+    for src in [
+        r"Cost $5\$10 and $20 today",
+        r"`$v\_{dend}$`",
+        "```text\n$v\\_{dend}$\n```",
+        r#"<span data-value="$v\_{dend}$">literal</span>"#,
+    ] {
+        assert!(
+            math_spans(src).is_empty(),
+            "math crossed a protected or escaped source boundary: {src:?}"
+        );
+    }
+}
+
+#[test]
 fn math_glued_to_words_still_recognised() {
     // LaTeX prose is often written without spaces around the delimiters.
     // The currency refusal keys on letter-before-plus-digit-after, not on
@@ -217,6 +277,69 @@ fn a_dollar_bearing_image_is_never_eaten_by_math() {
     let src = "![chart $5](pic$a.png)";
     assert_eq!(revealed(src), src, "no character may vanish");
     assert!(math_spans(src).is_empty(), "no math styling over an image");
+}
+
+#[test]
+fn subscript_then_call_notation_still_renders() {
+    // The reported note: `$v_{\text{dend}}[i](t)$` is ordinary scientific
+    // spelling — an indexed compartment evaluated at t. Its `]` matches a
+    // `[` INSIDE the pair, so the blanket `](` refusal this notation once
+    // tripped must never fire; refusing left both dollars on the page as
+    // literal text while every formula around them rendered.
+    let src = r"branches $v_{\text{dend}}[i](t)$:";
+    assert_eq!(math_spans(src), vec![r"v_{\text{dend}}[i](t)"]);
+    assert_eq!(revealed(src), r"branches v_{\text{dend}}[i](t):");
+    assert_eq!(math_spans("a f$\\max(0, v[i])^2$b").len(), 1);
+    assert_eq!(
+        math_spans("$A[i][j]$ and $M[x](y)$"),
+        vec!["A[i][j]", "M[x](y)"]
+    );
+    assert_eq!(
+        math_spans("[read $v[i](t)$ details](reference.md)"),
+        vec!["v[i](t)"],
+        "being inside a link label does not mean the formula crossed into its destination"
+    );
+}
+
+#[test]
+fn a_pair_cannot_account_for_a_separator_that_outruns_it() {
+    // A balanced label around the whole thing does not legitimise the
+    // crossing: the `$5](pic` content matches its `]` against `[inner`
+    // OUTSIDE the pair, so the pairing ate the image's separator exactly as
+    // in `![chart $5](pic$a.png)` and must be refused the same way.
+    let src = "![img [inner] $5](pic$a.png)";
+    assert_eq!(revealed(src), src);
+    assert!(math_spans(src).is_empty());
+}
+
+#[test]
+fn display_math_never_draws_over_a_mangled_image() {
+    // Display pairing had no crossing refusal at all, so the doubled-dollar
+    // spelling of the bug above produced a MathBlock — which the editor
+    // replaces with a typeset bitmap: a hole where the sentence was.
+    for src in [
+        "![chart $$5](pic$$a.png)",
+        "see [doc $$1](ref$$2.md) here",
+        "![img [inner] $$5](pic$$a.png)",
+    ] {
+        assert_eq!(
+            revealed(src),
+            src,
+            "{src:?} must reach the page exactly as written"
+        );
+        assert!(
+            !has_block(src, BlockKind::MathBlock),
+            "{src:?} must produce no formula block"
+        );
+        assert!(parse(src).markers.is_empty(), "{src:?} must hide nothing");
+    }
+}
+
+#[test]
+fn display_bracketed_indexing_still_recognised() {
+    // The display half of subscript-then-call keeps working.
+    assert!(has_block("$$A[1](b) = c$$", BlockKind::MathBlock));
+    assert!(has_block("$$\nx[0](t) + M[i][j]\n$$", BlockKind::MathBlock));
 }
 
 // MARK: - Offsets
@@ -326,6 +449,11 @@ fn fragment() -> impl Strategy<Value = String> {
             Just("**b**"),
             Just("[t](u)"),
             Just("![i](p.png)"),
+            // Subscript-then-call notation: the shape whose pairing must be
+            // allowed (brackets matched inside the pair) and whose mangled
+            // cousins must still be refused.
+            Just("$x[i](j)$"),
+            Just("![b $$c$$d.png]"),
             Just("> q "),
             Just("- l "),
             Just("# h "),

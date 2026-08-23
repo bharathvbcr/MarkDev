@@ -76,6 +76,42 @@ final class MathStressTests: XCTestCase {
 
     // MARK: - Bounded work
 
+    func testMarkdownCharacterReferencesAreDecodedBeforeLatexParsing() throws {
+        XCTAssertEqual(RichContentRenderer.normalisedMathSource("\\le&#x20;"), "\\le ")
+        XCTAssertEqual(
+            RichContentRenderer.normalisedMathSource("x&#32;&lt;y&#X20;&amp;z"),
+            "x <y &z")
+        XCTAssertEqual(RichContentRenderer.normalisedMathSource("x&nbsp;+y"), "x +y")
+
+        guard case .success(let encoded) = makeRenderer().math(
+            "\\le&#x20;", fontSize: 16, color: .black, display: false),
+            case .success(let plain) = makeRenderer().math(
+                "\\le ", fontSize: 16, color: .black, display: false)
+        else { return XCTFail("encoded command whitespace must typeset") }
+        XCTAssertEqual(encoded.size, plain.size, "equivalent sources must render identically")
+    }
+
+    func testMathEntityDecoderPreservesUnknownInvalidAndRawTexAmpersands() {
+        let matrix = "\\begin{matrix}a&b\\\\c&d\\end{matrix}"
+        XCTAssertEqual(RichContentRenderer.normalisedMathSource(matrix), matrix)
+
+        for malformed in [
+            "x&unknown;y", "x&#;y", "x&#x;y", "x&#x110000;y",
+            "x&#0;y", "x&#x7F;y", "x&amp y", "x&thisNameIsFarTooLong;y",
+        ] {
+            XCTAssertEqual(
+                RichContentRenderer.normalisedMathSource(malformed), malformed,
+                "invalid references must fail open without rewriting source")
+        }
+    }
+
+    func testAStormOfEntitiesStaysBoundedAndDeterministic() {
+        let source = String(repeating: "&#x20;", count: 1_000)
+        let decoded = RichContentRenderer.normalisedMathSource(source)
+        XCTAssertEqual(decoded, String(repeating: " ", count: 1_000))
+        XCTAssertEqual(RichContentRenderer.normalisedMathSource(source), decoded)
+    }
+
     /// A flat source too long to typeset on the main actor is refused with
     /// the reason named. Before the byte bound this laid out hundreds of
     /// thousands of points wide and rasterised 67MB — for a line that was
@@ -148,6 +184,32 @@ final class MathStressTests: XCTestCase {
     }
 
     // MARK: - The cache
+
+    func testInlineMathAttributesHaveStableValueSemanticsAcrossRenderers() throws {
+        let latex = "v_{\\text{dend}}[i](t)"
+        guard case .success(let firstContent) = makeRenderer().math(
+            latex, fontSize: 16, color: .black, display: false, maxWidth: 500),
+            case .success(let secondContent) = makeRenderer().math(
+                latex, fontSize: 16, color: .black, display: false, maxWidth: 500)
+        else { return XCTFail("both independent renderers should typeset the formula") }
+
+        let first = InlineMathRun(
+            image: try XCTUnwrap(firstContent.cgImage), size: firstContent.size,
+            source: latex, ink: .black, fontSize: 16,
+            baselineFromBottom: try XCTUnwrap(firstContent.baselineFromBottom))
+        let equivalent = InlineMathRun(
+            image: try XCTUnwrap(secondContent.cgImage), size: secondContent.size,
+            source: latex, ink: .black, fontSize: 16,
+            baselineFromBottom: try XCTUnwrap(secondContent.baselineFromBottom))
+        let differentSource = InlineMathRun(
+            image: try XCTUnwrap(secondContent.cgImage), size: secondContent.size,
+            source: "x", ink: .black, fontSize: 16,
+            baselineFromBottom: try XCTUnwrap(secondContent.baselineFromBottom))
+
+        XCTAssertTrue(first.isEqual(equivalent))
+        XCTAssertEqual(first.hash, equivalent.hash)
+        XCTAssertFalse(first.isEqual(differentSource))
+    }
 
     /// Two columns are two pictures of one formula, since the wider one draws
     /// larger. The key has to know that, or the prefetcher warms entries
@@ -295,6 +357,77 @@ final class MathStressTests: XCTestCase {
     }
 
     // MARK: - End to end, in the editor
+
+    func testRepeatedWidthRefreshDoesNotCompoundInlineMathScale() throws {
+        let source = "Before $v_{\\text{dend}}[i](t)$ after"
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 700, height: 240)
+        view.mode = .reading
+        view.setMarkdown(source)
+        let storage = try XCTUnwrap(view.textStorage)
+        let span = try XCTUnwrap(view.parsed.inlineMathSpans.first)
+        let initial = try XCTUnwrap(
+            storage.attribute(.inlineMathRun, at: span.range.location, effectiveRange: nil)
+                as? InlineMathRun)
+
+        for width in [690.0, 680.0, 670.0, 660.0, 650.0, 640.0, 630.0, 620.0] {
+            view.frame = NSRect(x: 0, y: 0, width: width, height: 240)
+            view.layoutSubtreeIfNeeded()
+            view.layout()
+        }
+
+        let refreshed = try XCTUnwrap(
+            storage.attribute(.inlineMathRun, at: span.range.location, effectiveRange: nil)
+                as? InlineMathRun)
+        XCTAssertEqual(refreshed.fontSize, initial.fontSize)
+        XCTAssertEqual(refreshed.size.height, initial.size.height, accuracy: 0.01)
+        XCTAssertEqual(view.markdown, source)
+    }
+
+    /// Dense notes exercise the integration cliffs that a single formula
+    /// cannot: cache reuse, hundreds of attributed anchors, repeated reveal
+    /// transitions, and column refits. Every transition must preserve the
+    /// source exactly and every collapsed formula must stay drawable.
+    func testHundredsOfInlineFormulasSurviveModeAndResizeCycles() throws {
+        let count = 300
+        let source = (0..<count).map { index in
+            "Row \(index): $v\\_{\\text{dend}}[i](t) + \\theta_{\(index % 7)}$ remains stable."
+        }.joined(separator: "\n")
+
+        let view = MarkdownTextView.make()
+        view.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
+        view.mode = .reading
+        view.setMarkdown(source)
+        let storage = try XCTUnwrap(view.textStorage)
+
+        XCTAssertEqual(view.parsed.inlineMathSpans.count, count)
+        for width in [900.0, 240.0, 520.0, 320.0, 760.0] {
+            view.frame = NSRect(x: 0, y: 0, width: width, height: 600)
+            view.layoutSubtreeIfNeeded()
+            view.layout()
+
+            for span in view.parsed.inlineMathSpans {
+                let run = try XCTUnwrap(
+                    storage.attribute(
+                        .inlineMathRun, at: span.range.location, effectiveRange: nil)
+                        as? InlineMathRun)
+                XCTAssertTrue(run.size.width.isFinite && run.size.height.isFinite)
+                XCTAssertGreaterThan(run.size.width, 0)
+                XCTAssertGreaterThan(run.size.height, 0)
+                XCTAssertLessThanOrEqual(run.size.width, view.renderContext.width + 0.5)
+            }
+
+            view.mode = .source
+            for span in view.parsed.inlineMathSpans {
+                XCTAssertNil(
+                    storage.attribute(
+                        .inlineMathRun, at: span.range.location, effectiveRange: nil))
+            }
+            view.mode = .reading
+        }
+
+        XCTAssertEqual(view.markdown, source)
+    }
 
     /// A document that mixes genuine formulas with currency prose and both
     /// kinds of hostile source, edited at random. Nothing here may crash, and

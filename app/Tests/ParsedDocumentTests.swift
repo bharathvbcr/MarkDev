@@ -66,6 +66,9 @@ final class ParsedDocumentTests: XCTestCase {
             "Cost $5 and$6 today",
             "He gave me $$5 and I gave him $$10 back",
             "![chart $5](pic$a.png)",
+            // The doubled-dollar spelling of the mangled image once produced
+            // a formula block — a typeset bitmap over the sentence's debris.
+            "![chart $$5](pic$$a.png)",
         ] {
             let doc = ParsedDocument.parse(source)
             XCTAssertTrue(
@@ -81,6 +84,33 @@ final class ParsedDocumentTests: XCTestCase {
                 "\(source) must hide nothing — hidden dollars are the gap"
             )
         }
+    }
+
+    func testSubscriptThenCallNotationCrossesTheFFIAsMath() {
+        // `$v_{\text{dend}}[i](t)$` from the reported note is ordinary
+        // scientific spelling: its `]` matches a `[` inside the pair, so it
+        // must arrive as inline math with both delimiters hidden — not as
+        // the literal text a blanket `](` refusal once left behind.
+        for (source, hiddenMarkers) in [
+            ("branches $v_{\\text{dend}}[i](t)$:", 2),
+            ("$A[i][j]$ and $M[x](y)$", 4),
+            // Two math delimiters plus the link's label/destination syntax.
+            ("[read $v[i](t)$ details](reference.md)", 4),
+        ] {
+            let doc = ParsedDocument.parse(source)
+            XCTAssertFalse(
+                doc.spans.filter { $0.kind == .inlineMath }.isEmpty,
+                "\(source) must produce inline math"
+            )
+            XCTAssertEqual(
+                doc.markers.count, hiddenMarkers,
+                "\(source) must hide exactly its math and surrounding Markdown markers"
+            )
+        }
+        XCTAssertTrue(
+            ParsedDocument.parse("$$A[1](b) = c$$").blocks.contains { $0.kind == .mathBlock },
+            "display bracketed indexing must still render"
+        )
     }
 
     func testComparisonsNeverBecomeHighlightsAcrossTheFFI() {

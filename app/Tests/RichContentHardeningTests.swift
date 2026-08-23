@@ -79,6 +79,26 @@ final class RichContentHardeningTests: XCTestCase {
         }
     }
 
+    func testCompactDiagramsDoNotCarryLargeBackgroundBands() throws {
+        let sources = [
+            "flowchart LR\n  A[Parse] --> B[Render]",
+            "sequenceDiagram\n  User->>MarkDev: Open\n  MarkDev-->>User: Preview",
+        ]
+
+        for source in sources {
+            let rows = try inkRows(of: source)
+            let first = try XCTUnwrap(rows.coverages.firstIndex { $0 > 0 })
+            let last = try XCTUnwrap(rows.coverages.lastIndex { $0 > 0 })
+            // Page-level breathing room belongs to the layout fragment. The
+            // bitmap keeps only a 2pt antialiasing guard; anything beyond a
+            // small raster tolerance is canvas inherited from the layout
+            // engine and becomes a blank band in the document fragment.
+            XCTAssertLessThanOrEqual(first, 8, "excess canvas above \(source)")
+            XCTAssertLessThanOrEqual(
+                rows.height - 1 - last, 8, "excess canvas below \(source)")
+        }
+    }
+
     // MARK: - Hostile sources
 
     func testHostileDiagramSourcesFailWithoutCrashing() {

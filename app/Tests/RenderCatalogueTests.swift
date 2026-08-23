@@ -17,7 +17,7 @@ import XCTest
 final class RenderCatalogueTests: XCTestCase {
     private func dump(
         _ name: String, _ markdown: String, height: CGFloat = 560, caret: Int? = nil,
-        documentDirectory: URL? = nil
+        documentDirectory: URL? = nil, mode: EditorMode = .livePreview
     ) throws {
         guard let directory = ProcessInfo.processInfo.environment["MARKDEV_CATALOGUE_DIR"] else {
             throw XCTSkip("MARKDEV_CATALOGUE_DIR unset")
@@ -36,6 +36,7 @@ final class RenderCatalogueTests: XCTestCase {
         // embedded picture against nothing and paints a failure it then has to
         // correct.
         view.documentDirectory = documentDirectory
+        view.mode = mode
         view.setMarkdown(markdown)
         if let caret {
             view.setSelectedRange(NSRange(location: caret, length: 0))
@@ -174,6 +175,64 @@ final class RenderCatalogueTests: XCTestCase {
             ### A heading with `code` in it
             """,
             height: 400, caret: 0)
+    }
+
+    func testScientificInlineMath() throws {
+        try dump(
+            "21-scientific-inline-math",
+            """
+            Each neuron consists of an adaptive somatic compartment $v(t)$, an adaptive somatic threshold $\\theta(t)$, and $K=4$ independent dendritic branches $v\\_{\\text{dend}}[i](t)$:
+
+            - **Impulse Deposition:** Synapses deposit charge directly into target dendritic branches; supralinear dendritic coincidence is supported via $\\sum \\max(0, v\\_{\\text{dend}}[i])^2$.
+            - **Spike Reset:** Somatic spikes reset only the soma ($v \\leftarrow 0.0, \\theta \\leftarrow \\theta + \\Delta\\theta$), preserving dendritic branch potentials across emission.
+
+            ---
+
+            ### B. Areas, Assemblies & $k$-WTA Lateral Inhibition (`binn-areas`)
+
+            ## Neurons are partitioned into contiguous populations called **Areas**.
+            """,
+            height: 700, mode: .reading)
+    }
+
+    func testScientificTableMathAndEncodedWhitespace() throws {
+        try dump(
+            "22-scientific-table-math-entities",
+            """
+            | Bound | Learning rule |
+            |---|---|
+            | $\\le&#x20;$ | Online 3-factor plasticity ($\\Delta w = \\eta e M - \\lambda w$), STDP eligibility, DFA/e-prop/BPTT reference baselines |
+
+            ---
+            """,
+            height: 360, mode: .reading)
+    }
+
+    func testMermaidSpacingAndBlankSourceLines() throws {
+        try dump(
+            "23-mermaid-spacing",
+            """
+            Before the flowchart.
+
+            ```mermaid
+            flowchart LR
+
+            A[Parse] --> B[Layout]
+            B --> C[Render]
+            ```
+
+            Between the diagrams.
+
+            ```mermaid
+            sequenceDiagram
+            User->>MarkDev: Open note
+
+            MarkDev-->>User: Rendered preview
+            ```
+
+            After the sequence diagram.
+            """,
+            height: 900, mode: .reading)
     }
 
     func testBlockControls() throws {

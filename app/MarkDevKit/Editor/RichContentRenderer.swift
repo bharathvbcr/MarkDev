@@ -15,6 +15,9 @@ public struct RenderedContent: @unchecked Sendable {
     public let image: NSImage
     /// Size to draw at, in points.
     public let size: CGSize
+    /// Distance from the bitmap's bottom edge to its typographic baseline.
+    /// Present for math, whose visible baseline is not its image edge.
+    public let baselineFromBottom: CGFloat?
 
     /// A `CGImage` for drawing straight into a `CGContext`.
     ///
@@ -23,9 +26,10 @@ public struct RenderedContent: @unchecked Sendable {
     /// not safe off the main actor.
     public let cgImage: CGImage?
 
-    public init(image: NSImage, size: CGSize) {
+    public init(image: NSImage, size: CGSize, baselineFromBottom: CGFloat? = nil) {
         self.image = image
         self.size = size
+        self.baselineFromBottom = baselineFromBottom
         var rect = CGRect(origin: .zero, size: image.size)
         self.cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
@@ -36,9 +40,10 @@ public struct RenderedContent: @unchecked Sendable {
     /// to re-derive a bitmap this initialiser already has, and the orientation
     /// of what comes back is AppKit's business rather than the caller's — for
     /// a picture whose orientation is the whole point, that is worth avoiding.
-    public init(cgImage: CGImage, size: CGSize) {
+    public init(cgImage: CGImage, size: CGSize, baselineFromBottom: CGFloat? = nil) {
         self.image = NSImage(cgImage: cgImage, size: size)
         self.size = size
+        self.baselineFromBottom = baselineFromBottom
         self.cgImage = cgImage
     }
 }
@@ -298,7 +303,7 @@ public final class RichContentRenderer {
         // beside the entry `render(_:)` had just stored.
         Key(
             kind: display ? "math.display" : "math.inline",
-            source: latex,
+            source: Self.canonicalMathSource(latex),
             scale: Self.bucket(fontSize * 10),
             dark: false,
             raster: Self.bucket(Self.sanitised(maxWidth) ?? 0),
@@ -407,6 +412,104 @@ public final class RichContentRenderer {
         return deepest
     }
 
+    /// The one canonical form of a formula's source: what the cache is keyed
+    /// on, and what SwiftMath is actually handed.
+    ///
+    /// Two rewrites stand between authored Markdown and a drawable formula,
+    /// and they compose in one order only. Character references decode first
+    /// (``normalisedMathSource``), because a command spelled through them --
+    /// `\operatorname&#x7b;ReLU&#x7d;` -- is not yet recognisable as a
+    /// command; conventional spellings then map onto SwiftMath's table
+    /// (``LaTeXNormalizer``), which tokenises the commands the first pass has
+    /// just made visible.
+    ///
+    /// Both callers go through here rather than normalising for themselves.
+    /// That is what makes the two rewrites' shared promise true: keying on the
+    /// canonical form is why `\varnothing` and `\emptyset` share one bitmap
+    /// instead of keeping two, and it is why ``isCached(_:)`` probes the entry
+    /// `math(_:)` stored rather than one beside it.
+    static func canonicalMathSource(_ source: String) -> String {
+        LaTeXNormalizer.normalize(normalisedMathSource(source))
+    }
+
+    /// Decodes the bounded HTML character references generators commonly
+    /// leave inside Markdown formula delimiters.
+    ///
+    /// Markdown resolves `&#x20;` before rendering, while SwiftMath accepts
+    /// LaTeX rather than HTML. Passing the source through unchanged turns a
+    /// command-terminating space (`\\le&#x20;`) into an invalid formula. This
+    /// decoder is intentionally small and single-pass: numeric references and
+    /// the six XML/HTML references useful in mathematics are accepted; an
+    /// unknown, unterminated, overlong, control, or invalid-scalar reference is
+    /// preserved literally so the ordinary visible failure path can explain
+    /// it. Raw TeX ampersands, including matrix separators, are untouched.
+    static func normalisedMathSource(_ source: String) -> String {
+        guard source.contains("&"), source.utf8.count <= maxMathBytes else { return source }
+
+        var output = String()
+        output.reserveCapacity(source.utf8.count)
+        var cursor = source.startIndex
+
+        while cursor < source.endIndex {
+            guard source[cursor] == "&" else {
+                output.append(source[cursor])
+                cursor = source.index(after: cursor)
+                continue
+            }
+
+            // Every accepted name fits well inside sixteen characters. The
+            // bound prevents one `&` from scanning the rest of an 8KB formula.
+            let limit = source.index(cursor, offsetBy: 16, limitedBy: source.endIndex)
+                ?? source.endIndex
+            let afterAmpersand = source.index(after: cursor)
+            guard let semicolon = source[afterAmpersand..<limit].firstIndex(of: ";"),
+                let replacement = decodedMathEntity(
+                    source[afterAmpersand..<semicolon])
+            else {
+                output.append("&")
+                cursor = afterAmpersand
+                continue
+            }
+
+            output.append(replacement)
+            cursor = source.index(after: semicolon)
+        }
+        return output
+    }
+
+    private static func decodedMathEntity(_ body: Substring) -> String? {
+        switch body {
+        case "amp": return "&"
+        case "lt": return "<"
+        case "gt": return ">"
+        case "quot": return "\""
+        case "apos": return "'"
+        // A non-breaking distinction has no useful meaning inside a formula;
+        // a regular space is the TeX command terminator the source intended.
+        case "nbsp": return " "
+        default: break
+        }
+
+        let digits: Substring
+        let radix: Int
+        if body.hasPrefix("#x") || body.hasPrefix("#X") {
+            digits = body.dropFirst(2)
+            radix = 16
+        } else if body.hasPrefix("#") {
+            digits = body.dropFirst()
+            radix = 10
+        } else {
+            return nil
+        }
+
+        guard !digits.isEmpty, digits.count <= 8,
+            let value = UInt32(digits, radix: radix),
+            value >= 0x20, !(0x7F...0x9F).contains(value),
+            let scalar = Unicode.Scalar(value)
+        else { return nil }
+        return String(scalar)
+    }
+
     /// Typesets `latex`, inline or display style.
     ///
     /// - Parameter maxWidth: the column the result has to fit, when there is
@@ -422,6 +525,7 @@ public final class RichContentRenderer {
         display: Bool,
         maxWidth: CGFloat? = nil
     ) -> Result<RenderedContent, RenderFailure> {
+        let normalised = Self.canonicalMathSource(latex)
         let column = Self.sanitised(maxWidth)
         let key = key(
             forMath: latex, fontSize: fontSize, color: color, display: display,
@@ -448,7 +552,7 @@ public final class RichContentRenderer {
             store(failure, for: key)
             return .failure(failure)
         }
-        let depth = Self.nestingDepth(of: latex)
+        let depth = Self.nestingDepth(of: normalised)
         guard depth <= Self.maxMathDepth else {
             let failure = RenderFailure(reason: "Formula too deeply nested")
             store(failure, for: key)
@@ -467,7 +571,7 @@ public final class RichContentRenderer {
 
         let label = MTMathUILabel()
         label.font = font
-        label.latex = latex
+        label.latex = normalised
         label.fontSize = fontSize
         label.textColor = color
         label.labelMode = display ? .display : .text
@@ -486,12 +590,23 @@ public final class RichContentRenderer {
         // `fittingSize`, not `intrinsicContentSize`: SwiftMath overrides the
         // former on macOS and the latter only on iOS, so reading the iOS name
         // here returns NSView's default of zero and every formula looks empty.
-        var size = label.fittingSize
-        guard size.width > 0, size.height > 0 else {
+        let naturalSize = label.fittingSize
+        guard naturalSize.width > 0, naturalSize.height > 0 else {
             let failure = RenderFailure(reason: "Empty formula")
             store(failure, for: key)
             return .failure(failure)
         }
+        // SwiftMath exposes the actual math-list descent. Preserve it before
+        // rasterisation: an inline caller must align this baseline with prose,
+        // not align either bitmap edge with the surrounding font's descender.
+        label.frame = CGRect(origin: .zero, size: naturalSize)
+        label.layoutSubtreeIfNeeded()
+        guard let display = label.displayList, display.descent.isFinite else {
+            let failure = RenderFailure(reason: "Formula baseline unavailable")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+        var size = naturalSize
 
         // A formula wider than its column is scaled down whole, aspect ratio
         // intact — the diagram rule. Whatever remains is then bounded by the
@@ -502,6 +617,7 @@ public final class RichContentRenderer {
             size = CGSize(width: size.width * fit, height: size.height * fit)
         }
         size = Self.drawable(size)
+        let baselineFromBottom = display.descent * (size.height / naturalSize.height)
 
         // `cacheDisplay` draws the *view*, whose bounds are still zero unless
         // they are set first — measured here as ink compressed into a sliver
@@ -515,7 +631,8 @@ public final class RichContentRenderer {
 
         let image = NSImage(size: size)
         image.addRepresentation(rep)
-        let rendered = RenderedContent(image: image, size: size)
+        let rendered = RenderedContent(
+            image: image, size: size, baselineFromBottom: baselineFromBottom)
         store(rendered, for: key)
         return .success(rendered)
     }
@@ -714,7 +831,122 @@ public final class RichContentRenderer {
         prepared.render(context, bounds)
 
         guard let image = context.makeImage() else { return nil }
-        return RenderedContent(cgImage: image, size: size)
+        return Self.cropDiagramCanvas(
+            image, context: context, background: theme.background.cgColor,
+            originalSize: size, originalFit: columnFit, maxWidth: maxWidth)
+    }
+
+    /// Removes the layout engine's minimum canvas while retaining a deliberate
+    /// 2pt antialiasing guard around the diagram.
+    ///
+    /// BeautifulMermaid's prepared bounds are a drawing canvas, not the ink's
+    /// bounds. Compact graphs routinely arrive with 30–40pt above and below
+    /// their nodes; treating that canvas as document content creates blank
+    /// bands even after every source line has collapsed correctly. Cropping
+    /// the finished raster is authoritative because it includes labels,
+    /// strokes, arrowheads, and shadows—the layout model alone does not.
+    private static func cropDiagramCanvas(
+        _ image: CGImage,
+        context: CGContext,
+        background: CGColor,
+        originalSize: CGSize,
+        originalFit: CGFloat,
+        maxWidth: CGFloat
+    ) -> RenderedContent? {
+        guard let data = context.data else { return nil }
+        let width = image.width
+        let height = image.height
+        let bytesPerRow = context.bytesPerRow
+        guard width > 0, height > 0, bytesPerRow >= width * 4 else { return nil }
+
+        let colourSpace = CGColorSpaceCreateDeviceRGB()
+        let converted = background.converted(
+            to: colourSpace, intent: .defaultIntent, options: nil)
+        let components = converted?.components ?? background.components ?? []
+        let red: CGFloat
+        let green: CGFloat
+        let blue: CGFloat
+        let alpha: CGFloat
+        if components.count >= 4 {
+            red = components[0]
+            green = components[1]
+            blue = components[2]
+            alpha = components[3]
+        } else if components.count >= 2 {
+            red = components[0]
+            green = components[0]
+            blue = components[0]
+            alpha = components[1]
+        } else {
+            red = 0
+            green = 0
+            blue = 0
+            alpha = 0
+        }
+        // The bitmap is premultiplied RGBA.
+        let backgroundBytes = (
+            Int((red * alpha * 255).rounded()),
+            Int((green * alpha * 255).rounded()),
+            Int((blue * alpha * 255).rounded()),
+            Int((alpha * 255).rounded()))
+        let pixels = data.assumingMemoryBound(to: UInt8.self)
+        var minX = width
+        var minY = height
+        var maxX = -1
+        var maxY = -1
+
+        for y in 0..<height {
+            let row = y * bytesPerRow
+            for x in 0..<width {
+                let offset = row + x * 4
+                let difference =
+                    abs(Int(pixels[offset]) - backgroundBytes.0)
+                    + abs(Int(pixels[offset + 1]) - backgroundBytes.1)
+                    + abs(Int(pixels[offset + 2]) - backgroundBytes.2)
+                    + abs(Int(pixels[offset + 3]) - backgroundBytes.3)
+                guard difference > 16 else { continue }
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+            }
+        }
+        // A supported parse that paints no distinguishable content is a
+        // rendering failure, not a successful blank panel.
+        guard maxX >= minX, maxY >= minY else { return nil }
+
+        let pointsPerPixelX = originalSize.width / CGFloat(width)
+        let pointsPerPixelY = originalSize.height / CGFloat(height)
+        // Page-level breathing room belongs to the layout fragment. Keeping
+        // it here as well double-counts the gap; these two points exist only
+        // so a faint shadow or antialiased stroke is never cut at the crop.
+        let paddingX = max(1, Int((2 / pointsPerPixelX).rounded(.up)))
+        let paddingY = max(1, Int((2 / pointsPerPixelY).rounded(.up)))
+        let left = max(0, minX - paddingX)
+        let top = max(0, minY - paddingY)
+        let right = min(width - 1, maxX + paddingX)
+        let bottom = min(height - 1, maxY + paddingY)
+        let crop = CGRect(
+            x: left, y: top,
+            width: right - left + 1, height: bottom - top + 1)
+        guard let cropped = image.cropping(to: crop) else { return nil }
+        // Fit the *ink* to the column, not the larger canvas it arrived in.
+        // Otherwise a graph whose prepared canvas is 400pt but whose visible
+        // content is 383pt is unnecessarily left 17pt shy of a 400pt column.
+        // Quantising the natural point size also makes logical geometry
+        // independent of whether the reader requested a 2x or 4x raster:
+        // antialiasing can move the detected edge by one pixel, but zooming
+        // must add detail rather than subtly resize the graph.
+        let safeFit = max(originalFit, .leastNonzeroMagnitude)
+        let naturalWidth = CGFloat(cropped.width) * pointsPerPixelX / safeFit
+        let naturalHeight = CGFloat(cropped.height) * pointsPerPixelY / safeFit
+        let inkFit = min(1, maxWidth / naturalWidth)
+        let fittedWidth = naturalWidth * inkFit
+        let fittedHeight = naturalHeight * inkFit
+        let croppedSize = CGSize(
+            width: inkFit < 1 ? maxWidth : ceil(fittedWidth),
+            height: ceil(fittedHeight))
+        return RenderedContent(cgImage: cropped, size: croppedSize)
     }
 
     /// A readable explanation for a diagram error.

@@ -159,6 +159,7 @@ final class TableStressTests: XCTestCase {
     ) -> String {
         let words = [
             "one", "podman", "`code`", "**bold**", "*italic*", "",
+            "$x^2$", "$\\le&#x20;$",
             "a rather longer cell that will want to wrap somewhere",
             "supercalifragilisticexpialidocious_unbreakable_identifier",
             "日本語のセル", "🎉 emoji", "[link](x.md)", "0", "—",
@@ -178,6 +179,198 @@ final class TableStressTests: XCTestCase {
     }
 
     // MARK: - Degenerate shapes
+
+    func testScientificFormulaeInTableCellsAreDrawnAtEveryWidth() {
+        let source = """
+            Intro.
+
+            | Bound | Learning rule |
+            |---|---|
+            | $\\le&#x20;$ | Online 3-factor plasticity ($\\Delta w = \\eta e M - \\lambda w$), STDP eligibility, DFA/e-prop/BPTT reference baselines |
+            """
+
+        for width in [40, 120, 300, 520, 1_600] as [CGFloat] {
+            let rendered = view(source, width: width)
+            let rows = rowFragments(in: rendered).compactMap(\.row)
+            let formulas = rows.flatMap(\.cells).flatMap(\.formulas)
+            XCTAssertEqual(formulas.count, 2, "formula loss at \(width)pt")
+            XCTAssertTrue(
+                formulas.allSatisfy {
+                    $0.rect.width > 0 && $0.rect.height > 0
+                        && $0.rect.origin.x.isFinite && $0.rect.origin.y.isFinite
+                        && $0.rect.width.isFinite && $0.rect.height.isFinite
+                },
+                "invalid formula geometry at \(width)pt")
+            for row in rows {
+                for (column, cell) in row.cells.enumerated() {
+                    guard row.grid.columns.indices.contains(column) else { continue }
+                    let columnWidth = row.grid.columns[column].width
+                    for formula in cell.formulas {
+                        XCTAssertGreaterThanOrEqual(
+                            formula.rect.minX, -0.5,
+                            "formula starts before its cell at \(width)pt")
+                        XCTAssertLessThanOrEqual(
+                            formula.rect.maxX, columnWidth + 0.5,
+                            "formula crosses its column at \(width)pt")
+                        XCTAssertGreaterThanOrEqual(
+                            formula.rect.minY, -1,
+                            "formula rises outside its row at \(width)pt")
+                        XCTAssertLessThanOrEqual(
+                            formula.rect.maxY, cell.height + 1,
+                            "formula falls outside its row at \(width)pt")
+                    }
+                }
+            }
+            assertNoRowIsHiddenWithoutBeingDrawn(in: rendered, "scientific math at \(width)pt")
+            assertColumnsAgree(in: rendered, "scientific math at \(width)pt")
+        }
+    }
+
+    func testTableCellsKeepTheDocumentsInlineContext() throws {
+        let source = """
+            Intro.
+
+            | Literal | Reference |
+            |---|---|
+            | # not a heading | [paper][source] |
+
+            [source]: reference.md
+            """
+        let rendered = view(source, width: 900)
+        let body = try XCTUnwrap(
+            rowFragments(in: rendered).compactMap(\.row).first { !$0.isHeader })
+        XCTAssertEqual(body.cells.count, 2)
+
+        let bodyFont = EditorTheme.standard.bodyFont
+        let bodyLineHeight = ceil(bodyFont.ascender - bodyFont.descender + bodyFont.leading)
+        XCTAssertLessThanOrEqual(
+            body.cells[0].height, bodyLineHeight + 1,
+            "a leading '# ' inside a GFM cell is literal text, not a standalone heading")
+
+        let referenceWidth = body.cells[1].lines.reduce(CGFloat.zero) { widest, line in
+            max(widest, CGFloat(CTLineGetTypographicBounds(line.line, nil, nil, nil)))
+        }
+        let paperWidth = ("paper" as NSString).size(
+            withAttributes: [.font: bodyFont]).width
+        XCTAssertLessThanOrEqual(
+            referenceWidth, paperWidth + 2,
+            "a reference link in a cell must hide syntax using definitions from its document")
+    }
+
+    func testTableCacheInvalidatesForEveryGeometryBearingThemeChange() throws {
+        let source = """
+            | Words |
+            |---|
+            | one two three four five six seven eight nine ten |
+            """
+        let document = ParsedDocument.parse(source)
+        let table = try XCTUnwrap(document.tables.first)
+        let row = try XCTUnwrap(document.blocks.first { $0.kind == .tableRow })
+        let resolver = TableLayoutResolver()
+        var compact = EditorTheme.standard
+        compact.lineSpacing = 1
+        let first = try XCTUnwrap(resolver.layout(
+            forRowAt: row.range, inTable: table, document: document,
+            text: source as NSString, availableWidth: 90,
+            theme: compact, ink: .black))
+
+        var spacious = compact
+        spacious.lineSpacing = 31
+        let second = try XCTUnwrap(resolver.layout(
+            forRowAt: row.range, inTable: table, document: document,
+            text: source as NSString, availableWidth: 90,
+            theme: spacious, ink: .black))
+
+        XCTAssertGreaterThan(
+            second.height, first.height + 20,
+            "line spacing is baked into cached cell drawings and must invalidate them")
+    }
+
+    func testStyledCellCacheKeysCannotCollideWithAuthoredControlCharacters() throws {
+        let prefix = "\u{1}bold\u{1}"
+        func columnWidth(body: String) throws -> CGFloat {
+            let source = "| x |\n|---|\n| \(body) |\n"
+            let document = ParsedDocument.parse(source)
+            let table = try XCTUnwrap(document.tables.first)
+            let row = try XCTUnwrap(document.blocks.first { $0.kind == .tableRow })
+            let resolver = TableLayoutResolver()
+            return try XCTUnwrap(resolver.layout(
+                forRowAt: row.range, inTable: table, document: document,
+                text: source as NSString, availableWidth: 1_000,
+                theme: .standard, ink: .black)).grid.columns[0].width
+        }
+
+        let adversarial = try columnWidth(body: prefix + "x")
+        let visibleControl = try columnWidth(body: "boldx")
+        XCTAssertGreaterThanOrEqual(
+            adversarial, visibleControl - 1,
+            "authored text must not alias the cache's internal bold sentinel")
+    }
+
+    func testTableFormulaeSurviveRevealEditAndCollapseCycles() {
+        let original = """
+            Before.
+
+            | Bound | Rule |
+            |---|---|
+            | $\\le&#x20;$ | $\\Delta w = \\eta e M - \\lambda w$ |
+
+            After.
+            """
+        let rendered = view(original, width: 420)
+        guard let table = rendered.parsed.tables.first else {
+            return XCTFail("fixture must parse as a table")
+        }
+
+        rendered.setSelectedRange(NSRange(location: table.range.location + 2, length: 0))
+        layout(rendered)
+        XCTAssertTrue(
+            rowFragments(in: rendered).compactMap(\.row).isEmpty,
+            "the caret must reveal the table's editable source instead of drawing over it")
+
+        rendered.insertText("x", replacementRange: rendered.selectedRange())
+        rendered.setSelectedRange(NSRange(location: 0, length: 0))
+        layout(rendered)
+
+        let rows = rowFragments(in: rendered).compactMap(\.row)
+        XCTAssertEqual(rows.flatMap(\.cells).flatMap(\.formulas).count, 2)
+        XCTAssertTrue(rendered.markdown.contains("$\\le&#x20;$"))
+        XCTAssertTrue(rendered.markdown.contains("$\\Delta w = \\eta e M - \\lambda w$"))
+        assertNoRowIsHiddenWithoutBeingDrawn(in: rendered, "reveal/edit/collapse")
+    }
+
+    func testTallAndNestedTableFormulaeStayInsideTheirCellsAtEveryWidth() {
+        let formulae = [
+            "\\frac{a}{b}",
+            "\\sum_{i=0}^{n} i^2",
+            "\\int_{-\\infty}^{\\infty} e^{-x^2} dx",
+            "x^{x^{x^{x}}}",
+            "\\sqrt{\\frac{1+\\sqrt{5}}{2}}",
+            "\\left(\\frac{a+b}{c+d}\\right)^{12}",
+        ]
+        let rows = formulae.map { "| $\($0)$ |" }.joined(separator: "\n")
+        let source = "Intro.\n\n| Formula |\n|---|\n" + rows + "\n"
+
+        for width in [35, 60, 100, 180, 420] as [CGFloat] {
+            let rendered = view(source, width: width)
+            let drawings = rowFragments(in: rendered).compactMap(\.row)
+            let bodyRows = drawings.filter { !$0.isHeader }
+            let cells = bodyRows.flatMap(\.cells)
+            XCTAssertEqual(cells.flatMap(\.formulas).count, formulae.count)
+            for row in bodyRows {
+                for (column, cell) in row.cells.enumerated() {
+                    let columnWidth = row.grid.columns.indices.contains(column)
+                        ? row.grid.columns[column].width : 0
+                    for formula in cell.formulas {
+                        XCTAssertGreaterThanOrEqual(formula.rect.minY, -0.5)
+                        XCTAssertLessThanOrEqual(formula.rect.maxY, cell.height + 0.5)
+                        XCTAssertGreaterThanOrEqual(formula.rect.minX, -0.5)
+                        XCTAssertLessThanOrEqual(formula.rect.maxX, columnWidth + 0.5)
+                    }
+                }
+            }
+        }
+    }
 
     func testDegenerateTablesDoNotBreakTheGrid() {
         let cases: [(String, String)] = [

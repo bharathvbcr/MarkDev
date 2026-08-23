@@ -243,15 +243,24 @@ final class RenderedBlockTests: XCTestCase {
         let drawing = try XCTUnwrap(fragments(view).first { $0.decoration.rendered != nil })
         let entry = try XCTUnwrap(view.renderedBlocks.entries.first)
         let frame = drawing.layoutFragmentFrame
-        let point = CGPoint(
-            x: frame.midX + view.textContainerOrigin.x,
-            y: frame.midY + view.textContainerOrigin.y)
+        let content = try XCTUnwrap(drawing.renderedContentRect).offsetBy(
+            dx: frame.minX + view.textContainerOrigin.x,
+            dy: frame.minY + view.textContainerOrigin.y)
+        let points = [
+            CGPoint(x: content.minX + 1, y: content.minY + 1),
+            CGPoint(x: content.midX, y: content.midY),
+            CGPoint(x: content.maxX - 1, y: content.minY + 1),
+            CGPoint(x: content.minX + 1, y: content.maxY - 1),
+            CGPoint(x: content.maxX - 1, y: content.maxY - 1),
+        ]
 
-        let offset = view.characterIndexForInsertion(at: point)
-        XCTAssertTrue(
-            NSLocationInRange(offset, entry.range) || offset == NSMaxRange(entry.range),
-            "a click at \(point) in the diagram resolved to \(offset), outside the block "
-                + "\(entry.range) it was drawn for")
+        for point in points {
+            let offset = view.characterIndexForInsertion(at: point)
+            XCTAssertTrue(
+                NSLocationInRange(offset, entry.range) || offset == NSMaxRange(entry.range),
+                "a click at \(point) in the diagram resolved to \(offset), outside the block "
+                    + "\(entry.range) it was drawn for")
+        }
     }
 
     // MARK: - Preview, which is the same engine

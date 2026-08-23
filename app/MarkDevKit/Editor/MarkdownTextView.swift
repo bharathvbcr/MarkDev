@@ -218,6 +218,11 @@ public final class MarkdownTextView: ScrollingTextView {
     /// The width the laid-out tables were last solved for.
     private var lastTableWidth: CGFloat = 0
 
+    /// Quantised column width the inline-formula attachments were rendered
+    /// against. Unlike prose glyphs, an attachment owns its width, so a pane
+    /// resize must replace it when the available column crosses a cache bucket.
+    private var lastInlineMathWidth: CGFloat = 0
+
     /// Solved table grids, kept across layout passes.
     ///
     /// The delegate asks for one per row fragment — several times for one
@@ -588,6 +593,8 @@ public final class MarkdownTextView: ScrollingTextView {
         let written = MarkdownStyler.apply(
             document: parsed, hidden: hiddenRanges, to: storage, theme: theme, scope: scope)
         let touched = scope == nil ? nil : written
+        applyInlineMathTypesetting(in: storage, scope: touched)
+        lastInlineMathWidth = renderContext.width
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: touched)
@@ -621,6 +628,48 @@ public final class MarkdownTextView: ScrollingTextView {
             storage.addAttribute(.underlineStyle, value: Self.issueUnderline, range: range)
             storage.addAttribute(.underlineColor, value: issue.kind.tint, range: range)
         }
+    }
+
+    /// Replaces collapsed `$…$` source with one source-preserving attachment.
+    ///
+    /// The attributed string's characters are never replaced: the first
+    /// composed character carries the attachment and the remaining source is
+    /// shrunk like any other collapsed syntax. That keeps plain-text copy,
+    /// undo, find, persistence, and caret offsets on the original Markdown.
+    /// When the block is revealed the base styling pass removes the attachment
+    /// and this method presents the formula as editable monospace source.
+    private func applyInlineMathTypesetting(
+        in storage: NSTextStorage, scope: NSRange?
+    ) {
+        InlineMathTypesetter.apply(
+            document: parsed, hidden: hiddenRanges, to: storage, theme: theme,
+            scope: scope, maxWidth: renderContext.width, ink: resolvedInk)
+    }
+
+    /// Re-rasterises inline formulae without reparsing or touching prose.
+    private func refreshInlineMathTypesetting() {
+        guard !isStyling, !parsed.inlineMathSpans.isEmpty, let storage = textStorage else {
+            lastInlineMathWidth = renderContext.width
+            return
+        }
+        isStyling = true
+        storage.beginEditing()
+        applyInlineMathTypesetting(in: storage, scope: nil)
+        // A previous renderer diagnostic may have owned the underline before
+        // this refresh. Restore proofreading's later layer after removing it.
+        applyProofreadingUnderlines(in: storage, scope: nil)
+        storage.endEditing()
+        isStyling = false
+        invalidateFragments(scope: nil)
+    }
+
+    /// Attachments have fixed geometry, so crossing a render-width bucket is
+    /// the inline equivalent of re-solving a table's columns.
+    private func resolveInlineMathIfWidthChanged() {
+        let width = renderContext.width
+        guard abs(width - lastInlineMathWidth) > 0.5 else { return }
+        lastInlineMathWidth = width
+        refreshInlineMathTypesetting()
     }
 
     /// The dotted rule drawn under a mistake — the same shape macOS has used
@@ -909,6 +958,48 @@ public final class MarkdownTextView: ScrollingTextView {
         let resigned = super.resignFirstResponder()
         if resigned { restyle() }
         return resigned
+    }
+
+    /// Maps every visible point of a rendered replacement back into the
+    /// source block it stands for.
+    ///
+    /// TextKit knows only about the collapsed opening-fence line; the diagram
+    /// height is added by ``MarkdownLayoutFragment``. Its default insertion
+    /// lookup therefore starts returning the following paragraph in the lower
+    /// half of a compact bitmap. Intercepting the painted replacement is what
+    /// makes every part of a diagram—not only a band near its top—a way back
+    /// to editable Mermaid source.
+    public override func characterIndexForInsertion(at point: NSPoint) -> Int {
+        renderedSourceOffset(at: point) ?? super.characterIndexForInsertion(at: point)
+    }
+
+    private func renderedSourceOffset(at point: CGPoint) -> Int? {
+        guard mode == .livePreview, !renderedBlocks.entries.isEmpty,
+            let manager = textLayoutManager
+        else { return nil }
+        let origin = textContainerOrigin
+        let target = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+        let documentStart = manager.documentRange.location
+
+        for entry in renderedBlocks.entries where hiddenRanges.covers(entry.range) {
+            guard let location = manager.location(
+                documentStart, offsetBy: entry.range.location),
+                let fragment = manager.textLayoutFragment(for: location)
+                    as? MarkdownLayoutFragment,
+                fragment.renderedContent != nil,
+                let content = fragment.renderedContentRect
+            else { continue }
+            let frame = fragment.layoutFragmentFrame
+            let painted = content.offsetBy(dx: frame.minX, dy: frame.minY)
+            guard painted.contains(target) else { continue }
+
+            // Strictly inside the range, so both the reveal policy and the
+            // selection nudge recognise this as rendered source. Empty blocks
+            // are never rendered, but retain a bounded fallback for malformed
+            // external descriptors.
+            return min(entry.range.location + 1, NSMaxRange(entry.range))
+        }
+        return nil
     }
 
     public override func didChangeText() {
@@ -1200,6 +1291,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
         reresolveTableFragments()
         paletteStore.replace(makePalette())
         reresolveRenderedContentInView()
+        refreshInlineMathTypesetting()
         needsDisplay = true
     }
 
@@ -1230,18 +1322,21 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
     public override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         resolveTablesIfWidthChanged()
+        resolveInlineMathIfWidthChanged()
         prefetchRenderedContent()
     }
 
     public override func layout() {
         super.layout()
         resolveTablesIfWidthChanged()
+        resolveInlineMathIfWidthChanged()
         prefetchRenderedContent()
     }
 
     public override func viewWillDraw() {
         super.viewWillDraw()
         resolveTablesIfWidthChanged()
+        resolveInlineMathIfWidthChanged()
         // The same three hooks the tables use, for the same reason: the frame
         // is set before the container has tracked it, and the container tracks
         // before TextKit has laid text into it. A warm made against a width
@@ -1302,7 +1397,7 @@ extension MarkdownTextView {
 
         fragment.tableRow = tableLayout.layout(
             forRowAt: range, inTable: table, document: parsed, text: text,
-            availableWidth: tableWidth, theme: theme)
+            availableWidth: tableWidth, theme: theme, ink: resolvedInk)
     }
 
     /// Re-solves the grid of every table row already laid out.

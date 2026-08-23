@@ -583,11 +583,13 @@ fn delimiter_run(source: &str, range: &Range<usize>, byte: u8) -> usize {
 /// - **Nothing follows the closer but a digit.** Pandoc's own currency
 ///   rule: `$50-$100` closes before the second `0`, `$5 and$6` before the
 ///   `6`. A letter suffix is a word, so `$n$th` survives.
-/// - **The content never spans markup.** A `$` pair that reaches across
-///   `](` is eating an image — `![chart $5](pic$a.png)` pairs its dollars
-///   through the link separator because pulldown's scanner runs before
-///   images resolve. Refusing leaves every character the reader typed on
-///   the page, unstyled; the honest failure.
+/// - **The pair never crosses from a link label into its destination.** A `$`
+///   pair in `![chart $5](pic$a.png)` reaches across `](` because pulldown's
+///   math scanner runs before images resolve. `](` alone is not enough to
+///   decide that: real scientific notation routinely contains `$v[i](t)$`,
+///   whose `]` matches a `[` inside the pair. A separator the pair cannot
+///   account for is what refuses.
+///   The same refusal guards `$$…$$`; see [`crosses_link_destination`].
 ///
 /// The two pulldown rules — non-space after the opener, non-space before
 /// the closer — are re-checked rather than trusted, so this function stays
@@ -624,14 +626,42 @@ fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     {
         return false;
     }
-    // Real LaTeX never contains `](`; a mangled image always does.
-    if bytes[opener + 1..closer]
-        .windows(2)
-        .any(|window| window == b"](")
-    {
+    if crosses_link_destination(bytes, opener + 1..closer) {
         return false;
     }
     true
+}
+
+/// Whether a `$`/`$$` pair spans from a Markdown label into its destination.
+///
+/// Pulldown-cmark pairs dollars before images and links resolve, so a pair
+/// that reaches across `](pic` has eaten an image separator — drawing it as
+/// math puts a formula where the reader's sentence was. A pair is refused
+/// when it cannot account for its own `](`. A `]` whose matching `[` lies
+/// inside the pair is subscript-then-call notation —
+/// `$v_{\text{dend}}[i](t)$`, ordinary scientific spelling. A `]` that
+/// matches nothing inside the pair is debris of a construct the pairing ran
+/// through, even when the surrounding brackets happen to balance
+/// (`![img [inner] $5](pic$a.png)`).
+///
+/// `content` excludes the delimiters themselves.
+fn crosses_link_destination(bytes: &[u8], content: Range<usize>) -> bool {
+    let mut depth = 0usize;
+    for i in content {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                if bytes.get(i + 1) == Some(&b'(') && depth == 0 {
+                    // The `]` matches nothing inside the pair: this
+                    // separator closes a bracket opened before the math.
+                    return true;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The same question for `$$…$$`.
@@ -639,9 +669,12 @@ fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
 /// Display pairing ignores whitespace entirely — pulldown-cmark only asks
 /// that both delimiters be doubled — so `He gave me $$5 and I gave him $$10`
 /// becomes a formula block *inside the sentence*, which the editor replaces
-/// with a typeset bitmap: a hole where the sentence was. The currency
-/// rules refuse it exactly as [`inline_math_is_valid`] does. Block math on
-/// its own lines ends at a newline or the end of the document and passes
+/// with a typeset bitmap: a hole where the sentence was. The currency rules
+/// refuse it exactly as [`inline_math_is_valid`] does, and so does the
+/// label-to-destination crossing: `![chart $$5](pic$$a.png)` would otherwise
+/// draw its formula over the mangled image's debris, the one gap the inline
+/// check's `](` refusal covered and this function lacked. Block math on its
+/// own lines ends at a newline or the end of the document and passes
 /// untouched; so does inline display math between words (`text $$x$$ more`),
 /// which notes in the wild rely on.
 fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
@@ -671,6 +704,9 @@ fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_digit())
     {
+        return false;
+    }
+    if crosses_link_destination(bytes, range.start + 2..range.end - 2) {
         return false;
     }
     true

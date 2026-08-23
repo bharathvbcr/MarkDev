@@ -308,6 +308,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     override var renderingSurfaceBounds: CGRect {
         var bounds = super.renderingSurfaceBounds
         if decoration != .none { bounds = bounds.union(decorationRect) }
+        for (_, rect) in inlineMathRects { bounds = bounds.union(rect) }
         // Claimed explicitly rather than left to the panel: an item whose text
         // is *only* its marker reports no indent for the panel to be measured
         // from, and the bullet then lands outside a surface that stops at the
@@ -548,6 +549,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
 
         if listMarker != nil { drawListMarker(in: context, at: point) }
         drawInlineCodePills(in: context, at: point)
+        drawInlineMath(in: context, at: point)
         drawControls(in: context, at: point)
 
         super.draw(at: point, in: context)
@@ -944,6 +946,60 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
                     cornerHeight: Metrics.inlineCodeRadius, transform: nil))
             context.fillPath()
         }
+    }
+
+    /// Draws typeset inline formulae over the transparent source runs that
+    /// reserve their geometry.
+    private func drawInlineMath(in context: CGContext, at point: CGPoint) {
+        let runs = inlineMathRects
+        guard !runs.isEmpty else { return }
+
+        for (run, local) in runs {
+            let rect = local.offsetBy(dx: point.x, dy: point.y)
+            context.saveGState()
+            // The fragment draws in a flipped text view. Normalise the bitmap
+            // the same way block formulae and images are normalised.
+            context.translateBy(x: 0, y: rect.midY)
+            context.scaleBy(x: 1, y: -1)
+            context.translateBy(x: 0, y: -rect.midY)
+            context.draw(run.image, in: rect)
+            context.restoreGState()
+        }
+    }
+
+    /// Formula payloads and their exact fragment-local drawing rectangles.
+    ///
+    /// Per line, like inline-code pills: a line fragment's character offsets
+    /// and baseline are the only geometry TextKit guarantees to agree with
+    /// where it will draw the surrounding prose.
+    var inlineMathRects: [(run: InlineMathRun, rect: CGRect)] {
+        var rects: [(InlineMathRun, CGRect)] = []
+        for line in textLineFragments {
+            let string = line.attributedString
+            let whole = NSRange(location: 0, length: string.length)
+            guard whole.length > 0 else { continue }
+
+            string.enumerateAttribute(.inlineMathRun, in: whole) { value, range, _ in
+                guard let run = value as? InlineMathRun, range.length > 0 else { return }
+                // NSTextLineFragment.attributedString is the complete source
+                // paragraph, not just the characters laid out on this visual
+                // line. Without this ownership check, a formula is painted
+                // once on every wrapped line in the paragraph.
+                guard NSIntersectionRange(range, line.characterRange).length > 0 else { return }
+                let bounds = line.typographicBounds
+                let x = bounds.origin.x + line.locationForCharacter(at: range.location).x
+                let baseline = bounds.origin.y + line.glyphOrigin.y
+                let rect = CGRect(
+                    x: x, y: baseline + run.baselineFromBottom - run.size.height,
+                    width: run.size.width, height: run.size.height)
+                guard rect.width > 0, rect.height > 0,
+                    rect.origin.x.isFinite, rect.origin.y.isFinite,
+                    rect.width.isFinite, rect.height.isFinite
+                else { return }
+                rects.append((run, rect))
+            }
+        }
+        return rects
     }
 
     /// The pills this fragment would draw, in the space `draw(at:in:)` works

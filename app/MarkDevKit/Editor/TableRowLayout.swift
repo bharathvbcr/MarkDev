@@ -30,9 +30,17 @@ struct TableCellDrawing: @unchecked Sendable {
         let baseline: CGFloat
     }
 
+    /// A source-preserving inline formula placed in this cell's coordinates.
+    struct Formula {
+        let image: CGImage
+        let rect: CGRect
+    }
+
     var lines: [Line] = []
     /// Where inline code sits, in the cell's own coordinates.
     var pills: [CGRect] = []
+    /// Formula bitmaps CoreText reserves room for but cannot paint itself.
+    var formulas: [Formula] = []
     /// Height the wrapped text occupies at the width it was given.
     var height: CGFloat = 0
 
@@ -86,13 +94,36 @@ struct TableCellDrawing: @unchecked Sendable {
                 contentsOf: pillRects(
                     in: text, line: line, range: range,
                     x: x, top: top, height: ascent + descent))
+            drawing.formulas.append(
+                contentsOf: formulaRects(
+                    in: text, line: line, range: range,
+                    x: x, baseline: baseline))
 
             top = baseline + descent + leading + lineSpacing
             start = range.location + range.length
         }
 
+        // The reserve font gives CoreText enough *advance* for a formula, but
+        // SwiftMath's baseline can still put the bitmap above the cell's zero
+        // or below CoreText's descent. Normalise the finished drawing, not
+        // just its text metrics: every item moves together so baselines and
+        // code pills keep their relationship, then the bitmap extents join
+        // the line metrics in deciding the cell's height.
+        let textBottom = max(top - lineSpacing, 0)
+        let formulaTop = drawing.formulas.map(\.rect.minY).min() ?? 0
+        let shift = max(-formulaTop, 0)
+        if shift > 0 {
+            drawing.lines = drawing.lines.map {
+                Line(line: $0.line, x: $0.x, baseline: $0.baseline + shift)
+            }
+            drawing.pills = drawing.pills.map { $0.offsetBy(dx: 0, dy: shift) }
+            drawing.formulas = drawing.formulas.map {
+                Formula(image: $0.image, rect: $0.rect.offsetBy(dx: 0, dy: shift))
+            }
+        }
+        let formulaBottom = drawing.formulas.map(\.rect.maxY).max() ?? 0
         // The gap after the final line belongs between lines, not under them.
-        drawing.height = ceil(max(top - lineSpacing, 0))
+        drawing.height = ceil(max(textBottom + shift, formulaBottom))
         return drawing
     }
 
@@ -126,6 +157,38 @@ struct TableCellDrawing: @unchecked Sendable {
         return rects
     }
 
+    /// Formula rectangles on one wrapped line, aligned to CoreText's actual
+    /// baseline exactly as the editor fragment aligns them to TextKit's.
+    private static func formulaRects(
+        in text: NSAttributedString,
+        line: CTLine,
+        range: CFRange,
+        x: CGFloat,
+        baseline: CGFloat
+    ) -> [Formula] {
+        var formulas: [Formula] = []
+        let lineRange = NSRange(location: range.location, length: range.length)
+        guard lineRange.length > 0 else { return formulas }
+
+        text.enumerateAttribute(.inlineMathRun, in: lineRange) { value, runRange, _ in
+            guard let run = value as? InlineMathRun else { return }
+            let clipped = NSIntersectionRange(runRange, lineRange)
+            guard clipped.length > 0 else { return }
+            let offset = CTLineGetOffsetForStringIndex(line, clipped.location, nil)
+            let rect = CGRect(
+                x: x + offset,
+                y: baseline + run.baselineFromBottom - run.size.height,
+                width: run.size.width,
+                height: run.size.height)
+            guard rect.width > 0, rect.height > 0,
+                rect.origin.x.isFinite, rect.origin.y.isFinite,
+                rect.width.isFinite, rect.height.isFinite
+            else { return }
+            formulas.append(Formula(image: run.image, rect: rect))
+        }
+        return formulas
+    }
+
     /// Paints the cell with its top-left at `origin`.
     ///
     /// The text matrix is flipped because the editor's context is: without it
@@ -140,6 +203,15 @@ struct TableCellDrawing: @unchecked Sendable {
             context.textPosition = CGPoint(
                 x: origin.x + line.x, y: origin.y + line.baseline)
             CTLineDraw(line.line, context)
+        }
+        for formula in formulas {
+            let rect = formula.rect.offsetBy(dx: origin.x, dy: origin.y)
+            context.saveGState()
+            context.translateBy(x: 0, y: rect.midY)
+            context.scaleBy(x: 1, y: -1)
+            context.translateBy(x: 0, y: -rect.midY)
+            context.draw(formula.image, in: rect)
+            context.restoreGState()
         }
     }
 }
@@ -188,12 +260,13 @@ struct TableRowLayout: Sendable {
 /// and the solved grid against the table's text and the width it was solved
 /// for.
 ///
-/// Cells are styled by re-parsing the cell's own source rather than by reading
-/// the document's storage, and that is not a shortcut. By the time a row is
-/// drawn its text is *hidden* — collapsed to `hiddenMarkerFontSize` like any
-/// other block replaced by rendered content — so the storage no longer holds
-/// anything worth measuring. Styling a copy is what lets the cell keep its
-/// bold, its links and its code while the row itself is stood down.
+/// Cells are styled from a range-local projection of the document parse rather
+/// than by reading the document's storage. By the time a row is drawn its text
+/// is *hidden* — collapsed to `hiddenMarkerFontSize` like any other block
+/// replaced by rendered content — so the storage no longer holds anything
+/// worth measuring. Projecting the document parse is the important part: a
+/// cell is inline context, so reparsing `# literal` as a standalone document
+/// turns it into a heading and loses reference definitions outside the cell.
 @MainActor
 final class TableLayoutResolver {
     /// Styled cell text and what it measures, keyed by the cell's source.
@@ -203,7 +276,7 @@ final class TableLayoutResolver {
     /// solved grids, and re-measuring every visible cell — one `size()` for
     /// the cell and one per word for its floor — is work that has nothing to
     /// do with the edit.
-    private var cells: [String: StyledCell] = [:]
+    private var cells: [StyledKey: StyledCell] = [:]
 
     /// Cells already broken into lines, keyed by source, width and alignment.
     ///
@@ -213,16 +286,50 @@ final class TableLayoutResolver {
     private var drawings: [DrawingKey: TableCellDrawing] = [:]
 
     private struct StyledCell {
+        let key: StyledKey
         let text: NSAttributedString
         let natural: CGFloat
         let minimum: CGFloat
     }
 
-    private struct DrawingKey: Hashable {
-        let source: String
+    private struct RangeKey: Hashable {
+        let location: Int
+        let length: Int
+    }
+
+    private struct SpanKey: Hashable {
+        let range: RangeKey
+        let kind: UInt16
+        let depth: UInt16
+        let data: UInt32
+        /// Link and wikilink styling depends on the interned destination, not
+        /// only its numeric slot, which is local to one parse.
+        let target: String?
+    }
+
+    private struct CellSource {
+        let text: String
+        let document: ParsedDocument
+        let spans: [SpanKey]
+        let markers: [RangeKey]
+
+        func key(bold: Bool) -> StyledKey {
+            StyledKey(text: text, bold: bold, spans: spans, markers: markers)
+        }
+    }
+
+    private struct StyledKey: Hashable {
+        let text: String
         let bold: Bool
+        let spans: [SpanKey]
+        let markers: [RangeKey]
+    }
+
+    private struct DrawingKey: Hashable {
+        let style: StyledKey
         let width: CGFloat
         let alignment: TableAlignment
+        let lineSpacing: CGFloat
     }
     /// Solved tables, keyed by position, parse revision, and width.
     private var tables: [Key: Solved] = [:]
@@ -256,6 +363,14 @@ final class TableLayoutResolver {
         let bodyFont: NSFont
         let textColor: NSColor
         let monoFont: NSFont
+        let lineSpacing: CGFloat
+        let secondaryColor: NSColor
+        let accentColor: NSColor
+        let codeColor: NSColor
+        let linkColor: NSColor
+        let tagColor: NSColor
+        let highlightBackground: NSColor
+        let markerColor: NSColor
     }
 
     /// Bumped whenever the document is reparsed.
@@ -280,9 +395,19 @@ final class TableLayoutResolver {
         tables.removeAll(keepingCapacity: true)
     }
 
-    private func flushIfThemeChanged(_ theme: EditorTheme) {
+    private func flushIfThemeChanged(_ theme: EditorTheme, ink: NSColor) {
         let current = Fingerprint(
-            bodyFont: theme.bodyFont, textColor: theme.textColor, monoFont: theme.monoFont)
+            bodyFont: theme.bodyFont,
+            textColor: ink,
+            monoFont: theme.monoFont,
+            lineSpacing: theme.lineSpacing,
+            secondaryColor: theme.secondaryColor,
+            accentColor: theme.accentColor,
+            codeColor: theme.codeColor,
+            linkColor: theme.linkColor,
+            tagColor: theme.tagColor,
+            highlightBackground: theme.highlightBackground,
+            markerColor: theme.markerColor)
         guard current != fingerprint else { return }
         fingerprint = current
         flush()
@@ -300,9 +425,10 @@ final class TableLayoutResolver {
         document: ParsedDocument,
         text: NSString,
         availableWidth: CGFloat,
-        theme: EditorTheme
+        theme: EditorTheme,
+        ink: NSColor
     ) -> TableRowLayout? {
-        flushIfThemeChanged(theme)
+        flushIfThemeChanged(theme, ink: ink)
 
         let key = Key(
             revision: revision,
@@ -316,7 +442,7 @@ final class TableLayoutResolver {
         } else {
             solved = solve(
                 table: table, in: document, text: text,
-                availableWidth: availableWidth, theme: theme)
+                availableWidth: availableWidth, theme: theme, ink: ink)
             // Bounded: the window can be dragged through hundreds of widths,
             // and an unbounded cache keyed on width would grow for its
             // lifetime. The whole map goes rather than the oldest entry —
@@ -352,7 +478,8 @@ final class TableLayoutResolver {
         in document: ParsedDocument,
         text: NSString,
         availableWidth: CGFloat,
-        theme: EditorTheme
+        theme: EditorTheme,
+        ink: NSColor
     ) -> Solved {
         let columnCount = max(table.tableColumnCount ?? 0, 1)
 
@@ -365,7 +492,7 @@ final class TableLayoutResolver {
         let tableEnd = NSMaxRange(table.range)
 
         var rowRanges: [NSRange] = []
-        var sourcesByRow: [[String]] = []
+        var sourcesByRow: [[CellSource]] = []
         var alignments = [TableAlignment](repeating: .auto, count: columnCount)
         var headerIndex: Int?
 
@@ -382,12 +509,14 @@ final class TableLayoutResolver {
                 // appearance: a row squared off with padding has holes, and
                 // positional filling would slide every later cell one column
                 // to the left.
-                sourcesByRow.append([String](repeating: "", count: columnCount))
+                sourcesByRow.append(
+                    (0..<columnCount).map { _ in Self.emptyCellSource })
             case .tableCell:
                 guard let column = block.tableColumn, column < columnCount,
                     !sourcesByRow.isEmpty
                 else { continue }
-                sourcesByRow[sourcesByRow.count - 1][column] = cellSource(block.range, in: text)
+                sourcesByRow[sourcesByRow.count - 1][column] = cellSource(
+                    block.range, in: text, document: document)
                 if let alignment = block.tableAlignment, alignment != .auto {
                     alignments[column] = alignment
                 }
@@ -405,7 +534,8 @@ final class TableLayoutResolver {
         for (rowIndex, sources) in sourcesByRow.enumerated() {
             var row: [StyledCell] = []
             for (column, source) in sources.enumerated() {
-                let cell = styledCell(source, bold: rowIndex == headerIndex, theme: theme)
+                let cell = styledCell(
+                    source, bold: rowIndex == headerIndex, theme: theme, ink: ink)
                 row.append(cell)
                 demands[column] = TableColumnDemand(
                     natural: max(demands[column].natural, cell.natural),
@@ -428,12 +558,13 @@ final class TableLayoutResolver {
                     drawing(
                         cell,
                         source: sourcesByRow[rowIndex][column],
-                        bold: rowIndex == headerIndex,
                         width: grid.columns.indices.contains(column)
                             ? grid.columns[column].width : 0,
                         alignment: grid.columns.indices.contains(column)
                             ? grid.columns[column].alignment : .auto,
-                        lineSpacing: theme.lineSpacing)
+                        lineSpacing: theme.lineSpacing,
+                        theme: theme,
+                        ink: ink)
                 },
                 isHeader: rowIndex == headerIndex,
                 isLast: rowIndex == styled.count - 1
@@ -465,27 +596,70 @@ final class TableLayoutResolver {
     /// A cell's source, trimmed of the padding the author used to line the
     /// pipes up. That padding is presentation in the source file and has
     /// nothing to say about the column's width.
-    private func cellSource(_ range: NSRange, in text: NSString) -> String {
-        let start = min(max(range.location, 0), text.length)
-        let length = min(range.length, text.length - start)
-        guard length > 0 else { return "" }
-        return text.substring(with: NSRange(location: start, length: length))
-            .trimmingCharacters(in: .whitespaces)
+    private static let emptyCellSource = CellSource(
+        text: "", document: .empty, spans: [], markers: [])
+
+    private func cellSource(
+        _ range: NSRange, in text: NSString, document: ParsedDocument
+    ) -> CellSource {
+        var start = min(max(range.location, 0), text.length)
+        var end = min(NSMaxRange(range), text.length)
+        while start < end, Self.isWhitespace(text.character(at: start)) { start += 1 }
+        while end > start, Self.isWhitespace(text.character(at: end - 1)) { end -= 1 }
+        guard end > start else { return Self.emptyCellSource }
+
+        let absolute = NSRange(location: start, length: end - start)
+        let localSpans = document.spans.compactMap { span -> StyleSpan? in
+            let clipped = NSIntersectionRange(span.range, absolute)
+            guard clipped.length > 0 else { return nil }
+            return StyleSpan(
+                range: NSRange(
+                    location: clipped.location - absolute.location, length: clipped.length),
+                kind: span.kind, depth: span.depth, data: span.data)
+        }
+        let localMarkers = document.markers.compactMap { marker -> SyntaxMarker? in
+            let clipped = NSIntersectionRange(marker.range, absolute)
+            guard clipped.length > 0 else { return nil }
+            return SyntaxMarker(
+                range: NSRange(
+                    location: clipped.location - absolute.location, length: clipped.length),
+                block: 0)
+        }
+        let localDocument = ParsedDocument(
+            spans: localSpans, markers: localMarkers, blocks: [], strings: document.strings)
+        let spanKeys = localSpans.map { span in
+            SpanKey(
+                range: RangeKey(location: span.range.location, length: span.range.length),
+                kind: span.kind.rawValue,
+                depth: span.depth,
+                data: span.data,
+                target: localDocument.target(for: span))
+        }
+        let markerKeys = localMarkers.map {
+            RangeKey(location: $0.range.location, length: $0.range.length)
+        }
+        return CellSource(
+            text: text.substring(with: absolute), document: localDocument,
+            spans: spanKeys, markers: markerKeys)
+    }
+
+    private static func isWhitespace(_ character: unichar) -> Bool {
+        UnicodeScalar(character).map(CharacterSet.whitespaces.contains) ?? false
     }
 
     /// One cell's text, styled the way the document styles inline Markdown.
     private func styledCell(
-        _ source: String, bold: Bool, theme: EditorTheme
+        _ source: CellSource, bold: Bool, theme: EditorTheme, ink: NSColor
     ) -> StyledCell {
-        let key = bold ? "\u{1}bold\u{1}" + source : source
+        let key = source.key(bold: bold)
         if let cached = cells[key] { return cached }
 
         let content: NSAttributedString
-        if source.isEmpty {
+        if source.text.isEmpty {
             content = NSAttributedString(string: "")
         } else {
-            let parsed = ParsedDocument.parse(source)
-            let storage = NSTextStorage(string: source)
+            let parsed = source.document
+            let storage = NSTextStorage(string: source.text)
             // `.reading` hides every marker: the cell is being drawn, not
             // edited, so its `**` has no more business showing than a
             // formula's `$$` does.
@@ -494,6 +668,9 @@ final class TableLayoutResolver {
                 mode: .reading)
             MarkdownStyler.apply(
                 document: parsed, hidden: hidden, to: storage, theme: theme)
+            InlineMathTypesetter.apply(
+                document: parsed, hidden: hidden, to: storage, theme: theme,
+                ink: ink)
 
             let whole = NSRange(location: 0, length: storage.length)
             // The styler's paragraph styles belong to a document — indents,
@@ -515,6 +692,7 @@ final class TableLayoutResolver {
         }
 
         let cell = StyledCell(
+            key: key,
             text: content,
             natural: ceil(content.size().width),
             minimum: Self.widestWord(in: content))
@@ -529,16 +707,35 @@ final class TableLayoutResolver {
     /// One cell broken into lines at `width`, remembered across re-solves.
     private func drawing(
         _ cell: StyledCell,
-        source: String,
-        bold: Bool,
+        source: CellSource,
         width: CGFloat,
         alignment: TableAlignment,
-        lineSpacing: CGFloat
+        lineSpacing: CGFloat,
+        theme: EditorTheme,
+        ink: NSColor
     ) -> TableCellDrawing {
-        let key = DrawingKey(source: source, bold: bold, width: width, alignment: alignment)
+        let key = DrawingKey(
+            style: cell.key, width: width, alignment: alignment, lineSpacing: lineSpacing)
         if let cached = drawings[key] { return cached }
+        let text: NSAttributedString
+        if source.text.contains("$"), width >= 1 {
+            // The natural cell is measured before the grid is solved. Refit a
+            // copy once the real column width is known so a wide equation is
+            // scaled to its cell rather than clipped at the next column.
+            let parsed = source.document
+            let fitted = NSTextStorage(attributedString: cell.text)
+            let hidden = HiddenRanges(
+                document: parsed, selection: NSRange(location: NSNotFound, length: 0),
+                mode: .reading)
+            InlineMathTypesetter.apply(
+                document: parsed, hidden: hidden, to: fitted, theme: theme,
+                maxWidth: width, ink: ink)
+            text = NSAttributedString(attributedString: fitted)
+        } else {
+            text = cell.text
+        }
         let made = TableCellDrawing.make(
-            text: cell.text, width: width, alignment: alignment, lineSpacing: lineSpacing)
+            text: text, width: width, alignment: alignment, lineSpacing: lineSpacing)
         if drawings.count > 4096 { drawings.removeAll(keepingCapacity: true) }
         drawings[key] = made
         return made

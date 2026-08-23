@@ -28,10 +28,21 @@ public struct HiddenRanges: Sendable, Equatable {
     /// mapping is a binary search rather than a scan.
     private let hiddenBefore: [Int]
 
+    /// Whether a read-only presentation may compact the authored blank line
+    /// after a block whose source has been replaced by a panel or bitmap.
+    /// Live preview keeps separator lines at normal height so a writer can
+    /// click and edit them; reading mode has no caret and should not pay both
+    /// a panel's padding and a full invisible source line.
+    let compactsReplacedBlockSeparators: Bool
+
     public static let none = HiddenRanges(ranges: [])
 
     /// Merges and sorts `input`, discarding empty ranges.
     public init(merging input: [NSRange]) {
+        self.init(merging: input, compactsReplacedBlockSeparators: false)
+    }
+
+    init(merging input: [NSRange], compactsReplacedBlockSeparators: Bool) {
         let sorted = input.filter { $0.length > 0 }.sorted {
             $0.location == $1.location ? $0.length < $1.length : $0.location < $1.location
         }
@@ -48,12 +59,15 @@ public struct HiddenRanges: Sendable, Equatable {
                 merged.append(range)
             }
         }
-        self.init(ranges: merged)
+        self.init(
+            ranges: merged,
+            compactsReplacedBlockSeparators: compactsReplacedBlockSeparators)
     }
 
     /// Assumes `ranges` is already normalised.
-    private init(ranges: [NSRange]) {
+    private init(ranges: [NSRange], compactsReplacedBlockSeparators: Bool = false) {
         self.ranges = ranges
+        self.compactsReplacedBlockSeparators = compactsReplacedBlockSeparators
         var running = 0
         var prefix: [Int] = []
         prefix.reserveCapacity(ranges.count)
