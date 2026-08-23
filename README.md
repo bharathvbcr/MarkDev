@@ -68,13 +68,16 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 
 ## Performance Budgets
 
-MarkDev enforces strict performance regression gates:
+MarkDev gates performance regressions in its test suite. The target is the
+frame budget; the enforced gate is what a test actually fails on, and for the
+Swift paths it is deliberately looser — see
+[docs/performance.md](docs/performance.md) for why.
 
-| Measurement | Target Budget | Measured Performance |
-|---|---|---|
-| **Release Parse (10k lines)** | `< 16.6ms` (1 frame) | **~2.55ms** |
-| **Prose Keystroke (10k lines)** | `< 16.6ms` (1 frame) | **~14.0ms** |
-| **Caret Navigation** | `< 2.0ms` | **~0.6ms** |
+| Measurement | Target Budget | Enforced Gate | Measured |
+|---|---|---|---|
+| **Release Parse (10k lines)** | `< 16.6ms` (1 frame) | `< 16.6ms` (Release) | **~2.55ms** |
+| **Prose Keystroke (10k lines)** | `< 16.6ms` (1 frame) | `< 50ms` (Debug) | **~14.0ms** |
+| **Caret Navigation** | `< 2.0ms` | `< 16.6ms` (one frame) | **~0.6ms** |
 
 ---
 

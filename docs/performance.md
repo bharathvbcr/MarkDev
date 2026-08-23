@@ -1,17 +1,45 @@
 # Performance Budgets & Benchmarking
 
-MarkDev is engineered to maintain a fluid **60fps / 120fps ProMotion** interactive experience even when editing massive, book-length Markdown documents. Every subsystem has an explicit, automated performance gate.
+MarkDev is engineered to maintain a fluid **60fps / 120fps ProMotion** interactive experience even when editing massive, book-length Markdown documents.
 
 ---
 
 ## Performance Budgets
 
-| Subsystem | Measurement Target | Automated Gate | Current Baseline |
-|---|---|---|---|
-| **Markdown Parser** | 10,000 lines CommonMark | `< 16.6ms` (Release) | **2.55ms** |
-| **Incremental Shift** | 10,000 lines single-word edit | `< 0.05ms` (Release) | **0.01ms** |
-| **Editor Keystroke** | 10,000 lines prose edit (Swift) | `< 16.6ms` (Debug) | **14.0ms** |
-| **Caret Navigation** | Movement across collapsed runs | `< 2.0ms` | **0.6ms** |
+Two different numbers, kept apart on purpose. The **target** is the frame budget
+the design aims at. The **enforced gate** is the assertion a test actually
+fails on — which, for the Swift subsystems, is deliberately looser than the
+target, for reasons the tests themselves record.
+
+Conflating them is how a budget nobody enforces comes to read as one that is.
+`core/tests/docs_contract.rs` re-derives this table from those assertions, so
+the gate column cannot drift from what the suite really does.
+
+| Subsystem | Measurement Target | Enforced Gate | Enforced In | Current Baseline |
+|---|---|---|---|---|
+| **Markdown Parser** | 10,000 lines CommonMark | `< 16.6ms` (Release) | `core/tests/performance.rs` | **2.55ms** |
+| **Incremental Shift** | 10,000 lines single-word edit | *correctness only — no timing gate* | `core/tests/incremental.rs` | **0.01ms** |
+| **Editor Keystroke** | 10,000 lines prose edit (Swift) | `< 50ms` (Debug) | `app/Tests/EditorPerformanceTests.swift` | **14.0ms** |
+| **Caret Navigation** | Movement across collapsed runs | `< 16.6ms` (one frame) | `app/Tests/EditorPerformanceTests.swift` | **0.6ms** |
+
+**Why the Swift gates are loose.** `@testable import` does not link against a
+Release build of the framework, so these figures are debug Swift over debug
+Rust. Of the 14ms keystroke, 9.4ms is `md_document_replace` plus copying the
+parse back across the FFI — neither of which that target can improve — leaving
+roughly 3ms of headroom against 16.6ms. An assertion that tight fails when the
+machine is busy rather than when the code is wrong, and it did exactly that on
+a contended run. The gate is therefore set where it catches the failure that
+matters: work that grows with the document. The quadratic marker lookup that
+once cost 5,000ms fails it immediately.
+
+The honest consequence is that **release performance for the Swift editor path
+is unverified**, and this table says so rather than implying a gate that is not
+there.
+
+**Incremental Shift** is gated on *behaviour*, not time: `core/tests/incremental.rs`
+asserts that typing in plain prose yields `Reparse::Shifted` — no reparse at
+all. The 0.01ms baseline follows from that property; nothing asserts the
+duration directly.
 
 ---
 
