@@ -9,7 +9,7 @@ set shell := ["zsh", "-cu"]
 # xcode-select on this machine points at CommandLineTools, whose SDK cannot
 # build a macOS app. Setting DEVELOPER_DIR per-invocation fixes that without
 # needing sudo.
-export DEVELOPER_DIR := "/Applications/Xcode.app/Contents/Developer"
+export DEVELOPER_DIR := env_var_or_default("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
 # C-backed tree-sitter grammars inherit the host SDK version unless this is
 # explicit, producing objects that cannot actually run on the app's 26.0
 # deployment target.
