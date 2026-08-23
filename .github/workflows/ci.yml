@@ -60,4 +60,4 @@ jobs:
 
       - name: Build and Test AppKit Targets
         run: |
-          xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug test
+          xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test

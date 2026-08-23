@@ -157,7 +157,12 @@ fn no_row_claims_a_tighter_gate_than_is_enforced() {
     // (subsystem, documented ms, enforced ms) — the enforced figure is read
     // from source below rather than trusted from here.
     let checks: &[(&str, f64, &str, &str)] = &[
-        ("Markdown Parser", 16.6, "core/tests/performance.rs", "median < "),
+        (
+            "Markdown Parser",
+            16.6,
+            "core/tests/performance.rs",
+            "median < ",
+        ),
         (
             "Editor Keystroke",
             50.0,

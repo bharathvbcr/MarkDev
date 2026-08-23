@@ -232,3 +232,11 @@ clean:
     rm -rf MarkDev.xcodeproj build/ app/MarkDev/Assets.xcassets app/MarkDev/Resources ~/Library/Developer/Xcode/DerivedData/MarkDev-*
 
 check: fmt-check lint-core test
+
+# Run full CI suite locally (matches GitHub Actions CI workflow)
+ci-local: fmt-check lint-core test-core
+    cd core && cargo test --release --test performance
+    just test-app
+
+ci: ci-local
+

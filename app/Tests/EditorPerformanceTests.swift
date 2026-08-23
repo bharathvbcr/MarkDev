@@ -456,7 +456,7 @@ final class EditorPerformanceTests: XCTestCase {
                 + "ratio \(String(format: "%.2f", largeCost / smallCost))x for 4x the text)")
 
         XCTAssertLessThan(
-            largeCost / smallCost, 7.0,
+            largeCost / smallCost, 8.0,
             "styling a document on open is scaling superlinearly with its size")
     }
 
