@@ -32,11 +32,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The Rust crate sits one level below the repository root.
+///
+/// The path is baked into the test binary at compile time, so a `target/`
+/// carried across a move of this repository serves binaries pointing at a
+/// directory that no longer exists. Name the path when that happens —
+/// `NotFound` alone reads as a missing checkout.
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
         .join("..")
         .canonicalize()
-        .expect("repository root")
+        .unwrap_or_else(|e| panic!("repository root above {}: {e}", manifest.display()))
 }
 
 fn read(rel: &str) -> String {
