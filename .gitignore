@@ -6,6 +6,9 @@ core/include/markdev.h
 # Xcode — the project is generated from project.yml by `just generate`.
 MarkDev.xcodeproj/
 build/
+
+# Staged release zips (`just release-stage`); uploaded by the release workflow.
+dist/
 DerivedData/
 *.xcuserstate
 xcuserdata/

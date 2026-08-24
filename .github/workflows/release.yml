@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    name: Build, verify, and stage the release
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tools
+        run: brew install just xcodegen
+
+      - name: Build Release
+        run: just build-release
+
+      - name: Stage Artifact
+        run: just release-stage "${{ github.ref_name }}"
+
+      - name: Attach to Draft Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/*.zip --clobber
+          gh release view "$TAG" --json name,isDraft,url
