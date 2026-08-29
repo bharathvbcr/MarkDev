@@ -30,6 +30,10 @@ public struct MarkdownEditorView: NSViewRepresentable {
     /// reader is working in — on first appearance, and whenever it takes the
     /// keyboard. The writing tools attach to whatever arrives here.
     public var onSurface: ((MarkdownTextView) -> Void)?
+    /// Called when the selection changes with (words, characters).
+    public var onSelectionStats: ((Int, Int) -> Void)?
+    /// Called when a link is hovered or unhovered.
+    public var onHoveredLink: ((String?) -> Void)?
     /// Set to scroll the editor to an offset; applied once per request.
     public var reveal: RevealRequest?
 
@@ -41,7 +45,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
         onFollowWikiLink: ((String) -> Void)? = nil,
-        onSurface: ((MarkdownTextView) -> Void)? = nil
+        onSurface: ((MarkdownTextView) -> Void)? = nil,
+        onSelectionStats: ((Int, Int) -> Void)? = nil,
+        onHoveredLink: ((String?) -> Void)? = nil
     ) {
         self._text = text
         self.mode = mode
@@ -51,6 +57,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
         self.onSurface = onSurface
+        self.onSelectionStats = onSelectionStats
+        self.onHoveredLink = onHoveredLink
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -71,6 +79,12 @@ public struct MarkdownEditorView: NSViewRepresentable {
         }
         textView.onFollowWikiLink = { [weak coordinator = context.coordinator] target in
             coordinator?.onFollowWikiLink?(target)
+        }
+        textView.onSelectionStatsChanged = { [weak coordinator = context.coordinator] words, chars in
+            coordinator?.onSelectionStats?(words, chars)
+        }
+        textView.onHoveredLinkChanged = { [weak coordinator = context.coordinator] link in
+            coordinator?.onHoveredLink?(link)
         }
         textView.onFocus = { [weak coordinator = context.coordinator, weak textView] in
             guard let textView else { return }
@@ -98,7 +112,12 @@ public struct MarkdownEditorView: NSViewRepresentable {
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
         context.coordinator.onSurface = onSurface
+        context.coordinator.onSelectionStats = onSelectionStats
+        context.coordinator.onHoveredLink = onHoveredLink
         if textView.mode != mode { textView.mode = mode }
+        if textView.baseTheme.bodyFont != theme.bodyFont || textView.theme.lineSpacing != theme.lineSpacing {
+            textView.setBaseTheme(theme)
+        }
         // Assigning re-renders only on a genuine change; the property guards
         // itself, so a document switching folders repaints its images and one
         // that did not costs nothing.
@@ -128,6 +147,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
         let coordinator = Coordinator(text: $text, onParse: onParse)
         coordinator.onFollowWikiLink = onFollowWikiLink
         coordinator.onSurface = onSurface
+        coordinator.onSelectionStats = onSelectionStats
+        coordinator.onHoveredLink = onHoveredLink
         return coordinator
     }
 
@@ -137,6 +158,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
         var onParse: ((ParsedDocument) -> Void)?
         var onFollowWikiLink: ((String) -> Void)?
         var onSurface: ((MarkdownTextView) -> Void)?
+        var onSelectionStats: ((Int, Int) -> Void)?
+        var onHoveredLink: ((String?) -> Void)?
         var appliedReveal: UUID?
         weak var textView: MarkdownTextView?
 

@@ -63,12 +63,21 @@ public struct RenderContext: Equatable {
     public let mathFontSize: CGFloat
     /// Ink a formula is typeset in.
     public let textColor: NSColor
+    /// Display backing scale factor (e.g. 2.0 on Retina, 1.0 on standard display).
+    public let scale: CGFloat
 
-    public init(width: CGFloat, dark: Bool, mathFontSize: CGFloat, textColor: NSColor) {
+    public init(
+        width: CGFloat,
+        dark: Bool,
+        mathFontSize: CGFloat,
+        textColor: NSColor,
+        scale: CGFloat = 2.0
+    ) {
         self.width = width
         self.dark = dark
         self.mathFontSize = mathFontSize
         self.textColor = textColor
+        self.scale = scale
     }
 }
 
@@ -118,16 +127,9 @@ public final class RichContentRenderer {
         /// served whichever of the two the editor had already cached.
         var raster: Int = 0
         /// The ink the content was drawn with, for the paths that take one.
-        ///
-        /// A formula is typeset in the colour the caller passes, but the key
-        /// used to record only the *ambient* appearance — so two requests for
-        /// the same formula in different colours collided, and the second was
-        /// served the first one's bitmap. Nothing reaches that today, because
-        /// the one caller derives its colour from the same appearance the key
-        /// samples. That is a coincidence of the current call site rather than
-        /// anything this cache enforces, which is exactly the kind of thing
-        /// that stops being true quietly.
         var tint: Int = 0
+        /// Display backing scale factor (e.g. 20 for 2.0x Retina, 10 for 1.0x standard).
+        var backingScale: Int = 20
     }
 
     /// Packs a colour into a cache key.
@@ -237,11 +239,13 @@ public final class RichContentRenderer {
                 fontSize: request.context.mathFontSize,
                 color: request.context.textColor,
                 display: true,
-                maxWidth: request.context.width)
+                maxWidth: request.context.width,
+                scale: request.context.scale)
         case .diagram:
             return diagram(
                 request.block.source, maxWidth: request.context.width,
-                dark: request.context.dark)
+                dark: request.context.dark,
+                scale: request.context.scale)
         case .image:
             return image(
                 at: request.block.source, relativeTo: request.directory,
@@ -267,11 +271,11 @@ public final class RichContentRenderer {
             return key(
                 forMath: request.block.source, fontSize: request.context.mathFontSize,
                 color: request.context.textColor, display: true,
-                maxWidth: request.context.width)
+                maxWidth: request.context.width, scale: request.context.scale)
         case .diagram:
             return key(
                 forDiagram: request.block.source, maxWidth: request.context.width,
-                dark: request.context.dark, scale: Self.rasterScale)
+                dark: request.context.dark, scale: request.context.scale)
         case .image:
             return key(
                 forImage: resolve(request.block.source, relativeTo: request.directory)?.path
@@ -286,7 +290,7 @@ public final class RichContentRenderer {
 
     private func key(
         forMath latex: String, fontSize: CGFloat, color: NSColor, display: Bool,
-        maxWidth: CGFloat?
+        maxWidth: CGFloat?, scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Key {
         // The column is part of the key for the same reason it is for a
         // diagram: a formula wider than its column is scaled down to fit, so
@@ -307,7 +311,8 @@ public final class RichContentRenderer {
             scale: Self.bucket(fontSize * 10),
             dark: false,
             raster: Self.bucket(Self.sanitised(maxWidth) ?? 0),
-            tint: Self.tint(of: color))
+            tint: Self.tint(of: color),
+            backingScale: Self.bucket(scale * 10))
     }
 
     private func key(
@@ -315,7 +320,8 @@ public final class RichContentRenderer {
     ) -> Key {
         Key(
             kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark,
-            raster: Self.bucket(scale * 10))
+            raster: Self.bucket(scale * 10),
+            backingScale: Self.bucket(scale * 10))
     }
 
     /// - Parameter width: the drawn width from ``boundedWidth(_:_:)``, not the
@@ -523,13 +529,14 @@ public final class RichContentRenderer {
         fontSize: CGFloat,
         color: NSColor,
         display: Bool,
-        maxWidth: CGFloat? = nil
+        maxWidth: CGFloat? = nil,
+        scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Result<RenderedContent, RenderFailure> {
         let normalised = Self.canonicalMathSource(latex)
         let column = Self.sanitised(maxWidth)
         let key = key(
             forMath: latex, fontSize: fontSize, color: color, display: display,
-            maxWidth: maxWidth)
+            maxWidth: maxWidth, scale: scale)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
 
@@ -623,7 +630,7 @@ public final class RichContentRenderer {
         // they are set first — measured here as ink compressed into a sliver
         // of the bitmap, which reads as a formula rendered at the wrong size.
         label.frame = CGRect(origin: .zero, size: size)
-        guard let rep = Self.rasterise(label, at: size) else {
+        guard let rep = Self.rasterise(label, at: size, scale: scale) else {
             let failure = RenderFailure(reason: "Could not rasterise formula")
             store(failure, for: key)
             return .failure(failure)
@@ -648,11 +655,15 @@ public final class RichContentRenderer {
     /// symbols. Building the rep explicitly lets ``fittedScale`` cap the
     /// pixels the same way it caps them for diagrams and vectors, and keeps
     /// the Retina detail those paths get.
-    private static func rasterise(_ label: MTMathUILabel, at size: CGSize) -> NSBitmapImageRep? {
+    private static func rasterise(
+        _ label: MTMathUILabel,
+        at size: CGSize,
+        scale requestedScale: CGFloat = rasterScale
+    ) -> NSBitmapImageRep? {
         guard size.width.isFinite, size.height.isFinite, size.width >= 1, size.height >= 1 else {
             return nil
         }
-        let scale = fittedScale(rasterScale, for: size)
+        let scale = fittedScale(requestedScale, for: size)
         let pixelWidth = max(1, Int((size.width * scale).rounded()))
         let pixelHeight = max(1, Int((size.height * scale).rounded()))
         guard

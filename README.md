@@ -66,6 +66,25 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 
 ---
 
+## Markdown Syntax & Feature Matrix
+
+| Feature | Syntax | Status | Design Rationale |
+|---|---|---|---|
+| **Tables (GFM)** | `\| A \| B \|` | Supported | Auto-aligned via kerning without altering source text. |
+| **Footnotes** | `[^1]` / `[^1]: Note` | Supported | Rendered as superscript references with bidirectional navigation. |
+| **Task Lists** | `- [ ]` / `- [x]` | Supported | Interactive checkboxes in layout fragment gutters. |
+| **LaTeX Math** | `$x$` / `$$\int$$` | Supported | Typeset via `SwiftMath` using Latin Modern fonts. |
+| **Mermaid** | ```` ```mermaid ```` | Supported | Flowcharts, sequence, class, state, and ER diagrams. |
+| **GFM Callouts** | `> [!NOTE]` | Supported | Distinct styled border panels with accent tinting. |
+| **YAML Frontmatter**| `---` metadata | Supported | Scanned for tags/aliases and displayed cleanly. |
+| **Definition Lists**| `Term\n: Def` | Supported | Extended multi-line definitions. |
+| **Wikilinks** | `[[Note]]` | Supported | Vault-relative path resolution with alias support. |
+| **Strikethrough** | `~~text~~` | Supported | Standard GFM strikethrough styling. |
+| **Subscript / Tilde**| `~x~` | *Excluded* | Kept literal so `~x~` is not ambiguous with strikethrough. |
+| **Smart Punctuation**| `"` → `“` | *Excluded* | Disabled so UTF-16 code unit buffer offsets never drift. |
+
+---
+
 ## Performance Budgets
 
 MarkDev gates performance regressions in its test suite. The target is the

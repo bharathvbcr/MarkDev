@@ -87,6 +87,12 @@ struct WorkspaceView: View {
     /// Pending scroll-to-offset per pane, from the outline and from links.
     @State private var reveals: [PaneID: RevealRequest] = [:]
 
+    /// Active selection word and character statistics per pane.
+    @State private var selectionStats: [PaneID: (words: Int, chars: Int)] = [:]
+
+    /// Destination of hovered link per pane.
+    @State private var hoveredLinks: [PaneID: String] = [:]
+
     /// The note under the held Space bar, if any.
     @State private var peek: URL?
 
@@ -817,6 +823,12 @@ struct WorkspaceView: View {
                     workspace.focusedPane = pane
                     writingTools.attach(to: surface)
                     editorSurfaces[pane] = surface
+                },
+                onSelectionStats: { words, chars in
+                    selectionStats[pane] = (words, chars)
+                },
+                onHoveredLink: { link in
+                    hoveredLinks[pane] = link
                 }
             )
             .onTapGesture { workspace.focusedPane = pane }
@@ -824,7 +836,10 @@ struct WorkspaceView: View {
             StatusBar(
                 location: statusLocation(for: document),
                 hasUnsavedChanges: document?.hasUnsavedChanges ?? false,
-                stats: document.flatMap { documentStats[$0.id] } ?? .empty)
+                stats: document.flatMap { documentStats[$0.id] } ?? .empty,
+                selectedWords: selectionStats[pane]?.words,
+                selectedCharacters: selectionStats[pane]?.chars,
+                hoveredLink: hoveredLinks[pane])
         }
         .contentShape(Rectangle())
         .onTapGesture { workspace.focusedPane = pane }
@@ -1712,6 +1727,21 @@ struct WorkspaceView: View {
                 symbol: terminalPlacement == .drawer
                     ? "arrow.right.to.line" : "arrow.down.to.line",
                 kind: .action(.moveTerminal)),
+            Command(
+                title: "Zoom In", symbol: "plus.magnifyingglass",
+                kind: .action(.zoomIn), shortcut: "⌘+"),
+            Command(
+                title: "Zoom Out", symbol: "minus.magnifyingglass",
+                kind: .action(.zoomOut), shortcut: "⌘-"),
+            Command(
+                title: "Actual Size", symbol: "1.magnifyingglass",
+                kind: .action(.resetZoom), shortcut: "⌘0"),
+            Command(
+                title: "Export as HTML…", symbol: "square.and.arrow.up",
+                kind: .action(.exportHTML)),
+            Command(
+                title: "Print…", symbol: "printer",
+                kind: .action(.printDocument), shortcut: "⌘P"),
         ]
 
         if workspace.layout.paneCount > 1 {
@@ -1839,7 +1869,57 @@ struct WorkspaceView: View {
         case .askHarness: showAssist(engine: .harness)
         case .openHarnessTerminal: openHarnessTerminal()
         case .moveTerminal: setTerminalPlacement(terminalPlacement.other)
+        case .zoomIn:
+            editorSurfaces[workspace.focusedPane]?.zoomIn()
+        case .zoomOut:
+            editorSurfaces[workspace.focusedPane]?.zoomOut()
+        case .resetZoom:
+            editorSurfaces[workspace.focusedPane]?.resetZoom()
+        case .exportHTML:
+            exportHTML()
+        case .printDocument:
+            printDocument()
         }
+    }
+
+    private func exportHTML() {
+        guard let doc = workspace.document(in: workspace.focusedPane) else { return }
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.html]
+        savePanel.nameFieldStringValue = (doc.url?.deletingPathExtension().lastPathComponent ?? "Untitled") + ".html"
+        savePanel.begin { response in
+            guard response == .OK, let url = savePanel.url else { return }
+            let title = doc.url?.deletingPathExtension().lastPathComponent ?? "Document"
+            let htmlContent = """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>\(title)</title>
+            <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #24292e; background: #ffffff; }
+            @media (prefers-color-scheme: dark) { body { color: #c9d1d9; background: #0d1117; } a { color: #58a6ff; } pre { background: #161b22; } }
+            pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; }
+            code { font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, monospace; font-size: 85%; }
+            blockquote { margin: 0; padding: 0 1em; color: #6a737d; border-left: 0.25em solid #dfe2e5; }
+            table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+            th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }
+            th { background: #f6f8fa; }
+            </style>
+            </head>
+            <body>
+            <pre style="white-space: pre-wrap; font-family: inherit;">\(doc.text)</pre>
+            </body>
+            </html>
+            """
+            try? htmlContent.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func printDocument() {
+        guard let surface = editorSurfaces[workspace.focusedPane] else { return }
+        surface.printView(nil)
     }
 
     /// Starts a proofreading pass and shows where its results will appear.

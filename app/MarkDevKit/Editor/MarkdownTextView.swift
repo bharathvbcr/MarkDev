@@ -165,6 +165,46 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
 
+    /// Called when the selection changes, passing word and character counts of the selection.
+    public var onSelectionStatsChanged: ((Int, Int) -> Void)?
+
+    /// Called when hovering over a link, passing the link's target or nil when unhovered.
+    public var onHoveredLinkChanged: ((String?) -> Void)?
+
+    /// The base unscaled editor theme.
+    public private(set) var baseTheme: EditorTheme = .standard
+
+    /// The current zoom scaling factor.
+    public var zoomFactor: CGFloat = 1.0 {
+        didSet {
+            let clamped = min(max(zoomFactor, 0.6), 3.0)
+            if clamped != oldValue {
+                theme = baseTheme.scaled(by: clamped)
+            }
+        }
+    }
+
+    /// Sets the base theme and applies the current zoom level.
+    public func setBaseTheme(_ newTheme: EditorTheme) {
+        baseTheme = newTheme
+        theme = newTheme.scaled(by: zoomFactor)
+    }
+
+    /// Zooms in by 10%.
+    public func zoomIn() {
+        zoomFactor = min(zoomFactor + 0.1, 3.0)
+    }
+
+    /// Zooms out by 10%.
+    public func zoomOut() {
+        zoomFactor = max(zoomFactor - 0.1, 0.6)
+    }
+
+    /// Resets zoom to 100%.
+    public func resetZoom() {
+        zoomFactor = 1.0
+    }
+
     /// Directory the document lives in, for resolving relative image paths.
     ///
     /// Setting it re-renders, since every embedded image resolves against it.
@@ -382,6 +422,8 @@ public final class MarkdownTextView: ScrollingTextView {
         // repaint them its own blue-underlined default.
         linkTextAttributes = [:]
 
+        registerForDraggedTypes([.fileURL, .png, .tiff])
+
         if let storage = textStorage {
             NotificationCenter.default.addObserver(
                 self,
@@ -389,6 +431,94 @@ public final class MarkdownTextView: ScrollingTextView {
                 name: NSTextStorage.didProcessEditingNotification,
                 object: storage)
         }
+    }
+
+    // MARK: - Drag and Drop / Paste Images
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if hasDraggableImages(sender) {
+            return .copy
+        }
+        return super.draggingEntered(sender)
+    }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if hasDraggableImages(sender) {
+            return .copy
+        }
+        return super.draggingUpdated(sender)
+    }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let pboard = sender.draggingPasteboard
+        if let urls = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+            let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "heic", "tiff"])
+            let imageURLs = urls.filter { imageExtensions.contains($0.pathExtension.lowercased()) }
+            if !imageURLs.isEmpty {
+                let point = convert(sender.draggingLocation, from: nil)
+                let charIndex = characterIndexForInsertion(at: point)
+                var insertions: [String] = []
+                for url in imageURLs {
+                    let alt = url.deletingPathExtension().lastPathComponent
+                    let ref: String
+                    if let docDir = documentDirectory, url.path.hasPrefix(docDir.path) {
+                        let rel = url.path.replacingOccurrences(of: docDir.path, with: "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                        ref = rel
+                    } else {
+                        ref = url.path
+                    }
+                    insertions.append("![\(alt)](\(ref))")
+                }
+                let markdownToInsert = insertions.joined(separator: "\n")
+                if shouldChangeText(in: NSRange(location: charIndex, length: 0), replacementString: markdownToInsert) {
+                    textStorage?.replaceCharacters(in: NSRange(location: charIndex, length: 0), with: markdownToInsert)
+                    didChangeText()
+                    setSelectedRange(NSRange(location: charIndex + (markdownToInsert as NSString).length, length: 0))
+                    return true
+                }
+            }
+        }
+        return super.performDragOperation(sender)
+    }
+
+    private func hasDraggableImages(_ sender: NSDraggingInfo) -> Bool {
+        let pboard = sender.draggingPasteboard
+        if let types = pboard.types, types.contains(.fileURL) {
+            if let urls = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+                let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "heic", "tiff"])
+                return urls.contains { imageExtensions.contains($0.pathExtension.lowercased()) }
+            }
+        }
+        return false
+    }
+
+    public override func paste(_ sender: Any?) {
+        let pboard = NSPasteboard.general
+        if let image = NSImage(pasteboard: pboard), let tiff = image.tiffRepresentation,
+           let bitmap = NSBitmapImageRep(data: tiff), let pngData = bitmap.representation(using: .png, properties: [:]) {
+            if pboard.string(forType: .string) == nil {
+                let docDir = documentDirectory ?? FileManager.default.temporaryDirectory
+                let assetsDir = docDir.appendingPathComponent("assets", isDirectory: true)
+                try? FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withYear, .withMonth, .withDay, .withTime]
+                let timestamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
+                let filename = "pasted-image-\(timestamp).png"
+                let targetURL = assetsDir.appendingPathComponent(filename)
+                if (try? pngData.write(to: targetURL)) != nil {
+                    let relPath = "assets/\(filename)"
+                    let md = "![Pasted image](\(relPath))"
+                    let sel = selectedRange()
+                    if shouldChangeText(in: sel, replacementString: md) {
+                        textStorage?.replaceCharacters(in: sel, with: md)
+                        didChangeText()
+                        setSelectedRange(NSRange(location: sel.location + (md as NSString).length, length: 0))
+                        return
+                    }
+                }
+            }
+        }
+        super.paste(sender)
     }
 
     // MARK: - Content
@@ -891,21 +1021,77 @@ public final class MarkdownTextView: ScrollingTextView {
 
     // MARK: - Overrides
 
-    /// Follows a wikilink click.
-    ///
-    /// Only links using MarkDev's own scheme are handled here; anything else
-    /// falls through to AppKit, which opens ordinary URLs as expected.
+    /// Follows a wikilink, footnote reference, or in-document anchor jump.
     public override func clicked(onLink link: Any, at charIndex: Int) {
         let url: URL? =
             (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
-        guard let url, url.scheme == MarkdownStyler.wikiLinkScheme else {
+        guard let url else {
             super.clicked(onLink: link, at: charIndex)
             return
         }
-        // The target rides in the host, percent-decoded back to its raw form.
-        let target = (url.host(percentEncoded: false) ?? url.absoluteString)
-            .replacingOccurrences(of: "\(MarkdownStyler.wikiLinkScheme)://", with: "")
-        onFollowWikiLink?(target.removingPercentEncoding ?? target)
+
+        if url.scheme == MarkdownStyler.wikiLinkScheme {
+            let target = (url.host(percentEncoded: false) ?? url.absoluteString)
+                .replacingOccurrences(of: "\(MarkdownStyler.wikiLinkScheme)://", with: "")
+            onFollowWikiLink?(target.removingPercentEncoding ?? target)
+            return
+        }
+
+        if url.scheme == MarkdownStyler.footnoteScheme {
+            let target = (url.host(percentEncoded: false) ?? url.absoluteString)
+                .replacingOccurrences(of: "\(MarkdownStyler.footnoteScheme)://", with: "")
+            jumpToFootnote(target.removingPercentEncoding ?? target)
+            return
+        }
+
+        let linkStr = url.absoluteString
+        if linkStr.hasPrefix("#") || url.scheme == nil {
+            let anchor = linkStr.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+            if jumpToHeading(anchor: anchor) { return }
+        }
+
+        super.clicked(onLink: link, at: charIndex)
+    }
+
+    /// Scrolls to the definition of a footnote `[^ref]`, or back from definition to reference.
+    public func jumpToFootnote(_ ref: String) {
+        guard let storage = textStorage else { return }
+        let text = storage.string as NSString
+        let needle = "[^\(ref)]:"
+        let range = text.range(of: needle)
+        if range.location != NSNotFound {
+            setSelectedRange(NSRange(location: range.location, length: 0))
+            scrollRangeToVisible(range)
+            return
+        }
+        // Fallback: search for [^ref]
+        let fallbackNeedle = "[^\(ref)]"
+        let fallbackRange = text.range(of: fallbackNeedle)
+        if fallbackRange.location != NSNotFound {
+            setSelectedRange(NSRange(location: fallbackRange.location, length: 0))
+            scrollRangeToVisible(fallbackRange)
+        }
+    }
+
+    /// Scrolls to the heading with matching slug or title.
+    @discardableResult
+    public func jumpToHeading(anchor: String) -> Bool {
+        guard let storage = textStorage else { return false }
+        let text = storage.string as NSString
+        let normalisedAnchor = anchor.lowercased().replacingOccurrences(of: "-", with: " ")
+        for block in parsed.blocks where block.kind == .heading {
+            let range = NSIntersectionRange(block.range, NSRange(location: 0, length: text.length))
+            guard range.length > 0 else { continue }
+            let line = text.substring(with: range).lowercased()
+            let headingText = line.trimmingCharacters(in: CharacterSet(charactersIn: "# \t\r\n"))
+            let slug = headingText.replacingOccurrences(of: " ", with: "-")
+            if headingText == normalisedAnchor || slug == anchor.lowercased() || headingText.contains(normalisedAnchor) {
+                setSelectedRange(NSRange(location: range.location, length: 0))
+                scrollRangeToVisible(range)
+                return true
+            }
+        }
+        return false
     }
 
     /// Ticks a checkbox when one is clicked, before the caret moves.
@@ -1215,6 +1401,19 @@ public final class MarkdownTextView: ScrollingTextView {
         }
 
         super.setSelectedRanges(adjusted, affinity: affinity, stillSelecting: stillSelecting)
+
+        if let storage = textStorage {
+            let sel = adjusted.first?.rangeValue ?? NSRange(location: 0, length: 0)
+            let clamped = NSIntersectionRange(sel, NSRange(location: 0, length: storage.length))
+            if sel.length > 0, clamped.length > 0 {
+                let selectedString = (storage.string as NSString).substring(with: clamped)
+                let words = selectedString.split(whereSeparator: { $0.isWhitespace }).count
+                let chars = selectedString.count
+                onSelectionStatsChanged?(words, chars)
+            } else {
+                onSelectionStatsChanged?(0, 0)
+            }
+        }
 
         // Safe to style from `parsed` here: a text change reparses inside the
         // storage's own edit cycle, which finishes before AppKit moves the
@@ -1808,6 +2007,16 @@ extension MarkdownTextView {
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         observeScrolling()
+        if window != nil {
+            needsLayout = true
+            needsDisplay = true
+        }
+    }
+
+    public override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+        needsDisplay = true
     }
 
     /// Watches the viewport so hover can be re-tested when the page moves.
@@ -1854,6 +2063,29 @@ extension MarkdownTextView {
 
     /// Lights the chip under the pointer, and puts out the one that was.
     func updateHover(at point: CGPoint?) {
+        if let point, let storage = textStorage, storage.length > 0 {
+            let charIndex = characterIndexForInsertion(at: point)
+            if charIndex >= 0 && charIndex < storage.length {
+                if let linkAttr = storage.attribute(.link, at: charIndex, effectiveRange: nil) {
+                    let dest: String
+                    if let url = linkAttr as? URL {
+                        dest = url.absoluteString
+                    } else if let str = linkAttr as? String {
+                        dest = str
+                    } else {
+                        dest = "\(linkAttr)"
+                    }
+                    onHoveredLinkChanged?(dest)
+                } else {
+                    onHoveredLinkChanged?(nil)
+                }
+            } else {
+                onHoveredLinkChanged?(nil)
+            }
+        } else {
+            onHoveredLinkChanged?(nil)
+        }
+
         let hit = point.flatMap { blockControl(at: $0) }
         guard hit?.control != hoveredControl || hit?.fragment !== hoveredControlFragment else {
             return
@@ -1870,6 +2102,116 @@ extension MarkdownTextView {
             redraw(fragment)
             NSCursor.arrow.set()
         }
+    }
+
+    // MARK: - Table Key Navigation
+
+    public override func insertTab(_ sender: Any?) {
+        if handleTableTab(forward: true) { return }
+        super.insertTab(sender)
+    }
+
+    public override func insertBacktab(_ sender: Any?) {
+        if handleTableTab(forward: false) { return }
+        super.insertBacktab(sender)
+    }
+
+    public override func insertNewline(_ sender: Any?) {
+        if handleTableNewline() { return }
+        super.insertNewline(sender)
+    }
+
+    private func handleTableTab(forward: Bool) -> Bool {
+        guard let storage = textStorage else { return false }
+        let text = storage.string as NSString
+        let selection = selectedRange()
+        guard selection.location <= text.length else { return false }
+
+        let lineRange = text.lineRange(for: NSRange(location: min(selection.location, max(text.length - 1, 0)), length: 0))
+        let line = text.substring(with: lineRange)
+        guard line.contains("|") else { return false }
+
+        var pipes: [Int] = []
+        for (i, char) in line.enumerated() {
+            if char == "|" {
+                pipes.append(lineRange.location + i)
+            }
+        }
+        guard pipes.count >= 2 else { return false }
+
+        if forward {
+            if let nextPipe = pipes.first(where: { $0 > selection.location }) {
+                let cellStart = nextPipe + 1
+                let targetLoc = min(cellStart + 1, text.length)
+                setSelectedRange(NSRange(location: targetLoc, length: 0))
+                return true
+            } else {
+                let nextLineLoc = lineRange.location + lineRange.length
+                if nextLineLoc < text.length {
+                    let nextLineRange = text.lineRange(for: NSRange(location: nextLineLoc, length: 0))
+                    let nextLine = text.substring(with: nextLineRange)
+                    if nextLine.contains("|"), let firstPipe = nextLine.firstIndex(of: "|") {
+                        let pipeOffset = nextLine.distance(from: nextLine.startIndex, to: firstPipe)
+                        setSelectedRange(NSRange(location: min(nextLineRange.location + pipeOffset + 2, text.length), length: 0))
+                        return true
+                    }
+                }
+                let colCount = max(pipes.count - 1, 1)
+                let newRow = "\n|" + String(repeating: "  |", count: colCount)
+                if shouldChangeText(in: NSRange(location: lineRange.location + lineRange.length, length: 0), replacementString: newRow) {
+                    storage.replaceCharacters(in: NSRange(location: lineRange.location + lineRange.length, length: 0), with: newRow)
+                    didChangeText()
+                    setSelectedRange(NSRange(location: lineRange.location + lineRange.length + 3, length: 0))
+                    return true
+                }
+            }
+        } else {
+            let prevPipes = pipes.filter { $0 < selection.location }
+            if prevPipes.count >= 2 {
+                let targetPipe = prevPipes[prevPipes.count - 2]
+                setSelectedRange(NSRange(location: min(targetPipe + 2, text.length), length: 0))
+                return true
+            } else if prevPipes.count == 1 {
+                setSelectedRange(NSRange(location: min(prevPipes[0] + 2, text.length), length: 0))
+                return true
+            }
+        }
+        return false
+    }
+
+    private func handleTableNewline() -> Bool {
+        guard let storage = textStorage else { return false }
+        let text = storage.string as NSString
+        let selection = selectedRange()
+        guard selection.location <= text.length else { return false }
+
+        let lineRange = text.lineRange(for: NSRange(location: min(selection.location, max(text.length - 1, 0)), length: 0))
+        let line = text.substring(with: lineRange)
+        guard line.contains("|") else { return false }
+
+        let pipeCount = line.filter { $0 == "|" }.count
+        guard pipeCount >= 2 else { return false }
+        let colCount = max(pipeCount - 1, 1)
+
+        let stripped = line.replacingOccurrences(of: "|", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped.isEmpty && !line.contains("---") {
+            if shouldChangeText(in: lineRange, replacementString: "\n") {
+                storage.replaceCharacters(in: lineRange, with: "\n")
+                didChangeText()
+                setSelectedRange(NSRange(location: lineRange.location + 1, length: 0))
+                return true
+            }
+        }
+
+        let newRow = "\n|" + String(repeating: "  |", count: colCount)
+        let insertLoc = lineRange.location + lineRange.length
+        if shouldChangeText(in: NSRange(location: insertLoc, length: 0), replacementString: newRow) {
+            storage.replaceCharacters(in: NSRange(location: insertLoc, length: 0), with: newRow)
+            didChangeText()
+            setSelectedRange(NSRange(location: insertLoc + 3, length: 0))
+            return true
+        }
+        return false
     }
 }
 
@@ -2006,15 +2348,17 @@ extension MarkdownTextView {
         RenderRequest(block: block, directory: documentDirectory, context: renderContext)
     }
 
-    /// The width, appearance and ink content is rendered against.
+    /// The width, appearance, backing scale, and ink content is rendered against.
     public var renderContext: RenderContext {
-        RenderContext(
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        return RenderContext(
             // The column the content has to fit, minus the panel's own padding,
             // quantised — see `renderWidth(for:)`.
             width: Self.renderWidth(for: bounds.width - theme.insets.width * 2 - 32),
             dark: effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua,
             mathFontSize: theme.bodyFont.pointSize * 1.25,
-            textColor: resolvedInk)
+            textColor: resolvedInk,
+            scale: scale)
     }
 
     /// The document's ink, resolved to a concrete colour *against this view's

@@ -43,6 +43,10 @@ struct MarkDevApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .commands { WorkspaceCommands() }
+
+        Settings {
+            SettingsView()
+        }
     }
 
     private func openWorkspaceWindow() {

@@ -47,6 +47,16 @@ public enum CommandAction: Sendable, Equatable {
     case openHarnessTerminal
     /// Swap the terminal between the drawer and the inspector.
     case moveTerminal
+    /// Zooms text in.
+    case zoomIn
+    /// Zooms text out.
+    case zoomOut
+    /// Resets text zoom to 100%.
+    case resetZoom
+    /// Exports the current document as HTML.
+    case exportHTML
+    /// Prints or exports the current document as PDF.
+    case printDocument
 }
 
 /// Something the palette can run.

@@ -140,6 +140,29 @@ final class BlockDecorationPaletteStore: @unchecked Sendable {
 final class MarkdownLayoutFragment: NSTextLayoutFragment {
     var decoration: BlockDecoration = .none
 
+    // MARK: - Accessibility
+
+    func accessibilityLabel() -> String? {
+        if let rendered = decoration.rendered {
+            switch rendered.kind {
+            case .math:
+                return "Math formula: \(rendered.source)"
+            case .diagram:
+                return "Mermaid diagram: \(rendered.source)"
+            case .image(let alt):
+                return alt.isEmpty ? "Image: \(rendered.source)" : alt
+            }
+        }
+        return nil
+    }
+
+    func accessibilityRole() -> NSAccessibility.Role? {
+        if decoration.rendered != nil {
+            return .image
+        }
+        return nil
+    }
+
     /// The view whose palette store this fragment draws from.
     ///
     /// Weak, mirroring ``MarkdownTextView/controlFragments``: TextKit owns

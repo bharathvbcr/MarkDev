@@ -84,6 +84,11 @@ struct WorkspaceCommands: Commands {
                 "Save As…", action: .saveAs, key: "s", modifiers: [.command, .shift])
         }
 
+        CommandGroup(after: .saveItem) {
+            actionButton("Export as HTML…", action: .exportHTML)
+            actionButton("Print…", action: .printDocument, key: "p")
+        }
+
         // Find travels the responder chain to whichever text view is first
         // responder, rather than through the workspace handler: the editor is
         // an `NSTextView` and already owns a find bar, so the menu's whole job
@@ -102,6 +107,12 @@ struct WorkspaceCommands: Commands {
                 .keyboardShortcut("g", modifiers: [.command, .shift])
             Button("Use Selection for Find") { performFindAction(.setSearchString) }
                 .keyboardShortcut("e")
+        }
+
+        CommandMenu("View") {
+            actionButton("Zoom In", action: .zoomIn, key: "=")
+            actionButton("Zoom Out", action: .zoomOut, key: "-")
+            actionButton("Actual Size", action: .resetZoom, key: "0")
         }
 
         CommandMenu("Editor") {

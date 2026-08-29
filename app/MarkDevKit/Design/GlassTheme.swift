@@ -133,15 +133,29 @@ public struct GlassPanel: ViewModifier {
     var interactive: Bool
     var padding: EdgeInsets
 
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
     public func body(content: Content) -> some View {
+        if reduceTransparency {
+            return AnyView(
+                content
+                    .padding(padding)
+                    .background(
+                        RoundedRectangle(cornerRadius: radius)
+                            .fill(Color(nsColor: .windowBackgroundColor))
+                    )
+            )
+        }
+
         var glass = Glass.regular
         if let tint { glass = glass.tint(tint) }
         if interactive { glass = glass.interactive() }
 
-        return
+        return AnyView(
             content
-            .padding(padding)
-            .glassEffect(glass, in: .rect(cornerRadius: radius))
+                .padding(padding)
+                .glassEffect(glass, in: .rect(cornerRadius: radius))
+        )
     }
 }
 

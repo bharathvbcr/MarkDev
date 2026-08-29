@@ -71,6 +71,52 @@ public struct EditorTheme {
         markerColor: .tertiaryLabelColor
     )
 
+    public static let serif = EditorTheme(
+        bodyFont: NSFont(name: "Georgia", size: 16) ?? .systemFont(ofSize: 16),
+        monoFont: .monospacedSystemFont(ofSize: 13.5, weight: .regular),
+        headingScale: [1.9, 1.55, 1.3, 1.15, 1.05, 1.0],
+        lineSpacing: 6,
+        paragraphSpacing: 14,
+        contentWidth: 720,
+        insets: NSSize(width: 32, height: 28),
+        textColor: .labelColor,
+        secondaryColor: .secondaryLabelColor,
+        accentColor: .controlAccentColor,
+        codeColor: .systemPink,
+        codeBackground: EditorTheme.adaptive(
+            "codeSurface",
+            light: NSColor(white: 0, alpha: 0.045),
+            dark: NSColor(white: 1, alpha: 0.075)),
+        linkColor: .linkColor,
+        tagColor: .systemTeal,
+        highlightBackground: NSColor.systemYellow.withAlphaComponent(0.28),
+        quoteColor: .secondaryLabelColor,
+        markerColor: .tertiaryLabelColor
+    )
+
+    public static let mono = EditorTheme(
+        bodyFont: .monospacedSystemFont(ofSize: 14, weight: .regular),
+        monoFont: .monospacedSystemFont(ofSize: 13.5, weight: .regular),
+        headingScale: [1.6, 1.4, 1.25, 1.15, 1.05, 1.0],
+        lineSpacing: 4,
+        paragraphSpacing: 10,
+        contentWidth: 780,
+        insets: NSSize(width: 32, height: 28),
+        textColor: .labelColor,
+        secondaryColor: .secondaryLabelColor,
+        accentColor: .controlAccentColor,
+        codeColor: .systemPink,
+        codeBackground: EditorTheme.adaptive(
+            "codeSurface",
+            light: NSColor(white: 0, alpha: 0.045),
+            dark: NSColor(white: 1, alpha: 0.075)),
+        linkColor: .linkColor,
+        tagColor: .systemTeal,
+        highlightBackground: NSColor.systemYellow.withAlphaComponent(0.28),
+        quoteColor: .secondaryLabelColor,
+        markerColor: .tertiaryLabelColor
+    )
+
     public init(
         bodyFont: NSFont,
         monoFont: NSFont,
@@ -109,10 +155,25 @@ public struct EditorTheme {
         self.markerColor = markerColor
     }
 
+    /// Returns a new theme with font sizes and line spacings scaled by `factor`.
+    public func scaled(by factor: CGFloat) -> EditorTheme {
+        let clampedFactor = min(max(factor, 0.6), 3.0)
+        let scaledBody = NSFont(descriptor: bodyFont.fontDescriptor, size: max((bodyFont.pointSize * clampedFactor).rounded(), 9)) ?? bodyFont
+        let scaledMono = NSFont(descriptor: monoFont.fontDescriptor, size: max((monoFont.pointSize * clampedFactor).rounded(), 8)) ?? monoFont
+        var copy = self
+        copy.bodyFont = scaledBody
+        copy.monoFont = scaledMono
+        copy.lineSpacing = max(lineSpacing * clampedFactor, 1)
+        copy.paragraphSpacing = max(paragraphSpacing * clampedFactor, 2)
+        return copy
+    }
+
     /// Bold heading font for `level` (1–6).
     public func headingFont(level: Int) -> NSFont {
         let index = min(max(level, 1), headingScale.count) - 1
-        return .boldSystemFont(ofSize: bodyFont.pointSize * headingScale[index])
+        let size = bodyFont.pointSize * headingScale[index]
+        let desc = bodyFont.fontDescriptor.withSymbolicTraits(.bold)
+        return NSFont(descriptor: desc, size: size) ?? .boldSystemFont(ofSize: size)
     }
 
     // MARK: - Derived surfaces
@@ -123,15 +184,27 @@ public struct EditorTheme {
     // own background, and would make every call site of the initialiser churn
     // whenever the renderer learns to draw one more thing.
 
-    /// A colour that resolves differently in light and dark appearance.
+    /// A colour that resolves differently in light and dark appearance,
+    /// and adapts when Increase Contrast is active in system Accessibility settings.
     ///
     /// The semantic `NSColor` statics are the right default for *text*, but
     /// the decoration surfaces need known ink levels: composing an alpha onto
     /// an already-translucent semantic colour multiplies the two, and the
     /// result is a panel nobody can see.
-    static func adaptive(_ name: String, light: NSColor, dark: NSColor) -> NSColor {
+    static func adaptive(
+        _ name: String,
+        light: NSColor,
+        dark: NSColor,
+        highContrastLight: NSColor? = nil,
+        highContrastDark: NSColor? = nil
+    ) -> NSColor {
         NSColor(name: NSColor.Name(name)) { appearance in
-            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+                if isDark, let hc = highContrastDark { return hc }
+                if !isDark, let hc = highContrastLight { return hc }
+            }
+            return isDark ? dark : light
         }
     }
 
@@ -151,7 +224,9 @@ public struct EditorTheme {
         Self.adaptive(
             "codeBorder",
             light: NSColor(white: 0, alpha: 0.11),
-            dark: NSColor(white: 1, alpha: 0.14))
+            dark: NSColor(white: 1, alpha: 0.14),
+            highContrastLight: NSColor(white: 0, alpha: 0.45),
+            highContrastDark: NSColor(white: 1, alpha: 0.50))
     }
 
     /// Fill behind a table's header row.
@@ -159,7 +234,9 @@ public struct EditorTheme {
         Self.adaptive(
             "tableHeader",
             light: NSColor(white: 0, alpha: 0.065),
-            dark: NSColor(white: 1, alpha: 0.10))
+            dark: NSColor(white: 1, alpha: 0.10),
+            highContrastLight: NSColor(white: 0, alpha: 0.22),
+            highContrastDark: NSColor(white: 1, alpha: 0.28))
     }
 
     /// Fill behind alternate body rows. Faint on purpose: banding should help
@@ -168,7 +245,9 @@ public struct EditorTheme {
         Self.adaptive(
             "tableStripe",
             light: NSColor(white: 0, alpha: 0.028),
-            dark: NSColor(white: 1, alpha: 0.05))
+            dark: NSColor(white: 1, alpha: 0.05),
+            highContrastLight: NSColor(white: 0, alpha: 0.12),
+            highContrastDark: NSColor(white: 1, alpha: 0.16))
     }
 
     /// The grid's own lines.
@@ -176,7 +255,9 @@ public struct EditorTheme {
         Self.adaptive(
             "tableBorder",
             light: NSColor(white: 0, alpha: 0.14),
-            dark: NSColor(white: 1, alpha: 0.17))
+            dark: NSColor(white: 1, alpha: 0.17),
+            highContrastLight: NSColor(white: 0, alpha: 0.48),
+            highContrastDark: NSColor(white: 1, alpha: 0.55))
     }
 
     /// Fill behind a block's copy or zoom chip.

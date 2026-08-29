@@ -29,55 +29,85 @@ public struct StatusBar: View {
     public let location: String?
     public let hasUnsavedChanges: Bool
     public let stats: DocumentStats
+    public let selectedWords: Int?
+    public let selectedCharacters: Int?
+    public let hoveredLink: String?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(location: String?, hasUnsavedChanges: Bool, stats: DocumentStats) {
+    public init(
+        location: String?,
+        hasUnsavedChanges: Bool,
+        stats: DocumentStats,
+        selectedWords: Int? = nil,
+        selectedCharacters: Int? = nil,
+        hoveredLink: String? = nil
+    ) {
         self.location = location
         self.hasUnsavedChanges = hasUnsavedChanges
         self.stats = stats
+        self.selectedWords = selectedWords
+        self.selectedCharacters = selectedCharacters
+        self.hoveredLink = hoveredLink
     }
 
     public var body: some View {
         HStack(spacing: GlassTheme.Spacing.tight) {
-            Image(systemName: location == nil ? "doc" : "doc.text")
-                .imageScale(.small)
-                .foregroundStyle(.tertiary)
+            if let hoveredLink, !hoveredLink.isEmpty {
+                Image(systemName: "link")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
 
-            Text(location ?? "Unsaved document")
-                .lineLimit(1)
-                .truncationMode(.head)
-                .foregroundStyle(.secondary)
-                .help(location ?? "This document has never been saved.")
-
-            if hasUnsavedChanges {
-                Text("Edited")
+                Text(hoveredLink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: location == nil ? "doc" : "doc.text")
+                    .imageScale(.small)
                     .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(
-                        Capsule().fill(Color.primary.opacity(0.07)))
-                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+
+                Text(location ?? "Unsaved document")
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .foregroundStyle(.secondary)
+                    .help(location ?? "This document has never been saved.")
+
+                if hasUnsavedChanges {
+                    Text("Edited")
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(
+                            Capsule().fill(Color.primary.opacity(0.07)))
+                        .transition(.scale(scale: 0.7).combined(with: .opacity))
+                }
             }
 
             Spacer(minLength: GlassTheme.Spacing.snug)
 
-            // A pane in a four-way split is narrow. Rather than truncating the
-            // counts — which turns a number into a lie — drop whole measures
-            // until what is left fits.
-            ViewThatFits(in: .horizontal) {
-                counts(showingCharacters: true, showingReadingTime: true)
-                counts(showingCharacters: false, showingReadingTime: true)
-                counts(showingCharacters: false, showingReadingTime: false)
-                Text(compactWordCount)
+            if let selectedWords, selectedWords > 0 {
+                Text("\(selectedWords) of \(stats.words) words")
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            } else {
+                // A pane in a four-way split is narrow. Rather than truncating the
+                // counts — which turns a number into a lie — drop whole measures
+                // until what is left fits.
+                ViewThatFits(in: .horizontal) {
+                    counts(showingCharacters: true, showingReadingTime: true)
+                    counts(showingCharacters: false, showingReadingTime: true)
+                    counts(showingCharacters: false, showingReadingTime: false)
+                    Text(compactWordCount)
+                }
+                .foregroundStyle(.tertiary)
+                .monospacedDigit()
+                // Counts arrive on a debounce, in jumps. Rolling the digits shows
+                // that the number moved rather than swapping one still frame for
+                // another at the corner of the eye.
+                .contentTransition(.numericText())
+                .fixedSize()
             }
-            .foregroundStyle(.tertiary)
-            .monospacedDigit()
-            // Counts arrive on a debounce, in jumps. Rolling the digits shows
-            // that the number moved rather than swapping one still frame for
-            // another at the corner of the eye.
-            .contentTransition(.numericText())
-            .fixedSize()
         }
         .font(.caption)
         .animation(

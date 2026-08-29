@@ -713,15 +713,36 @@ public enum MarkdownStyler {
                 break
             case .image:
                 storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
-            case .footnoteReference, .taskMarker, .inlineHTML:
+            case .footnoteReference:
+                let superFont = NSFont.systemFont(
+                    ofSize: max((theme.bodyFont.pointSize * 0.75).rounded(), 9),
+                    weight: .semibold)
+                storage.addAttributes([
+                    .font: superFont,
+                    .baselineOffset: theme.bodyFont.pointSize * 0.35,
+                    .foregroundColor: theme.accentColor
+                ], range: range)
+            case .superscript:
+                let superFont = NSFont.systemFont(
+                    ofSize: max((theme.bodyFont.pointSize * 0.8).rounded(), 9))
+                storage.addAttributes([
+                    .font: superFont,
+                    .baselineOffset: theme.bodyFont.pointSize * 0.35
+                ], range: range)
+            case .subscript:
+                let subFont = NSFont.systemFont(
+                    ofSize: max((theme.bodyFont.pointSize * 0.8).rounded(), 9))
+                storage.addAttributes([
+                    .font: subFont,
+                    .baselineOffset: -theme.bodyFont.pointSize * 0.2
+                ], range: range)
+            case .taskMarker, .inlineHTML:
                 storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
-            case .superscript, .subscript:
-                break
             }
         }
     }
 
-    /// Tags wikilinks with a `.link` attribute carrying their target.
+    /// Tags links, wikilinks, and footnotes with a `.link` attribute carrying their target.
     ///
     /// Using AppKit's own link attribute rather than hand-rolled hit testing
     /// buys the pointing-hand cursor, `clickedOnLink` routing, and
@@ -734,23 +755,62 @@ public enum MarkdownStyler {
         limit: NSRange,
         scope: NSRange
     ) {
-        for span in document.spans where span.kind == .wikiLink {
+        for span in document.spans {
             let range = NSIntersectionRange(clamp(span.range, to: limit), scope)
             guard range.length > 0 else { continue }
-            guard let target = document.target(for: span) else { continue }
-            guard
-                let encoded = target.addingPercentEncoding(
-                    withAllowedCharacters: .urlPathAllowed),
-                let url = URL(string: "\(MarkdownStyler.wikiLinkScheme)://\(encoded)")
-            else { continue }
-            storage.addAttribute(.link, value: url, range: range)
+
+            switch span.kind {
+            case .wikiLink:
+                guard let target = document.target(for: span) else { continue }
+                guard
+                    let encoded = target.addingPercentEncoding(
+                        withAllowedCharacters: .urlPathAllowed),
+                    let url = URL(string: "\(MarkdownStyler.wikiLinkScheme)://\(encoded)")
+                else { continue }
+                storage.addAttribute(.link, value: url, range: range)
+
+            case .footnoteReference:
+                let refText: String
+                if let target = document.target(for: span), !target.isEmpty {
+                    refText = target
+                } else {
+                    let clamped = clamp(span.range, to: limit)
+                    guard clamped.length > 0 else { continue }
+                    let raw = (storage.string as NSString).substring(with: clamped)
+                    refText = raw.trimmingCharacters(in: CharacterSet(charactersIn: "[^]"))
+                }
+                guard
+                    let encoded = refText.addingPercentEncoding(
+                        withAllowedCharacters: .urlPathAllowed),
+                    let url = URL(string: "\(MarkdownStyler.footnoteScheme)://\(encoded)")
+                else { continue }
+                storage.addAttribute(.link, value: url, range: range)
+
+            case .link:
+                guard let target = document.target(for: span), !target.isEmpty else { continue }
+                let url: URL?
+                if let direct = URL(string: target), direct.scheme != nil {
+                    url = direct
+                } else if let encoded = target.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+                    url = URL(string: encoded)
+                } else {
+                    url = nil
+                }
+                if let url {
+                    storage.addAttribute(.link, value: url, range: range)
+                }
+
+            default:
+                break
+            }
         }
     }
 
-    /// URL scheme used to carry a wikilink target through AppKit's link
-    /// machinery. Never registered with the system — it exists only so
-    /// `clickedOnLink` can recognise its own links.
+    /// URL scheme used to carry a wikilink target through AppKit's link machinery.
     public static let wikiLinkScheme = "markdev-wiki"
+
+    /// URL scheme used to carry footnote navigation targets through AppKit's link machinery.
+    public static let footnoteScheme = "markdev-footnote"
 
     @MainActor
     private static func applyMarkers(
