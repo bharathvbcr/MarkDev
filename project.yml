@@ -20,12 +20,12 @@ settings:
     # interface references CMarkDev, so every dependent target must be able
     # to resolve the module too.
     SWIFT_INCLUDE_PATHS: $(SRCROOT)/core/include
-    MARKETING_VERSION: "0.0.3"
+    MARKETING_VERSION: "0.1.4"
     # Launch Services caches document-icon artwork per bundle *version*, not
     # per build: changing the icon without bumping this leaves Finder showing
     # the old icon indefinitely. Bump when the type declarations or the icon
     # assets change.
-    CURRENT_PROJECT_VERSION: "8"
+    CURRENT_PROJECT_VERSION: "9"
     ONLY_ACTIVE_ARCH: true
     # Off for as long as the identity below is ad-hoc, and flipped back on in
     # the same change that introduces a real one — the two are one decision,
@@ -128,6 +128,8 @@ targets:
       properties:
         CFBundleName: MarkDev
         CFBundleDisplayName: MarkDev
+        # Embedded at build time; staging rejects bundles from another commit.
+        MarkDevSourceCommit: $(MARKDEV_SOURCE_COMMIT)
         CFBundlePackageType: APPL
         LSMinimumSystemVersion: "26.0"
         # xcodegen bakes its own CFBundleVersion of "1" unless told otherwise,

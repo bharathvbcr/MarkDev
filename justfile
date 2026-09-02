@@ -91,7 +91,7 @@ build: build-core-debug generate
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation build
 
 build-release: build-core generate
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release -skipPackagePluginValidation build
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" -skipPackagePluginValidation build
 
 # A Release signed with a real identity.
 #
@@ -152,6 +152,7 @@ build-release-signed IDENTITY="Apple Development": build-core generate
     # Manual signing: a Mac app with no team-restricted entitlements needs no
     # provisioning profile, and automatic signing would insist on fetching one.
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release \
+        MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" \
         CODE_SIGN_IDENTITY="{{IDENTITY}}" \
         DEVELOPMENT_TEAM="$team" \
         CODE_SIGN_STYLE=Manual \
@@ -227,58 +228,27 @@ preview-status:
 
 # --- Release ---------------------------------------------------------------
 
-# Guard: a release tag must equal the app's marketing version.
-#
-# A tag disagreeing with project.yml ships a bundle whose About box and
-# Launch Services record tell a different story than the release says.
-# Refuses loudly naming both values rather than letting the mismatch through;
-# the release workflow calls this before building anything.
-verify-tag TAG:
-    #!/usr/bin/env zsh
-    set -euo pipefail
-    marketing=$(sed -n 's/^ *MARKETING_VERSION: *"\([^"]*\)".*/\1/p' project.yml)
-    build=$(sed -n 's/^ *CURRENT_PROJECT_VERSION: *"\([^"]*\)".*/\1/p' project.yml)
-    if [[ -z "$marketing" || -z "$build" ]]; then
-        echo "could not read MARKETING_VERSION / CURRENT_PROJECT_VERSION from project.yml" >&2
-        exit 1
-    fi
-    if [[ "{{TAG}}" != "v$marketing" ]]; then
-        echo "tag {{TAG}} does not match MARKETING_VERSION $marketing (expected v$marketing)" >&2
-        exit 1
-    fi
-    echo "{{TAG}}: marketing $marketing, build $build"
+# Release arguments are environment values, never interpolated shell source.
+verify-tag $TAG:
+    python3 tools/release/release.py verify-tag "$TAG"
 
-# Stage a release zip from a built Release configuration.
-#
-# Runs after `just build-release`. Verifies the tag against project.yml, the
-# bundle against codesign and its own Info.plist, then packages under the
-# canonical asset name into dist/. The release workflow uploads from there to
-# a *draft* GitHub release; publishing stays a human decision.
-release-stage TAG: (verify-tag TAG)
-    #!/usr/bin/env zsh
-    set -euo pipefail
-    tag='{{TAG}}'
-    ver=${tag#v}
-    products=$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev \
-        -configuration Release -showBuildSettings 2>/dev/null \
-        | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')
-    app="$products/MarkDev.app"
-    if [[ ! -d "$app" ]]; then
-        echo "no MarkDev.app under $products — run just build-release first" >&2
-        exit 1
-    fi
-    codesign --verify --deep --strict "$app"
-    version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
-    build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-    if [[ "$version" != "$ver" ]]; then
-        echo "bundle CFBundleShortVersionString $version does not match tag $tag" >&2
-        exit 1
-    fi
-    rm -rf dist
-    mkdir -p dist
-    zip="dist/MarkDev-$ver-macos.zip"
-    ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
-    echo "staged $zip (version $version, build $build)"
+release-preflight $TAG:
+    python3 tools/release/release.py preflight "$TAG"
+
+# Build first with `just build-release`. Staging verifies all owned bundles,
+# architecture, the extracted archive, source/tag identity, and checksums.
+release-stage $TAG:
+    python3 tools/release/release.py stage "$TAG"
+
+release-verify $TAG:
+    python3 tools/release/release.py verify-assets "$TAG"
+
+# Retry missing uploads, but never replace an asset or mutate a public release.
+release-draft $TAG:
+    python3 tools/release/release.py draft "$TAG"
+
+test-release:
+    python3 -m unittest discover -s tools/release -p 'test_*.py' -v
 
 # --- Housekeeping ----------------------------------------------------------
 
@@ -286,12 +256,23 @@ clean:
     cd core && cargo clean
     rm -rf MarkDev.xcodeproj build/ app/MarkDev/Assets.xcassets app/MarkDev/Resources ~/Library/Developer/Xcode/DerivedData/MarkDev-*
 
-check: fmt-check lint-core test
+check: test-release fmt-check lint-core test
 
 # Run full CI suite locally (matches GitHub Actions CI workflow)
-ci-local: fmt-check lint-core test-core
+ci-core: test-release fmt-check lint-core test-core
     cd core && cargo test --release --test performance
-    just test-app
+
+verify-toolchain:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    version=$(xcodebuild -version)
+    if [[ "$version" != 'Xcode 26.'* ]]; then
+        echo "Xcode 26.x is required; selected toolchain reports: $version" >&2
+        exit 1
+    fi
+    echo "$version"
+
+ci-local: verify-toolchain ci-core test-app
 
 ci: ci-local
 

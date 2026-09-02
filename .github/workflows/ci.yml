@@ -5,71 +5,44 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust-checks:
-    name: Rust Core (fmt, clippy, tests)
+    name: Rust Core and Release Contracts
     runs-on: macos-26
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: core
-
-      - name: Format Check
-        run: cd core && cargo fmt --check
-
-      - name: Clippy Linter
-        run: cd core && cargo clippy --all-targets -- -D warnings
-
-      - name: Run Core Tests
-        run: cd core && cargo test
-
-      - name: Performance Release Benchmark
-        run: cd core && cargo test --release --test performance
+      - name: Install Tools
+        run: brew install just
+      - name: Rust, performance, and release checks
+        run: just ci-core
 
   macos-app:
     name: macOS App (Swift + MarkDevKit)
     runs-on: macos-26
     needs: rust-checks
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Verify Xcode Toolchain
-        run: |
-          version=$(xcodebuild -version | awk 'NR==1 {print $2}')
-          case "$version" in
-            26.*)
-              echo "Using Xcode $version"
-              ;;
-            *)
-              echo "::error::Xcode 26.x is required (MACOSX_DEPLOYMENT_TARGET=26.0); runner has '$version'"
-              exit 1
-              ;;
-          esac
-
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install Tools
         run: brew install just xcodegen
-
-      - name: Build Rust Core
-        run: just build-core-debug
-
-      - name: Generate Xcode Project
-        run: just generate
-
+      - name: Verify Xcode Toolchain
+        run: just verify-toolchain
       - name: Build and Test AppKit Targets
         run: just test-app
