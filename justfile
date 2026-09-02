@@ -91,6 +91,7 @@ build: build-core-debug generate
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation build
 
 build-release: build-core generate
+    python3 tools/release/project_contract.py -v
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" -skipPackagePluginValidation build
 
 # A Release signed with a real identity.
@@ -148,6 +149,7 @@ build-release-signed IDENTITY="Apple Development": build-core generate
         echo "could not read a team identifier from {{IDENTITY}}." >&2
         exit 1
     fi
+    python3 tools/release/project_contract.py -v
     echo "signing as {{IDENTITY}} (team $team)"
     # Manual signing: a Mac app with no team-restricted entitlements needs no
     # provisioning profile, and automatic signing would insist on fetching one.
@@ -194,6 +196,7 @@ install-only:
 test: test-core test-app
 
 test-app: build-core-debug generate
+    python3 tools/release/project_contract.py -v
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test
 
 run: build
