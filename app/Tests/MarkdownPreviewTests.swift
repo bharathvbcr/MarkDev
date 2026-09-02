@@ -362,16 +362,20 @@ final class MarkdownPreviewTests: XCTestCase {
     }
 
     func testInlineMathContributesPaintedInk() throws {
-        // Attribute and geometry checks alone can pass while a custom layout
-        // fragment forgets to composite its bitmap. Keep the surrounding text
-        // identical and prove the formula adds visible pixels to the preview.
-        let plain = "Before     after"
-        let typeset = "Before $\\sum_{i=0}^{n} i$ after"
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for scale in [CGFloat(1), 2] {
+                // Attribute and geometry checks alone can pass while a custom layout
+                // fragment forgets to composite its bitmap. Keep the surrounding text
+                // identical and prove the formula adds visible pixels to the preview.
+                let plain = "Before     after"
+                let typeset = "Before $\\sum_{i=0}^{n} i$ after"
 
-        XCTAssertGreaterThan(
-            try inkedPixels(rendering: typeset),
-            try inkedPixels(rendering: plain),
-            "the inline formula reserved space but painted no bitmap")
+                XCTAssertGreaterThan(
+                    try inkedPixels(rendering: typeset, appearance: appearance, scale: scale),
+                    try inkedPixels(rendering: plain, appearance: appearance, scale: scale),
+                    "the inline formula reserved space but painted no bitmap")
+            }
+        }
     }
 
     func testWrappedInlineMathPaintsEachFormulaExactlyOnce() throws {
@@ -437,8 +441,11 @@ final class MarkdownPreviewTests: XCTestCase {
     }
 
     /// Lays a document out in a real preview and counts painted pixels.
-    private func inkedPixels(rendering markdown: String) throws -> Int {
+    private func inkedPixels(
+        rendering markdown: String, appearance: NSAppearance.Name = .aqua, scale: CGFloat = 1
+    ) throws -> Int {
         let controller = makeController()
+        controller.view.appearance = NSAppearance(named: appearance)
         controller.show(markdown, directory: nil)
         let view = try textView(of: controller)
         view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
@@ -448,27 +455,9 @@ final class MarkdownPreviewTests: XCTestCase {
         manager.ensureLayout(for: manager.documentRange)
         view.layoutSubtreeIfNeeded()
 
-        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-        view.cacheDisplay(in: view.bounds, to: rep)
+        let rep = try RenderingTestBitmap.capture(view, scale: scale)
 
-        guard let background = rep.colorAt(x: 2, y: 2)?.usingColorSpace(.deviceRGB) else {
-            return 0
-        }
-        var count = 0
-        for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
-            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
-                guard let sample = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
-                    continue
-                }
-                if abs(sample.redComponent - background.redComponent) > 0.01
-                    || abs(sample.greenComponent - background.greenComponent) > 0.01
-                    || abs(sample.blueComponent - background.blueComponent) > 0.01
-                {
-                    count += 1
-                }
-            }
-        }
-        return count
+        return RenderingTestBitmap.inkedPixels(rep)
     }
 
     // MARK: - Loading

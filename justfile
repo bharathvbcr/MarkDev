@@ -195,9 +195,9 @@ install-only:
 
 test: test-core test-app
 
-test-app: build-core-debug generate
+test-app $TEST_FILTER="": build-core-debug generate
     python3 tools/release/project_contract.py -v
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test ${TEST_FILTER:+"-only-testing:$TEST_FILTER"}
 
 run: build
     open "$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')/MarkDev.app"

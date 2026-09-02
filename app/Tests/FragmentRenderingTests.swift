@@ -19,9 +19,11 @@ import XCTest
 final class FragmentRenderingTests: XCTestCase {
     /// Lays out `markdown` in a real view and returns its rendered pixels.
     private func render(
-        _ markdown: String, height: CGFloat = 420, mode: EditorMode = .livePreview
+        _ markdown: String, height: CGFloat = 420, mode: EditorMode = .livePreview,
+        appearance: NSAppearance.Name = .aqua, scale: CGFloat = 1
     ) throws -> NSBitmapImageRep {
         let view = MarkdownTextView.make()
+        view.appearance = NSAppearance(named: appearance)
         view.mode = mode
         view.frame = NSRect(x: 0, y: 0, width: 520, height: height)
         view.setMarkdown(markdown)
@@ -30,8 +32,7 @@ final class FragmentRenderingTests: XCTestCase {
         view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
         view.layoutSubtreeIfNeeded()
 
-        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-        view.cacheDisplay(in: view.bounds, to: rep)
+        let rep = try RenderingTestBitmap.capture(view, scale: scale)
         return rep
     }
 
@@ -60,32 +61,6 @@ final class FragmentRenderingTests: XCTestCase {
         return bestSaturation > 0.2 ? best : nil
     }
 
-    /// How many sampled pixels differ from the view's flat background.
-    ///
-    /// A count over the whole surface, rather than a probe at fixed
-    /// coordinates: where a fragment paints depends on font metrics and line
-    /// breaking, so a fixed sample point can fail for reasons unrelated to
-    /// the drawing being correct.
-    private func inkedPixels(_ rep: NSBitmapImageRep) -> Int {
-        guard let background = rep.colorAt(x: 2, y: 2)?.usingColorSpace(.deviceRGB) else {
-            return 0
-        }
-        var count = 0
-        for y in stride(from: 0, to: rep.pixelsHigh, by: 2) {
-            for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
-                guard let sample = rep.colorAt(x: x, y: y)?
-                    .usingColorSpace(.deviceRGB) else { continue }
-                if abs(sample.redComponent - background.redComponent) > 0.01
-                    || abs(sample.greenComponent - background.greenComponent) > 0.01
-                    || abs(sample.blueComponent - background.blueComponent) > 0.01
-                {
-                    count += 1
-                }
-            }
-        }
-        return count
-    }
-
     /// Rows carrying ink anywhere across their width.
     ///
     /// Unlike ``decoratedRows(_:)``, which samples one column near the content
@@ -100,9 +75,7 @@ final class FragmentRenderingTests: XCTestCase {
             for x in stride(from: 0, to: rep.pixelsWide, by: 2) {
                 guard let sample = rep.colorAt(x: x, y: y)?
                     .usingColorSpace(.deviceRGB) else { continue }
-                if abs(sample.redComponent - background.redComponent) > 0.01
-                    || abs(sample.greenComponent - background.greenComponent) > 0.01
-                    || abs(sample.blueComponent - background.blueComponent) > 0.01
+                if RenderingTestBitmap.differs(sample, from: background)
                 {
                     rows.append(y)
                     break
@@ -128,9 +101,7 @@ final class FragmentRenderingTests: XCTestCase {
             // a hit means background decoration rather than glyphs.
             guard let sample = rep.colorAt(x: sampleX, y: y)?
                 .usingColorSpace(.deviceRGB) else { continue }
-            if abs(sample.redComponent - background.redComponent) > 0.01
-                || abs(sample.greenComponent - background.greenComponent) > 0.01
-                || abs(sample.blueComponent - background.blueComponent) > 0.01
+            if RenderingTestBitmap.differs(sample, from: background)
             {
                 rows.append(y)
             }
@@ -145,8 +116,8 @@ final class FragmentRenderingTests: XCTestCase {
         let plain = try render("let value = 42\n")
         let fenced = try render("```swift\nlet value = 42\n```\n")
 
-        let plainInk = inkedPixels(plain)
-        let fencedInk = inkedPixels(fenced)
+        let plainInk = RenderingTestBitmap.inkedPixels(plain)
+        let fencedInk = RenderingTestBitmap.inkedPixels(fenced)
 
         XCTAssertGreaterThan(
             fencedInk, plainInk * 2,
@@ -296,9 +267,7 @@ final class FragmentRenderingTests: XCTestCase {
             for x in stride(from: rep.pixelsWide - 1, through: 0, by: -1) {
                 guard let sample = rep.colorAt(x: x, y: y)?
                     .usingColorSpace(.deviceRGB) else { continue }
-                if abs(sample.redComponent - background.redComponent) > 0.01
-                    || abs(sample.greenComponent - background.greenComponent) > 0.01
-                    || abs(sample.blueComponent - background.blueComponent) > 0.01
+                if RenderingTestBitmap.differs(sample, from: background)
                 {
                     return x
                 }
@@ -323,48 +292,54 @@ final class FragmentRenderingTests: XCTestCase {
     // MARK: - Rendered content
 
     func testAMathBlockPaintsATypesetFormulaInPlaceOfItsSource() throws {
-        // "In place of" is the assertion. The source is collapsed to 0.01pt, so
-        // every inked pixel in this document must be the formula — and there
-        // must be a lot of them, since a fragment that resolves correctly and
-        // then draws nothing is exactly what a pixel test is for.
-        //
-        // This used to compare the ink against the same words as prose, which
-        // passed for the wrong reason: the formula was being drawn once per line
-        // of its own source, so three stacked copies out-inked any sentence.
-        let view = MarkdownTextView.make()
-        view.mode = .reading
-        view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
-        view.setMarkdown("$$\nE = mc^2\n$$\n")
-        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
-        view.layoutSubtreeIfNeeded()
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for scale in [CGFloat(1), 2] {
+                // "In place of" is the assertion. The source is collapsed to 0.01pt, so
+                // every inked pixel in this document must be the formula — and there
+                // must be a lot of them, since a fragment that resolves correctly and
+                // then draws nothing is exactly what a pixel test is for.
+                //
+                // This used to compare the ink against the same words as prose, which
+                // passed for the wrong reason: the formula was being drawn once per line
+                // of its own source, so three stacked copies out-inked any sentence.
+                let view = MarkdownTextView.make()
+                view.appearance = NSAppearance(named: appearance)
+                view.mode = .reading
+                view.frame = NSRect(x: 0, y: 0, width: 520, height: 420)
+                view.setMarkdown("$$\nE = mc^2\n$$\n")
+                view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+                view.layoutSubtreeIfNeeded()
 
-        var content = CGRect.null
-        view.textLayoutManager?.enumerateTextLayoutFragments(
-            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
-        ) { fragment in
-            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
-                content = content.union(fragment.layoutFragmentFrame)
+                var content = CGRect.null
+                view.textLayoutManager?.enumerateTextLayoutFragments(
+                    from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+                ) { fragment in
+                    if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                        content = content.union(fragment.layoutFragmentFrame)
+                    }
+                    return true
+                }
+                XCTAssertFalse(content.isNull, "the formula should have typeset")
+
+                let rep = try RenderingTestBitmap.capture(view, scale: scale)
+                // Preserve the original 2x ink-area threshold at either raster scale.
+                XCTAssertGreaterThan(
+                    CGFloat(RenderingTestBitmap.inkedPixels(rep)) * (2 / scale) * (2 / scale), 150,
+                    "the typeset formula should paint substantially")
+
+                // The formula is drawn inside the one fragment that stands in for the
+                // block, so no ink may appear below where that fragment ends. In pixels,
+                // not points: the capture explicitly exercises both backing scales,
+                // so a row index can represent either one point or half a point.
+                let backingScale = CGFloat(rep.pixelsHigh) / view.bounds.height
+                let limit = Int((content.maxY + view.textContainerOrigin.y) * backingScale) + 4
+                let rows = inkedRows(rep)
+                XCTAssertFalse(rows.isEmpty)
+                XCTAssertLessThanOrEqual(
+                    rows.max() ?? 0, limit,
+                    "ink below row \(limit) means the formula's source is painting as well as the formula")
             }
-            return true
         }
-        XCTAssertFalse(content.isNull, "the formula should have typeset")
-
-        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-        view.cacheDisplay(in: view.bounds, to: rep)
-        XCTAssertGreaterThan(
-            inkedPixels(rep), 150, "the typeset formula should paint substantially")
-
-        // The formula is drawn inside the one fragment that stands in for the
-        // block, so no ink may appear below where that fragment ends. In pixels,
-        // not points: `bitmapImageRepForCachingDisplay` follows the backing
-        // scale, so on a Retina display a row index is half a point.
-        let scale = CGFloat(rep.pixelsHigh) / view.bounds.height
-        let limit = Int((content.maxY + view.textContainerOrigin.y) * scale) + 4
-        let rows = inkedRows(rep)
-        XCTAssertFalse(rows.isEmpty)
-        XCTAssertLessThanOrEqual(
-            rows.max() ?? 0, limit,
-            "ink below row \(limit) means the formula's source is painting as well as the formula")
     }
 
     func testAMathFragmentGrowsToFitTheFormula() throws {
@@ -705,17 +680,21 @@ final class FragmentRenderingTests: XCTestCase {
         let checked = try render("- [x] todo\n")
 
         XCTAssertGreaterThan(
-            inkedPixels(checked), inkedPixels(unchecked),
+            RenderingTestBitmap.inkedPixels(checked), RenderingTestBitmap.inkedPixels(unchecked),
             "a ticked box should cover more than an empty one")
     }
 
     func testATableHeaderIsShaded() throws {
-        let table = try render("| a | b |\n|---|---|\n| 1 | 2 |\n")
-        let plain = try render("a b\n1 2\n")
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for scale in [CGFloat(1), 2] {
+                let table = try render("| a | b |\n|---|---|\n| 1 | 2 |\n", appearance: appearance, scale: scale)
+                let plain = try render("a b\n1 2\n", appearance: appearance, scale: scale)
 
-        XCTAssertGreaterThan(
-            inkedPixels(table), inkedPixels(plain),
-            "a table should paint header shading and row rules")
+                XCTAssertGreaterThan(
+                    RenderingTestBitmap.inkedPixels(table), RenderingTestBitmap.inkedPixels(plain),
+                    "a table should paint header shading and row rules")
+            }
+        }
     }
 
     func testRenderingIsStableForAnEmptyDocument() throws {

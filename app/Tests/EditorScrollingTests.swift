@@ -33,9 +33,11 @@ final class EditorScrollingTests: XCTestCase {
         let scrollView: NSScrollView
         let window: NSWindow
 
-        init(_ textView: ScrollingTextView, width: CGFloat = 600, height: CGFloat = 400) {
+        init(_ textView: ScrollingTextView, width: CGFloat = 600, height: CGFloat = 400,
+             scrollerStyle: NSScroller.Style? = nil) {
             self.textView = textView
             self.scrollView = ScrollingTextView.scrollView(hosting: textView)
+            if let scrollerStyle { self.scrollView.scrollerStyle = scrollerStyle }
             self.window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                 styleMask: [.titled, .resizable],
@@ -66,6 +68,7 @@ final class EditorScrollingTests: XCTestCase {
             settle()
         }
 
+        var viewportWidth: CGFloat { scrollView.contentView.bounds.width }
         var viewportHeight: CGFloat { scrollView.contentView.bounds.height }
         var documentHeight: CGFloat { textView.frame.height }
         var scrollY: CGFloat { scrollView.documentVisibleRect.origin.y }
@@ -244,49 +247,55 @@ final class EditorScrollingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(harness.scrollY, 0)
     }
 
+    // A legacy scroller consumes 17pt of the window. The clip view is the
+    // viewport; comparing against the window width tests the user preference.
     // MARK: - Width tracks the viewport
 
     func testNarrowingTheViewportRewrapsRatherThanScrollingSideways() {
-        let harness = Harness(editor(longMarkdown()), width: 900)
-        let wideHeight = harness.documentHeight
-        harness.resize(width: 400)
+        for style in [NSScroller.Style.legacy, .overlay] {
+            let harness = Harness(editor(longMarkdown()), width: 900, scrollerStyle: style)
+            let wideHeight = harness.documentHeight
+            harness.resize(width: 400)
 
-        XCTAssertEqual(
-            harness.textView.frame.width, 400, accuracy: 1,
-            "the document view must follow the viewport's width")
-        XCTAssertEqual(
-            harness.textView.textContainer?.size.width ?? 0,
-            400 - harness.textView.textContainerInset.width * 2,
-            accuracy: 1,
-            "the text container must follow the view, or lines keep their old wrap points")
-        XCTAssertGreaterThan(
-            harness.documentHeight, wideHeight,
-            "a narrower column wraps more lines and must therefore be taller")
-        XCTAssertFalse(harness.textView.isHorizontallyResizable)
+            XCTAssertEqual(
+                harness.textView.frame.width, harness.viewportWidth, accuracy: 1,
+                "the document view must follow the viewport's width")
+            XCTAssertEqual(
+                harness.textView.textContainer?.size.width ?? 0,
+                harness.viewportWidth - harness.textView.textContainerInset.width * 2,
+                accuracy: 1,
+                "the text container must follow the view, or lines keep their old wrap points")
+            XCTAssertGreaterThan(
+                harness.documentHeight, wideHeight,
+                "a narrower column wraps more lines and must therefore be taller")
+            XCTAssertFalse(harness.textView.isHorizontallyResizable)
+        }
     }
 
     // MARK: - Shared by every surface
 
     func testThePlainScrollingSurfaceSharesTheSameContract() {
-        // The Quick Look extension builds one of these directly rather than
-        // pulling in the editing machinery, so the contract has to hold for
-        // the bare initialiser too.
-        let view = ScrollingTextView()
-        view.textContainerInset = NSSize(width: 24, height: 24)
-        let harness = Harness(view)
-        view.textStorage?.setAttributedString(
-            NSAttributedString(
-                string: longMarkdown(), attributes: [.font: NSFont.systemFont(ofSize: 14)]))
-        harness.settle()
+        for style in [NSScroller.Style.legacy, .overlay] {
+            // The Quick Look extension builds one of these directly rather than
+            // pulling in the editing machinery, so the contract has to hold for
+            // the bare initialiser too.
+            let view = ScrollingTextView()
+            view.textContainerInset = NSSize(width: 24, height: 24)
+            let harness = Harness(view, scrollerStyle: style)
+            view.textStorage?.setAttributedString(
+                NSAttributedString(
+                    string: longMarkdown(), attributes: [.font: NSFont.systemFont(ofSize: 14)]))
+            harness.settle()
 
-        XCTAssertGreaterThan(view.maxSize.height, 1_000_000)
-        XCTAssertTrue(harness.isScrollable)
-        XCTAssertEqual(
-            view.autoresizingMask, [.width],
-            "a preview panel is resizable, so its text must rewrap with it")
+            XCTAssertGreaterThan(view.maxSize.height, 1_000_000)
+            XCTAssertTrue(harness.isScrollable)
+            XCTAssertEqual(
+                view.autoresizingMask, [.width],
+                "a preview panel is resizable, so its text must rewrap with it")
 
-        harness.resize(width: 300)
-        XCTAssertEqual(view.frame.width, 300, accuracy: 1)
+            harness.resize(width: 300)
+            XCTAssertEqual(view.frame.width, harness.viewportWidth, accuracy: 1)
+        }
     }
 
     // MARK: - Robustness
