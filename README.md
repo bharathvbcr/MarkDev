@@ -157,7 +157,7 @@ just check
 
 ## Releases
 
-See [v0.1.4 release notes](docs/releases/v0.1.4.md) for downloads, changes, and signing limitations.
+See [v0.0.3 release notes](docs/releases/v0.0.3.md) for downloads, changes, and signing limitations.
 The repository's local CI command is `just ci-local` (there is no npm `ci:local` script).
 
 Release sequence: update the version/build in `project.yml` and the matching
