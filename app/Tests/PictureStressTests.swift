@@ -218,9 +218,18 @@ final class PictureStressTests: XCTestCase {
 
             for entry in rendered.entries {
                 let hidden = text.substring(with: entry.range)
-                XCTAssertNotNil(
-                    HTMLImageTag.parse(hidden),
-                    "step \(step) hid \(hidden.debugDescription), which is not a picture")
+                switch entry.content.kind {
+                case .image:
+                    XCTAssertNotNil(
+                        HTMLImageTag.parse(hidden),
+                        "step \(step) hid \(hidden.debugDescription), which is not a picture")
+                case .htmlFlow:
+                    XCTAssertNotNil(
+                        HTMLFlow.parse(hidden),
+                        "step \(step) hid \(hidden.debugDescription), which is not a fragment")
+                default:
+                    XCTFail("step \(step) hid \(hidden.debugDescription) as \(entry.content.kind)")
+                }
                 XCTAssertFalse(
                     hidden.contains("keep this line") || hidden.contains("and this one"),
                     "step \(step) hid the prose around \(mangled.debugDescription)")
@@ -263,7 +272,10 @@ final class PictureStressTests: XCTestCase {
         let rendered = RenderedBlocks(document: parsed, text: text)
 
         for entry in rendered.entries {
-            guard case .image = entry.content.kind else { continue }
+            switch entry.content.kind {
+            case .image, .htmlFlow: break
+            default: continue
+            }
             for offset in entry.range.location..<NSMaxRange(entry.range) {
                 let character = text.character(at: offset)
                 // Whitespace either side of the tag is inside the block and

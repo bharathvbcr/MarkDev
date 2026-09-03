@@ -8,7 +8,7 @@
 import CoreGraphics
 import Foundation
 
-/// One `<img>` tag standing on its own.
+/// One `<img>` tag standing on its own — or consumed from a larger fragment.
 ///
 /// Markdown has no way to say how wide a picture should be, so a note that
 /// needs one — a mark at the head of a README, a badge — writes the HTML tag
@@ -60,10 +60,13 @@ public struct HTMLImageTag: Equatable, Sendable {
     public let alt: String
     /// The `width` attribute, in points, if it gave a usable one.
     ///
-    /// A percentage is dropped rather than resolved: it is a fraction of a
-    /// containing box that this layout does not have, and guessing the column
-    /// would make `width="100%"` mean something different in a split pane.
+    /// A percentage other than `100%` is dropped: it is a fraction of a box
+    /// this layout does not have. `100%` is not a guess at that box — it is
+    /// the column the picture sits in, which is what GitHub READMEs mean by
+    /// it and what ``fillsColumn`` records.
     public let width: CGFloat?
+    /// Whether `width="100%"` asked the picture to fill its column.
+    public let fillsColumn: Bool
 
     /// The most a lone `<img>` tag may measure before it is refused.
     ///
@@ -74,10 +77,13 @@ public struct HTMLImageTag: Equatable, Sendable {
     /// be walked past on every keystroke.
     public static let maximumLength = 4096
 
-    public init(source: String, alt: String = "", width: CGFloat? = nil) {
+    public init(
+        source: String, alt: String = "", width: CGFloat? = nil, fillsColumn: Bool = false
+    ) {
         self.source = source
         self.alt = alt
         self.width = width
+        self.fillsColumn = fillsColumn
     }
 
     /// Parses `text` as a single `<img>` tag, or answers `nil` if it is
@@ -92,8 +98,22 @@ public struct HTMLImageTag: Equatable, Sendable {
         // U+2003, none of which the grammar allows anywhere. A leading one
         // makes the line literal text to the core, and trimming it away was
         // enough to have this call it a picture.
-        var scanner = TagScanner(TagScanner.trimmed(text))
-        guard scanner.take("<img"), scanner.atTagNameBoundary else { return nil }
+        var scanner = HTMLTagScanner(HTMLTagScanner.trimmed(text))
+        guard let tag = consume(&scanner), scanner.isAtEnd else { return nil }
+        return tag
+    }
+
+    /// Consumes one `<img>` at the scanner's current position.
+    ///
+    /// Used by ``HTMLFlow`` so a badge row can read several tags without
+    /// copying each one out. Fails without advancing when the next token is
+    /// not an image tag.
+    static func consume(_ scanner: inout HTMLTagScanner) -> HTMLImageTag? {
+        let saved = scanner.cursor
+        guard scanner.take("<img"), scanner.atTagNameBoundary else {
+            scanner.cursor = saved
+            return nil
+        }
 
         var attributes: [String: String] = [:]
         while true {
@@ -103,34 +123,49 @@ public struct HTMLImageTag: Equatable, Sendable {
             // note off the page.
             let spaced = scanner.skipWhitespace()
             if scanner.take("/>") || scanner.take(">") { break }
-            guard spaced, let (name, value) = scanner.attribute() else { return nil }
+            guard spaced, let (name, value) = scanner.attribute() else {
+                scanner.cursor = saved
+                return nil
+            }
             // First wins, which is how a browser reads a repeated attribute.
             if attributes[name] == nil { attributes[name] = value }
         }
-        // Nothing may follow the tag: the block is the picture, or it is text.
-        guard scanner.isAtEnd else { return nil }
 
         let source = (attributes["src"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !source.isEmpty else { return nil }
+        guard !source.isEmpty else {
+            scanner.cursor = saved
+            return nil
+        }
+        let dimension = Self.dimension(from: attributes["width"] ?? "")
         return HTMLImageTag(
             source: source,
             alt: attributes["alt"] ?? "",
-            width: attributes["width"].flatMap(points(from:)))
+            width: dimension.width,
+            fillsColumn: dimension.fillsColumn)
     }
 
     /// Reads an HTML length attribute.
     ///
     /// HTML measures these in CSS pixels, which are points here — the editor
     /// lays out in points and the display's scale is TextKit's business.
-    private static func points(from value: String) -> CGFloat? {
+    private static func dimension(from value: String) -> (width: CGFloat?, fillsColumn: Bool) {
         let text = value.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty, !text.hasSuffix("%") else { return nil }
+        guard !text.isEmpty else { return (nil, false) }
+        if text.hasSuffix("%") {
+            let digits = text.dropLast().trimmingCharacters(in: .whitespaces)
+            guard let number = Double(digits), number.isFinite else { return (nil, false) }
+            // Only a full-column request is a size we can honour. `50%` would
+            // need a containing box we do not have a second measurement for.
+            return (99...100).contains(number) ? (nil, true) : (nil, false)
+        }
         let digits = text.prefix { $0.isNumber || $0 == "." }
-        guard let number = Double(digits), number.isFinite, number >= 1 else { return nil }
+        guard let number = Double(digits), number.isFinite, number >= 1 else {
+            return (nil, false)
+        }
         // Anything after the number must be a unit HTML does not have. A
         // stray `72pt` is the author's meaning plainly enough; `72 and a bit`
         // is not, and is refused by `Double` above.
-        return CGFloat(number)
+        return (CGFloat(number), false)
     }
 }
 
@@ -138,14 +173,22 @@ public struct HTMLImageTag: Equatable, Sendable {
 ///
 /// Deliberately small: this reads a single element with quoted attributes, and
 /// stops at the first thing it does not understand. It is not an HTML parser
-/// and must not grow into one.
-private struct TagScanner {
+/// and must not grow into one. ``HTMLFlow`` uses the same reader so a badge
+/// row and a lone `<img>` cannot disagree about what an attribute is.
+struct HTMLTagScanner {
     private let characters: [Character]
     private var index: Int
 
     init(_ text: String) {
         characters = Array(text)
         index = 0
+    }
+
+    /// The position in the character array. Restored on a failed take so a
+    /// caller can try `<img>` and then `<a>` against the same input.
+    var cursor: Int {
+        get { index }
+        set { index = min(max(newValue, 0), characters.count) }
     }
 
     var isAtEnd: Bool { index >= characters.count }
@@ -205,9 +248,41 @@ private struct TagScanner {
         }
     }
 
-    private func peek(_ offset: Int = 0) -> Character? {
+    func peek(_ offset: Int = 0) -> Character? {
         let position = index + offset
         return position < characters.count ? characters[position] : nil
+    }
+
+    /// An HTML tag name: ASCII letters, then letters, digits or `-`.
+    mutating func tagName() -> String? {
+        guard let first = peek(), first.isASCII, first.isLetter else { return nil }
+        var name = String(first)
+        index += 1
+        while let next = peek(), next.isASCII,
+            next.isLetter || next.isNumber || next == "-"
+        {
+            name.append(next)
+            index += 1
+        }
+        return name.lowercased()
+    }
+
+    /// A closing tag `</name>`, allowing space before `>`.
+    mutating func closeTag(_ name: String) -> Bool {
+        let saved = index
+        skipWhitespace()
+        guard take("</"), take(name) else {
+            index = saved
+            return false
+        }
+        // `skipWhitespace` returns whether there *was* any, so it cannot sit
+        // in a `guard` — `</p>` has no space before `>` and is still a closer.
+        skipWhitespace()
+        guard take(">") else {
+            index = saved
+            return false
+        }
+        return true
     }
 
     /// Consumes `text`, case-insensitively, or leaves the position alone.
@@ -287,15 +362,41 @@ private struct TagScanner {
     }
 }
 
+extension HTMLTagScanner {
+    /// An opening tag with its attributes, or `nil` if the next token is not
+    /// one. Restores the position on failure.
+    mutating func openTag() -> (name: String, attributes: [String: String], selfClosing: Bool)? {
+        let saved = index
+        guard take("<"), let name = tagName(), atTagNameBoundary else {
+            index = saved
+            return nil
+        }
+        var attributes: [String: String] = [:]
+        while true {
+            let spaced = skipWhitespace()
+            if take("/>") { return (name, attributes, true) }
+            if take(">") { return (name, attributes, false) }
+            guard spaced, let (attributeName, value) = attribute() else {
+                index = saved
+                return nil
+            }
+            if attributes[attributeName] == nil { attributes[attributeName] = value }
+        }
+    }
+}
+
 /// The handful of entities a hand-written tag actually uses.
 ///
 /// A file name with an `&` in it arrives as `&amp;`, and resolving that
 /// against the document's directory unchanged looks for a file whose name has
 /// `&amp;` in it. The rest are here because they are what a quoted `alt`
 /// carries.
-private enum HTMLEntities {
+enum HTMLEntities {
     private static let known: [String: String] = [
         "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": "\u{00A0}",
+        "rarr": "\u{2192}", "larr": "\u{2190}", "uarr": "\u{2191}", "darr": "\u{2193}",
+        "ndash": "\u{2013}", "mdash": "\u{2014}", "hellip": "\u{2026}",
+        "copy": "\u{00A9}", "reg": "\u{00AE}", "trade": "\u{2122}",
     ]
 
     /// The longest entity name that can mean anything.

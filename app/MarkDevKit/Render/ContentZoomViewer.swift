@@ -82,6 +82,21 @@ public enum ZoomedContent {
             .mapError { failure in
                 alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")
             }
+        case .htmlFlow(let flow):
+            guard flow.images.count == 1, let image = flow.images.first else {
+                return .failure(RenderFailure(reason: "Nothing to open large"))
+            }
+            let alt = image.alt
+            let scalable = RichContentRenderer.shared.isScalable(
+                at: image.source, relativeTo: documentDirectory)
+            return RichContentRenderer.shared.image(
+                at: image.source, relativeTo: documentDirectory,
+                maxWidth: scalable ? vectorWidth : imageWidth,
+                width: scalable ? vectorWidth : nil
+            )
+            .mapError { failure in
+                alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")
+            }
         }
     }
 
@@ -96,6 +111,13 @@ public enum ZoomedContent {
         case .image:
             let name = (block.source as NSString).lastPathComponent
             return name.isEmpty ? "Image" : name
+        case .htmlFlow(let flow):
+            if flow.images.count == 1, let image = flow.images.first {
+                let name = (image.source as NSString).lastPathComponent
+                if !name.isEmpty { return name }
+                if !image.alt.isEmpty { return image.alt }
+            }
+            return "Image"
         }
     }
 

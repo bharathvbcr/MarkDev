@@ -16,6 +16,9 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
         case diagram
         /// Alt text, shown if the file cannot be loaded.
         case image(alt: String)
+        /// A GitHub-README HTML fragment: badges, a centred tagline, a hero
+        /// image. Drawn by the fragment, not rasterised as one bitmap.
+        case htmlFlow(HTMLFlow)
     }
 
     public let kind: Kind
@@ -29,11 +32,33 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
     /// is what the render cache is keyed on — deciding it a second time at the
     /// render call is how a warmed entry becomes one nothing ever hits.
     public let width: CGFloat?
+    /// Whether an `<img width="100%">` asked this picture to fill its column.
+    public let fillsColumn: Bool
 
-    public init(kind: Kind, source: String, width: CGFloat? = nil) {
+    public init(
+        kind: Kind, source: String, width: CGFloat? = nil, fillsColumn: Bool = false
+    ) {
         self.kind = kind
         self.source = source
         self.width = width
+        self.fillsColumn = fillsColumn
+    }
+
+    /// The pictures the prefetcher should rasterise for this block.
+    ///
+    /// An HTML flow is not itself a bitmap — it is a layout of pictures and
+    /// text — so warming it means warming each local image it contains.
+    public var prefetchUnits: [RenderedBlock] {
+        switch kind {
+        case .htmlFlow(let flow):
+            return flow.images.map {
+                RenderedBlock(
+                    kind: .image(alt: $0.alt), source: $0.source, width: $0.width,
+                    fillsColumn: $0.fillsColumn)
+            }
+        default:
+            return [self]
+        }
     }
 }
 
@@ -104,7 +129,7 @@ public struct RenderedBlocks: Sendable, Equatable {
             case .mermaidBlock:
                 content = Self.diagram(block, in: document, text: text)
             case .htmlBlock:
-                content = Self.htmlImage(block.range, in: text)
+                content = Self.htmlContent(block.range, in: text)
             case .paragraph:
                 paragraphs.append((index, block))
                 continue
@@ -308,18 +333,31 @@ public struct RenderedBlocks: Sendable, Equatable {
         return text.character(at: last) == 0x29  // )
     }
 
-    /// A block that is one `<img>` tag and nothing else.
+    /// A block that is one `<img>` tag, or a GitHub-README HTML fragment.
     ///
-    /// Nothing else in raw HTML renders: the tag is recognised precisely so
-    /// that the source it replaces is certainly a picture. Anything this
-    /// refuses stays on the page as the markup the author wrote, which is the
-    /// honest answer for HTML the editor cannot draw.
+    /// The lone-tag path is the cheap one and runs first. A fragment is
+    /// recognised only so that the source it replaces is certainly something
+    /// this can draw: anything ``HTMLFlow`` refuses stays on the page as the
+    /// markup the author wrote.
     ///
     /// The two cheap tests come first and read characters straight out of the
     /// string, for the reason ``looksLikeAnImage(_:in:)`` does: this is asked
     /// of every paragraph and every HTML block in the document on every parse,
     /// and an HTML block can be a whole page of markup. Copying each one out
     /// to look at it would be that allocation per block per keystroke.
+    private static func htmlContent(_ range: NSRange, in text: NSString) -> RenderedBlock? {
+        if let picture = htmlImage(range, in: text) { return picture }
+        guard let body = clamp(range, to: text.length),
+            body.length <= HTMLFlow.maximumLength,
+            looksLikeHTMLFlow(body, in: text),
+            let flow = HTMLFlow.parse(text.substring(with: body)),
+            flow.hasVisibleContent
+        else { return nil }
+        return RenderedBlock(
+            kind: .htmlFlow(flow), source: flow.images.first?.source ?? "")
+    }
+
+    /// A block that is one `<img>` tag and nothing else.
     private static func htmlImage(_ range: NSRange, in text: NSString) -> RenderedBlock? {
         guard let body = clamp(range, to: text.length),
             body.length <= HTMLImageTag.maximumLength,
@@ -327,7 +365,8 @@ public struct RenderedBlocks: Sendable, Equatable {
             let tag = HTMLImageTag.parse(text.substring(with: body))
         else { return nil }
         return RenderedBlock(
-            kind: .image(alt: tag.alt), source: tag.source, width: tag.width)
+            kind: .image(alt: tag.alt), source: tag.source, width: tag.width,
+            fillsColumn: tag.fillsColumn)
     }
 
     /// A paragraph whose whole content is one raw-HTML `<img>` tag.
@@ -399,6 +438,28 @@ public struct RenderedBlocks: Sendable, Equatable {
         var last = end - 1
         while last > first, isWhitespace(text.character(at: last)) { last -= 1 }
         return text.character(at: last) == 0x3E  // >
+    }
+
+    /// Whether `body` opens with a tag ``HTMLFlow`` might accept.
+    ///
+    /// Five or six characters, and the decision for everything that is not
+    /// README chrome: a `<table>`, a comment, a `<script>`. ``HTMLFlow/parse``
+    /// decides for what gets past it.
+    private static func looksLikeHTMLFlow(_ body: NSRange, in text: NSString) -> Bool {
+        guard body.length >= 3 else { return false }
+        var first = body.location
+        let end = NSMaxRange(body)
+        while first < end, isWhitespace(text.character(at: first)) { first += 1 }
+        guard first < end, text.character(at: first) == 0x3C else { return false }  // <
+        first += 1
+        guard first < end else { return false }
+        let letter = text.character(at: first) | 0x20
+        switch letter {
+        case 0x70, 0x61, 0x62, 0x64, 0x65, 0x69, 0x73:  // p a b d e i s
+            return true
+        default:
+            return false
+        }
     }
 
     private static func isWhitespace(_ character: unichar) -> Bool {

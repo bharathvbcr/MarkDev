@@ -1616,7 +1616,8 @@ extension MarkdownTextView {
 
         fragment.tableRow = tableLayout.layout(
             forRowAt: range, inTable: table, document: parsed, text: text,
-            availableWidth: tableWidth, theme: theme, ink: resolvedInk)
+            availableWidth: tableWidth, theme: theme, ink: resolvedInk,
+            directory: documentDirectory)
     }
 
     /// Lays out the key/value panel for collapsed frontmatter.
@@ -1691,7 +1692,11 @@ extension MarkdownTextView {
     /// frame is what a live resize drives, and the container tracks it.
     func resolveTablesIfWidthChanged() {
         let hasFrontmatter = parsed.blocks.contains { $0.kind == .frontmatter }
-        guard !tableBlocks.isEmpty || hasFrontmatter else {
+        let hasHTMLFlow = renderedBlocks.entries.contains {
+            if case .htmlFlow = $0.content.kind { return true }
+            return $0.content.fillsColumn
+        }
+        guard !tableBlocks.isEmpty || hasFrontmatter || hasHTMLFlow else {
             lastTableWidth = tableWidth
             return
         }
@@ -1706,8 +1711,40 @@ extension MarkdownTextView {
         // layout pass — would otherwise close the door on the pass that could
         // have done the work, and the tables would keep the geometry of
         // whatever size the window happened to open at.
-        guard reresolveTableFragments() > 0 else { return }
+        let tables = reresolveTableFragments()
+        let flows = reresolveHTMLFlowFragments()
+        guard tables + flows > 0 else { return }
         lastTableWidth = width
+    }
+
+    /// Re-lays out README HTML fragments after a resize.
+    ///
+    /// Text wrap and `width="100%"` both depend on the column, and TextKit
+    /// reuses the fragment objects across a frame change — the same reason
+    /// ``reresolveTableFragments()`` exists for grids.
+    @discardableResult
+    func reresolveHTMLFlowFragments() -> Int {
+        guard let manager = textLayoutManager else { return 0 }
+        let start = manager.documentRange.location
+        var resolved = 0
+        manager.enumerateTextLayoutFragments(from: start) { fragment in
+            guard let fragment = fragment as? MarkdownLayoutFragment else { return true }
+            switch fragment.decoration.rendered?.kind {
+            case .htmlFlow:
+                break
+            case .image where fragment.decoration.rendered?.fillsColumn == true:
+                break
+            default:
+                return true
+            }
+            resolveRenderedContent(for: fragment)
+            resolved += 1
+            return true
+        }
+        if resolved > 0 {
+            manager.invalidateLayout(for: manager.documentRange)
+        }
+        return resolved
     }
 
     /// The width a table has to lay itself out in.
@@ -2380,7 +2417,26 @@ extension MarkdownTextView {
     /// all need main-actor state, while TextKit may ask a fragment for its
     /// metrics from anywhere.
     func resolveRenderedContent(for fragment: MarkdownLayoutFragment) {
-        guard let block = fragment.decoration.rendered else { return }
+        fragment.htmlFlow = nil
+        guard let block = fragment.decoration.rendered else {
+            fragment.renderedContent = nil
+            fragment.renderFailure = nil
+            return
+        }
+
+        if case .htmlFlow(let flow) = block.kind {
+            fragment.renderFailure = nil
+            fragment.renderedContent = nil
+            let layout = HTMLFlowLayout.make(
+                flow: flow,
+                columnWidth: renderContext.width,
+                directory: documentDirectory,
+                theme: theme,
+                ink: resolvedInk)
+            fragment.htmlFlow = layout
+            fragment.renderedContent = layout.primaryImage
+            return
+        }
 
         switch RichContentRenderer.shared.render(renderRequest(for: block)) {
         case .success(let content):
@@ -2492,7 +2548,8 @@ extension MarkdownTextView {
 
         warmedGeometry = geometry
         warmedContents = renderedBlocks.entries.map(\.content)
-        contentPrefetcher.warmDocument(warmedContents, in: documentDirectory, using: context)
+        contentPrefetcher.warmDocument(
+            warmedContents.flatMap(\.prefetchUnits), in: documentDirectory, using: context)
     }
 
     /// Whether this parse's pictures are the ones already queued.

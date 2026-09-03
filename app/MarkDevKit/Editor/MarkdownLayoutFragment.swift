@@ -155,6 +155,14 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
                 return "Mermaid diagram: \(rendered.source)"
             case .image(let alt):
                 return alt.isEmpty ? "Image: \(rendered.source)" : alt
+            case .htmlFlow(let flow):
+                let alts = flow.images.map(\.alt).filter { !$0.isEmpty }
+                if !alts.isEmpty { return alts.joined(separator: ", ") }
+                let text = flow.items.compactMap { item -> String? in
+                    if case .run(let run) = item { return run.text }
+                    return nil
+                }.joined(separator: " ")
+                return text.isEmpty ? "HTML content" : text
             }
         }
         return nil
@@ -239,6 +247,9 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// The key/value panel standing in for collapsed frontmatter.
     var frontmatter: FrontmatterLayout?
 
+    /// The laid-out GitHub-README HTML fragment this block draws.
+    var htmlFlow: HTMLFlowLayout?
+
     /// Whether this fragment draws the chip that copies its block's code.
     ///
     /// Set by the delegate rather than derived from ``decoration``, like
@@ -267,6 +278,9 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         // nothing, so the row's whole height is the fragment's to add.
         if let tableRow { return tableRow.height }
         if let frontmatter { return frontmatter.height }
+        if case .rendered = decoration, let htmlFlow {
+            return htmlFlow.height + Metrics.blockPadding * 2
+        }
         if let renderedContent {
             return renderedContent.size.height + Metrics.blockPadding * 2
         }
@@ -573,7 +587,11 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         case .rule:
             drawRule(in: context, at: point)
         case .rendered:
-            drawRenderedContent(in: context, at: point)
+            if htmlFlow != nil {
+                drawHTMLFlow(in: context, at: point)
+            } else {
+                drawRenderedContent(in: context, at: point)
+            }
         case .task(let checked):
             drawCheckbox(checked: checked, in: context, at: point)
         case .tableRow(let isHeader, let isLast):
@@ -1218,6 +1236,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         case .math: "Formula"
         case .diagram: "Diagram"
         case .image: "Image"
+        case .htmlFlow: "Image"
         case nil: nil
         }
     }
@@ -1396,6 +1415,16 @@ extension MarkdownLayoutFragment {
 
             cell.draw(in: context, at: at)
         }
+    }
+
+    /// Draws a README HTML fragment in place of its source.
+    private func drawHTMLFlow(in context: CGContext, at point: CGPoint) {
+        guard let htmlFlow else { return }
+        htmlFlow.draw(
+            in: context,
+            at: CGPoint(
+                x: point.x + Metrics.blockPadding,
+                y: point.y + contentTop))
     }
 
     /// Draws YAML/TOML frontmatter as a key/value card in place of its fence.

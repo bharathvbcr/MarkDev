@@ -249,8 +249,17 @@ public final class RichContentRenderer {
         case .image:
             return image(
                 at: request.block.source, relativeTo: request.directory,
-                maxWidth: request.context.width, width: request.block.width)
+                maxWidth: request.context.width, width: Self.requestedWidth(for: request))
+        case .htmlFlow:
+            return .failure(
+                RenderFailure(reason: "HTML flow is drawn, not rasterised"))
         }
+    }
+
+    /// The width a picture asked for: a point size, or the column when it
+    /// said `width="100%"`.
+    private static func requestedWidth(for request: RenderRequest) -> CGFloat? {
+        request.block.fillsColumn ? request.context.width : request.block.width
     }
 
     /// Whether `request` is already answered, without rendering anything.
@@ -280,7 +289,10 @@ public final class RichContentRenderer {
             return key(
                 forImage: resolve(request.block.source, relativeTo: request.directory)?.path
                     ?? request.block.source,
-                width: Self.boundedWidth(request.context.width, request.block.width))
+                width: Self.boundedWidth(
+                    request.context.width, Self.requestedWidth(for: request)))
+        case .htmlFlow:
+            return Key(kind: "htmlFlow", source: request.block.source, scale: 0, dark: false)
         }
     }
 

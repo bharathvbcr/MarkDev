@@ -579,13 +579,20 @@ final class RenderedBlockTests: XCTestCase {
     func testHTMLThatIsNotOnePictureKeepsItsSource() {
         // Everything here is markup the editor cannot draw. Rendering any of
         // it as a picture would hide text the reader wrote.
+        //
+        // `<div>hello</div>` is no longer in this list: a centred (or plain)
+        // paragraph of README HTML is a fragment we *can* draw. Two `<img>`
+        // tags with no wrapper are a *paragraph* of inline HTML, not an HTML
+        // block, and still keep their source — a paragraph holding two
+        // pictures is a paragraph.
         for markup in [
-            "<div>hello</div>",
             #"<img src="a.svg"><img src="b.svg">"#,
             #"see <img src="a.svg"> here"#,
             "<img>",
             #"<img alt="no source">"#,
             "<!-- <img src=\"a.svg\"> -->",
+            "<table><tr><td>x</td></tr></table>",
+            "<script>alert(1)</script>",
             // A `<br>` cannot be drawn, only inserted, and collapsed syntax
             // shrinks rather than being replaced — so there is nothing to put
             // in its place and it keeps its source, `clear` and all.

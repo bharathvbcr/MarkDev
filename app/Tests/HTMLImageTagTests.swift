@@ -76,16 +76,21 @@ final class HTMLImageTagTests: XCTestCase {
 
     // MARK: - Widths
 
+    func testAHundredPercentWidthFillsTheColumn() throws {
+        let tag = try XCTUnwrap(HTMLImageTag.parse(#"<img src="x.svg" width="100%">"#))
+        XCTAssertNil(tag.width)
+        XCTAssertTrue(tag.fillsColumn)
+    }
+
     func testWidthsThatCannotMeanAnything() throws {
-        // A percentage is a fraction of a containing box this layout does not
-        // have; resolving it against the column would make `width="100%"`
-        // mean two different sizes in two split panes. Dropped, rather than
-        // guessed — the picture still draws at its own size.
-        for width in ["100%", "0", "-40", "auto", "", "abc"] {
+        // A percentage other than 100% is a fraction of a box this layout
+        // does not have. Dropped, rather than guessed.
+        for width in ["50%", "0", "-40", "auto", "", "abc"] {
             let tag = try XCTUnwrap(
                 HTMLImageTag.parse(#"<img src="x.svg" width="\#(width)">"#),
                 "the tag itself is still a picture")
             XCTAssertNil(tag.width, "width=\(width.debugDescription) should be dropped")
+            XCTAssertFalse(tag.fillsColumn, "width=\(width.debugDescription) is not a fill")
         }
     }
 

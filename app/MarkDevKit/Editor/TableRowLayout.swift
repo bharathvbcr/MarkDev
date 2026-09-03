@@ -52,6 +52,14 @@ struct TableCellDrawing: @unchecked Sendable {
     var pills: [Pill] = []
     /// Formula bitmaps CoreText reserves room for but cannot paint itself.
     var formulas: [Formula] = []
+    /// A cell that is a picture rather than text — an HTML `<img>` or a
+    /// Markdown image, including the `[<img>](url)` GitHub README spelling.
+    struct Picture {
+        let image: CGImage
+        let rect: CGRect
+    }
+
+    var pictures: [Picture] = []
     /// Height the wrapped text occupies at the width it was given.
     var height: CGFloat = 0
 
@@ -224,7 +232,7 @@ struct TableCellDrawing: @unchecked Sendable {
     /// every glyph is drawn upside down. Same idiom as the block label and the
     /// drawn list marker.
     func draw(in context: CGContext, at origin: CGPoint) {
-        guard !lines.isEmpty else { return }
+        guard !lines.isEmpty || !pictures.isEmpty else { return }
         context.saveGState()
         defer { context.restoreGState() }
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
@@ -240,6 +248,15 @@ struct TableCellDrawing: @unchecked Sendable {
             context.scaleBy(x: 1, y: -1)
             context.translateBy(x: 0, y: -rect.midY)
             context.draw(formula.image, in: rect)
+            context.restoreGState()
+        }
+        for picture in pictures {
+            let rect = picture.rect.offsetBy(dx: origin.x, dy: origin.y)
+            context.saveGState()
+            context.translateBy(x: 0, y: rect.midY)
+            context.scaleBy(x: 1, y: -1)
+            context.translateBy(x: 0, y: -rect.midY)
+            context.draw(picture.image, in: rect)
             context.restoreGState()
         }
     }
@@ -319,6 +336,7 @@ final class TableLayoutResolver {
         let text: NSAttributedString
         let natural: CGFloat
         let minimum: CGFloat
+        let picture: RenderedContent?
     }
 
     private struct RangeKey: Hashable {
@@ -400,6 +418,7 @@ final class TableLayoutResolver {
         let tagColor: NSColor
         let highlightBackground: NSColor
         let markerColor: NSColor
+        let directory: String
     }
 
     /// Bumped whenever the document is reparsed.
@@ -424,7 +443,7 @@ final class TableLayoutResolver {
         tables.removeAll(keepingCapacity: true)
     }
 
-    private func flushIfThemeChanged(_ theme: EditorTheme, ink: NSColor) {
+    private func flushIfThemeChanged(_ theme: EditorTheme, ink: NSColor, directory: URL?) {
         let current = Fingerprint(
             bodyFont: theme.bodyFont,
             textColor: ink,
@@ -436,7 +455,8 @@ final class TableLayoutResolver {
             linkColor: theme.linkColor,
             tagColor: theme.tagColor,
             highlightBackground: theme.highlightBackground,
-            markerColor: theme.markerColor)
+            markerColor: theme.markerColor,
+            directory: directory?.path ?? "")
         guard current != fingerprint else { return }
         fingerprint = current
         flush()
@@ -455,9 +475,10 @@ final class TableLayoutResolver {
         text: NSString,
         availableWidth: CGFloat,
         theme: EditorTheme,
-        ink: NSColor
+        ink: NSColor,
+        directory: URL? = nil
     ) -> TableRowLayout? {
-        flushIfThemeChanged(theme, ink: ink)
+        flushIfThemeChanged(theme, ink: ink, directory: directory)
 
         let key = Key(
             revision: revision,
@@ -471,7 +492,8 @@ final class TableLayoutResolver {
         } else {
             solved = solve(
                 table: table, in: document, text: text,
-                availableWidth: availableWidth, theme: theme, ink: ink)
+                availableWidth: availableWidth, theme: theme, ink: ink,
+                directory: directory)
             // Bounded: the window can be dragged through hundreds of widths,
             // and an unbounded cache keyed on width would grow for its
             // lifetime. The whole map goes rather than the oldest entry —
@@ -508,7 +530,8 @@ final class TableLayoutResolver {
         text: NSString,
         availableWidth: CGFloat,
         theme: EditorTheme,
-        ink: NSColor
+        ink: NSColor,
+        directory: URL?
     ) -> Solved {
         let columnCount = max(table.tableColumnCount ?? 0, 1)
 
@@ -564,7 +587,8 @@ final class TableLayoutResolver {
             var row: [StyledCell] = []
             for (column, source) in sources.enumerated() {
                 let cell = styledCell(
-                    source, bold: rowIndex == headerIndex, theme: theme, ink: ink)
+                    source, bold: rowIndex == headerIndex, theme: theme, ink: ink,
+                    directory: directory)
                 row.append(cell)
                 demands[column] = TableColumnDemand(
                     natural: max(demands[column].natural, cell.natural),
@@ -678,10 +702,41 @@ final class TableLayoutResolver {
 
     /// One cell's text, styled the way the document styles inline Markdown.
     private func styledCell(
-        _ source: CellSource, bold: Bool, theme: EditorTheme, ink: NSColor
+        _ source: CellSource, bold: Bool, theme: EditorTheme, ink: NSColor,
+        directory: URL?
     ) -> StyledCell {
         let key = source.key(bold: bold)
         if let cached = cells[key] { return cached }
+
+        if let tag = Self.cellPicture(source) {
+            if case .success(let rendered) = RichContentRenderer.shared.image(
+                at: tag.source, relativeTo: directory, maxWidth: 2048, width: tag.width),
+                rendered.cgImage != nil
+            {
+                let cell = StyledCell(
+                    key: key,
+                    text: NSAttributedString(string: ""),
+                    natural: ceil(rendered.size.width),
+                    minimum: min(ceil(rendered.size.width), 80),
+                    picture: rendered)
+                if cells.count > 4096 { cells.removeAll(keepingCapacity: true) }
+                cells[key] = cell
+                return cell
+            }
+            let label = tag.alt.isEmpty ? "image" : tag.alt
+            let fallback = NSAttributedString(
+                string: label,
+                attributes: [.font: theme.bodyFont, .foregroundColor: ink])
+            let cell = StyledCell(
+                key: key,
+                text: fallback,
+                natural: ceil(fallback.size().width),
+                minimum: Self.widestWord(in: fallback),
+                picture: nil)
+            if cells.count > 4096 { cells.removeAll(keepingCapacity: true) }
+            cells[key] = cell
+            return cell
+        }
 
         let content: NSAttributedString
         if source.text.isEmpty {
@@ -724,7 +779,8 @@ final class TableLayoutResolver {
             key: key,
             text: content,
             natural: ceil(content.size().width),
-            minimum: Self.widestWord(in: content))
+            minimum: Self.widestWord(in: content),
+            picture: nil)
 
         // Bounded for the same reason the table cache is: a long document of
         // wide tables would otherwise keep every cell it ever styled.
@@ -746,6 +802,26 @@ final class TableLayoutResolver {
         let key = DrawingKey(
             style: cell.key, width: width, alignment: alignment, lineSpacing: lineSpacing)
         if let cached = drawings[key] { return cached }
+        if let picture = cell.picture, let image = picture.cgImage {
+            let fit = min(width, picture.size.width)
+            let height = picture.size.height * (fit / max(picture.size.width, 1))
+            let x: CGFloat
+            switch alignment {
+            case .auto, .left: x = 0
+            case .center: x = max(width - fit, 0) / 2
+            case .right: x = max(width - fit, 0)
+            }
+            var drawing = TableCellDrawing()
+            drawing.pictures = [
+                TableCellDrawing.Picture(
+                    image: image,
+                    rect: CGRect(x: x, y: 0, width: fit, height: height))
+            ]
+            drawing.height = ceil(height)
+            if drawings.count > 4096 { drawings.removeAll(keepingCapacity: true) }
+            drawings[key] = drawing
+            return drawing
+        }
         let text: NSAttributedString
         if source.text.contains("$"), width >= 1 {
             // The natural cell is measured before the grid is solved. Refit a
@@ -768,6 +844,70 @@ final class TableLayoutResolver {
         if drawings.count > 4096 { drawings.removeAll(keepingCapacity: true) }
         drawings[key] = made
         return made
+    }
+
+    /// A cell whose whole content is one picture: a lone `<img>`, a Markdown
+    /// image, or GitHub's `[<img src>](url)` wrapper.
+    private static func cellPicture(_ source: CellSource) -> HTMLImageTag? {
+        if let tag = HTMLImageTag.parse(source.text) { return tag }
+
+        let html = source.document.spans.filter { $0.kind == .inlineHTML }
+        let images = source.document.spans.filter { $0.kind == .image }
+        let text = source.text as NSString
+
+        if html.count == 1, let span = html.first {
+            let range = span.range
+            guard range.location >= 0, NSMaxRange(range) <= text.length,
+                let tag = HTMLImageTag.parse(text.substring(with: range)),
+                remainderIsSyntax(source, covering: range)
+            else { return nil }
+            return tag
+        }
+
+        if images.count == 1, html.isEmpty, let span = images.first,
+            remainderIsSyntax(source, covering: span.range),
+            let target = source.document.target(for: span), !target.isEmpty
+        {
+            let alt: String
+            if span.range.location >= 0, NSMaxRange(span.range) <= text.length {
+                alt = text.substring(with: span.range)
+            } else {
+                alt = ""
+            }
+            return HTMLImageTag(source: target, alt: alt)
+        }
+        return nil
+    }
+
+    /// Whether everything in the cell besides `covering` is whitespace or
+    /// Markdown syntax (a wrapping link, the image's own markers).
+    private static func remainderIsSyntax(_ source: CellSource, covering inner: NSRange) -> Bool {
+        let length = (source.text as NSString).length
+        guard inner.location >= 0, NSMaxRange(inner) <= length else { return false }
+        var covered = IndexSet()
+        covered.insert(integersIn: inner.location..<NSMaxRange(inner))
+        for span in source.document.spans {
+            switch span.kind {
+            case .link, .image, .wikiLink, .inlineHTML:
+                let range = span.range
+                guard range.location >= 0, NSMaxRange(range) <= length else { continue }
+                covered.insert(integersIn: range.location..<NSMaxRange(range))
+            default:
+                continue
+            }
+        }
+        for marker in source.document.markers {
+            let range = marker.range
+            guard range.location >= 0, NSMaxRange(range) <= length else { continue }
+            covered.insert(integersIn: range.location..<NSMaxRange(range))
+        }
+        let text = source.text as NSString
+        for index in 0..<length {
+            if covered.contains(index) { continue }
+            if isWhitespace(text.character(at: index)) { continue }
+            return false
+        }
+        return true
     }
 
     /// The widest run with no break opportunity in it — the width below which
