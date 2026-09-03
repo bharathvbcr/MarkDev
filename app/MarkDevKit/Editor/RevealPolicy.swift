@@ -125,7 +125,7 @@ public enum RevealPolicy {
         var ranges: [NSRange] = []
         for (index, block) in document.blocks.enumerated() {
             switch block.kind {
-            case .mathBlock, .mermaidBlock, .tableRow, .tableHead:
+            case .mathBlock, .mermaidBlock, .tableRow, .tableHead, .frontmatter:
                 guard !revealed.contains(index) else { continue }
             default:
                 continue
@@ -197,7 +197,11 @@ extension HiddenRanges {
             }
             return block.range
         }
-        let replaced = rendered.collapsedRanges(revealed: revealed) + tableRows
+        let frontmatter: [NSRange] = document.blocks.enumerated().compactMap { index, block in
+            guard block.kind == .frontmatter, !revealed.contains(index) else { return nil }
+            return block.range
+        }
+        let replaced = rendered.collapsedRanges(revealed: revealed) + tableRows + frontmatter
 
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }

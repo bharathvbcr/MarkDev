@@ -89,6 +89,71 @@ final class RenderedBlockTests: XCTestCase {
         XCTAssertEqual(fragments(view).filter { $0.decoration.rendered != nil }.count, 1)
     }
 
+    func testFencedAndBracketedMathTypesetRatherThanSittingAsCode() {
+        for source in [
+            "```math\nE = mc^2\n```\n",
+            "\\[E = mc^2\\]\n",
+            "\\\\[E = mc^2\\\\]\n",
+        ] {
+            let view = view(source)
+            let drawing = fragments(view).filter { $0.decoration.rendered != nil }
+            XCTAssertEqual(drawing.count, 1, "\(source) should typeset once")
+            XCTAssertEqual(drawing.first?.decoration.rendered?.kind, .math)
+            XCTAssertTrue(
+                fragments(view).allSatisfy {
+                    if case .code = $0.decoration { return false }
+                    return true
+                },
+                "\(source) must not draw as a code panel while collapsed")
+        }
+    }
+
+    func testParenthesizedInlineMathTypesets() {
+        let view = view("see \\(a + b\\) here\n")
+        XCTAssertFalse(view.parsed.inlineMathSpans.isEmpty)
+        let storage = view.textStorage
+        for span in view.parsed.inlineMathSpans {
+            XCTAssertNotNil(
+                storage?.attribute(.inlineMathRun, at: span.range.location, effectiveRange: nil),
+                "\\(a + b\\) should typeset, not sit as source")
+        }
+    }
+
+    func testMarkdownEscapedParenMathTypesets() {
+        let view = view("see \\\\(a + b\\\\) here\n")
+        XCTAssertFalse(view.parsed.inlineMathSpans.isEmpty)
+        let storage = view.textStorage
+        for span in view.parsed.inlineMathSpans {
+            XCTAssertNotNil(
+                storage?.attribute(.inlineMathRun, at: span.range.location, effectiveRange: nil),
+                "\\\\(a + b\\\\) should typeset, not sit as source")
+        }
+    }
+
+    func testLivePreviewTypesetsMathWhenTheCaretIsElsewhere() {
+        // setMarkdown parks the caret at the end, which would reveal the last
+        // block as source. A leading paragraph is the ordinary reading pose.
+        let view = view("Intro.\n\n```math\nE = mc^2\n```\n\nsee \\(a + b\\) here\n", mode: .livePreview)
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        XCTAssertEqual(
+            fragments(view).filter { $0.decoration.rendered?.kind == .math }.count, 1,
+            "a fenced math block away from the caret must typeset in live preview")
+        let span = view.parsed.inlineMathSpans.first
+        XCTAssertNotNil(span)
+        XCTAssertNotNil(
+            view.textStorage?.attribute(
+                .inlineMathRun, at: span!.range.location, effectiveRange: nil),
+            "paren math away from the caret must typeset in live preview")
+    }
+
+    func testMathInsideInlineCodeDoesNotTypeset() {
+        let view = view("use `\\(x\\)` in a shell\n")
+        XCTAssertTrue(view.parsed.inlineMathSpans.isEmpty)
+        XCTAssertTrue(view.renderedBlocks.entries.isEmpty)
+    }
+
     func testARenderedBlockTakesTheHeightOfItsContentAndNoMore() throws {
         // The failure this replaces was arithmetic, not cosmetic: every line of
         // the fence grew its own frame by the diagram's full height, so the
@@ -276,6 +341,81 @@ final class RenderedBlockTests: XCTestCase {
         XCTAssertEqual(
             fragments(text).filter { $0.decoration.rendered != nil }.count, 1,
             "Quick Look and the hold-Space peek go through this same path")
+    }
+
+    // MARK: - Nested combinations
+
+    func testAMermaidFenceInsideACalloutStillDrawsADiagram() {
+        let view = view(
+            "> [!NOTE]\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n")
+        XCTAssertEqual(
+            fragments(view).filter { $0.renderedContent != nil }.count, 1,
+            "a diagram inside a callout is still a diagram")
+    }
+
+    func testMathInsideAListStillTypesets() {
+        let view = view("- item\n\n  $$\n  x^2\n  $$\n")
+        XCTAssertEqual(
+            fragments(view).filter { $0.renderedContent != nil }.count, 1,
+            "a formula under a bullet is still a formula")
+    }
+
+    func testMathInsideACalloutStillTypesets() {
+        let view = view("> [!NOTE]\n> $$\n> x^2\n> $$\n")
+        XCTAssertEqual(
+            fragments(view).filter { $0.renderedContent != nil }.count, 1,
+            "a formula inside a callout must strip the `> ` prefixes before typesetting")
+    }
+
+    func testAnImageInsideACalloutIsStillAPicture() {
+        let source = "> [!NOTE]\n> ![plan](plan.png)\n"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        let entry = rendered.entries.first { entry in
+            if case .image = entry.content.kind { return true }
+            return false
+        }
+        XCTAssertNotNil(entry, "a standalone image under a callout is still a picture")
+        XCTAssertEqual(entry?.content.source, "plan.png")
+    }
+
+    func testATableInsideACalloutStillDrawsAGrid() {
+        // Park the caret on a leading paragraph so the table stays collapsed;
+        // TextKit also needs a display pass before `tableRow` is reliably set.
+        let view = view(
+            "Intro.\n\n> [!TIP]\n>\n> | a | b |\n> |---|---|\n> | 1 | 2 |\n")
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        view.layoutSubtreeIfNeeded()
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
+        }
+        let rows = fragments(view).filter {
+            if case .tableRow = $0.decoration { return true }
+            return false
+        }
+        XCTAssertFalse(rows.isEmpty, "a table inside a callout is still a grid")
+        XCTAssertFalse(
+            rows.filter { $0.tableRow != nil }.isEmpty,
+            "the collapsed rows must resolve a grid, or they render as a blank band")
+    }
+
+    func testAnXyChartMermaidFenceDrawsADiagram() {
+        let view = view(
+            "```mermaid\nxychart-beta\n  y-axis 0 --> 100\n  bar [10, 40, 90]\n```\n")
+        XCTAssertGreaterThan(
+            fragments(view).filter { $0.renderedContent != nil }.count, 0,
+            "an xy-chart is a native-supported type and must draw, not sit as code")
+    }
+
+    func testUnsupportedMermaidExplainsRatherThanBlanking() {
+        let view = view("```mermaid\ngantt\n    title A gantt\n```\n")
+        let failures = fragments(view).compactMap(\.renderFailure)
+        XCTAssertFalse(
+            failures.isEmpty,
+            "a mermaid type the native renderer cannot draw must fail visibly")
+        XCTAssertTrue(
+            fragments(view).allSatisfy { $0.renderedContent == nil || $0.renderFailure != nil },
+            "an unsupported diagram must not paint an empty picture")
     }
 
     // MARK: - The index itself

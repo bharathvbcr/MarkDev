@@ -53,6 +53,15 @@ final class EditorStressTests: XCTestCase {
         "<div>raw html</div>",
         "Trailing spaces here.   ",
         "A line ending in a backslash \\",
+        "Term\n: A definition list entry.",
+        "1) paren numbered",
+        "    indented code line",
+        "~~~\ntilde fence\n~~~",
+        "> [!CAUTION]\n> mermaid in a callout\n>\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```",
+        "> [!TIP]\n>\n> | a | b |\n> |---|---|\n> | 1 | 2 |",
+        "```mermaid\nxychart-beta\n  y-axis 0 --> 100\n  bar [10, 40, 90]\n```",
+        "+++\ntitle = \"Note\"\n+++\n\nBody after toml.",
+        "[see][ref]\n\n[ref]: https://example.test/ref",
     ]
 
     /// What a keystroke, a paste, or a delete looks like. Weighted towards the

@@ -177,7 +177,7 @@ enum ParseDivergence {
         else { return false }
 
         switch old.kind {
-        case .link, .wikiLink, .image:
+        case .link, .wikiLink, .image, .footnoteReference:
             // `data` indexes the parse's own string table, which is renumbered
             // whenever a link anywhere in the document appears or disappears.
             // Two spans with the same number can point at different notes, so

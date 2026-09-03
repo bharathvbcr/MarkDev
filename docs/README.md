@@ -22,7 +22,7 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
 - [Editor Engine & Rendering Pipeline](./editor-engine.md)
   - TextKit 2 layout fragment architecture (`NSTextLayoutFragment`)
   - Non-destructive marker collapsing with 0.01pt fonts
-  - Dynamic table alignment with character kerning
+  - GFM tables drawn as a grid (`TableGrid` / `TableRowLayout`)
   - Native rich block rendering (LaTeX via SwiftMath, Mermaid via BeautifulMermaid)
   - Incremental shift parsing vs full reparsing
 

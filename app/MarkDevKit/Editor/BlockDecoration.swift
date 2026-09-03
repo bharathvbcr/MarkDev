@@ -62,12 +62,14 @@ public enum BlockDecoration: Sendable, Equatable {
     case task(checked: Bool)
     /// A GFM table row. `isHeader` shades the first row.
     case tableRow(isHeader: Bool, isLast: Bool)
+    /// YAML/TOML frontmatter drawn as a key/value panel in place of its fence.
+    case frontmatter
 
     /// Whether this decoration paints a background the text sits on.
     public var hasBackground: Bool {
         switch self {
         case .none, .rule, .rendered, .task: false
-        case .code, .callout, .quote, .tableRow: true
+        case .code, .callout, .quote, .tableRow, .frontmatter: true
         }
     }
 
@@ -150,7 +152,14 @@ extension BlockDecoration {
             // and it reads as one. The formula is drawn only once the source
             // has gone, which is ``renderedPiece(of:at:hidden:)`` above.
             return .code(edge: edge, language: nil)
-        case .codeBlock, .mermaidBlock, .frontmatter:
+        case .frontmatter:
+            // Collapsed: a structured panel in place of the fence, the same
+            // bargain a table makes. Revealed: the YAML/TOML itself, as code.
+            if hidden.covers(block.range) {
+                return edge.roundsTop ? .frontmatter : .none
+            }
+            return .code(edge: edge, language: nil)
+        case .codeBlock, .mermaidBlock:
             return .code(edge: edge, language: block.info)
         case .callout:
             return .callout(kind: block.calloutKind ?? .note, edge: edge)

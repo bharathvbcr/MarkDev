@@ -54,6 +54,43 @@ final class MarkdownPreviewTests: XCTestCase {
         }
     }
 
+    func testDefinitionListsAndFootnotesSurvivePreview() throws {
+        let source = """
+            Term
+            : A definition.
+
+            See this[^1].
+
+            [^1]: The note.
+            """
+        let controller = makeController()
+        controller.show(source, directory: nil)
+        let view = try textView(of: controller)
+
+        XCTAssertTrue(view.parsed.blocks.contains { $0.kind == .definitionList })
+        XCTAssertTrue(view.parsed.spans.contains { $0.kind == .footnoteReference })
+        XCTAssertEqual(controller.markdown, source)
+    }
+
+    func testAMermaidFenceInsideACalloutDrawsInPreview() throws {
+        let controller = makeController()
+        controller.show(
+            "> [!NOTE]\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n", directory: nil)
+        let view = try textView(of: controller)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        var diagrams = 0
+        view.textLayoutManager?.enumerateTextLayoutFragments(
+            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                diagrams += 1
+            }
+            return true
+        }
+        XCTAssertGreaterThan(diagrams, 0, "preview is the same engine as the editor")
+    }
+
     func testTheSourceRoundTripsExactly() throws {
         // The old renderer *deleted* hidden syntax, so its output could not be
         // copied back out as Markdown. Collapsing keeps the buffer honest.
@@ -461,6 +498,113 @@ final class MarkdownPreviewTests: XCTestCase {
     }
 
     // MARK: - Loading
+
+    func testPreviewTypesetsFencedAndParenMath() throws {
+        let controller = makeController()
+        controller.show(
+            "```math\nE = mc^2\n```\n\nsee \\(a + b\\) and \\\\(c + d\\\\) here\n", directory: nil)
+        let view = try textView(of: controller)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        XCTAssertTrue(view.parsed.blocks.contains { $0.kind == .mathBlock })
+        XCTAssertFalse(view.parsed.inlineMathSpans.isEmpty)
+        var formulas = 0
+        view.textLayoutManager?.enumerateTextLayoutFragments(
+            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                formulas += 1
+            }
+            return true
+        }
+        XCTAssertGreaterThan(formulas, 0, "fenced math must typeset in the read-only preview")
+        let span = try XCTUnwrap(view.parsed.inlineMathSpans.first)
+        XCTAssertNotNil(
+            view.textStorage?.attribute(.inlineMathRun, at: span.range.location, effectiveRange: nil))
+    }
+
+    func testPreviewDrawsFrontmatterAndFollowsWithTheBody() throws {
+        let controller = makeController()
+        controller.show("---\ntitle: Note\n---\n\n# Body\n", directory: nil)
+        let view = try textView(of: controller)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        var panels = 0
+        view.textLayoutManager?.enumerateTextLayoutFragments(
+            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.frontmatter != nil {
+                panels += 1
+            }
+            return true
+        }
+        XCTAssertEqual(panels, 1)
+        let heading = (view.markdown as NSString).range(of: "Body")
+        let font = view.textStorage?.attribute(.font, at: heading.location, effectiveRange: nil)
+            as? NSFont
+        XCTAssertGreaterThan(font?.pointSize ?? 0, EditorTheme.standard.bodyFont.pointSize)
+    }
+
+    func testPreviewResolvesParentRelativeImagesAndRefusesRemote() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevPreviewImg-\(UUID().uuidString)")
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let image = NSImage(size: CGSize(width: 40, height: 20))
+        image.lockFocus()
+        NSColor.systemBlue.drawSwatch(in: CGRect(x: 0, y: 0, width: 40, height: 20))
+        image.unlockFocus()
+        let data = try XCTUnwrap(
+            NSBitmapImageRep(data: image.tiffRepresentation ?? Data())?
+                .representation(using: .png, properties: [:]))
+        try data.write(to: root.appendingPathComponent("pic.png"))
+
+        let controller = makeController()
+        controller.show("![shot](../pic.png)\n", directory: notes)
+        let view = try textView(of: controller)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        var pictures = 0
+        view.textLayoutManager?.enumerateTextLayoutFragments(
+            from: view.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                pictures += 1
+            }
+            return true
+        }
+        XCTAssertEqual(pictures, 1, "preview must resolve ../ against the document folder")
+
+        controller.show("<img src=\"../pic.png\">\n", directory: notes)
+        let htmlView = try textView(of: controller)
+        htmlView.textLayoutManager?.ensureLayout(for: htmlView.textLayoutManager!.documentRange)
+        var htmlPictures = 0
+        htmlView.textLayoutManager?.enumerateTextLayoutFragments(
+            from: htmlView.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                htmlPictures += 1
+            }
+            return true
+        }
+        XCTAssertEqual(htmlPictures, 1, "preview must resolve a parent-relative <img>")
+
+        controller.show("![web](https://example.com/x.png)\n", directory: notes)
+        let remote = try textView(of: controller)
+        remote.textLayoutManager?.ensureLayout(for: remote.textLayoutManager!.documentRange)
+        var remotePictures = 0
+        remote.textLayoutManager?.enumerateTextLayoutFragments(
+            from: remote.textLayoutManager!.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment, fragment.renderedContent != nil {
+                remotePictures += 1
+            }
+            return true
+        }
+        XCTAssertEqual(remotePictures, 0, "preview must not fetch a remote image")
+    }
 
     func testLoadingAFileResolvesItsDirectoryForImages() throws {
         let directory = URL(fileURLWithPath: NSTemporaryDirectory())

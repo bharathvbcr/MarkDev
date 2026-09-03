@@ -31,6 +31,15 @@ extension NSAttributedString.Key {
     /// Marks renderer diagnostics so a later successful refresh can remove
     /// only its own underline without disturbing proofreading or link style.
     public static let inlineMathFailure = NSAttributedString.Key("dev.markdev.inlineMathFailure")
+
+    /// Marks `==highlight==` so the fragment can draw a pill sized to the type.
+    ///
+    /// `.backgroundColor` fills the line's full height, the same slab that
+    /// made inline code collide with the lines around it.
+    public static let highlightRun = NSAttributedString.Key("dev.markdev.highlight")
+
+    /// Marks a `#tag` so the fragment can draw a pill behind it.
+    public static let tagRun = NSAttributedString.Key("dev.markdev.tag")
 }
 
 /// Immutable payload stored on an attributed inline-math anchor.
@@ -114,14 +123,8 @@ enum InlineMathTypesetter {
             if NSMaxRange(body) <= target.location { continue }
             if body.location >= NSMaxRange(target) { break }
 
-            let close = NSMaxRange(body)
-            guard body.location > 0, close < text.length,
-                text.character(at: body.location - 1) == 0x24,
-                text.character(at: close) == 0x24
+            guard let (openingMarker, closingMarker) = Self.delimiters(around: body, in: text)
             else { continue }
-
-            let openingMarker = NSRange(location: body.location - 1, length: 1)
-            let closingMarker = NSRange(location: close, length: 1)
             let collapsed = hidden.covers(openingMarker) && hidden.covers(closingMarker)
             let previousRun = storage.attribute(
                 .inlineMathRun, at: body.location, effectiveRange: nil) as? InlineMathRun
@@ -221,6 +224,48 @@ enum InlineMathTypesetter {
                     range: body)
             }
         }
+    }
+
+    /// `$…$`, `\(...\)`, or Markdown-escaped `\\(...\\)` around an inline span.
+    ///
+    /// Longer fences first so `\\(x\\)` is not read as `\(` starting one
+    /// backslash later.
+    private static func delimiters(
+        around body: NSRange, in text: NSString
+    ) -> (open: NSRange, close: NSRange)? {
+        let close = NSMaxRange(body)
+        let length = text.length
+        func chars(_ start: Int, _ expected: [unichar]) -> Bool {
+            guard start >= 0, start + expected.count <= length else { return false }
+            for (offset, ch) in expected.enumerated() {
+                if text.character(at: start + offset) != ch { return false }
+            }
+            return true
+        }
+        let backslash: unichar = 0x5C
+        let dollar: unichar = 0x24
+        let lparen: unichar = 0x28
+        let rparen: unichar = 0x29
+        if chars(body.location - 3, [backslash, backslash, lparen]),
+            chars(close, [backslash, backslash, rparen])
+        {
+            return (
+                NSRange(location: body.location - 3, length: 3),
+                NSRange(location: close, length: 3))
+        }
+        if chars(body.location - 2, [backslash, lparen]),
+            chars(close, [backslash, rparen])
+        {
+            return (
+                NSRange(location: body.location - 2, length: 2),
+                NSRange(location: close, length: 2))
+        }
+        if chars(body.location - 1, [dollar]), chars(close, [dollar]) {
+            return (
+                NSRange(location: body.location - 1, length: 1),
+                NSRange(location: close, length: 1))
+        }
+        return nil
     }
 }
 
@@ -353,37 +398,60 @@ public enum MarkdownStyler {
     /// that stayed invisible in the keystroke tests, where the scope is a
     /// block or two, and only showed up on open: 10,000 lines cost 8x what
     /// 2,500 did, against 4x the text.
-    private static func taskMarkerRanges(in document: ParsedDocument) -> [NSRange] {
+    private static func taskMarkers(in document: ParsedDocument) -> [StyleSpan] {
         document.spans
             .lazy
             .filter { $0.kind == .taskMarker }
-            .map(\.range)
-            .sorted { $0.location < $1.location }
+            .sorted { $0.range.location < $1.range.location }
     }
 
-    /// Whether a list item carries a task checkbox.
+    /// The `- [ ]` marker overlapping `range`, if this item is a task.
     ///
-    /// - Parameter taskMarkers: ``taskMarkerRanges(in:)`` for this document.
-    ///   Task markers never overlap, so sorting by location also sorts by
-    ///   end, which is what lets this binary-search.
-    private static func isTaskItem(
-        _ block: BlockDescriptor, taskMarkers: [NSRange]
-    ) -> Bool {
-        // The first marker that could still reach into the block: everything
-        // before it ends at or before the block starts.
+    /// `range` must be the item's *own* text — see ``ownText(of:among:limit:)``
+    /// — not the parsed ListItem extent. A parent item contains nested
+    /// children, so searching the whole block would pick up a child's `[x]`
+    /// and strike the parent.
+    ///
+    /// Task markers never overlap, so sorting by location also sorts by
+    /// end, which is what lets this binary-search.
+    private static func taskMarker(
+        overlapping range: NSRange, in markers: [StyleSpan]
+    ) -> StyleSpan? {
+        guard range.length > 0 else { return nil }
         var low = 0
-        var high = taskMarkers.count
+        var high = markers.count
         while low < high {
             let mid = low + (high - low) / 2
-            if NSMaxRange(taskMarkers[mid]) <= block.range.location {
+            if NSMaxRange(markers[mid].range) <= range.location {
                 low = mid + 1
             } else {
                 high = mid
             }
         }
-        guard low < taskMarkers.count else { return false }
-        // Overlap, matching the intersection test this replaced.
-        return taskMarkers[low].location < NSMaxRange(block.range)
+        guard low < markers.count else { return nil }
+        let marker = markers[low]
+        guard NSIntersectionRange(marker.range, range).length > 0 else { return nil }
+        return marker
+    }
+
+    /// The item's own text, stopping before a nested list so a checked parent
+    /// does not strike an unchecked child.
+    private static func ownText(
+        of item: BlockDescriptor, among blocks: [BlockDescriptor], limit: NSRange
+    ) -> NSRange {
+        var end = NSMaxRange(item.range)
+        for other in blocks {
+            guard other.range.location > item.range.location,
+                NSMaxRange(other.range) <= NSMaxRange(item.range)
+            else { continue }
+            if other.kind == .list || other.kind == .listItem {
+                end = min(end, other.range.location)
+                break
+            }
+        }
+        return NSIntersectionRange(
+            NSRange(location: item.range.location, length: max(0, end - item.range.location)),
+            limit)
     }
 
     @MainActor
@@ -398,7 +466,7 @@ public enum MarkdownStyler {
         // Built on first use, not up front: a scoped restyle usually covers a
         // block or two, and one holding no list items should not pay to walk
         // the document's spans at all.
-        var taskMarkers: [NSRange]?
+        var taskMarkers: [StyleSpan]?
         let text = storage.string as NSString
 
         for block in blocks {
@@ -457,6 +525,17 @@ public enum MarkdownStyler {
                 paragraph.headIndent = 16
                 storage.addAttribute(.foregroundColor, value: theme.quoteColor, range: range)
                 storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
+            case .definitionListTitle:
+                if range.length > 0 { addTrait(.bold, to: storage, range: range) }
+            case .definitionListDefinition:
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineSpacing = theme.lineSpacing
+                paragraph.firstLineHeadIndent = 24
+                paragraph.headIndent = 24
+                storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
+            case .linkReferenceDefinition:
+                storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
+                storage.addAttribute(.font, value: theme.monoFont, range: range)
             case .listItem:
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.lineSpacing = theme.lineSpacing
@@ -464,19 +543,31 @@ public enum MarkdownStyler {
                 var indent = CGFloat(block.depth) * 8 + 16
                 // A task item needs a gutter for its drawn checkbox, since
                 // the `- [ ]` it replaces has been collapsed to nothing.
-                let markers: [NSRange]
+                let markers: [StyleSpan]
                 if let built = taskMarkers {
                     markers = built
                 } else {
-                    markers = taskMarkerRanges(in: document)
+                    markers = Self.taskMarkers(in: document)
                     taskMarkers = markers
                 }
-                if isTaskItem(block, taskMarkers: markers) {
+                let own = ownText(of: block, among: blocks, limit: limit)
+                let marker = taskMarker(overlapping: own, in: markers)
+                if marker != nil {
                     indent += MarkdownLayoutFragment.Metrics.checkboxGutter
                 }
                 paragraph.firstLineHeadIndent = indent
                 paragraph.headIndent = indent
                 storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
+                if marker?.data == 1 {
+                    let textRange = NSIntersectionRange(own, scope)
+                    if textRange.length > 0 {
+                        storage.addAttribute(
+                            .strikethroughStyle, value: NSUnderlineStyle.single.rawValue,
+                            range: textRange)
+                        storage.addAttribute(
+                            .foregroundColor, value: theme.secondaryColor, range: textRange)
+                    }
+                }
             default:
                 break
             }
@@ -631,17 +722,28 @@ public enum MarkdownStyler {
 
     /// The blocks no other block contains, in document order.
     ///
-    /// A linear sweep rather than a containment test per pair: blocks arrive
-    /// sorted by start offset with parents before their children, so a block
-    /// starting at or after the current top-level block's end is the next
-    /// top-level one.
+    /// A linear sweep rather than a containment test per pair. At a shared
+    /// start the parent is the longest block: a List and its first ListItem
+    /// open at the same offset, and taking the child first made every item
+    /// look top-level (paragraph spacing per bullet) whenever the parse
+    /// array was rematerialised.
     private static func topLevel(_ blocks: [BlockDescriptor]) -> [BlockDescriptor] {
         var result: [BlockDescriptor] = []
         var end = Int.min
-        for block in blocks where block.range.length > 0 {
-            guard block.range.location >= end else { continue }
-            result.append(block)
-            end = NSMaxRange(block.range)
+        var index = 0
+        while index < blocks.count {
+            let block = blocks[index]
+            index += 1
+            guard block.range.length > 0, block.range.location >= end else { continue }
+            var best = block
+            while index < blocks.count, blocks[index].range.location == best.range.location {
+                if blocks[index].range.length > best.range.length {
+                    best = blocks[index]
+                }
+                index += 1
+            }
+            result.append(best)
+            end = NSMaxRange(best.range)
         }
         return result
     }
@@ -700,10 +802,15 @@ public enum MarkdownStyler {
                     range: range
                 )
             case .tag:
-                storage.addAttribute(.foregroundColor, value: theme.tagColor, range: range)
+                storage.addAttributes(
+                    [
+                        .foregroundColor: theme.tagColor,
+                        .tagRun: true,
+                    ],
+                    range: range
+                )
             case .highlight:
-                storage.addAttribute(
-                    .backgroundColor, value: theme.highlightBackground, range: range)
+                storage.addAttribute(.highlightRun, value: true, range: range)
             case .inlineMath:
                 // Resolved after the marker pass by `MarkdownTextView`: the
                 // same span is source text while its block is revealed and a

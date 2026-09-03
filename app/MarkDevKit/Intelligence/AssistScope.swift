@@ -16,7 +16,8 @@ extension BlockKind {
     /// note that no longer parses.
     public var isVerbatim: Bool {
         switch self {
-        case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter, .htmlBlock:
+        case .codeBlock, .mermaidBlock, .mathBlock, .frontmatter, .htmlBlock,
+            .linkReferenceDefinition:
             true
         default:
             false

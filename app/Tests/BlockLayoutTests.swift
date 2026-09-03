@@ -168,6 +168,118 @@ final class BlockLayoutTests: XCTestCase {
         XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["1.", "2.", "7."])
     }
 
+    func testAnOrderedItemWrittenWithAParenKeepsThatNumber() throws {
+        let view = makeView("1) first\n2) second\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["1)", "2)"])
+    }
+
+    func testADefinitionIsIndentedUnderItsTerm() throws {
+        let view = makeView("Term\n: A longer definition of the term\n")
+        let term = try XCTUnwrap(lineStyle(view, containing: "Term"))
+        let definition = try XCTUnwrap(lineStyle(view, containing: "A longer definition"))
+        XCTAssertGreaterThan(
+            definition.headIndent, term.headIndent,
+            "a definition sits under its term, not flush with it")
+
+        let storage = try XCTUnwrap(view.textStorage)
+        let termRange = (view.markdown as NSString).range(of: "Term")
+        let font = storage.attribute(.font, at: termRange.location, effectiveRange: nil) as? NSFont
+        XCTAssertTrue(
+            font?.fontDescriptor.symbolicTraits.contains(.bold) == true,
+            "the term is the heading of the pair")
+    }
+
+    func testAFootnoteReferenceKeepsAVisibleLabel() throws {
+        let view = makeView("See this[^1].\n\n[^1]: The note.\n")
+        let storage = try XCTUnwrap(view.textStorage)
+        let source = view.markdown as NSString
+        let marker = source.range(of: "[^1]")
+        let label = NSRange(location: marker.location + 2, length: 1)
+        let font = storage.attribute(.font, at: label.location, effectiveRange: nil) as? NSFont
+        XCTAssertNotEqual(
+            font?.pointSize, EditorTheme.hiddenMarkerFontSize,
+            "the label is the superscript; hiding it leaves a hole")
+        XCTAssertNotNil(
+            storage.attribute(.baselineOffset, at: label.location, effectiveRange: nil),
+            "a footnote reference is drawn as a superscript")
+        XCTAssertNotNil(
+            storage.attribute(.link, at: label.location, effectiveRange: nil),
+            "clicking the mark jumps to the definition")
+    }
+
+    func testHighlightAndTagArePillsNotLineSlabs() throws {
+        let view = makeView("A ==hot== word and a #tag here\n")
+        let storage = try XCTUnwrap(view.textStorage)
+        let text = view.markdown as NSString
+        let hot = text.range(of: "hot")
+        let tag = text.range(of: "#tag")
+        XCTAssertNil(
+            storage.attribute(.backgroundColor, at: hot.location, effectiveRange: nil),
+            "highlight must not fill the line the way .backgroundColor does")
+        XCTAssertNotNil(storage.attribute(.highlightRun, at: hot.location, effectiveRange: nil))
+        XCTAssertNotNil(storage.attribute(.tagRun, at: tag.location, effectiveRange: nil))
+
+        let painted = fragments(view)
+        XCTAssertTrue(
+            painted.contains { !$0.highlightRects.isEmpty },
+            "the fragment draws a highlight pill")
+        XCTAssertTrue(
+            painted.contains { !$0.tagRects.isEmpty },
+            "the fragment draws a tag pill")
+    }
+
+    func testIndentedCodeHidesTheLeadingFenceIndent() throws {
+        let view = makeView("    let x = 1\n")
+        let storage = try XCTUnwrap(view.textStorage)
+        let font = storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(
+            font?.pointSize, EditorTheme.hiddenMarkerFontSize,
+            "the four-space indent is syntax, same as a fence line")
+    }
+
+    func testATightListDoesNotSpaceEveryItemWhenALinkDefinitionForcesAResort() throws {
+        // Control: items are not top-level, so they do not carry paragraph
+        // spacing of their own.
+        let plain = makeView("- one\n- two\n")
+        XCTAssertEqual(
+            try XCTUnwrap(lineStyle(plain, containing: "one")).paragraphSpacing, 0)
+
+        let withDef = makeView("- one\n- two\n\n[foo]: https://example.test/foo\n")
+        XCTAssertTrue(withDef.parsed.blocks.contains { $0.kind == .linkReferenceDefinition })
+        let kinds = withDef.parsed.blocks.map(\.kind)
+        let list = try XCTUnwrap(kinds.firstIndex(of: .list))
+        let item = try XCTUnwrap(kinds.firstIndex(of: .listItem))
+        XCTAssertLessThan(
+            list, item,
+            "parent List must precede ListItem after the link-def resort")
+        XCTAssertEqual(
+            try XCTUnwrap(lineStyle(withDef, containing: "one")).paragraphSpacing, 0,
+            "scrambling open order makes every item look top-level and spaces the list")
+    }
+
+    func testADefinitionListKeepsParentBeforeChildrenWhenALinkDefinitionIsPresent() throws {
+        let view = makeView("Term\n: Definition\n\n[foo]: https://example.test/foo\n")
+        let kinds = view.parsed.blocks.map(\.kind)
+        let list = try XCTUnwrap(kinds.firstIndex(of: .definitionList))
+        let title = try XCTUnwrap(kinds.firstIndex(of: .definitionListTitle))
+        XCTAssertLessThan(
+            list, title,
+            "parent DefinitionList must precede its title after the link-def resort")
+    }
+
+    func testALinkReferenceDefinitionCollapses() throws {
+        let view = makeView("[see][foo]\n\n[foo]: https://example.test/foo\n")
+        XCTAssertTrue(
+            view.parsed.blocks.contains { $0.kind == .linkReferenceDefinition },
+            "the definition is a construct, not leftover source")
+        let storage = try XCTUnwrap(view.textStorage)
+        let def = (view.markdown as NSString).range(of: "[foo]:")
+        let font = storage.attribute(.font, at: def.location, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(
+            font?.pointSize, EditorTheme.hiddenMarkerFontSize,
+            "live preview hides the definition; the resolved link is what remains")
+    }
+
     func testARevealedItemDrawsNoBulletBesideItsOwnMarker() throws {
         let source = "- first\n- second\n"
         let view = makeView(source, mode: .livePreview)
@@ -218,6 +330,17 @@ final class BlockLayoutTests: XCTestCase {
     func testAnAlertIsLabelledWithItsFlavour() throws {
         let view = makeView("> [!WARNING]\n> mind the gap\n")
         XCTAssertEqual(fragments(view).compactMap(\.blockLabel), ["WARNING"])
+    }
+
+    func testAnAlertShowsItsCustomTitleBesideTheFlavour() throws {
+        let view = makeView("> [!NOTE] Custom\n> body\n")
+        XCTAssertEqual(fragments(view).compactMap(\.blockLabel), ["NOTE Custom"])
+        let storage = try XCTUnwrap(view.textStorage)
+        let custom = (view.markdown as NSString).range(of: "Custom")
+        let font = storage.attribute(.font, at: custom.location, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(
+            font?.pointSize ?? 0, EditorTheme.hiddenMarkerFontSize, accuracy: 0.001,
+            "the authored title belongs on the strip, not as a second copy of the words")
     }
 
     func testAPanelPaysForAStripOnlyWhenSomethingIsDrawnInIt() throws {

@@ -128,6 +128,10 @@ struct Frame {
     span: Option<(SpanKind, u32)>,
     /// True for blockquote frames, which need the continuation-marker pass.
     is_block_quote: bool,
+    /// Indented code: the four-space (or tab) prefix is syntax, like a fence.
+    indented_code: bool,
+    /// Extra syntax on a GFM alert's first line (`[!NOTE]`, a custom title).
+    extra_markers: Vec<Range<usize>>,
 }
 
 /// Parses `source` into the flat model the editor renders from.
@@ -150,9 +154,13 @@ pub fn parse(source: &str) -> ParseResult {
                 if is_verbatim_tag(&tag) {
                     verbatim += 1;
                 }
+                let footnote_def_label = match &tag {
+                    Tag::FootnoteDefinition(label) => Some(label.to_string()),
+                    _ => None,
+                };
                 let frame = open_frame(
                     &tag,
-                    range,
+                    range.clone(),
                     source,
                     &mut result,
                     &mut block_stack,
@@ -163,6 +171,26 @@ pub fn parse(source: &str) -> ParseResult {
                     inline_depth += 1;
                 }
                 stack.push(frame);
+                // A footnote definition's `[^label]:` prefix is a gap the
+                // child paragraph does not cover. Covering the label leaves
+                // only the brackets and colon as markers, so the superscript
+                // has something to sit on — hiding the whole prefix was a
+                // hole where the mark should be.
+                if let Some(label) = footnote_def_label {
+                    if let Some(label_range) = footnote_label_in_definition(source, &range, &label)
+                    {
+                        cover(&mut stack, label_range.clone());
+                        let dest = result.intern(&label);
+                        push_span(
+                            &mut result,
+                            &mapper,
+                            &label_range,
+                            SpanKind::FootnoteReference,
+                            inline_depth,
+                            dest,
+                        );
+                    }
+                }
             }
 
             Event::End(end) => {
@@ -232,19 +260,43 @@ pub fn parse(source: &str) -> ParseResult {
                 }
                 cover(&mut stack, range);
             }
-            Event::FootnoteReference(_) => {
-                // `[^label]` is entirely syntax standing in for a rendered mark.
-                emit_delimited_leaf(
-                    &range,
-                    source,
-                    SpanKind::FootnoteReference,
-                    0,
-                    &mapper,
-                    &mut result,
-                    &block_stack,
-                    inline_depth,
-                );
-                mark_current(&mut result, &mapper, range.clone(), &block_stack);
+            Event::FootnoteReference(label) => {
+                // `[^label]` is brackets around a label. Hiding the whole run
+                // leaves a hole; hiding `[^` and `]` leaves the label for the
+                // superscript the styler draws.
+                let dest = result.intern(&label);
+                let bytes = source.as_bytes();
+                if range.len() >= 3
+                    && bytes.get(range.start) == Some(&b'[')
+                    && bytes.get(range.start + 1) == Some(&b'^')
+                    && bytes.get(range.end - 1) == Some(&b']')
+                {
+                    let inner = range.start + 2..range.end - 1;
+                    push_span(
+                        &mut result,
+                        &mapper,
+                        &inner,
+                        SpanKind::FootnoteReference,
+                        inline_depth,
+                        dest,
+                    );
+                    mark_current(
+                        &mut result,
+                        &mapper,
+                        range.start..range.start + 2,
+                        &block_stack,
+                    );
+                    mark_current(&mut result, &mapper, range.end - 1..range.end, &block_stack);
+                } else {
+                    push_span(
+                        &mut result,
+                        &mapper,
+                        &range,
+                        SpanKind::FootnoteReference,
+                        inline_depth,
+                        dest,
+                    );
+                }
                 cover(&mut stack, range);
             }
             Event::TaskListMarker(checked) => {
@@ -296,11 +348,28 @@ pub fn parse(source: &str) -> ParseResult {
                 }
                 cover(&mut stack, range);
             }
-            Event::Html(_) | Event::SoftBreak | Event::HardBreak => {
+            Event::Html(_) | Event::SoftBreak => {
+                cover(&mut stack, range);
+            }
+            Event::HardBreak => {
+                // Two trailing spaces, or a backslash, are the hard-break
+                // marker. The newline is the break itself and must stay, or
+                // the two lines join.
+                let bytes = source.as_bytes();
+                let mut end = range.end;
+                while end > range.start && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+                    end -= 1;
+                }
+                if end > range.start {
+                    mark_current(&mut result, &mapper, range.start..end, &block_stack);
+                }
                 cover(&mut stack, range);
             }
         }
     }
+
+    collect_delimited_math(source, &mapper, &mut result);
+    collect_link_reference_definitions(source, &mapper, &mut result);
 
     result.spans.sort_by_key(|s| (s.start, s.end));
     result.markers.sort_by_key(|m| (m.start, m.end));
@@ -325,6 +394,8 @@ fn open_frame(
         block: None,
         span: None,
         is_block_quote: false,
+        indented_code: false,
+        extra_markers: Vec::new(),
     };
 
     // Block slots are reserved on open so markers can reference them, and
@@ -351,10 +422,31 @@ fn open_frame(
         }
         Tag::BlockQuote(kind) => {
             frame.is_block_quote = true;
-            frame.block = Some(match kind {
-                Some(k) => reserve(result, BlockKind::Callout, callout_kind(*k) as u32, NO_INFO),
-                None => reserve(result, BlockKind::BlockQuote, 0, NO_INFO),
-            });
+            let alert = gfm_alert_line(source, &range);
+            match (kind, alert) {
+                (Some(k), alert) => {
+                    let idx = reserve(result, BlockKind::Callout, callout_kind(*k) as u32, NO_INFO);
+                    if let Some(alert) = alert {
+                        apply_alert_title(result, &mut frame, idx, alert);
+                    }
+                    frame.block = Some(idx);
+                }
+                (None, Some(alert)) => {
+                    // pulldown only names a flavour when `[!NOTE]` is the whole
+                    // line. `> [!NOTE] Custom` is a BlockQuote to it; we still
+                    // owe the reader a callout whose strip can show the title.
+                    let idx = reserve(result, BlockKind::Callout, alert.kind as u32, NO_INFO);
+                    frame.extra_markers.push(alert.tag);
+                    if let Some((title, title_range)) = alert.title {
+                        result.blocks[idx].info = result.intern(&title);
+                        frame.extra_markers.push(title_range);
+                    }
+                    frame.block = Some(idx);
+                }
+                (None, None) => {
+                    frame.block = Some(reserve(result, BlockKind::BlockQuote, 0, NO_INFO));
+                }
+            }
         }
         Tag::CodeBlock(kind) => {
             let (block_kind, info) = match kind {
@@ -368,11 +460,16 @@ fn open_frame(
                     // Routed by kind so the editor never string-compares.
                     if lang.eq_ignore_ascii_case("mermaid") {
                         (BlockKind::MermaidBlock, info)
+                    } else if lang.eq_ignore_ascii_case("math") {
+                        (BlockKind::MathBlock, info)
                     } else {
                         (BlockKind::CodeBlock, info)
                     }
                 }
-                CodeBlockKind::Indented => (BlockKind::CodeBlock, NO_INFO),
+                CodeBlockKind::Indented => {
+                    frame.indented_code = true;
+                    (BlockKind::CodeBlock, NO_INFO)
+                }
             };
             frame.block = Some(reserve(result, block_kind, 0, info));
         }
@@ -413,8 +510,9 @@ fn open_frame(
             ));
         }
         Tag::HtmlBlock => frame.block = Some(reserve(result, BlockKind::HtmlBlock, 0, NO_INFO)),
-        Tag::FootnoteDefinition(_) => {
-            frame.block = Some(reserve(result, BlockKind::FootnoteDefinition, 0, NO_INFO))
+        Tag::FootnoteDefinition(label) => {
+            let info = result.intern(label);
+            frame.block = Some(reserve(result, BlockKind::FootnoteDefinition, 0, info))
         }
         Tag::DefinitionList => {
             frame.block = Some(reserve(result, BlockKind::DefinitionList, 0, NO_INFO))
@@ -480,7 +578,10 @@ fn close_frame(
     result: &mut ParseResult,
     block_stack: &mut Vec<usize>,
 ) {
-    let range = frame.range.clone();
+    let mut range = frame.range.clone();
+    if frame.indented_code {
+        range.start = indented_code_line_start(source, range.start);
+    }
 
     if let Some(idx) = frame.block {
         result.blocks[idx].start = mapper.to_utf16(range.start);
@@ -521,6 +622,12 @@ fn close_frame(
     // paragraph's range, so the gap rule cannot see it.
     if frame.is_block_quote {
         mark_quote_prefixes(source, &range, mapper, result, owner);
+    }
+    if frame.indented_code {
+        mark_indented_code_prefixes(source, &range, mapper, result, owner);
+    }
+    for extra in frame.extra_markers {
+        mark(result, mapper, extra, owner);
     }
 
     let _ = end;
@@ -797,6 +904,642 @@ fn mark_current(
 ) {
     let owner = block_stack.last().copied().unwrap_or(0) as u32;
     mark(result, mapper, range, owner);
+}
+
+/// Byte offset of the label inside a footnote definition's `[^label]:` prefix.
+fn footnote_label_in_definition(
+    source: &str,
+    range: &Range<usize>,
+    label: &str,
+) -> Option<Range<usize>> {
+    let prefix = format!("[^{label}]");
+    source
+        .get(range.clone())
+        .filter(|s| s.starts_with(&prefix))
+        .map(|_| range.start + 2..range.start + 2 + label.len())
+}
+
+/// Start of the line holding `content_start`, when the prefix is indent.
+fn indented_code_line_start(source: &str, content_start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = content_start.min(bytes.len());
+    while i > 0 && bytes[i - 1] != b'\n' && bytes[i - 1] != b'\r' {
+        i -= 1;
+    }
+    if bytes[i..content_start]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t')
+    {
+        i
+    } else {
+        content_start
+    }
+}
+
+/// Hides the four-space (or tab) indent that opens each line of an indented
+/// code block. Continuation lines are usually already a gap; the first line's
+/// indent sits *before* pulldown's range and would otherwise stay visible.
+fn mark_indented_code_prefixes(
+    source: &str,
+    range: &Range<usize>,
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+    block: u32,
+) {
+    let bytes = source.as_bytes();
+    let mut i = range.start;
+    let mut at_line_start = true;
+    while i < range.end.min(bytes.len()) {
+        if at_line_start {
+            let mut j = i;
+            let mut spaces = 0u8;
+            while j < range.end && spaces < 4 {
+                match bytes[j] {
+                    b' ' => {
+                        spaces += 1;
+                        j += 1;
+                    }
+                    b'\t' => {
+                        j += 1;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if j > i {
+                mark(result, mapper, i..j, block);
+                i = j;
+                at_line_start = false;
+                continue;
+            }
+        }
+        at_line_start = bytes[i] == b'\n';
+        i += 1;
+    }
+}
+
+struct GfmAlertLine {
+    kind: CalloutKind,
+    /// `[!NOTE]` (and an optional trailing `+` / `-`).
+    tag: Range<usize>,
+    title: Option<(String, Range<usize>)>,
+}
+
+fn apply_alert_title(result: &mut ParseResult, frame: &mut Frame, idx: usize, alert: GfmAlertLine) {
+    if let Some((title, title_range)) = alert.title {
+        result.blocks[idx].info = result.intern(&title);
+        frame.extra_markers.push(title_range);
+    }
+}
+
+/// First line of a blockquote that is a GFM alert, including the GitHub
+/// custom-title form pulldown-cmark leaves as a plain quote.
+fn gfm_alert_line(source: &str, range: &Range<usize>) -> Option<GfmAlertLine> {
+    let bytes = source.as_bytes();
+    let end = range.end.min(bytes.len());
+    let mut i = range.start.min(end);
+    while i < end && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i < end && bytes[i] == b'>' {
+        i += 1;
+    }
+    if i < end && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i + 1 >= end || bytes[i] != b'[' || bytes[i + 1] != b'!' {
+        return None;
+    }
+    let tag_open = i;
+    i += 2;
+    let name_start = i;
+    while i < end && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i >= end || bytes[i] != b']' || i == name_start {
+        return None;
+    }
+    let kind = match source[name_start..i].to_ascii_uppercase().as_str() {
+        "NOTE" => CalloutKind::Note,
+        "TIP" => CalloutKind::Tip,
+        "IMPORTANT" => CalloutKind::Important,
+        "WARNING" => CalloutKind::Warning,
+        "CAUTION" => CalloutKind::Caution,
+        _ => return None,
+    };
+    i += 1;
+    if i < end && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let tag = tag_open..i;
+    let mut line_end = i;
+    while line_end < end && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
+        line_end += 1;
+    }
+    let title_text = source[i..line_end].trim();
+    let title = if title_text.is_empty() {
+        None
+    } else {
+        Some((title_text.to_string(), i..line_end))
+    };
+    Some(GfmAlertLine { kind, tag, title })
+}
+
+/// `\(...\)`, `\[...\]`, and their Markdown-escaped `\\(…\\)` / `\\[…\\]` forms.
+///
+/// pulldown-cmark's math scanner only pairs `$` / `$$`. These delimiters are
+/// recognised against the source so a note written for KaTeX still typesets,
+/// while code, existing math, and link labels stay literal. The `$` currency
+/// and adjacency refusals are not reimplemented here — they already ran on
+/// the dollar events; this pass only claims constructs that scanner never sees.
+fn collect_delimited_math(source: &str, mapper: &Utf16Mapper, result: &mut ParseResult) {
+    let bytes = source.as_bytes();
+    if !bytes.contains(&b'\\') {
+        return;
+    }
+    let occupied = occupied_byte_ranges(mapper, result);
+    let mut i = 0;
+    let mut added_block = false;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || range_is_occupied(&occupied, i) {
+            i += 1;
+            continue;
+        }
+        let preceded = i > 0 && bytes[i - 1] == b'\\';
+        if preceded {
+            i += 1;
+            continue;
+        }
+
+        let taken = take_delimited_math(source, mapper, result, &occupied, i, &mut added_block);
+        i = if taken > i { taken } else { i + 1 };
+    }
+    if added_block {
+        resort_blocks(result);
+    }
+}
+
+fn take_delimited_math(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+    occupied: &[(usize, usize)],
+    i: usize,
+    added_block: &mut bool,
+) -> usize {
+    let bytes = source.as_bytes();
+    // Longer openers first so `\\[` is not eaten as `\[` starting one later.
+    let candidates: [(&[u8], &[u8], bool); 4] = [
+        (b"\\\\[", b"\\\\]", true),
+        (b"\\\\(", b"\\\\)", false),
+        (b"\\[", b"\\]", true),
+        (b"\\(", b"\\)", false),
+    ];
+    for &(opener, closer, display) in &candidates {
+        if !bytes[i..].starts_with(opener) {
+            continue;
+        }
+        let inner_start = i + opener.len();
+        let Some(close) = find_math_closer(bytes, inner_start, closer, display) else {
+            continue;
+        };
+        let inner_end = close;
+        let full_end = close + closer.len();
+        if inner_end <= inner_start {
+            continue;
+        }
+        if range_is_occupied(occupied, i) || range_overlaps(occupied, i, full_end) {
+            continue;
+        }
+        if crosses_link_destination(bytes, inner_start..inner_end) {
+            continue;
+        }
+        if display {
+            emit_delimited_math_block(mapper, result, i..full_end, opener.len(), closer.len());
+            *added_block = true;
+        } else {
+            emit_delimited_math_span(mapper, result, i..full_end, opener.len(), closer.len());
+        }
+        return full_end;
+    }
+    i
+}
+
+fn find_math_closer(bytes: &[u8], from: usize, closer: &[u8], display: bool) -> Option<usize> {
+    let mut i = from;
+    while i + closer.len() <= bytes.len() {
+        if !display && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+            return None;
+        }
+        if bytes[i..].starts_with(closer) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn emit_delimited_math_span(
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+    range: Range<usize>,
+    opener_len: usize,
+    closer_len: usize,
+) {
+    let inner = range.start + opener_len..range.end - closer_len;
+    let utf = mapper.to_utf16(range.start);
+    let owner = innermost_block(result, utf).unwrap_or(0) as u32;
+    push_span(result, mapper, &inner, SpanKind::InlineMath, 0, 0);
+    mark(result, mapper, range.start..range.start + opener_len, owner);
+    mark(result, mapper, range.end - closer_len..range.end, owner);
+}
+
+fn emit_delimited_math_block(
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+    range: Range<usize>,
+    opener_len: usize,
+    closer_len: usize,
+) {
+    let utf_start = mapper.to_utf16(range.start);
+    let enclosing = innermost_block(result, utf_start);
+    let depth = enclosing
+        .map(|i| result.blocks[i].depth.saturating_add(1))
+        .unwrap_or(0);
+    let block = push_block(
+        result,
+        mapper,
+        &range,
+        BlockKind::MathBlock,
+        depth,
+        0,
+        NO_INFO,
+    );
+    if enclosing.is_none() {
+        result.top_level.push(range.clone());
+    }
+    mark(result, mapper, range.start..range.start + opener_len, block);
+    if range.end >= range.start + opener_len + closer_len {
+        mark(result, mapper, range.end - closer_len..range.end, block);
+    }
+}
+
+fn innermost_block(result: &ParseResult, utf16: u32) -> Option<usize> {
+    result
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.start <= utf16 && utf16 < b.end)
+        .min_by_key(|(_, b)| b.end.saturating_sub(b.start))
+        .map(|(i, _)| i)
+}
+
+fn occupied_byte_ranges(mapper: &Utf16Mapper, result: &ParseResult) -> Vec<(usize, usize)> {
+    let mut v: Vec<(usize, usize)> = Vec::new();
+    for b in &result.blocks {
+        if b.kind == BlockKind::CodeBlock as u16
+            || b.kind == BlockKind::MermaidBlock as u16
+            || b.kind == BlockKind::MathBlock as u16
+            || b.kind == BlockKind::Frontmatter as u16
+            || b.kind == BlockKind::HtmlBlock as u16
+        {
+            let start = mapper.to_byte(b.start);
+            let end = mapper.to_byte(b.end);
+            if end > start {
+                v.push((start, end));
+            }
+        }
+    }
+    for s in &result.spans {
+        if s.kind == SpanKind::InlineCode as u16
+            || s.kind == SpanKind::InlineMath as u16
+            || s.kind == SpanKind::Link as u16
+            || s.kind == SpanKind::WikiLink as u16
+            || s.kind == SpanKind::Image as u16
+            || s.kind == SpanKind::InlineHtml as u16
+        {
+            let start = mapper.to_byte(s.start);
+            let end = mapper.to_byte(s.end);
+            if end > start {
+                v.push((start, end));
+            }
+        }
+    }
+    if v.len() < 2 {
+        return v;
+    }
+    v.sort_unstable();
+    let mut out = Vec::with_capacity(v.len());
+    let mut cur = v[0];
+    for next in v.into_iter().skip(1) {
+        if next.0 <= cur.1 {
+            cur.1 = cur.1.max(next.1);
+        } else {
+            out.push(cur);
+            cur = next;
+        }
+    }
+    out.push(cur);
+    out
+}
+
+fn range_is_occupied(occupied: &[(usize, usize)], pos: usize) -> bool {
+    occupied.iter().any(|&(s, e)| pos >= s && pos < e)
+}
+
+fn range_overlaps(occupied: &[(usize, usize)], start: usize, end: usize) -> bool {
+    occupied.iter().any(|&(s, e)| start < e && end > s)
+}
+
+/// pulldown-cmark consumes link reference definitions and emits no event for
+/// them, so they would otherwise sit in the document as leftover source.
+///
+/// Walks only the gaps between existing blocks. Scanning every line against
+/// every block is quadratic and was measured at 14× for 4× the text.
+fn collect_link_reference_definitions(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+) {
+    let occupied = merge_utf16_intervals(
+        result
+            .blocks
+            .iter()
+            .filter(|b| b.end > b.start)
+            .map(|b| (b.start, b.end)),
+    );
+    let doc_end = mapper.len_utf16();
+    let mut cursor = 0u32;
+    let mut found = false;
+    for &(start, end) in &occupied {
+        if start > cursor {
+            found |= emit_link_defs_in_span(source, mapper, result, cursor, start);
+        }
+        if end > cursor {
+            cursor = end;
+        }
+    }
+    if cursor < doc_end {
+        found |= emit_link_defs_in_span(source, mapper, result, cursor, doc_end);
+    }
+    if found {
+        resort_blocks(result);
+    }
+}
+
+fn merge_utf16_intervals(intervals: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
+    let mut v: Vec<(u32, u32)> = intervals.collect();
+    if v.len() < 2 {
+        return v;
+    }
+    v.sort_unstable();
+    let mut out = Vec::with_capacity(v.len());
+    let mut cur = v[0];
+    for next in v.into_iter().skip(1) {
+        if next.0 <= cur.1 {
+            cur.1 = cur.1.max(next.1);
+        } else {
+            out.push(cur);
+            cur = next;
+        }
+    }
+    out.push(cur);
+    out
+}
+
+fn emit_link_defs_in_span(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseResult,
+    utf_start: u32,
+    utf_end: u32,
+) -> bool {
+    if utf_end <= utf_start {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let span_end = mapper.to_byte(utf_end);
+    let mut i = mapper.to_byte(utf_start);
+    if i > 0 && i < bytes.len() && bytes[i - 1] != b'\n' && bytes[i - 1] != b'\r' {
+        i = next_line_start(source, i);
+    }
+    let mut found = false;
+    while i < span_end {
+        if let Some(def_end) = scan_link_reference_definition(source, i) {
+            let def_utf_end = mapper.to_utf16(def_end);
+            if def_utf_end > utf_end {
+                break;
+            }
+            let utf_s = mapper.to_utf16(i);
+            let idx = result.blocks.len() as u32;
+            result.blocks.push(BlockDescriptor {
+                start: utf_s,
+                end: def_utf_end,
+                kind: BlockKind::LinkReferenceDefinition as u16,
+                depth: 0,
+                data: 0,
+                info: NO_INFO,
+            });
+            mark(result, mapper, i..def_end, idx);
+            result.top_level.push(i..def_end);
+            found = true;
+            i = def_end;
+            continue;
+        }
+        let next = next_line_start(source, i);
+        if next <= i {
+            break;
+        }
+        i = next;
+    }
+    found
+}
+
+fn next_line_start(source: &str, from: usize) -> usize {
+    match source.get(from..).and_then(|s| s.find('\n')) {
+        Some(n) => from + n + 1,
+        None => source.len(),
+    }
+}
+
+/// CommonMark link reference definition starting at `start`, or `None`.
+///
+/// CommonMark: optional whitespace after the colon includes one newline, so
+/// the destination may sit on the next line, and a quoted title may follow
+/// on the destination line or the line after that.
+fn scan_link_reference_definition(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut i = start;
+    let mut spaces = 0;
+    while i < bytes.len() && bytes[i] == b' ' && spaces < 3 {
+        i += 1;
+        spaces += 1;
+    }
+    if i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        return None;
+    }
+    if i >= bytes.len() || bytes[i] != b'[' {
+        return None;
+    }
+    i += 1;
+    let label_start = i;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' || b == b'\r' {
+            return None;
+        }
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'[' {
+            return None;
+        }
+        if b == b']' {
+            break;
+        }
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b']' || i == label_start {
+        return None;
+    }
+    i += 1;
+    if i >= bytes.len() || bytes[i] != b':' {
+        return None;
+    }
+    i += 1;
+    i = skip_space_and_one_newline(bytes, i);
+    if i >= bytes.len() || bytes[i] == b'\n' || bytes[i] == b'\r' {
+        return None;
+    }
+    // Destination: <...> or a run of non-space.
+    if bytes[i] == b'<' {
+        i += 1;
+        while i < bytes.len() && bytes[i] != b'>' && bytes[i] != b'\n' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'>' {
+            return None;
+        }
+        i += 1;
+    } else {
+        let dest_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == dest_start {
+            return None;
+        }
+    }
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if let Some(after_title) = scan_link_title(bytes, i) {
+        return finish_definition_line(bytes, after_title);
+    }
+    // Optional title on the next line. If that line is not a title, the
+    // definition ended on the destination line — do not swallow the paragraph
+    // that follows.
+    if i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b'\r') {
+        let dest_line_end = skip_one_newline(bytes, i);
+        let after = skip_spaces(bytes, dest_line_end);
+        if let Some(after_title) = scan_link_title(bytes, after) {
+            return finish_definition_line(bytes, after_title);
+        }
+        return Some(dest_line_end);
+    }
+    finish_definition_line(bytes, i)
+}
+
+fn skip_spaces(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    i
+}
+
+fn skip_one_newline(bytes: &[u8], mut i: usize) -> usize {
+    if i < bytes.len() && bytes[i] == b'\r' {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Spaces, then at most one line ending, then spaces — CommonMark's
+/// "optional whitespace including up to one line ending".
+fn skip_space_and_one_newline(bytes: &[u8], i: usize) -> usize {
+    skip_spaces(bytes, skip_one_newline(bytes, skip_spaces(bytes, i)))
+}
+
+fn scan_link_title(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if i >= bytes.len() {
+        return None;
+    }
+    let closer = match bytes[i] {
+        b'"' | b'\'' => bytes[i],
+        b'(' => b')',
+        _ => return None,
+    };
+    i += 1;
+    while i < bytes.len() && bytes[i] != closer && bytes[i] != b'\n' && bytes[i] != b'\r' {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != closer {
+        return None;
+    }
+    Some(skip_spaces(bytes, i + 1))
+}
+
+fn finish_definition_line(bytes: &[u8], i: usize) -> Option<usize> {
+    if i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+        return None;
+    }
+    Some(skip_one_newline(bytes, i))
+}
+
+fn resort_blocks(result: &mut ParseResult) {
+    let n = result.blocks.len();
+    if n < 2 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    // Parents before children at the same start: a List and its first
+    // ListItem share an offset, and `MarkdownStyler.topLevel` takes the first
+    // block whose start is free. Sorting by `(start, end)` put the shorter
+    // child first, so every item looked top-level the moment a link
+    // definition forced this rematerialisation.
+    order.sort_by(|&a, &b| {
+        let x = &result.blocks[a];
+        let y = &result.blocks[b];
+        x.start
+            .cmp(&y.start)
+            .then(y.end.cmp(&x.end))
+            .then(a.cmp(&b))
+    });
+    if order.iter().copied().eq(0..n) {
+        return;
+    }
+    let mut new_index = vec![0u32; n];
+    for (new_i, &old_i) in order.iter().enumerate() {
+        new_index[old_i] = new_i as u32;
+    }
+    let old = std::mem::take(&mut result.blocks);
+    result.blocks = order.into_iter().map(|i| old[i]).collect();
+    for m in &mut result.markers {
+        if (m.block as usize) < new_index.len() {
+            m.block = new_index[m.block as usize];
+        }
+    }
 }
 
 /// Hides `>` (and one following space) at the start of every line inside a

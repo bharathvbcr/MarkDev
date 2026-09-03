@@ -1235,14 +1235,25 @@ public final class RichContentRenderer {
         let trimmed = source.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
 
-        if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased() {
-            return scheme == "file" ? url : nil
+        // Protocol-relative URLs are remote in everything but name.
+        if trimmed.hasPrefix("//") { return nil }
+        if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(), !scheme.isEmpty {
+            return scheme == "file" ? url.standardizedFileURL : nil
         }
         if trimmed.hasPrefix("/") {
-            return URL(fileURLWithPath: trimmed)
+            return URL(fileURLWithPath: trimmed).standardizedFileURL
         }
         let decoded = trimmed.removingPercentEncoding ?? trimmed
-        return base?.appendingPathComponent(decoded)
+        guard let base else { return nil }
+        // Force a directory URL: `fileURLWithPath:relativeTo:` treats a base
+        // without a trailing slash as a *file* and replaces its last
+        // component, so `notes/pic.png` became `pic.png` next to `notes`.
+        // `appendingPathComponent("../pic.png")` is the other trap — it keeps
+        // `../pic.png` as one path component. Joining as a relative file URL
+        // against an explicit directory, then standardising, makes `../` a
+        // parent and `pic.png` a child.
+        let folder = URL(fileURLWithPath: base.path, isDirectory: true)
+        return URL(fileURLWithPath: decoded, relativeTo: folder).absoluteURL.standardizedFileURL
     }
 
     // MARK: - Cache

@@ -129,6 +129,26 @@ final class BlockDecorationTests: XCTestCase {
         XCTAssertEqual(block.source, "E = mc^2", "the `$$` delimiters are not part of the formula")
     }
 
+    func testAFencedMathBlockBecomesRenderedLatex() {
+        let source = "```math\nE = mc^2\n```"
+        let decoration = headDecoration(source)
+        guard case .rendered(let block) = decoration else {
+            return XCTFail("expected rendered math, got \(decoration)")
+        }
+        XCTAssertEqual(block.kind, .math)
+        XCTAssertEqual(block.source, "E = mc^2")
+    }
+
+    func testBracketedDisplayMathBecomesRenderedLatex() {
+        let source = "\\[E = mc^2\\]"
+        let decoration = headDecoration(source)
+        guard case .rendered(let block) = decoration else {
+            return XCTFail("expected rendered math, got \(decoration)")
+        }
+        XCTAssertEqual(block.kind, .math)
+        XCTAssertEqual(block.source, "E = mc^2")
+    }
+
     func testAMermaidFenceBecomesARenderedDiagram() {
         let source = "```mermaid\ngraph TD;\n  A --> B;\n```"
         let decoration = headDecoration(source)

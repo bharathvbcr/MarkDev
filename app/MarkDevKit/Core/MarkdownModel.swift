@@ -63,6 +63,7 @@ public enum BlockKind: UInt16, Sendable, CaseIterable {
     case definitionList = 17
     case definitionListTitle = 18
     case definitionListDefinition = 19
+    case linkReferenceDefinition = 20
 }
 
 /// How a table column's cells sit in their column.

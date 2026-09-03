@@ -37,8 +37,19 @@ struct TableCellDrawing: @unchecked Sendable {
     }
 
     var lines: [Line] = []
-    /// Where inline code sits, in the cell's own coordinates.
-    var pills: [CGRect] = []
+    enum PillKind {
+        case code
+        case highlight
+        case tag
+    }
+
+    struct Pill {
+        let rect: CGRect
+        let kind: PillKind
+    }
+
+    /// Where inline code, highlight, and tag pills sit, in the cell's own coordinates.
+    var pills: [Pill] = []
     /// Formula bitmaps CoreText reserves room for but cannot paint itself.
     var formulas: [Formula] = []
     /// Height the wrapped text occupies at the width it was given.
@@ -93,7 +104,18 @@ struct TableCellDrawing: @unchecked Sendable {
             drawing.pills.append(
                 contentsOf: pillRects(
                     in: text, line: line, range: range,
-                    x: x, top: top, height: ascent + descent))
+                    x: x, top: top, height: ascent + descent,
+                    attribute: .inlineCodeRun, kind: .code))
+            drawing.pills.append(
+                contentsOf: pillRects(
+                    in: text, line: line, range: range,
+                    x: x, top: top, height: ascent + descent,
+                    attribute: .highlightRun, kind: .highlight))
+            drawing.pills.append(
+                contentsOf: pillRects(
+                    in: text, line: line, range: range,
+                    x: x, top: top, height: ascent + descent,
+                    attribute: .tagRun, kind: .tag))
             drawing.formulas.append(
                 contentsOf: formulaRects(
                     in: text, line: line, range: range,
@@ -116,7 +138,9 @@ struct TableCellDrawing: @unchecked Sendable {
             drawing.lines = drawing.lines.map {
                 Line(line: $0.line, x: $0.x, baseline: $0.baseline + shift)
             }
-            drawing.pills = drawing.pills.map { $0.offsetBy(dx: 0, dy: shift) }
+            drawing.pills = drawing.pills.map {
+                Pill(rect: $0.rect.offsetBy(dx: 0, dy: shift), kind: $0.kind)
+            }
             drawing.formulas = drawing.formulas.map {
                 Formula(image: $0.image, rect: $0.rect.offsetBy(dx: 0, dy: shift))
             }
@@ -138,13 +162,15 @@ struct TableCellDrawing: @unchecked Sendable {
         range: CFRange,
         x: CGFloat,
         top: CGFloat,
-        height: CGFloat
-    ) -> [CGRect] {
-        var rects: [CGRect] = []
+        height: CGFloat,
+        attribute: NSAttributedString.Key,
+        kind: PillKind
+    ) -> [Pill] {
+        var rects: [Pill] = []
         let lineRange = NSRange(location: range.location, length: range.length)
         guard lineRange.length > 0 else { return rects }
 
-        text.enumerateAttribute(.inlineCodeRun, in: lineRange) { value, runRange, _ in
+        text.enumerateAttribute(attribute, in: lineRange) { value, runRange, _ in
             guard value != nil else { return }
             let clipped = NSIntersectionRange(runRange, lineRange)
             guard clipped.length > 0 else { return }
@@ -152,7 +178,10 @@ struct TableCellDrawing: @unchecked Sendable {
             let to = CTLineGetOffsetForStringIndex(line, NSMaxRange(clipped), nil)
             let width = to - from
             guard width.isFinite, width > 0, from.isFinite else { return }
-            rects.append(CGRect(x: x + from, y: top, width: width, height: height))
+            rects.append(
+                Pill(
+                    rect: CGRect(x: x + from, y: top, width: width, height: height),
+                    kind: kind))
         }
         return rects
     }

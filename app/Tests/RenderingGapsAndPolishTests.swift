@@ -60,18 +60,20 @@ final class RenderingGapsAndPolishTests: XCTestCase {
             return XCTFail("Text storage should exist")
         }
 
-        // Find [^1] in text
+        // The superscript sits on the label, not on the brackets — those are
+        // the syntax the live-preview collapse hides.
         let nsText = storage.string as NSString
         let refRange = nsText.range(of: "[^1]")
         XCTAssertNotEqual(refRange.location, NSNotFound)
+        let label = NSRange(location: refRange.location + 2, length: 1)
 
-        // Verify baseline offset > 0
-        if let baseline = storage.attribute(.baselineOffset, at: refRange.location, effectiveRange: nil) as? CGFloat {
+        if let baseline = storage.attribute(.baselineOffset, at: label.location, effectiveRange: nil)
+            as? CGFloat
+        {
             XCTAssertGreaterThan(baseline, 0, "Footnote reference should have positive baseline offset")
         }
 
-        // Verify link attribute exists
-        let linkAttr = storage.attribute(.link, at: refRange.location, effectiveRange: nil)
+        let linkAttr = storage.attribute(.link, at: label.location, effectiveRange: nil)
         XCTAssertNotNil(linkAttr, "Footnote reference should carry a .link attribute")
         if let url = linkAttr as? URL {
             XCTAssertEqual(url.scheme, MarkdownStyler.footnoteScheme)
@@ -88,6 +90,13 @@ final class RenderingGapsAndPolishTests: XCTestCase {
         let nsText = (view.textStorage?.string ?? "") as NSString
         let defRange = nsText.range(of: "[^alpha]:")
         XCTAssertEqual(sel.location, defRange.location)
+
+        view.jumpToFootnote("alpha", from: defRange.location + 2)
+        let back = view.selectedRange()
+        let refRange = nsText.range(of: "[^alpha]")
+        XCTAssertEqual(
+            back.location, refRange.location + 2,
+            "clicking the definition's mark returns to the reference")
     }
 
     func testHeadingAnchorJumpNavigatesToHeading() {
@@ -191,5 +200,207 @@ final class RenderingGapsAndPolishTests: XCTestCase {
 
         view.insertNewline(nil)
         XCTAssertTrue(view.markdown.contains("|  |  |"), "Newline inside table should insert new empty table row")
+    }
+
+    // MARK: - Frontmatter panel, checked tasks, images
+
+    func testYamlFrontmatterDrawsKeysAndListItemsNotTheFence() {
+        let source = """
+            ---
+            title: Note
+            tags:
+              - alpha
+              - beta
+            ---
+
+            # Body
+            """
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 600)
+        view.setMarkdown(source)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        let panel = fragments(view).compactMap(\.frontmatter).first
+        XCTAssertNotNil(panel, "collapsed frontmatter must draw a structured panel")
+        XCTAssertEqual(panel?.entries.map(\.key), ["title", "tags"])
+        XCTAssertEqual(panel?.entries.first?.value, "Note")
+        XCTAssertEqual(panel?.entries.last?.items, ["alpha", "beta"])
+
+        let storage = view.textStorage
+        let titleSource = (source as NSString).range(of: "title: Note")
+        let titleFont = storage?.attribute(.font, at: titleSource.location, effectiveRange: nil)
+            as? NSFont
+        XCTAssertEqual(
+            titleFont?.pointSize ?? 0, EditorTheme.hiddenMarkerFontSize, accuracy: 0.001,
+            "the fence is replaced by the panel, not shown as a YAML dump")
+
+        let heading = (source as NSString).range(of: "Body")
+        let headingFont = storage?.attribute(.font, at: heading.location, effectiveRange: nil)
+            as? NSFont
+        XCTAssertGreaterThan(
+            headingFont?.pointSize ?? 0, EditorTheme.standard.bodyFont.pointSize,
+            "the body after the closer is still a heading")
+    }
+
+    func testTomlFrontmatterDrawsKeysAndListItems() {
+        let source = """
+            +++
+            title = "Note"
+            tags = ["alpha", "beta"]
+            +++
+
+            After.
+            """
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 600)
+        view.setMarkdown(source)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        let panel = fragments(view).compactMap(\.frontmatter).first
+        XCTAssertEqual(panel?.entries.map(\.key), ["title", "tags"])
+        XCTAssertEqual(panel?.entries.first?.value, "Note")
+        XCTAssertEqual(panel?.entries.last?.items, ["alpha", "beta"])
+        let storage = view.textStorage
+        let after = (source as NSString).range(of: "After.")
+        let font = storage?.attribute(.font, at: after.location, effectiveRange: nil) as? NSFont
+        XCTAssertGreaterThan(
+            font?.pointSize ?? 0, EditorTheme.hiddenMarkerFontSize,
+            "the body after the closer still renders")
+    }
+
+    func testCheckedTasksAreStruckAndMutedWhileTheCheckboxStays() {
+        let source = "- [x] done task\n- [ ] open task\n"
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 400)
+        view.setMarkdown(source)
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        let storage = view.textStorage
+        let ns = source as NSString
+        let done = ns.range(of: "done")
+        let open = ns.range(of: "open")
+        XCTAssertEqual(
+            storage?.attribute(.strikethroughStyle, at: done.location, effectiveRange: nil) as? Int
+                ?? 0,
+            NSUnderlineStyle.single.rawValue)
+        XCTAssertEqual(
+            storage?.attribute(.foregroundColor, at: done.location, effectiveRange: nil) as? NSColor,
+            EditorTheme.standard.secondaryColor)
+        XCTAssertNil(
+            storage?.attribute(.strikethroughStyle, at: open.location, effectiveRange: nil))
+
+        let tasks = fragments(view).compactMap(\.decoration.taskChecked)
+        XCTAssertEqual(tasks, [true, false], "the checkbox must still be offered")
+    }
+
+    func testANestedCheckedTaskDoesNotStrikeItsParent() {
+        // The parent item's range contains the nested `[x]`. Looking the
+        // marker up against that whole range would strike "shopping" too.
+        let source = "- shopping\n  - [x] milk\n"
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 400)
+        view.setMarkdown(source)
+
+        let storage = view.textStorage
+        let ns = source as NSString
+        let shopping = ns.range(of: "shopping")
+        let milk = ns.range(of: "milk")
+        XCTAssertNil(
+            storage?.attribute(.strikethroughStyle, at: shopping.location, effectiveRange: nil),
+            "a nested checked item must not strike the parent")
+        XCTAssertNotEqual(
+            storage?.attribute(.foregroundColor, at: shopping.location, effectiveRange: nil)
+                as? NSColor,
+            EditorTheme.standard.secondaryColor,
+            "the parent must keep body colour")
+        XCTAssertEqual(
+            storage?.attribute(.strikethroughStyle, at: milk.location, effectiveRange: nil)
+                as? Int ?? 0,
+            NSUnderlineStyle.single.rawValue)
+    }
+
+    func testAStruckCheckboxStillTogglesThroughTheOrdinaryInputPath() {
+        // Strikethrough is an attribute on the item text; ticking still has to
+        // be `insertText` on `[x]`, or undo and the document binding miss it.
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .livePreview
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 400)
+        view.setMarkdown("Intro.\n\n- [x] done task\n")
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+
+        let done = (view.markdown as NSString).range(of: "done")
+        XCTAssertEqual(
+            view.textStorage?.attribute(
+                .strikethroughStyle, at: done.location, effectiveRange: nil) as? Int ?? 0,
+            NSUnderlineStyle.single.rawValue)
+        let marker = view.parsed.spans.first { $0.kind == .taskMarker }
+        XCTAssertNotNil(marker)
+        XCTAssertTrue(view.toggleTask(at: marker!.range.location))
+        XCTAssertTrue(view.markdown.contains("[ ]"))
+        XCTAssertFalse(view.markdown.contains("[x]"))
+    }
+
+    func testAParentRelativeImageLoadsAndARemoteOneDoesNot() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevRel-\(UUID().uuidString)")
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let image = NSImage(size: CGSize(width: 40, height: 20))
+        image.lockFocus()
+        NSColor.systemGreen.drawSwatch(in: CGRect(x: 0, y: 0, width: 40, height: 20))
+        image.unlockFocus()
+        let data = try XCTUnwrap(
+            NSBitmapImageRep(data: image.tiffRepresentation ?? Data())?
+                .representation(using: .png, properties: [:]))
+        try data.write(to: root.appendingPathComponent("pic.png"))
+
+        let view = MarkdownTextView.make(theme: .standard)
+        view.mode = .reading
+        view.frame = NSRect(x: 0, y: 0, width: 520, height: 400)
+        view.documentDirectory = notes
+        view.setMarkdown("![shot](../pic.png)\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+
+        XCTAssertEqual(
+            fragments(view).filter { $0.renderedContent != nil }.count, 1,
+            "a parent-relative local image must resolve")
+
+        view.setMarkdown("<img src=\"../pic.png\">\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        XCTAssertEqual(
+            fragments(view).filter { $0.renderedContent != nil }.count, 1,
+            "a parent-relative lone <img> must resolve through the same path")
+
+        view.setMarkdown("![web](https://example.com/x.png)\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        XCTAssertTrue(
+            fragments(view).allSatisfy { $0.renderedContent == nil },
+            "a remote image must not be fetched")
+        XCTAssertFalse(fragments(view).compactMap(\.renderFailure).isEmpty)
+
+        view.setMarkdown("<img src=\"https://example.com/x.png\">\n")
+        view.textLayoutManager?.ensureLayout(for: view.textLayoutManager!.documentRange)
+        XCTAssertTrue(
+            fragments(view).allSatisfy { $0.renderedContent == nil },
+            "a remote <img> must not be fetched")
+    }
+
+    private func fragments(_ view: MarkdownTextView) -> [MarkdownLayoutFragment] {
+        guard let manager = view.textLayoutManager else { return [] }
+        manager.ensureLayout(for: manager.documentRange)
+        var found: [MarkdownLayoutFragment] = []
+        manager.enumerateTextLayoutFragments(
+            from: manager.documentRange.location, options: [.ensuresLayout]
+        ) { fragment in
+            if let fragment = fragment as? MarkdownLayoutFragment { found.append(fragment) }
+            return true
+        }
+        return found
     }
 }

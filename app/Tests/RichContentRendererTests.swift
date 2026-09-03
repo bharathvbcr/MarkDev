@@ -230,6 +230,30 @@ final class RichContentRendererTests: XCTestCase {
         XCTAssertTrue(failure.reason.contains("nope.png"))
     }
 
+    func testAParentRelativePathResolvesToTheParentFile() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevParentImg-\(UUID().uuidString)")
+        let notes = root.appendingPathComponent("notes")
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let image = NSImage(size: CGSize(width: 80, height: 40))
+        image.lockFocus()
+        NSColor.systemOrange.drawSwatch(in: CGRect(x: 0, y: 0, width: 80, height: 40))
+        image.unlockFocus()
+        let data = try XCTUnwrap(
+            NSBitmapImageRep(data: image.tiffRepresentation ?? Data())?
+                .representation(using: .png, properties: [:]))
+        try data.write(to: root.appendingPathComponent("pic.png"))
+
+        let renderer = makeRenderer()
+        guard case .success(let content) = renderer.image(
+            at: "../pic.png", relativeTo: notes, maxWidth: 400)
+        else { return XCTFail("a parent-relative local path must load") }
+        XCTAssertGreaterThan(content.size.width, 0)
+        XCTAssertGreaterThan(content.size.height, 0)
+    }
+
     func testRemoteImagesAreRefused() {
         // Opening a note must not become a network request: that is both a
         // privacy leak and a way for a document to phone home on preview.

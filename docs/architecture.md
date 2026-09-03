@@ -72,7 +72,7 @@ Raw Text Edit (NSTextStorage)
 MarkdownStyler (Apply Attributes)
   • Collapses syntax markers to 0.01pt hidden font
   • Applies typography, colors, and line spacing
-  • Applies kerning offsets for table alignment
+  • Draws GFM tables as a grid (not kerned pipes)
         │
         ▼
 SyntaxHighlighter (Tree-sitter Spans)

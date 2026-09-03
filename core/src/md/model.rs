@@ -30,7 +30,7 @@ pub enum SpanKind {
     /// `[[Note]]` or `[[Note|alias]]`.
     WikiLink = 7,
     Image = 8,
-    /// `$x$`
+    /// `$x$`, `\(...\)`, or the Markdown-escaped `\\(...\\)` form.
     InlineMath = 9,
     /// Heading text itself; `data` carries the level (1–6).
     Heading = 10,
@@ -59,7 +59,7 @@ pub enum BlockKind {
     /// A fenced block whose language is `mermaid`, split out so the editor
     /// can route it to the diagram renderer without string comparison.
     MermaidBlock = 3,
-    /// `$$…$$`
+    /// `$$…$$`, `\[…\]`, Markdown-escaped `\\[…\\]`, or a fenced `math` block.
     MathBlock = 4,
     Table = 5,
     TableHead = 6,
@@ -79,6 +79,13 @@ pub enum BlockKind {
     DefinitionList = 17,
     DefinitionListTitle = 18,
     DefinitionListDefinition = 19,
+    /// A CommonMark link reference definition (`[label]: dest`).
+    ///
+    /// pulldown-cmark consumes these internally and emits no event, so they
+    /// would otherwise sit in the document as leftover source — visible
+    /// syntax with no construct owning them. Detected in a post-pass over
+    /// ranges no other block covers.
+    LinkReferenceDefinition = 20,
 }
 
 /// GFM alert flavour, carried in [`BlockKind::Callout`]'s `data` field.

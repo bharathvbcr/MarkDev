@@ -42,6 +42,30 @@ final class ParsedDocumentTests: XCTestCase {
         XCTAssertTrue(doc.blocks.contains { $0.kind == .mermaidBlock })
     }
 
+    func testParenAndBracketMathCrossTheFFI() {
+        XCTAssertFalse(
+            ParsedDocument.parse("\\(a + b\\)").spans.filter { $0.kind == .inlineMath }.isEmpty)
+        XCTAssertTrue(
+            ParsedDocument.parse("\\[a = b\\]").blocks.contains { $0.kind == .mathBlock })
+        XCTAssertFalse(
+            ParsedDocument.parse("\\\\(a + b\\\\)").spans.filter { $0.kind == .inlineMath }.isEmpty)
+        XCTAssertTrue(
+            ParsedDocument.parse("```math\nx\n```").blocks.contains { $0.kind == .mathBlock })
+        XCTAssertTrue(
+            ParsedDocument.parse("`\\(x\\)`").spans.filter { $0.kind == .inlineMath }.isEmpty)
+        XCTAssertTrue(
+            ParsedDocument.parse("[\\[4\\]](https://example.com/p4)").blocks.filter {
+                $0.kind == .mathBlock
+            }.isEmpty)
+    }
+
+    func testCalloutCustomTitleCrossesTheStringTable() {
+        let doc = ParsedDocument.parse("> [!NOTE] Custom\n> body")
+        let callout = doc.blocks.first { $0.kind == .callout }
+        XCTAssertEqual(callout?.calloutKind, .note)
+        XCTAssertEqual(callout?.info, "Custom")
+    }
+
     func testCalloutKindDecodes() {
         let doc = ParsedDocument.parse("> [!WARNING]\n> careful")
         let callout = doc.blocks.first { $0.kind == .callout }

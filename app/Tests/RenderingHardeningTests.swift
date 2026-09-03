@@ -97,6 +97,19 @@ final class RenderingHardeningTests: XCTestCase {
             + (0..<40).map { "  N\($0) --> N\($0 + 1);" }.joined(separator: "\n") + "\n```\n"),
         ("mermaid inside a list", "- item\n\n  ```mermaid\n  graph TD;\n  A-->B;\n  ```\n"),
         ("mermaid inside a quote", "> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n"),
+        ("mermaid inside a callout", "> [!NOTE]\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n"),
+        ("xy-chart mermaid", "```mermaid\nxychart-beta\n  y-axis 0 --> 100\n  bar [10, 40, 90]\n```\n"),
+        ("definition list", "Term\n: A definition that runs on\n  to a second line\n"),
+        ("footnote with definition", "See this[^1] and that[^note].\n\n[^1]: First.\n\n[^note]: Second.\n"),
+        ("link reference definition", "[see][foo]\n\n[foo]: https://example.test/foo\n"),
+        ("setext heading", "Title\n=====\n\nBody\n"),
+        ("toml frontmatter", "+++\ntitle = \"Note\"\n+++\n\nBody\n"),
+        ("hard break spaces", "line  \nbreak\n"),
+        ("hard break slash", "line\\\nbreak\n"),
+        ("table inside a callout", "> [!TIP]\n>\n> | a | b |\n> |---|---|\n> | 1 | 2 |\n"),
+        ("math inside a list", "- item\n\n  $$\n  x^2\n  $$\n"),
+        ("image inside a callout", "> [!NOTE]\n> ![p](p.png)\n"),
+        ("ordered paren list", "1) first\n2) second\n"),
         ("two diagrams in a row", "```mermaid\ngraph TD;\nA-->B;\n```\n"
             + "```mermaid\ngraph LR;\nC-->D;\n```\n"),
         ("empty math", "$$\n$$\n"),
@@ -406,6 +419,10 @@ final class RenderingHardeningTests: XCTestCase {
         // collapse-whole-block path as well as the collapse-a-marker one.
         "```mermaid\ngraph TD;\nA-->B;\n```\n", "```mermaid\nnope\n```\n", "```mermaid\n```\n",
         "![p](p.png)\n", "$$\n$$\n", "$$\n\\frac{a}{b}\n$$\n",
+        "Term\n: definition\n", "See it[^1].\n\n[^1]: note\n",
+        "[lab][r]\n\n[r]: https://example.test\n",
+        "> [!NOTE]\n> ```mermaid\n> graph TD;\n> A-->B;\n> ```\n",
+        "```mermaid\nxychart-beta\n  y-axis 0 --> 100\n  bar [1, 2]\n```\n",
     ]
 
     private func randomDocument(seed: UInt64, blocks: Int) -> String {

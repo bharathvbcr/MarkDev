@@ -40,6 +40,8 @@ struct BlockDecorationPalette: Sendable {
     let important: CGColor
     let warning: CGColor
     let caution: CGColor
+    let highlightFill: CGColor
+    let tagFill: CGColor
 
     @MainActor
     init(theme: EditorTheme) {
@@ -66,6 +68,8 @@ struct BlockDecorationPalette: Sendable {
         important = theme.calloutAccent(.important).cgColor
         warning = theme.calloutAccent(.warning).cgColor
         caution = theme.calloutAccent(.caution).cgColor
+        highlightFill = theme.highlightBackground.cgColor
+        tagFill = theme.tagBackground.cgColor
     }
 
     func calloutAccent(_ kind: CalloutKind) -> CGColor {
@@ -232,6 +236,9 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// pipes out as ordinary text and this fragment adds nothing.
     var tableRow: TableRowLayout?
 
+    /// The key/value panel standing in for collapsed frontmatter.
+    var frontmatter: FrontmatterLayout?
+
     /// Whether this fragment draws the chip that copies its block's code.
     ///
     /// Set by the delegate rather than derived from ``decoration``, like
@@ -259,6 +266,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         // A drawn table row stands in for text that has been collapsed to
         // nothing, so the row's whole height is the fragment's to add.
         if let tableRow { return tableRow.height }
+        if let frontmatter { return frontmatter.height }
         if let renderedContent {
             return renderedContent.size.height + Metrics.blockPadding * 2
         }
@@ -273,6 +281,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         switch decoration {
         case .code(let edge, _) where edge.roundsTop: return Metrics.blockPadding + topStrip
         case .callout(_, let edge) where edge.roundsTop: return Metrics.blockPadding + topStrip
+        case .frontmatter: return Metrics.blockPadding
         case .rule: return Metrics.rulePadding
         default: return super.topMargin
         }
@@ -301,6 +310,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         switch decoration {
         case .code(let edge, _) where edge.roundsBottom: Metrics.blockPadding
         case .callout(_, let edge) where edge.roundsBottom: Metrics.blockPadding
+        case .frontmatter: Metrics.blockPadding
         case .rule: Metrics.rulePadding
         default: super.bottomMargin
         }
@@ -568,10 +578,12 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             drawCheckbox(checked: checked, in: context, at: point)
         case .tableRow(let isHeader, let isLast):
             drawTableRow(isHeader: isHeader, isLast: isLast, in: context, at: point)
+        case .frontmatter:
+            drawFrontmatter(in: context, at: point)
         }
 
         if listMarker != nil { drawListMarker(in: context, at: point) }
-        drawInlineCodePills(in: context, at: point)
+        drawInlinePills(in: context, at: point)
         drawInlineMath(in: context, at: point)
         drawControls(in: context, at: point)
 
@@ -953,14 +965,20 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     ///
     /// Per *line fragment*, so a span that wraps gets a pill on each line it
     /// occupies rather than one box spanning the gap between them.
-    private func drawInlineCodePills(in context: CGContext, at point: CGPoint) {
+    private func drawInlinePills(in context: CGContext, at point: CGPoint) {
         guard let palette else { return }
-        let rects = inlineCodeRects
-        guard !rects.isEmpty else { return }
+        drawPills(inlineCodeRects, fill: palette.codeBackground, in: context, at: point)
+        drawPills(highlightRects, fill: palette.highlightFill, in: context, at: point)
+        drawPills(tagRects, fill: palette.tagFill, in: context, at: point)
+    }
 
+    private func drawPills(
+        _ rects: [CGRect], fill: CGColor, in context: CGContext, at point: CGPoint
+    ) {
+        guard !rects.isEmpty else { return }
         context.saveGState()
         defer { context.restoreGState() }
-        context.setFillColor(palette.codeBackground)
+        context.setFillColor(fill)
         for rect in rects {
             context.addPath(
                 CGPath(
@@ -1030,14 +1048,22 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     ///
     /// Exposed so the geometry can be asserted against TextKit's own answer for
     /// where those characters are, rather than against a screenshot.
-    var inlineCodeRects: [CGRect] {
+    var inlineCodeRects: [CGRect] { runRects(for: .inlineCodeRun) }
+
+    /// Highlight pills, sized to the type the same way inline code is.
+    var highlightRects: [CGRect] { runRects(for: .highlightRun) }
+
+    /// Tag pills.
+    var tagRects: [CGRect] { runRects(for: .tagRun) }
+
+    private func runRects(for attribute: NSAttributedString.Key) -> [CGRect] {
         var rects: [CGRect] = []
         for line in textLineFragments {
             let string = line.attributedString
             let whole = NSRange(location: 0, length: string.length)
             guard whole.length > 0 else { continue }
 
-            string.enumerateAttribute(.inlineCodeRun, in: whole) { value, range, _ in
+            string.enumerateAttribute(attribute, in: whole) { value, range, _ in
                 guard value != nil, range.length > 0 else { return }
                 guard let rect = pillRect(for: range, in: line) else { return }
                 rects.append(rect)
@@ -1346,12 +1372,18 @@ extension MarkdownLayoutFragment {
             guard frame.width > 0 else { continue }
             let at = CGPoint(x: origin.x + frame.minX, y: origin.y)
 
-            if let pill = palette?.codeBackground {
-                context.setFillColor(pill)
-                for rect in cell.pills {
-                    let placed = rect.offsetBy(dx: at.x, dy: at.y)
+            if let palette {
+                for pill in cell.pills {
+                    let fill: CGColor
+                    switch pill.kind {
+                    case .code: fill = palette.codeBackground
+                    case .highlight: fill = palette.highlightFill
+                    case .tag: fill = palette.tagFill
+                    }
+                    let placed = pill.rect.offsetBy(dx: at.x, dy: at.y)
                         .insetBy(dx: -Metrics.inlineCodePadding, dy: 0)
                     guard placed.width > 0, placed.height > 0 else { continue }
+                    context.setFillColor(fill)
                     context.addPath(
                         CGPath(
                             roundedRect: placed,
@@ -1364,6 +1396,20 @@ extension MarkdownLayoutFragment {
 
             cell.draw(in: context, at: at)
         }
+    }
+
+    /// Draws YAML/TOML frontmatter as a key/value card in place of its fence.
+    private func drawFrontmatter(in context: CGContext, at point: CGPoint) {
+        drawPanel(
+            in: context, at: point, edge: .only,
+            fill: palette?.codeBackground, border: palette?.codeBorder, bar: nil)
+        guard let frontmatter else { return }
+        let rect = decorationRect.offsetBy(dx: point.x, dy: point.y)
+        frontmatter.draw(
+            in: context,
+            at: CGPoint(
+                x: rect.minX + Metrics.panelInset,
+                y: rect.minY + Metrics.blockPadding))
     }
 
     /// Draws a thematic break in place of its `---`.

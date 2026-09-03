@@ -39,6 +39,23 @@ fn math_spans(source: &str) -> Vec<String> {
     spans_of(source, SpanKind::InlineMath)
 }
 
+fn ranges_in_bounds(source: &str) {
+    let len = source.encode_utf16().count() as u32;
+    let result = parse(source);
+    for m in &result.markers {
+        assert!(m.start <= m.end, "inverted marker in {source:?}");
+        assert!(m.end <= len, "marker past end of {source:?}");
+    }
+    for s in &result.spans {
+        assert!(s.start <= s.end, "inverted span in {source:?}");
+        assert!(s.end <= len, "span past end of {source:?}");
+    }
+    for b in &result.blocks {
+        assert!(b.start <= b.end, "inverted block in {source:?}");
+        assert!(b.end <= len, "block past end of {source:?}");
+    }
+}
+
 fn spans_of(source: &str, kind: SpanKind) -> Vec<String> {
     let result = parse(source);
     let units: Vec<u16> = source.encode_utf16().collect();
@@ -340,6 +357,70 @@ fn display_bracketed_indexing_still_recognised() {
     // The display half of subscript-then-call keeps working.
     assert!(has_block("$$A[1](b) = c$$", BlockKind::MathBlock));
     assert!(has_block("$$\nx[0](t) + M[i][j]\n$$", BlockKind::MathBlock));
+}
+
+#[test]
+fn parenthesized_and_bracketed_delimiters_are_math() {
+    assert_eq!(math_spans(r"\(x^2\)"), vec!["x^2"]);
+    assert_eq!(revealed(r"see \(a + b\) here"), "see a + b here");
+    assert!(has_block(r"\[a = b\]", BlockKind::MathBlock));
+    assert_eq!(revealed(r"\[a = b\]"), "a = b");
+    ranges_in_bounds(r"\(x^2\)");
+    ranges_in_bounds(r"\[a = b\]");
+}
+
+#[test]
+fn markdown_escaped_paren_and_bracket_delimiters_are_math() {
+    // Authors double the backslash so Markdown emits the TeX form.
+    assert_eq!(math_spans(r"\\(x^2\\)"), vec!["x^2"]);
+    assert!(has_block(r"\\[a = b\\]", BlockKind::MathBlock));
+    assert_eq!(revealed(r"\\[a = b\\]"), "a = b");
+    ranges_in_bounds(r"\\(x^2\\)");
+    ranges_in_bounds(r"\\[a = b\\]");
+}
+
+#[test]
+fn a_fenced_math_block_is_math_not_code() {
+    let src = "```math\nE = mc^2\n```";
+    assert!(has_block(src, BlockKind::MathBlock));
+    assert!(!has_block(src, BlockKind::CodeBlock));
+    assert_eq!(revealed(src), "E = mc^2\n");
+    ranges_in_bounds(src);
+}
+
+#[test]
+fn math_delimiters_stay_literal_inside_code() {
+    assert!(
+        math_spans(r"`\(x\)`").is_empty(),
+        "inline code must keep its source"
+    );
+    assert!(
+        math_spans("```\n\\(x\\)\n```").is_empty(),
+        "a non-math fence must keep its source"
+    );
+    assert!(
+        !has_block("```swift\n\\[a\\]\n```", BlockKind::MathBlock),
+        "a language fence is code, not a formula"
+    );
+    let fenced = "```\n\\(x\\)\n```";
+    assert_eq!(revealed(fenced), "\\(x\\)\n");
+}
+
+#[test]
+fn escaped_brackets_inside_a_link_are_not_display_math() {
+    // markdown-preview protects `\[` / `\]` that sit in a link label:
+    // they are Markdown bracket escapes, not TeX display delimiters.
+    let src = r"[\[4\]](https://example.com/p4)";
+    assert!(
+        !has_block(src, BlockKind::MathBlock),
+        "a labelled link must not become a formula"
+    );
+    assert!(math_spans(src).is_empty());
+    assert!(
+        !spans_of(src, SpanKind::Link).is_empty(),
+        "the construct is a link, so its label stays link text"
+    );
+    ranges_in_bounds(src);
 }
 
 // MARK: - Offsets

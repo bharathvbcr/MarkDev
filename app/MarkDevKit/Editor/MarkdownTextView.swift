@@ -1040,7 +1040,7 @@ public final class MarkdownTextView: ScrollingTextView {
         if url.scheme == MarkdownStyler.footnoteScheme {
             let target = (url.host(percentEncoded: false) ?? url.absoluteString)
                 .replacingOccurrences(of: "\(MarkdownStyler.footnoteScheme)://", with: "")
-            jumpToFootnote(target.removingPercentEncoding ?? target)
+            jumpToFootnote(target.removingPercentEncoding ?? target, from: charIndex)
             return
         }
 
@@ -1054,7 +1054,34 @@ public final class MarkdownTextView: ScrollingTextView {
     }
 
     /// Scrolls to the definition of a footnote `[^ref]`, or back from definition to reference.
-    public func jumpToFootnote(_ ref: String) {
+    public func jumpToFootnote(_ ref: String, from origin: Int? = nil) {
+        let caret = origin ?? selectedRange().location
+        let inDefinition = parsed.blocks.contains {
+            $0.kind == .footnoteDefinition
+                && NSLocationInRange(caret, $0.range)
+                && $0.info == ref
+        }
+        if origin != nil, inDefinition {
+            if let span = parsed.spans.first(where: { span in
+                span.kind == .footnoteReference
+                    && parsed.target(for: span) == ref
+                    && !parsed.blocks.contains { block in
+                        block.kind == .footnoteDefinition
+                            && NSLocationInRange(span.range.location, block.range)
+                    }
+            }) {
+                setSelectedRange(NSRange(location: span.range.location, length: 0))
+                scrollRangeToVisible(span.range)
+            }
+            return
+        }
+        if let definition = parsed.blocks.first(where: {
+            $0.kind == .footnoteDefinition && $0.info == ref
+        }) {
+            setSelectedRange(NSRange(location: definition.range.location, length: 0))
+            scrollRangeToVisible(definition.range)
+            return
+        }
         guard let storage = textStorage else { return }
         let text = storage.string as NSString
         let needle = "[^\(ref)]:"
@@ -1062,14 +1089,6 @@ public final class MarkdownTextView: ScrollingTextView {
         if range.location != NSNotFound {
             setSelectedRange(NSRange(location: range.location, length: 0))
             scrollRangeToVisible(range)
-            return
-        }
-        // Fallback: search for [^ref]
-        let fallbackNeedle = "[^\(ref)]"
-        let fallbackRange = text.range(of: fallbackNeedle)
-        if fallbackRange.location != NSNotFound {
-            setSelectedRange(NSRange(location: fallbackRange.location, length: 0))
-            scrollRangeToVisible(fallbackRange)
         }
     }
 
@@ -1566,6 +1585,7 @@ extension MarkdownTextView: @preconcurrency NSTextLayoutManagerDelegate {
             for: range, in: parsed, rendered: renderedBlocks, hidden: hiddenRanges)
         resolveRenderedContent(for: fragment)
         resolveTableRow(for: fragment, at: range)
+        resolveFrontmatter(for: fragment, at: range)
         resolveCollapsedSyntax(for: fragment, at: range)
         // Last: a zoom chip is offered only where there is a picture to open,
         // which is not known until the content above has been resolved.
@@ -1599,6 +1619,26 @@ extension MarkdownTextView {
             availableWidth: tableWidth, theme: theme, ink: resolvedInk)
     }
 
+    /// Lays out the key/value panel for collapsed frontmatter.
+    func resolveFrontmatter(for fragment: MarkdownLayoutFragment, at range: NSRange) {
+        fragment.frontmatter = nil
+        guard case .frontmatter = fragment.decoration,
+            let text = textStorage?.string as NSString?,
+            let block = parsed.blocks.first(where: {
+                $0.kind == .frontmatter && NSIntersectionRange($0.range, range).length > 0
+            })
+        else { return }
+        let raw = CodeBlockSource.copyText(of: block, in: parsed, text: text)
+        let format: FrontmatterFormat = block.data == 1 ? .toml : .yaml
+        let entries = FrontmatterLayout.parse(raw, format: format)
+        fragment.frontmatter = FrontmatterLayout.make(
+            entries: entries,
+            availableWidth: tableWidth,
+            theme: theme,
+            keyColor: theme.secondaryColor.cgColor,
+            valueColor: resolvedInk.cgColor)
+    }
+
     /// Re-solves the grid of every table row already laid out.
     ///
     /// Needed because TextKit caches a fragment against its text *element*,
@@ -1613,7 +1653,8 @@ extension MarkdownTextView {
     @discardableResult
     func reresolveTableFragments() -> Int {
         guard let manager = textLayoutManager else { return 0 }
-        guard !tableBlocks.isEmpty else {
+        let hasFrontmatter = parsed.blocks.contains { $0.kind == .frontmatter }
+        guard !tableBlocks.isEmpty || hasFrontmatter else {
             manager.invalidateLayout(for: manager.documentRange)
             return 0
         }
@@ -1622,13 +1663,20 @@ extension MarkdownTextView {
 
         manager.enumerateTextLayoutFragments(from: start) { fragment in
             guard let fragment = fragment as? MarkdownLayoutFragment,
-                case .tableRow = fragment.decoration,
                 let element = fragment.textElement?.elementRange
             else { return true }
+            let isTable: Bool
+            if case .tableRow = fragment.decoration { isTable = true } else { isTable = false }
+            let isFrontmatter: Bool
+            if case .frontmatter = fragment.decoration { isFrontmatter = true } else {
+                isFrontmatter = false
+            }
+            guard isTable || isFrontmatter else { return true }
             let from = manager.offset(from: start, to: element.location)
             let to = manager.offset(from: start, to: element.endLocation)
             guard from >= 0, to >= from else { return true }
             resolveTableRow(for: fragment, at: NSRange(location: from, length: to - from))
+            resolveFrontmatter(for: fragment, at: NSRange(location: from, length: to - from))
             resolved += 1
             return true
         }
@@ -1642,7 +1690,8 @@ extension MarkdownTextView {
     /// Called from `setFrameSize` rather than watched from the container: the
     /// frame is what a live resize drives, and the container tracks it.
     func resolveTablesIfWidthChanged() {
-        guard !tableBlocks.isEmpty else {
+        let hasFrontmatter = parsed.blocks.contains { $0.kind == .frontmatter }
+        guard !tableBlocks.isEmpty || hasFrontmatter else {
             lastTableWidth = tableWidth
             return
         }
@@ -2235,15 +2284,28 @@ extension MarkdownTextView {
             }
         case .callout(let kind, let edge):
             if edge.roundsTop, opensWithHiddenLine {
-                fragment.blockLabel = kind.title
+                fragment.blockLabel = calloutLabel(kind: kind, at: range)
             }
         case .task:
             // The checkbox is the stand-in; a bullet beside it would be a
             // second marker for one item.
             break
+        case .frontmatter:
+            break
         default:
             fragment.listMarker = listMarker(forFragmentAt: range, in: text)
         }
+    }
+
+    /// Flavour, plus an authored title when the alert wrote one on the same line.
+    private func calloutLabel(kind: CalloutKind, at range: NSRange) -> String {
+        let title = parsed.blocks.first {
+            $0.kind == .callout && NSIntersectionRange($0.range, range).length > 0
+        }?.info
+        if let title, !title.isEmpty {
+            return "\(kind.title) \(title)"
+        }
+        return kind.title
     }
 
     /// The bullet or number for a list item opening at this fragment.

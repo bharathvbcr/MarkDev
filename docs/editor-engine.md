@@ -61,16 +61,11 @@ TextKit 2 breaks text into `NSTextLayoutFragment` instances corresponding to lay
 
 ---
 
-## 4. Real-Time Table Alignment via Kerning
+## 4. GFM Tables as a Grid
 
-Rather than replacing Markdown pipe tables with complex UI grid controls, MarkDev formats tables directly in the text view using **character kerning**:
+A table row's source is collapsed and its cells are drawn as a real grid (`TableGrid` / `TableRowLayout`). Kerning the `|` separators cannot wrap a cell: a row is one paragraph, `NSParagraphStyle` has one `headIndent`, and a cell wider than the container wrapped back to the row's leading edge.
 
-1. Pipe characters (`|`) and padding spaces are identified by the parser.
-2. Cell widths are measured using their active fonts (bold/code expands width appropriately).
-3. The trailing pipe character is assigned a positive kerning attribute (`.kern`) equal to the remaining column width.
-
-> [!IMPORTANT]
-> `alignTableColumns` must run **after all marker passes**. Running it earlier causes `applyMarkers` to zero out the computed kerning on collapsed pipe markers.
+Columns are solved by lowering a common ceiling until the table fits, so a table only ever takes room from its widest columns. A row that fails to resolve a layout renders as nothing, so `tableWidth` has a floor rather than a silent skip.
 
 ---
 

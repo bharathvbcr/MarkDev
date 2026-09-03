@@ -100,9 +100,9 @@ public struct RenderedBlocks: Sendable, Equatable {
             let content: RenderedBlock?
             switch block.kind {
             case .mathBlock:
-                content = Self.math(block, in: text)
+                content = Self.math(block, in: document, text: text)
             case .mermaidBlock:
-                content = Self.diagram(block, in: text)
+                content = Self.diagram(block, in: document, text: text)
             case .htmlBlock:
                 content = Self.htmlImage(block.range, in: text)
             case .paragraph:
@@ -260,30 +260,27 @@ public struct RenderedBlocks: Sendable, Equatable {
     // MARK: - Reading a block's source
 
     /// The LaTeX inside a `$$…$$` block.
-    private static func math(_ block: BlockDescriptor, in text: NSString) -> RenderedBlock? {
-        guard let body = clamp(block.range, to: text.length) else { return nil }
-        let raw = text.substring(with: body)
+    private static func math(
+        _ block: BlockDescriptor, in document: ParsedDocument, text: NSString
+    ) -> RenderedBlock? {
+        // Markers, not a second fence scan: a formula inside a quote or list
+        // wears that container's prefixes, and trimming `$$` off the raw
+        // substring leaves `> x^2` which SwiftMath cannot typeset.
+        let cleaned = CodeBlockSource.copyText(of: block, in: document, text: text)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let stripped = raw
-            .trimmingPrefix("$$")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let latex = stripped.hasSuffix("$$")
-            ? String(stripped.dropLast(2)) : stripped
-        let cleaned = latex.trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? nil : RenderedBlock(kind: .math, source: cleaned)
     }
 
     /// The body of a fenced block, without its delimiter lines.
-    private static func diagram(_ block: BlockDescriptor, in text: NSString) -> RenderedBlock? {
-        guard let body = clamp(block.range, to: text.length) else { return nil }
-        var lines = text.substring(with: body).components(separatedBy: "\n")
-        if lines.first?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
-            lines.removeFirst()
-        }
-        if lines.last?.trimmingCharacters(in: .whitespaces).hasPrefix("```") == true {
-            lines.removeLast()
-        }
-        let source = lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
+    private static func diagram(
+        _ block: BlockDescriptor, in document: ParsedDocument, text: NSString
+    ) -> RenderedBlock? {
+        // Same owner the copy chip uses: a mermaid fence inside a callout is
+        // marked line by line (`> ```mermaid`, then `> ` on every body line),
+        // and leaving those prefixes in the source is a diagram that never
+        // draws.
+        let source = CodeBlockSource.copyText(of: block, in: document, text: text)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return source.isEmpty ? nil : RenderedBlock(kind: .diagram, source: source)
     }
 

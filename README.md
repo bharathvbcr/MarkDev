@@ -46,7 +46,7 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 ### 🧮 Native Rich Block Rendering
 - **LaTeX Math**: Rendered in pure Swift using Core Text via `SwiftMath` (no MathJax web overhead).
 - **Mermaid Diagrams**: Native graph layout and rendering for flowcharts, sequence diagrams, state machines, and ER diagrams via `BeautifulMermaid`.
-- **Dynamic Kerning Tables**: Markdown pipe tables auto-align columns in real time using font kerning without modifying raw text.
+- **GFM Tables as Grids**: Pipe tables are drawn as a real grid with per-column alignment, without modifying raw text.
 - **Interactive Checkboxes**: Clickable GFM task list checkboxes rendered directly into gutter fragments.
 
 ### 🧠 Knowledge Vault & Link Graph
@@ -70,7 +70,7 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 
 | Feature | Syntax | Status | Design Rationale |
 |---|---|---|---|
-| **Tables (GFM)** | `\| A \| B \|` | Supported | Auto-aligned via kerning without altering source text. |
+| **Tables (GFM)** | `\| A \| B \|` | Supported | Drawn as a grid with per-column alignment, without altering source text. |
 | **Footnotes** | `[^1]` / `[^1]: Note` | Supported | Rendered as superscript references with bidirectional navigation. |
 | **Task Lists** | `- [ ]` / `- [x]` | Supported | Interactive checkboxes in layout fragment gutters. |
 | **LaTeX Math** | `$x$` / `$$\int$$` | Supported | Typeset via `SwiftMath` using Latin Modern fonts. |
@@ -80,7 +80,7 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 | **Definition Lists**| `Term\n: Def` | Supported | Extended multi-line definitions. |
 | **Wikilinks** | `[[Note]]` | Supported | Vault-relative path resolution with alias support. |
 | **Strikethrough** | `~~text~~` | Supported | Standard GFM strikethrough styling. |
-| **Subscript / Tilde**| `~x~` | *Excluded* | Kept literal so `~x~` is not ambiguous with strikethrough. |
+| **Subscript** | `~x~` as subscript | *Excluded* | pulldown's subscript option stays off. Flanked `~x~` is GFM strikethrough, same as `~~x~~`. |
 | **Smart Punctuation**| `"` → `“` | *Excluded* | Disabled so UTF-16 code unit buffer offsets never drift. |
 
 ---

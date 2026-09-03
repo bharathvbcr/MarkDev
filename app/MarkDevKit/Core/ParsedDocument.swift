@@ -63,6 +63,13 @@ public struct ParsedDocument: Sendable, Equatable {
     /// a large document just to find the usually tiny formula set.
     public let inlineMathSpans: [StyleSpan]
 
+    /// `prefixMaxEnd[i]` is the maximum end of `markers[0..<i]`.
+    ///
+    /// `markerIndices(overlapping:)` widens backwards using this so a long
+    /// marker (a callout's `[!IMPORTANT]`, a link definition) is not skipped
+    /// because a short marker sits between it and the probe.
+    private let markerPrefixMaxEnd: [Int]
+
     /// An empty result, used for empty documents and as a safe fallback when
     /// the source cannot be parsed.
     public static let empty = ParsedDocument(spans: [], markers: [], blocks: [])
@@ -88,6 +95,16 @@ public struct ParsedDocument: Sendable, Equatable {
         self.tableHeads = heads
         self.taskMarkerSpans = spans.filter { $0.kind == .taskMarker }
         self.inlineMathSpans = spans.filter { $0.kind == .inlineMath }
+
+        var running = 0
+        var prefix: [Int] = []
+        prefix.reserveCapacity(markers.count + 1)
+        prefix.append(0)
+        for marker in markers {
+            running = max(running, NSMaxRange(marker.range))
+            prefix.append(running)
+        }
+        self.markerPrefixMaxEnd = prefix
     }
 
     /// The GFM table containing `range`, found by binary search.
@@ -145,12 +162,9 @@ public struct ParsedDocument: Sendable, Equatable {
     ///
     /// Markers are *not* guaranteed disjoint: a blockquote re-marks its `>`
     /// prefixes over the gap rule's own marker. The search therefore widens
-    /// backwards over neighbours that reach into `range`, which costs a step
-    /// per duplicate rather than a document scan. That widening assumes
-    /// overlapping markers are *adjacent* in sort order — true of duplicates,
-    /// which share a start — rather than one long marker hiding behind several
-    /// short ones. `ParsedDocumentTests` checks the result against a full scan
-    /// over a document containing every construct the parser emits.
+    /// backwards over any earlier marker whose end reaches into `range`, using
+    /// a prefix-max-end table so a long run (`[!IMPORTANT]`, a link definition)
+    /// is not skipped because a short marker sits between it and the probe.
     public func markerIndices(overlapping range: NSRange) -> Range<Int> {
         guard range.length > 0, !markers.isEmpty else { return 0..<0 }
         let end = range.location + range.length
@@ -184,7 +198,7 @@ public struct ParsedDocument: Sendable, Equatable {
                 low = mid + 1
             }
         }
-        while lower > 0, NSMaxRange(markers[lower - 1].range) > range.location {
+        while lower > 0, markerPrefixMaxEnd[lower] > range.location {
             lower -= 1
         }
 
@@ -199,7 +213,7 @@ public struct ParsedDocument: Sendable, Equatable {
     /// aliased `[[Target|shown]]` cannot be read back from the document.
     public func target(for span: StyleSpan) -> String? {
         switch span.kind {
-        case .link, .wikiLink, .image:
+        case .link, .wikiLink, .image, .footnoteReference:
             let index = Int(span.data)
             return strings.indices.contains(index) ? strings[index] : nil
         default:
