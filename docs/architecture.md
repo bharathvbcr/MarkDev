@@ -34,6 +34,8 @@ The Rust core is a pure static library (`libmarkdev.a`) that knows nothing about
   Built on `pulldown-cmark` with SIMD acceleration enabled. It tokenizes CommonMark blocks, headings, lists, tables, code blocks, task lists, and inline formatting.
 - **Incremental Engine (`src/md/incremental.rs`)**:
   Features a provably safe **shift-only** fast path. When inert prose is typed away from block markers or line-start indentation, the previous parse tree is retained and offsets are simply shifted in memory without running the parser. Any ambiguous edit safely falls back to a complete reparse.
+- **HTML Export (`src/html.rs`)**:
+  Renders notes to browser-ready HTML with strict bounds checking, link/image destination sanitization, and strict CSP framing for safe local consumption.
 - **Tree-sitter Syntax Highlighting (`src/highlight/`)**:
   High-accuracy, AST-based syntax highlighting for fenced code blocks. Uses real grammars for Rust, Swift, JavaScript/TypeScript, Python, JSON, and Bash.
 - **Vault Index & Graph (`src/vault/`)**:
@@ -57,6 +59,8 @@ Both the main application (`app/MarkDev/`) and the Quick Look extension (`app/Ma
 | **`Splits/`** | `SplitLayout` pure value-type layout engine for recursive horizontal/vertical panes. |
 | **`Vault/`** | `VaultIndex` wrapper, backlinks engine, and interactive force-directed graph canvas. |
 | **`Terminal/`** | Integrated VT100/xterm pty terminal drawer built on `SwiftTerm`. |
+| **`Diagnostics/`** | Bounded telemetry ring, OS and file sinks, support-report export, and lifecycle contracts. |
+| **`Intelligence/`** | AI-powered writing/proofreading panel and services with guarded source validation before edits. |
 | **`Brand/`** | Vector geometry for the MarkDev mark and icon generation logic. |
 
 ---
@@ -106,7 +110,19 @@ public enum SplitLayout: Equatable, Sendable {
 
 ---
 
-## 5. Embedded Terminal Drawer
+## 5. Diagnostics and Support Reporting
+
+Diagnostics now runs through a typed, bounded pipeline:
+
+- **`DiagnosticsEmitter`** buffers events in fixed-capacity memory so production call sites stay non-blocking.
+- **`DiagnosticsCenter`** persists validated events into rotating JSONL files in
+  `~/Library/Application Support/MarkDev/Diagnostics` and OSLog.
+- **Support Report Export** creates an atomic, byte-limited support bundle for sharing with maintainers.
+- **Privacy by construction**: metadata keys and codes are typed and sanitized, and only bounded context is exported.
+
+---
+
+## 6. Embedded Terminal Drawer
 
 The terminal drawer is built on `SwiftTerm` and provides a true VT100/xterm pty session:
 - Spawns user's default login shell (`$SHELL` or `/bin/zsh`).

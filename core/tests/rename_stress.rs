@@ -7,7 +7,7 @@
 //! after, and no link that pointed anywhere else changed by a byte.
 
 use markdev::vault::rename::rewrite_links_in;
-use markdev::vault::Vault;
+use markdev::vault::{Note, Vault};
 
 // MARK: - Rewriter invariants
 
@@ -414,34 +414,183 @@ fn occurrences_outside_code(source: &str, needle: &str) -> usize {
 
 #[test]
 fn rename_survives_hostile_destination_names_without_touching_disk() {
-    let root = std::env::temp_dir().join(format!("markdev-rename-hostile-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let sandbox = std::env::temp_dir().join(format!(
+        "markdev-rename-hostile-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let root = sandbox.join("vault");
+    let _ = std::fs::remove_dir_all(&sandbox);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("Keep.md"), "# Keep").unwrap();
     std::fs::write(root.join("Mover.md"), "# Mover").unwrap();
     let mut vault = Vault::open(&root);
 
-    let hostile = [
-        "Keep.MD",      // case variant of an existing note
-        "../Escape.md", // traversal
-        "sub/../../Out.md",
-        "",
+    let absolute = sandbox.join("Absolute.md");
+    let hostile = vec![
+        "Keep.MD".to_string(), // case variant of an existing note
+        "../Escape.md".to_string(),
+        "sub/../../Out.md".to_string(),
+        absolute.to_string_lossy().into_owned(),
+        "Bad\0Name.md".to_string(),
+        ".".to_string(),
+        "./".to_string(),
+        "./Alias.md".to_string(),
+        "nested/./Alias.md".to_string(),
+        "".to_string(),
     ];
     for name in hostile {
-        // Every hostile name must be refused outright — a case-variant of an
-        // existing note, traversal, or empty — or at minimum leave Keep.md's
-        // bytes alone. The assertion is on the invariant that matters.
-        let _ = vault.rename_note("Mover.md", name);
+        // Every hostile name is refused at the core boundary. Checking only an
+        // unrelated bystander made the old test pass while `../Escape.md`
+        // actually moved Mover.md out of the vault.
+        assert!(
+            vault.rename_note("Mover.md", &name).is_none(),
+            "hostile destination was accepted: {name:?}"
+        );
+        assert!(
+            std::fs::exists(root.join("Mover.md")).unwrap(),
+            "source escaped the vault via destination {name:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Mover.md")).unwrap(),
+            "# Mover",
+            "source bytes changed after refusing {name:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("Keep.md")).unwrap(),
             "# Keep",
             "Keep.md was damaged via destination {name:?}"
         );
-        assert!(
-            std::fs::read_to_string(root.join("Keep.md")).is_ok(),
-            "Keep.md vanished via {name:?}"
-        );
+        assert!(!std::fs::exists(sandbox.join("Escape.md")).unwrap());
+        assert!(!std::fs::exists(sandbox.join("Out.md")).unwrap());
+        assert!(!std::fs::exists(&absolute).unwrap());
     }
 
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn rename_refuses_an_indexed_source_path_outside_the_vault() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "markdev-rename-outside-source-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let root = sandbox.join("vault");
+    let outside = sandbox.join("Outside.md");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&outside, "# Outside").unwrap();
+    let mut vault = Vault::build(
+        root.clone(),
+        vec![Note::parse("../Outside.md".to_string(), "# Outside")],
+    );
+
+    let result = vault.rename_note("../Outside.md", "Captured.md");
+    let source_text = std::fs::read_to_string(&outside).ok();
+    let destination_exists = std::fs::exists(root.join("Captured.md")).unwrap();
+    let _ = std::fs::remove_dir_all(&sandbox);
+
+    assert!(result.is_none(), "an indexed outside source was accepted");
+    assert_eq!(source_text.as_deref(), Some("# Outside"));
+    assert!(!destination_exists);
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_refuses_a_destination_beneath_a_symlinked_directory() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = std::env::temp_dir().join(format!(
+        "markdev-rename-destination-link-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let root = sandbox.join("vault");
+    let outside = sandbox.join("outside");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(root.join("Mover.md"), "# Mover").unwrap();
+    symlink(&outside, root.join("linked-parent")).unwrap();
+    let mut vault = Vault::open(&root);
+
+    let result = vault.rename_note("Mover.md", "linked-parent/Escape.md");
+    let source_stayed = std::fs::read_to_string(root.join("Mover.md")).ok();
+    let escaped = std::fs::exists(outside.join("Escape.md")).unwrap();
+    let _ = std::fs::remove_dir_all(&sandbox);
+
+    assert!(
+        result.is_none(),
+        "a symlinked destination parent was accepted"
+    );
+    assert_eq!(source_stayed.as_deref(), Some("# Mover"));
+    assert!(
+        !escaped,
+        "the destination escaped through a symlinked parent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_refuses_an_indexed_source_that_is_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = std::env::temp_dir().join(format!(
+        "markdev-rename-source-link-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let root = sandbox.join("vault");
+    let outside = sandbox.join("outside");
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let secret = outside.join("Secret.md");
+    std::fs::write(&secret, "# Outside").unwrap();
+    symlink(&secret, root.join("Alias.md")).unwrap();
+    let mut vault = Vault::build(
+        root.clone(),
+        vec![Note::parse("Alias.md".to_string(), "# Outside")],
+    );
+
+    // If a scanner ever indexes an alias, the mutation boundary still refuses
+    // to move it. Scan policy and mutation policy are independent belts.
+    let result = vault.rename_note("Alias.md", "Moved.md");
+    let alias_stayed = std::fs::symlink_metadata(root.join("Alias.md")).is_ok();
+    let destination_exists = std::fs::symlink_metadata(root.join("Moved.md")).is_ok();
+    let secret_text = std::fs::read_to_string(&secret).ok();
+    let _ = std::fs::remove_dir_all(&sandbox);
+
+    assert!(result.is_none(), "a symlink source was accepted");
+    assert!(alias_stayed, "the source symlink was moved");
+    assert!(!destination_exists);
+    assert_eq!(secret_text.as_deref(), Some("# Outside"));
+}
+
+#[test]
+fn stale_legacy_rewrite_temp_cannot_turn_a_rename_into_false_success() {
+    let root = std::env::temp_dir().join(format!(
+        "markdev-rename-stale-temp-{}-{}",
+        std::process::id(),
+        line!()
+    ));
     let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("Mover.md"), "# Mover").unwrap();
+    std::fs::write(root.join("Ref.md"), "See [[Mover]].\n").unwrap();
+    std::fs::write(root.join(".Ref.md.markdev-tmp"), "stale crash artifact").unwrap();
+    let mut vault = Vault::open(&root);
+
+    let outcome = vault
+        .rename_note("Mover.md", "Moved.md")
+        .expect("the source move should succeed");
+    let rewritten = std::fs::read_to_string(root.join("Ref.md")).unwrap();
+    let stale = std::fs::read_to_string(root.join(".Ref.md.markdev-tmp")).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(outcome.rewritten_notes, 1);
+    assert_eq!(outcome.rewritten_links, 1);
+    assert_eq!(rewritten, "See [[Moved]].\n");
+    assert_eq!(stale, "stale crash artifact");
 }

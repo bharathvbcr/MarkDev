@@ -10,6 +10,10 @@ import XCTest
 
 @testable import MarkDevKit
 
+#if canImport(CMarkDev)
+    import CMarkDev
+#endif
+
 final class ParsedDocumentTests: XCTestCase {
     func testABIMatches() {
         // A mismatch means libmarkdev.a is stale; every other test in this
@@ -22,6 +26,19 @@ final class ParsedDocumentTests: XCTestCase {
 
     func testEmptySourceParsesToEmpty() {
         XCTAssertEqual(ParsedDocument.parse(""), .empty)
+    }
+
+    func testCheckedParseDistinguishesAValidEmptyDocumentFromRefusal() {
+        XCTAssertEqual(ParsedDocument.parseChecked(""), .parsed(.empty))
+        XCTAssertEqual(ParsedDocument.parseChecked("before\0after"), .rejected)
+    }
+
+    func testCheckedParseAcceptsTheExactByteLimitAndRejectsPlusOne() {
+        let exact = String(repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes)
+        guard case .parsed = ParsedDocument.parseChecked(exact) else {
+            return XCTFail("the exact parser limit must remain usable")
+        }
+        XCTAssertEqual(ParsedDocument.parseChecked(exact + "x"), .rejected)
     }
 
     func testHeadingProducesBlockAndSpan() {
@@ -215,5 +232,158 @@ final class ParsedDocumentTests: XCTestCase {
             return XCTFail("expected a strong span")
         }
         XCTAssertEqual(ns.substring(with: strong.range), "bold")
+    }
+
+    func testSpanOverlapIndexFindsAnEarlierLongOuterSpan() {
+        let document = ParsedDocument(
+            spans: [
+                StyleSpan(
+                    range: NSRange(location: 0, length: 100), kind: .link, depth: 0, data: 0),
+                StyleSpan(
+                    range: NSRange(location: 10, length: 1), kind: .strong, depth: 1, data: 0),
+                StyleSpan(
+                    range: NSRange(location: 70, length: 10), kind: .emphasis, depth: 1, data: 0),
+            ],
+            markers: [],
+            blocks: [],
+            strings: ["destination"])
+
+        XCTAssertEqual(
+            document.spanIndices(overlapping: NSRange(location: 75, length: 1)),
+            0..<3,
+            "a short nested span must not hide an earlier outer overlap")
+    }
+
+    func testOverlapIndexesRejectOverflowingQueriesWithoutTrapping() {
+        let document = ParsedDocument(
+            spans: [
+                StyleSpan(
+                    range: NSRange(location: 0, length: 1), kind: .strong, depth: 0, data: 0)
+            ],
+            markers: [SyntaxMarker(range: NSRange(location: 0, length: 1), block: 0)],
+            blocks: [
+                BlockDescriptor(
+                    range: NSRange(location: 0, length: 1), kind: .paragraph, depth: 0,
+                    data: 0, info: nil)
+            ])
+        let overflowing = NSRange(location: Int.max, length: 1)
+
+        XCTAssertEqual(document.spanIndices(overlapping: overflowing), 0..<0)
+        XCTAssertEqual(document.markerIndices(overlapping: overflowing), 0..<0)
+    }
+
+    // MARK: - Nested blocks survive the bridge
+
+    /// Every nested construct in the language must decode.
+    ///
+    /// The bridge validates the core's arrays before trusting them, and its
+    /// ordering check was written once for all three. Spans and markers *are*
+    /// sorted by `(start, end)` — `core/src/md/parse.rs` sorts them explicitly
+    /// — but `blocks` is never sorted at all: a descriptor is pushed when its
+    /// construct opens, so a container precedes its contents and, at a shared
+    /// start, ends *later* than the child that follows it.
+    ///
+    /// Holding blocks to the span rule therefore rejected the whole parse of
+    /// any nested construct. `decode` returned nil, `setMarkdown` refused the
+    /// document, and the editor showed an **empty page** for an ordinary note
+    /// — an ordered list, a table, a task list, a display formula. Nothing
+    /// reported an error; the text simply never arrived.
+    func testEveryNestedConstructDecodesRatherThanRejectingTheWholeParse() {
+        let nested: [(String, String)] = [
+            ("ordered list", "998. a\n999. b\n1000. c\n"),
+            ("ordered list with parens", "1) a\n2) b\n"),
+            ("bullet list", "- one\n- two\n"),
+            ("nested list", "- outer\n  - inner\n    - deeper\n"),
+            ("task list", "- [ ] todo\n- [x] done\n"),
+            ("table", "| a | b |\n|---|---|\n| 1 | 2 |\n"),
+            ("table in a list", "- item\n\n  | a | b |\n  |---|---|\n  | 1 | 2 |\n"),
+            ("display math", "$$\nx^2\n$$\n"),
+            ("blockquote", "> quoted\n> more\n"),
+            ("callout", "> [!NOTE]\n> body\n"),
+            ("list holding a fence", "- item\n\n  ```swift\n  let x = 1\n  ```\n"),
+            ("footnote definition", "See[^1].\n\n[^1]: The note.\n"),
+        ]
+
+        for (name, source) in nested {
+            guard case .parsed(let document) = ParsedDocument.parseChecked(source) else {
+                XCTFail("\(name) was refused by the bridge; the editor renders that as a blank page")
+                continue
+            }
+            XCTAssertFalse(
+                document.blocks.isEmpty, "\(name) decoded to no blocks at all")
+        }
+    }
+
+    /// The fixture above must actually contain the shape it exists to cover.
+    ///
+    /// A container that happens to end exactly where its only child does
+    /// satisfies the span rule by coincidence — a one-item list did, which is
+    /// why the bug looked like it only touched *some* documents. Without this,
+    /// a future parser change could quietly stop producing the overlapping
+    /// pair and leave the test above passing while covering nothing.
+    func testTheNestedFixtureReallyContainsAContainerOutlivingItsFirstChild() {
+        guard case .parsed(let document) = ParsedDocument.parseChecked("998. a\n999. b\n1000. c\n")
+        else { return XCTFail("the multi-item list must parse") }
+
+        let pairs = zip(document.blocks, document.blocks.dropFirst())
+        XCTAssertTrue(
+            pairs.contains { outer, inner in
+                outer.range.location == inner.range.location
+                    && NSMaxRange(outer.range) > NSMaxRange(inner.range)
+            },
+            "no block is followed by one starting at the same offset and ending sooner — "
+                + "the ordering this guards is no longer exercised")
+    }
+
+    /// What the bridge does require of blocks, and all it requires.
+    ///
+    /// `overlapWindow` binary-searches on start location alone;
+    /// `prefixMaximumEnds` exists precisely because the ends do not rise with
+    /// them. Starts going backwards would silently truncate that window.
+    func testBlockStartsNeverGoBackwardsAcrossNestedConstructs() {
+        for source in [
+            "- outer\n  - inner\n    - deeper\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n",
+            "> [!NOTE]\n> - item\n>\n> | a | b |\n> |---|---|\n> | 1 | 2 |\n",
+        ] {
+            guard case .parsed(let document) = ParsedDocument.parseChecked(source) else {
+                XCTFail("\(source.debugDescription) must parse")
+                continue
+            }
+            for (left, right) in zip(document.blocks, document.blocks.dropFirst()) {
+                XCTAssertLessThanOrEqual(
+                    left.range.location, right.range.location,
+                    "block starts went backwards in \(source.debugDescription)")
+            }
+        }
+    }
+
+    // MARK: - Constants Swift keeps its own copy of
+
+    /// `TableAlignment` hand-writes the packing the core defines.
+    ///
+    /// `MarkdownModel.swift` is deliberately pure Foundation — it is the one
+    /// model file that does not import the C header — so it restates `bits`
+    /// as a literal rather than reading `MDTABLE_ALIGNMENT_BITS`. That keeps
+    /// the file portable and makes the two copies free to drift: widening the
+    /// field in Rust would leave Swift shifting by the old width, and every
+    /// table cell would decode a wrong column index with nothing failing.
+    ///
+    /// `MDTABLE_ALIGNMENT_MASK` cannot be read from Swift at all — it is
+    /// `((1 << MDTABLE_ALIGNMENT_BITS) - 1)`, outside the importable macro
+    /// grammar `core/tests/header_contract.rs` describes — so the mask is
+    /// re-derived here from the width rather than compared directly.
+    func testTableAlignmentPackingMatchesTheCore() {
+        #if canImport(CMarkDev)
+            XCTAssertEqual(
+                TableAlignment.bits, UInt32(MDTABLE_ALIGNMENT_BITS),
+                "Swift and the core disagree about the width of the alignment field")
+            XCTAssertEqual(
+                TableAlignment.mask, (1 << UInt32(MDTABLE_ALIGNMENT_BITS)) - 1,
+                "the derived mask no longer covers the core's alignment field")
+            XCTAssertTrue(
+                TableAlignment.allCases.allSatisfy { $0.rawValue <= TableAlignment.mask },
+                "an alignment case does not fit the field it is packed into")
+        #endif
     }
 }

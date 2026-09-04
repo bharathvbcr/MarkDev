@@ -56,6 +56,10 @@ extension FocusedValues {
 }
 
 struct WorkspaceCommands: Commands {
+    /// Where the Help menu points, since there is no help book to open.
+    static let documentationURL = URL(
+        string: "https://github.com/bharathvbcr/MarkDev/blob/main/docs/README.md")!
+
     @FocusedValue(\.workspaceCommandHandler)
     private var handler
     @FocusedValue(\.tabSwitcher)
@@ -109,7 +113,13 @@ struct WorkspaceCommands: Commands {
                 .keyboardShortcut("e")
         }
 
-        CommandMenu("View") {
+        // Added to the View menu AppKit already provides, not declared as a
+        // second one. `CommandMenu("View")` does not find the existing menu by
+        // name — it builds another beside it, and the menu bar then reads
+        // "File Edit View View Editor", with the zoom items in the second and
+        // Enter Full Screen in the first. A reader looking for Zoom In has two
+        // menus to check and no way to tell which.
+        CommandGroup(after: .toolbar) {
             actionButton("Zoom In", action: .zoomIn, key: "=")
             actionButton("Zoom Out", action: .zoomOut, key: "-")
             actionButton("Actual Size", action: .resetZoom, key: "0")
@@ -125,7 +135,7 @@ struct WorkspaceCommands: Commands {
                 modifiers: [.command, .option])
             actionButton("Toggle Terminal", action: .toggleTerminal, key: "j")
             actionButton(
-                "Graph View", action: .toggleGraph, key: "g", modifiers: [.command, .shift])
+                "Graph View", action: .toggleGraph, key: "g", modifiers: [.command, .option])
             Divider()
             actionButton(SplitEdge.trailing.commandTitle, action: .splitRight)
             actionButton(SplitEdge.bottom.commandTitle, action: .splitDown)
@@ -158,6 +168,17 @@ struct WorkspaceCommands: Commands {
                 actionButton(
                     mode.commandTitle, action: .setMode(mode),
                     key: KeyEquivalent(Character("\(index + 1)")), modifiers: .control)
+            }
+        }
+
+        // AppKit's default Help item looks for a help book, and MarkDev ships
+        // none — so "MarkDev Help" was a menu item whose entire behaviour was
+        // an alert saying help is unavailable. Replaced rather than removed:
+        // the Help menu is where somebody looks first, and the documentation
+        // does exist.
+        CommandGroup(replacing: .help) {
+            Button("MarkDev Documentation") {
+                NSWorkspace.shared.open(Self.documentationURL)
             }
         }
 

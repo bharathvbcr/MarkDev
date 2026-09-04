@@ -34,6 +34,10 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public var onSelectionStats: ((Int, Int) -> Void)?
     /// Called when a link is hovered or unhovered.
     public var onHoveredLink: ((String?) -> Void)?
+    /// Called when the editor refuses a document and is therefore showing
+    /// nothing. Wired to the window's alert, because a blank page is otherwise
+    /// the only thing the reader is told.
+    public var onDocumentRejected: ((String) -> Void)?
     /// Set to scroll the editor to an offset; applied once per request.
     public var reveal: RevealRequest?
 
@@ -47,7 +51,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
         onFollowWikiLink: ((String) -> Void)? = nil,
         onSurface: ((MarkdownTextView) -> Void)? = nil,
         onSelectionStats: ((Int, Int) -> Void)? = nil,
-        onHoveredLink: ((String?) -> Void)? = nil
+        onHoveredLink: ((String?) -> Void)? = nil,
+        onDocumentRejected: ((String) -> Void)? = nil
     ) {
         self._text = text
         self.mode = mode
@@ -58,6 +63,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self.onFollowWikiLink = onFollowWikiLink
         self.onSurface = onSurface
         self.onSelectionStats = onSelectionStats
+        self.onDocumentRejected = onDocumentRejected
         self.onHoveredLink = onHoveredLink
     }
 
@@ -114,6 +120,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         context.coordinator.onSurface = onSurface
         context.coordinator.onSelectionStats = onSelectionStats
         context.coordinator.onHoveredLink = onHoveredLink
+        context.coordinator.onDocumentRejected = onDocumentRejected
         if textView.mode != mode { textView.mode = mode }
         if textView.baseTheme.bodyFont != theme.bodyFont || textView.theme.lineSpacing != theme.lineSpacing {
             textView.setBaseTheme(theme)
@@ -125,12 +132,22 @@ public struct MarkdownEditorView: NSViewRepresentable {
 
         // Only push text in when it genuinely differs, or every keystroke
         // would reset the document and collapse the selection.
-        if textView.markdown != text {
+        if context.coordinator.shouldPush(text, currentlyShowing: textView.markdown) {
             let selection = textView.selectedRange()
-            textView.setMarkdown(text)
-            let length = (textView.markdown as NSString).length
-            textView.setSelectedRange(
-                NSRange(location: min(selection.location, length), length: 0))
+            let accepted = textView.setMarkdown(text)
+            context.coordinator.recordPush(of: text, accepted: accepted)
+            if accepted {
+                let length = (textView.markdown as NSString).length
+                textView.setSelectedRange(
+                    NSRange(location: min(selection.location, length), length: 0))
+            } else {
+                // Reported once per distinct document, not once per update
+                // pass: the alert is modal, and a window that re-raises it
+                // every time SwiftUI recomputes cannot be dismissed.
+                context.coordinator.onDocumentRejected?(
+                    "This document could not be opened. It is either larger than "
+                        + "MarkDev can edit safely, or it contains bytes that are not text.")
+            }
         }
 
         // Applied once per request. Comparing identities rather than offsets
@@ -160,12 +177,38 @@ public struct MarkdownEditorView: NSViewRepresentable {
         var onSurface: ((MarkdownTextView) -> Void)?
         var onSelectionStats: ((Int, Int) -> Void)?
         var onHoveredLink: ((String?) -> Void)?
+        var onDocumentRejected: ((String) -> Void)?
+        /// The exact text the editor last refused.
+        ///
+        /// `updateNSView` pushes text in whenever it differs from the view's,
+        /// and a refused document never becomes the view's — so the condition
+        /// stays true and SwiftUI re-attempts the same rejected parse on every
+        /// update pass, for the life of the window. Holding the string costs
+        /// nothing (Swift strings are copy-on-write, so this is a retain) and
+        /// turns an unbounded retry into one attempt per distinct document.
+        var refusedText: String?
         var appliedReveal: UUID?
         weak var textView: MarkdownTextView?
 
         init(text: Binding<String>, onParse: ((ParsedDocument) -> Void)?) {
             self.text = text
             self.onParse = onParse
+        }
+
+        /// Whether `text` should be handed to the view.
+        ///
+        /// Pure, and separate from `updateNSView`, because that method takes a
+        /// SwiftUI `Context` no test can construct — leaving the rule that
+        /// bounds the retry loop the one part of this file nothing could
+        /// assert. The rule: push when the view does not already hold the
+        /// text, unless that exact text is the one it just refused.
+        func shouldPush(_ text: String, currentlyShowing current: String) -> Bool {
+            text != current && refusedText != text
+        }
+
+        /// Records the outcome of a push so the next update can act on it.
+        func recordPush(of text: String, accepted: Bool) {
+            refusedText = accepted ? nil : text
         }
 
         public func textDidChange(_ notification: Notification) {

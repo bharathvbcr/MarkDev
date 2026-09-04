@@ -7,7 +7,8 @@
 
 pub mod ffi;
 pub mod highlight;
+pub mod html;
 pub mod md;
 pub mod vault;
 
-pub use md::{parse, BlockKind, ParseResult, SpanKind};
+pub use md::{parse, parse_checked, BlockKind, ParseError, ParseResult, SpanKind};

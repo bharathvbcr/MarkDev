@@ -19,14 +19,23 @@ import Foundation
 /// anyway: two windows' updates serialise through the same actor, and the
 /// core's own lock guards the Rust side (see ``VaultIndex/coreLock``).
 ///
-/// Indexes live until process exit. A personal-vault index is kilobytes of
-/// strings; evicting on last-close would buy nothing and cost a full re-walk
-/// when the reader reopens the same vault an hour later.
+/// The registry is a weak rendezvous point, not an owner. Windows that overlap
+/// share one live index, but closing the last window releases the Rust index
+/// and its complete vault corpus instead of retaining every vault ever opened
+/// until process exit.
 @MainActor
 public final class VaultIndexRegistry {
     public static let shared = VaultIndexRegistry()
 
-    private var indexes: [URL: VaultIndex] = [:]
+    private final class WeakIndex {
+        weak var value: VaultIndex?
+
+        init(_ value: VaultIndex) {
+            self.value = value
+        }
+    }
+
+    private var indexes: [URL: WeakIndex] = [:]
 
     private init() {}
 
@@ -43,12 +52,16 @@ public final class VaultIndexRegistry {
             .standardizedFileURL
             .resolvingSymlinksInPath()
 
-        if let existing = indexes[key] {
+        // Pruning on the only public lookup keeps even the dictionary of dead
+        // path keys bounded by currently live vaults plus, at most, the keys
+        // released since the previous lookup.
+        indexes = indexes.filter { $0.value.value != nil }
+        if let existing = indexes[key]?.value {
             return existing
         }
         let fresh = VaultIndex()
         fresh.open(key)
-        indexes[key] = fresh
+        indexes[key] = WeakIndex(fresh)
         return fresh
     }
 

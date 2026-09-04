@@ -1,7 +1,8 @@
 //! The vault: notes, the link graph between them, tags, and search.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,115 @@ pub struct SearchHit {
 pub struct TagCount {
     pub tag: String,
     pub count: u32,
+}
+
+/// Largest note the index will hold in memory by default (16 MiB).
+pub const DEFAULT_MAX_NOTE_BYTES: usize = 16 * 1_048_576;
+
+/// Largest aggregate body-text payload retained by an initial vault scan
+/// (256 MiB). Parsed metadata adds overhead, so this deliberately bounds the
+/// raw input well below a process-sized allocation.
+pub const DEFAULT_MAX_VAULT_BYTES: usize = 256 * 1_048_576;
+
+/// Accepts only a non-empty lexical path made entirely of normal relative
+/// components. Filesystem mutation and in-memory mutation share this owner so
+/// a caller cannot insert a path the rename boundary would later refuse.
+pub(crate) fn validated_relative_path(value: &str) -> Option<&Path> {
+    if value.is_empty() || value.contains('\0') {
+        return None;
+    }
+    if value
+        .split(['/', '\\'])
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut components = path.components();
+    let first = components.next()?;
+    if !matches!(first, Component::Normal(_))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path)
+}
+
+/// Resource bounds for a recursive vault scan.
+///
+/// The Swift catch-up walker uses the same defaults. Keeping both limits
+/// explicit prevents a corrupt or adversarial tree from turning vault open
+/// into unbounded recursion or memory growth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultScanLimits {
+    /// The root is depth zero. Files directly inside a directory at this
+    /// depth are still considered; child directories are not descended into.
+    pub max_depth: usize,
+    /// Every visible or ignored directory entry examined consumes one unit.
+    pub max_entries: usize,
+    /// Maximum bytes read from any one note.
+    pub max_note_bytes: usize,
+    /// Maximum aggregate note bytes read and retained by the scan.
+    pub max_total_bytes: usize,
+}
+
+impl Default for VaultScanLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 48,
+            max_entries: 100_000,
+            max_note_bytes: DEFAULT_MAX_NOTE_BYTES,
+            max_total_bytes: DEFAULT_MAX_VAULT_BYTES,
+        }
+    }
+}
+
+/// What the initial filesystem scan was actually able to cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultScanStatus {
+    pub scan_performed: bool,
+    pub visited_entries: usize,
+    /// In-policy Markdown candidates encountered during the bounded walk.
+    pub discovered_files: usize,
+    /// Metadata-snapshot bytes for every discovered candidate.
+    pub discovered_bytes: u64,
+    /// Candidates admitted by the per-note and aggregate byte budgets.
+    pub selected_files: usize,
+    /// Metadata-snapshot bytes for selected candidates.
+    pub selected_bytes: u64,
+    /// Selected files successfully read as bounded UTF-8 and parsed.
+    pub indexed_files: usize,
+    /// Actual UTF-8 bytes retained in indexed notes.
+    pub indexed_bytes: u64,
+    /// Discovered files not indexed for any reason. This aggregate prevents a
+    /// caller from mistaking a byte-capped sample for a complete inventory.
+    pub skipped_files: usize,
+    pub skipped_symlinks: usize,
+    pub unreadable_directories: usize,
+    pub unreadable_entries: usize,
+    pub unreadable_files: usize,
+    pub oversized_files: usize,
+    pub hit_depth_limit: bool,
+    pub hit_entry_limit: bool,
+    pub hit_total_byte_limit: bool,
+}
+
+impl VaultScanStatus {
+    /// `true` only when the entire in-policy tree was inspected and read.
+    pub fn is_complete(&self) -> bool {
+        self.scan_performed
+            && !self.hit_depth_limit
+            && !self.hit_entry_limit
+            && !self.hit_total_byte_limit
+            && self.skipped_files == 0
+            && self.unreadable_directories == 0
+            && self.unreadable_entries == 0
+            && self.unreadable_files == 0
+            && self.oversized_files == 0
+    }
 }
 
 /// A link a note points *out* at, with where it lands.
@@ -97,15 +207,35 @@ pub struct Vault {
     /// Target note index to the links pointing at it.
     backlinks: HashMap<usize, Vec<(usize, usize)>>,
     search: SearchIndex,
+    scan_status: VaultScanStatus,
 }
 
 impl Vault {
-    /// Reads and indexes every Markdown file under `root`.
+    /// Reads Markdown under `root` with the standard safety bounds.
+    /// Inspect [`Vault::scan_status`] before treating the inventory as complete.
     pub fn open(root: impl AsRef<Path>) -> Vault {
-        let root = root.as_ref().to_path_buf();
-        let mut notes = Vec::new();
-        collect(&root, &root, &mut notes);
-        Vault::build(root, notes)
+        Self::open_with_limits(root, VaultScanLimits::default())
+    }
+
+    /// Reads Markdown under `root` while enforcing caller-selected bounds.
+    ///
+    /// Symlinks are never followed. The canonical root is the containment
+    /// boundary, and every directory and file is checked against it again
+    /// before it is read. See [`Vault::scan_status`] before treating absence
+    /// from the returned index as proof that a path is absent from disk.
+    pub fn open_with_limits(root: impl AsRef<Path>, limits: VaultScanLimits) -> Vault {
+        let requested_root = root.as_ref().to_path_buf();
+        let Ok(root) = std::fs::canonicalize(&requested_root) else {
+            let mut vault = Vault::build(requested_root, Vec::new());
+            vault.scan_status.scan_performed = true;
+            vault.scan_status.unreadable_directories = 1;
+            return vault;
+        };
+
+        let (notes, scan_status) = collect(&root, limits);
+        let mut vault = Vault::build(root, notes);
+        vault.scan_status = scan_status;
+        vault
     }
 
     /// Builds a vault from notes already in memory. Used by tests, and by
@@ -128,6 +258,11 @@ impl Vault {
         &self.notes
     }
 
+    /// Coverage of the filesystem walk that produced this index.
+    pub fn scan_status(&self) -> VaultScanStatus {
+        self.scan_status
+    }
+
     pub fn note(&self, path: &str) -> Option<&Note> {
         self.by_path.get(path).map(|&index| &self.notes[index])
     }
@@ -138,13 +273,24 @@ impl Vault {
     /// backlinks anywhere — so the graph is rebuilt rather than patched. At
     /// personal-vault scale that is microseconds, and it removes a whole
     /// class of stale-edge bugs.
-    pub fn update(&mut self, path: &str, source: &str) {
+    pub fn update(&mut self, path: &str, source: &str) -> bool {
+        if validated_relative_path(path).is_none() {
+            return false;
+        }
+        if self
+            .by_path
+            .get(path)
+            .is_some_and(|&index| self.notes[index].text == source)
+        {
+            return false;
+        }
         let note = Note::parse(path.to_string(), source);
         match self.by_path.get(path) {
             Some(&index) => self.notes[index] = note,
             None => self.notes.push(note),
         }
         self.reindex();
+        true
     }
 
     pub fn remove(&mut self, path: &str) {
@@ -379,36 +525,221 @@ impl Vault {
     }
 }
 
-/// Walks `directory`, reading every Markdown file into a note.
-fn collect(root: &Path, directory: &Path, notes: &mut Vec<Note>) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        // An unreadable directory contributes nothing rather than aborting
-        // the whole index; permissions vary across a vault.
-        return;
+/// Walks the in-policy tree without following filesystem aliases.
+fn collect(root: &Path, limits: VaultScanLimits) -> (Vec<Note>, VaultScanStatus) {
+    let mut notes = Vec::new();
+    let mut status = VaultScanStatus {
+        scan_performed: true,
+        ..VaultScanStatus::default()
     };
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if name.starts_with('.') || IGNORED.contains(&name.as_str()) {
+    'directories: while let Some((directory, depth)) = pending.pop() {
+        // A directory may have been replaced with a symlink after its parent
+        // was listed. Resolve it immediately before use and fail closed if it
+        // no longer belongs to the canonical vault.
+        let Ok(canonical_directory) = std::fs::canonicalize(&directory) else {
+            status.unreadable_directories = status.unreadable_directories.saturating_add(1);
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+            status.unreadable_directories = status.unreadable_directories.saturating_add(1);
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !canonical_directory.starts_with(root) {
+            status.skipped_symlinks = status.skipped_symlinks.saturating_add(1);
             continue;
         }
 
-        if path.is_dir() {
-            collect(root, &path, notes);
-        } else if is_markdown(&path) {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            status.unreadable_directories = status.unreadable_directories.saturating_add(1);
+            continue;
+        };
+
+        for entry in entries {
+            if status.visited_entries >= limits.max_entries {
+                status.hit_entry_limit = true;
+                break 'directories;
+            }
+            status.visited_entries = status.visited_entries.saturating_add(1);
+
+            let Ok(entry) = entry else {
+                status.unreadable_entries = status.unreadable_entries.saturating_add(1);
                 continue;
             };
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            notes.push(Note::parse(relative, &text));
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(file_type) = entry.file_type() else {
+                status.unreadable_entries = status.unreadable_entries.saturating_add(1);
+                continue;
+            };
+
+            // `DirEntry::file_type` and `symlink_metadata` do not follow the
+            // link. Skipping every symlink is intentionally stricter than
+            // following only links that currently resolve inside: it remains
+            // safe if their target is changed between checks.
+            if file_type.is_symlink() {
+                status.skipped_symlinks = status.skipped_symlinks.saturating_add(1);
+                continue;
+            }
+
+            if name.starts_with('.') || IGNORED.contains(&name.as_str()) {
+                continue;
+            }
+
+            if file_type.is_dir() {
+                if depth >= limits.max_depth {
+                    status.hit_depth_limit = true;
+                } else {
+                    pending.push((path, depth + 1));
+                }
+                continue;
+            }
+
+            if !file_type.is_file() || !is_markdown(&path) {
+                continue;
+            }
+
+            status.discovered_files = status.discovered_files.saturating_add(1);
+
+            // Repeat both checks immediately before reading. This catches an
+            // entry swapped for a symlink or moved outside after `read_dir`.
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                status.unreadable_files = status.unreadable_files.saturating_add(1);
+                continue;
+            };
+            let Ok(canonical_path) = std::fs::canonicalize(&path) else {
+                status.unreadable_files = status.unreadable_files.saturating_add(1);
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || !canonical_path.starts_with(root)
+            {
+                status.skipped_symlinks = status
+                    .skipped_symlinks
+                    .saturating_add(usize::from(metadata.file_type().is_symlink()));
+                continue;
+            }
+
+            let declared_bytes = metadata.len();
+            status.discovered_bytes = status.discovered_bytes.saturating_add(declared_bytes);
+            let note_limit = u64::try_from(limits.max_note_bytes).unwrap_or(u64::MAX);
+            if declared_bytes > note_limit {
+                status.oversized_files = status.oversized_files.saturating_add(1);
+                continue;
+            }
+            let total_limit = u64::try_from(limits.max_total_bytes).unwrap_or(u64::MAX);
+            let Some(proposed_selected_bytes) = status.selected_bytes.checked_add(declared_bytes)
+            else {
+                status.hit_total_byte_limit = true;
+                continue;
+            };
+            if proposed_selected_bytes > total_limit {
+                status.hit_total_byte_limit = true;
+                continue;
+            }
+            status.selected_files = status.selected_files.saturating_add(1);
+            status.selected_bytes = proposed_selected_bytes;
+
+            let remaining_bytes = total_limit.saturating_sub(status.indexed_bytes);
+            let text = match read_regular_file(
+                &canonical_path,
+                limits.max_note_bytes,
+                usize::try_from(remaining_bytes).unwrap_or(usize::MAX),
+            ) {
+                Ok(ReadRegularFile::Text(text)) => text,
+                Ok(ReadRegularFile::OversizedNote) => {
+                    status.oversized_files = status.oversized_files.saturating_add(1);
+                    continue;
+                }
+                Ok(ReadRegularFile::TotalBudgetExceeded) => {
+                    status.hit_total_byte_limit = true;
+                    continue;
+                }
+                Err(_) => {
+                    status.unreadable_files = status.unreadable_files.saturating_add(1);
+                    continue;
+                }
+            };
+            let Ok(relative) = path.strip_prefix(root) else {
+                status.unreadable_files = status.unreadable_files.saturating_add(1);
+                continue;
+            };
+            status.indexed_files = status.indexed_files.saturating_add(1);
+            status.indexed_bytes = status
+                .indexed_bytes
+                .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+            notes.push(Note::parse(
+                relative.to_string_lossy().replace('\\', "/"),
+                &text,
+            ));
         }
     }
+
+    status.skipped_files = status.discovered_files.saturating_sub(status.indexed_files);
+
+    (notes, status)
+}
+
+enum ReadRegularFile {
+    Text(String),
+    OversizedNote,
+    TotalBudgetExceeded,
+}
+
+fn read_regular_file(
+    path: &Path,
+    maximum_note_bytes: usize,
+    remaining_total_bytes: usize,
+) -> io::Result<ReadRegularFile> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // macOS provides the stronger O_NOFOLLOW_ANY: unlike O_NOFOLLOW, it
+    // rejects a symlink swapped into any parent component during the scan.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
+        const O_NONBLOCK: i32 = 0x0004;
+        options.custom_flags(O_NOFOLLOW_ANY | O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vault entry is no longer a regular file",
+        ));
+    }
+    let note_limit = u64::try_from(maximum_note_bytes).unwrap_or(u64::MAX);
+    if metadata.len() > note_limit {
+        return Ok(ReadRegularFile::OversizedNote);
+    }
+    let total_limit = u64::try_from(remaining_total_bytes).unwrap_or(u64::MAX);
+    if metadata.len() > total_limit {
+        return Ok(ReadRegularFile::TotalBudgetExceeded);
+    }
+
+    // Metadata is only a snapshot: cap the read too, so a file growing after
+    // `metadata()` cannot allocate beyond the contract.
+    let maximum_read_bytes = maximum_note_bytes.min(remaining_total_bytes);
+    let read_limit = u64::try_from(maximum_read_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let allocation_limit = u64::try_from(maximum_read_bytes).unwrap_or(u64::MAX);
+    let capacity = usize::try_from(metadata.len().min(allocation_limit)).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum_note_bytes {
+        return Ok(ReadRegularFile::OversizedNote);
+    }
+    if bytes.len() > remaining_total_bytes {
+        return Ok(ReadRegularFile::TotalBudgetExceeded);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(ReadRegularFile::Text(text))
 }
 
 const IGNORED: &[&str] = &["node_modules", "DerivedData", "target", ".build"];
@@ -421,6 +752,55 @@ fn is_markdown(path: &Path) -> bool {
             .as_deref(),
         Some("md" | "markdown" | "mdown" | "mdx" | "mkd")
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod read_tests {
+    use super::read_regular_file;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        const O_NONBLOCK: i32 = 0x0004;
+        let root = std::env::temp_dir().join(format!(
+            "markdev-vault-fifo-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("Swapped.md");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("launch mkfifo");
+        assert!(status.success(), "mkfifo failed: {status}");
+        let fifo = std::fs::canonicalize(fifo).expect("canonical FIFO path");
+
+        // The delayed nonblocking writer exists only to release the old,
+        // vulnerable O_RDONLY open. A hardened reader returns before it runs.
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(writer_path);
+        });
+
+        let started = Instant::now();
+        let result = read_regular_file(&fifo, 1_024, 1_024);
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(result.is_err(), "a FIFO was accepted as note text");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "opening a FIFO blocked for {elapsed:?}"
+        );
+    }
 }
 
 /// The text of a 1-based line, trimmed for display.

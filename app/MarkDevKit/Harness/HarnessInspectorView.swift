@@ -65,7 +65,7 @@ struct HarnessInspectorView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(assistant.isRunning)
+                .disabled(assistant.isRunning || assistant.settings.runBlocker != nil)
                 .background(
                     RoundedRectangle(cornerRadius: GlassTheme.Radius.small)
                         .fill(Color.primary.opacity(0.05)))
@@ -84,7 +84,8 @@ struct HarnessInspectorView: View {
                 .controlSize(.small)
                 .disabled(
                     assistant.isRunning
-                        || assistant.instruction.trimmingCharacters(in: .whitespaces).isEmpty)
+                        || assistant.instruction.trimmingCharacters(in: .whitespaces).isEmpty
+                        || assistant.settings.runBlocker != nil)
         }
     }
 
@@ -215,6 +216,12 @@ struct HarnessInspectorView: View {
                     Button("Copy") { assistant.copyAnswer() }.controlSize(.small)
                     Spacer(minLength: 0)
                 }
+                if let refusal = assistant.applicationRefusal {
+                    Label(refusal, systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .assistCard()
         }
@@ -280,6 +287,11 @@ private struct HarnessSettingsView: View {
                 field("Server", placeholder: "MANVI’s own setting", text: $settings.serverURL)
                 field("Model", placeholder: "MANVI’s own setting", text: $settings.model)
 
+                Toggle("Force local provider", isOn: $settings.useLocalProvider)
+                    .font(.caption2)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+
                 Picker("Authority", selection: $settings.authority) {
                     ForEach(HarnessAuthority.allCases, id: \.self) { authority in
                         Text(authority.title).tag(authority)
@@ -292,6 +304,33 @@ private struct HarnessSettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if settings.authority == .editing {
+                    Toggle(
+                        "Allow file edits and commands",
+                        isOn: $settings.allowEditing
+                    )
+                    .font(.caption2)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                }
+
+                if settings.requiresRemoteServerConsent {
+                    Toggle(
+                        "Allow sending note content off this Mac",
+                        isOn: $settings.allowRemoteServer
+                    )
+                    .font(.caption2)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                }
+
+                if let blocker = settings.runBlocker {
+                    Label(blocker, systemImage: "exclamationmark.triangle")
+                        .font(.caption2)
+                        .foregroundStyle(Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 HStack(spacing: GlassTheme.Spacing.tight) {
                     stepper("Steps", value: $settings.maxSteps, range: HarnessSettings.stepRange)

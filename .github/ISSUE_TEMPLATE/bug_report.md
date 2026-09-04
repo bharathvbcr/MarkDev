@@ -24,8 +24,8 @@ A clear and concise description of what you expected to happen.
 ```
 
 **Environment Information:**
- - OS Version: macOS [e.g. macOS 15.0 / 26.0]
- - Xcode Version: [e.g. Xcode 16.2]
+ - OS Version: macOS [e.g. macOS 26.0]
+ - Xcode Version: [e.g. Xcode 26.0]
  - MarkDev Version / Commit SHA: [e.g. 0.1.0 (commit abc1234)]
 
 **Additional context / Console Output**

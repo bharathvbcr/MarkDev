@@ -27,12 +27,134 @@ use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, LinkType, MetadataBlockKind, Options, Parser,
     Tag, TagEnd,
 };
-use std::ops::Range;
+use std::collections::HashMap;
+use std::ops::{Deref, DerefMut, Range};
 
 use super::model::{
     BlockDescriptor, BlockKind, CalloutKind, ParseResult, SpanKind, StyleSpan, SyntaxMarker,
-    TableAlignment, Utf16Mapper, NO_INFO, TABLE_ALIGNMENT_BITS,
+    TableAlignment, Utf16Mapper, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS,
+    MAX_INTERNED_STRING_BYTES, MAX_PARSE_EVENTS, MAX_PARSE_NESTING, MAX_STRUCTURAL_RECORDS,
+    MAX_TOTAL_STRING_BYTES, NO_INFO, TABLE_ALIGNMENT_BITS,
 };
+
+/// Why a Markdown input was refused before a partial model could escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseError {
+    SourceTooLarge,
+    TooManyEvents,
+    TooDeep,
+    TooManyRecords,
+    TooManyStrings,
+    StringTooLong,
+    TooManyStringBytes,
+    InteriorNul,
+}
+
+/// Private bounded owner used while a parse is under construction.
+///
+/// Every output allocation passes through this type. Once any limit would be
+/// crossed the parse returns `Err`; callers never receive a prefix that could
+/// be mistaken for a complete document model.
+struct ParseAccumulator {
+    result: ParseResult,
+    string_index: HashMap<String, u32>,
+    string_bytes: usize,
+    structural_records: usize,
+}
+
+impl ParseAccumulator {
+    fn new() -> Self {
+        Self {
+            result: ParseResult::default(),
+            string_index: HashMap::new(),
+            string_bytes: 0,
+            structural_records: 0,
+        }
+    }
+
+    fn charge_record(&mut self) -> Result<(), ParseError> {
+        if self.structural_records >= MAX_STRUCTURAL_RECORDS {
+            return Err(ParseError::TooManyRecords);
+        }
+        self.structural_records += 1;
+        Ok(())
+    }
+
+    fn push_span(&mut self, span: StyleSpan) -> Result<(), ParseError> {
+        self.charge_record()?;
+        self.result.spans.push(span);
+        Ok(())
+    }
+
+    fn push_marker(&mut self, marker: SyntaxMarker) -> Result<(), ParseError> {
+        self.charge_record()?;
+        self.result.markers.push(marker);
+        Ok(())
+    }
+
+    fn push_block(&mut self, block: BlockDescriptor) -> Result<u32, ParseError> {
+        self.charge_record()?;
+        let index =
+            u32::try_from(self.result.blocks.len()).map_err(|_| ParseError::TooManyRecords)?;
+        self.result.blocks.push(block);
+        Ok(index)
+    }
+
+    fn push_top_level(&mut self, range: Range<usize>) -> Result<(), ParseError> {
+        // Every top-level range owns a block, but retain an independent guard
+        // so a future parser change cannot turn this auxiliary index into an
+        // unbounded allocation.
+        if self.result.top_level.len() >= MAX_STRUCTURAL_RECORDS {
+            return Err(ParseError::TooManyRecords);
+        }
+        self.result.top_level.push(range);
+        Ok(())
+    }
+
+    fn intern(&mut self, value: &str) -> Result<u32, ParseError> {
+        if let Some(&index) = self.string_index.get(value) {
+            return Ok(index);
+        }
+        if value.len() > MAX_INTERNED_STRING_BYTES {
+            return Err(ParseError::StringTooLong);
+        }
+        if self.result.strings.len() >= MAX_INTERNED_STRINGS {
+            return Err(ParseError::TooManyStrings);
+        }
+        let next_bytes = self
+            .string_bytes
+            .checked_add(value.len())
+            .ok_or(ParseError::TooManyStringBytes)?;
+        if next_bytes > MAX_TOTAL_STRING_BYTES {
+            return Err(ParseError::TooManyStringBytes);
+        }
+        let index =
+            u32::try_from(self.result.strings.len()).map_err(|_| ParseError::TooManyStrings)?;
+        let owned = value.to_owned();
+        self.result.strings.push(owned.clone());
+        self.string_index.insert(owned, index);
+        self.string_bytes = next_bytes;
+        Ok(index)
+    }
+
+    fn finish(self) -> ParseResult {
+        self.result
+    }
+}
+
+impl Deref for ParseAccumulator {
+    type Target = ParseResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
+
+impl DerefMut for ParseAccumulator {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.result
+    }
+}
 
 /// Parser options MarkDev renders with.
 ///
@@ -75,10 +197,14 @@ struct TableState {
 }
 
 impl TableState {
-    fn open(&mut self, alignments: &[Alignment]) {
+    fn open(&mut self, alignments: &[Alignment]) -> Result<(), ParseError> {
+        if alignments.len() > MAX_STRUCTURAL_RECORDS {
+            return Err(ParseError::TooManyRecords);
+        }
         self.tables
             .push(alignments.iter().copied().map(alignment).collect());
         self.column = 0;
+        Ok(())
     }
 
     fn close(&mut self) {
@@ -134,10 +260,33 @@ struct Frame {
     extra_markers: Vec<Range<usize>>,
 }
 
-/// Parses `source` into the flat model the editor renders from.
+/// Parses a known-bounded source for compatibility with existing core callers.
+///
+/// Production and other untrusted-input paths must call [`parse_checked`].
+/// This convenience deliberately panics on refusal rather than silently
+/// returning an empty or partial document that could be mistaken for success.
 pub fn parse(source: &str) -> ParseResult {
+    parse_checked(source).expect("Markdown source exceeds the parser contract")
+}
+
+/// Parses `source` into the flat model the editor renders from.
+///
+/// The result is atomic: every source, event, nesting, record, and string cap
+/// is enforced while building, and no partial [`ParseResult`] is returned.
+pub fn parse_checked(source: &str) -> Result<ParseResult, ParseError> {
+    if source.len() > MAX_DOCUMENT_BYTES {
+        return Err(ParseError::SourceTooLarge);
+    }
+    // C ABI v3 is length-delimited, but pulldown-cmark deliberately treats a
+    // NUL as invalid Markdown preprocessing and may stop recognising the
+    // construct that contains it. Rejecting the whole document is explicit
+    // and lossless; accepting a model with a silently missing destination or
+    // info string is not.
+    if source.as_bytes().contains(&0) {
+        return Err(ParseError::InteriorNul);
+    }
     let mapper = Utf16Mapper::new(source);
-    let mut result = ParseResult::default();
+    let mut result = ParseAccumulator::new();
     let mut stack: Vec<Frame> = Vec::new();
     // Innermost open block, so markers can be attributed to their block.
     let mut block_stack: Vec<usize> = Vec::new();
@@ -147,17 +296,18 @@ pub fn parse(source: &str) -> ParseResult {
     // `==highlight==` — a `#` inside a code fence is code, not a tag.
     let mut verbatim: usize = 0;
     let mut tables = TableState::default();
+    let mut event_count = 0usize;
 
     for (event, range) in Parser::new_ext(source, options()).into_offset_iter() {
+        charge_event(&mut event_count)?;
         match event {
             Event::Start(tag) => {
+                if stack.len() >= MAX_PARSE_NESTING {
+                    return Err(ParseError::TooDeep);
+                }
                 if is_verbatim_tag(&tag) {
                     verbatim += 1;
                 }
-                let footnote_def_label = match &tag {
-                    Tag::FootnoteDefinition(label) => Some(label.to_string()),
-                    _ => None,
-                };
                 let frame = open_frame(
                     &tag,
                     range.clone(),
@@ -166,7 +316,7 @@ pub fn parse(source: &str) -> ParseResult {
                     &mut block_stack,
                     inline_depth,
                     &mut tables,
-                );
+                )?;
                 if frame.span.is_some() {
                     inline_depth += 1;
                 }
@@ -176,11 +326,10 @@ pub fn parse(source: &str) -> ParseResult {
                 // only the brackets and colon as markers, so the superscript
                 // has something to sit on — hiding the whole prefix was a
                 // hole where the mark should be.
-                if let Some(label) = footnote_def_label {
-                    if let Some(label_range) = footnote_label_in_definition(source, &range, &label)
-                    {
+                if let Tag::FootnoteDefinition(label) = &tag {
+                    if let Some(label_range) = footnote_label_in_definition(source, &range, label) {
                         cover(&mut stack, label_range.clone());
-                        let dest = result.intern(&label);
+                        let dest = result.intern(label)?;
                         push_span(
                             &mut result,
                             &mapper,
@@ -188,7 +337,7 @@ pub fn parse(source: &str) -> ParseResult {
                             SpanKind::FootnoteReference,
                             inline_depth,
                             dest,
-                        );
+                        )?;
                     }
                 }
             }
@@ -204,7 +353,7 @@ pub fn parse(source: &str) -> ParseResult {
                 if frame.span.is_some() {
                     inline_depth = inline_depth.saturating_sub(1);
                 }
-                close_frame(frame, &end, source, &mapper, &mut result, &mut block_stack);
+                close_frame(frame, &end, source, &mapper, &mut result, &mut block_stack)?;
                 // The closed construct is covered ground for its parent.
                 cover(&mut stack, range);
             }
@@ -220,7 +369,7 @@ pub fn parse(source: &str) -> ParseResult {
                     &mut result,
                     &block_stack,
                     inline_depth,
-                );
+                )?;
                 cover(&mut stack, range);
             }
             Event::InlineMath(_) => {
@@ -234,7 +383,7 @@ pub fn parse(source: &str) -> ParseResult {
                         &mut result,
                         &block_stack,
                         inline_depth,
-                    );
+                    )?;
                 }
                 cover(&mut stack, range);
             }
@@ -248,14 +397,14 @@ pub fn parse(source: &str) -> ParseResult {
                         block_stack.len() as u16,
                         0,
                         NO_INFO,
-                    );
+                    )?;
                     if block_stack.is_empty() {
-                        result.top_level.push(range.clone());
+                        result.push_top_level(range.clone())?;
                     }
                     // `$$` on both sides is syntax, the formula between is content.
-                    mark(&mut result, &mapper, range.start..range.start + 2, block);
+                    mark(&mut result, &mapper, range.start..range.start + 2, block)?;
                     if range.end >= range.start + 2 {
-                        mark(&mut result, &mapper, range.end - 2..range.end, block);
+                        mark(&mut result, &mapper, range.end - 2..range.end, block)?;
                     }
                 }
                 cover(&mut stack, range);
@@ -264,7 +413,7 @@ pub fn parse(source: &str) -> ParseResult {
                 // `[^label]` is brackets around a label. Hiding the whole run
                 // leaves a hole; hiding `[^` and `]` leaves the label for the
                 // superscript the styler draws.
-                let dest = result.intern(&label);
+                let dest = result.intern(&label)?;
                 let bytes = source.as_bytes();
                 if range.len() >= 3
                     && bytes.get(range.start) == Some(&b'[')
@@ -279,14 +428,14 @@ pub fn parse(source: &str) -> ParseResult {
                         SpanKind::FootnoteReference,
                         inline_depth,
                         dest,
-                    );
+                    )?;
                     mark_current(
                         &mut result,
                         &mapper,
                         range.start..range.start + 2,
                         &block_stack,
-                    );
-                    mark_current(&mut result, &mapper, range.end - 1..range.end, &block_stack);
+                    )?;
+                    mark_current(&mut result, &mapper, range.end - 1..range.end, &block_stack)?;
                 } else {
                     push_span(
                         &mut result,
@@ -295,7 +444,7 @@ pub fn parse(source: &str) -> ParseResult {
                         SpanKind::FootnoteReference,
                         inline_depth,
                         dest,
-                    );
+                    )?;
                 }
                 cover(&mut stack, range);
             }
@@ -307,9 +456,9 @@ pub fn parse(source: &str) -> ParseResult {
                     SpanKind::TaskMarker,
                     inline_depth,
                     u32::from(checked),
-                );
+                )?;
                 // The literal `[ ]` is replaced by a drawn checkbox.
-                mark_current(&mut result, &mapper, range.clone(), &block_stack);
+                mark_current(&mut result, &mapper, range.clone(), &block_stack)?;
                 cover(&mut stack, range);
             }
             Event::Rule => {
@@ -321,12 +470,12 @@ pub fn parse(source: &str) -> ParseResult {
                     block_stack.len() as u16,
                     0,
                     NO_INFO,
-                );
+                )?;
                 if block_stack.is_empty() {
-                    result.top_level.push(range.clone());
+                    result.push_top_level(range.clone())?;
                 }
                 // The `---` is replaced by a drawn line.
-                mark(&mut result, &mapper, range.clone(), block);
+                mark(&mut result, &mapper, range.clone(), block)?;
                 cover(&mut stack, range);
             }
             Event::InlineHtml(_) => {
@@ -337,14 +486,14 @@ pub fn parse(source: &str) -> ParseResult {
                     SpanKind::InlineHtml,
                     inline_depth,
                     0,
-                );
+                )?;
                 cover(&mut stack, range);
             }
 
             // Plain content: covered, never a marker.
             Event::Text(_) => {
                 if verbatim == 0 {
-                    scan_text_extensions(source, &range, &mapper, &mut result, &block_stack);
+                    scan_text_extensions(source, &range, &mapper, &mut result, &block_stack)?;
                 }
                 cover(&mut stack, range);
             }
@@ -361,20 +510,30 @@ pub fn parse(source: &str) -> ParseResult {
                     end -= 1;
                 }
                 if end > range.start {
-                    mark_current(&mut result, &mapper, range.start..end, &block_stack);
+                    mark_current(&mut result, &mapper, range.start..end, &block_stack)?;
                 }
                 cover(&mut stack, range);
             }
         }
     }
 
-    collect_delimited_math(source, &mapper, &mut result);
-    collect_link_reference_definitions(source, &mapper, &mut result);
+    collect_delimited_math(source, &mapper, &mut result)?;
+    collect_link_reference_definitions(source, &mapper, &mut result)?;
 
     result.spans.sort_by_key(|s| (s.start, s.end));
     result.markers.sort_by_key(|m| (m.start, m.end));
     result.top_level.sort_by_key(|r| (r.start, r.end));
-    result
+    Ok(result.finish())
+}
+
+fn charge_event(event_count: &mut usize) -> Result<(), ParseError> {
+    *event_count = event_count
+        .checked_add(1)
+        .ok_or(ParseError::TooManyEvents)?;
+    if *event_count > MAX_PARSE_EVENTS {
+        return Err(ParseError::TooManyEvents);
+    }
+    Ok(())
 }
 
 /// Opens a frame for a `Start` tag, reserving a block slot where applicable.
@@ -382,11 +541,11 @@ fn open_frame(
     tag: &Tag,
     range: Range<usize>,
     source: &str,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block_stack: &mut Vec<usize>,
     inline_depth: u16,
     tables: &mut TableState,
-) -> Frame {
+) -> Result<Frame, ParseError> {
     let depth = block_stack.len() as u16;
     let mut frame = Frame {
         range: range.clone(),
@@ -400,24 +559,27 @@ fn open_frame(
 
     // Block slots are reserved on open so markers can reference them, and
     // filled in on close once the full range is known.
-    let reserve = |result: &mut ParseResult, kind: BlockKind, data: u32, info: u32| -> usize {
-        let idx = result.blocks.len();
-        result.blocks.push(BlockDescriptor {
+    let reserve = |result: &mut ParseAccumulator,
+                   kind: BlockKind,
+                   data: u32,
+                   info: u32|
+     -> Result<usize, ParseError> {
+        let index = result.push_block(BlockDescriptor {
             start: 0,
             end: 0,
             kind: kind as u16,
             depth,
             data,
             info,
-        });
-        idx
+        })?;
+        Ok(index as usize)
     };
 
     match tag {
-        Tag::Paragraph => frame.block = Some(reserve(result, BlockKind::Paragraph, 0, NO_INFO)),
+        Tag::Paragraph => frame.block = Some(reserve(result, BlockKind::Paragraph, 0, NO_INFO)?),
         Tag::Heading { level, .. } => {
             let lvl = *level as u32;
-            frame.block = Some(reserve(result, BlockKind::Heading, lvl, NO_INFO));
+            frame.block = Some(reserve(result, BlockKind::Heading, lvl, NO_INFO)?);
             frame.span = Some((SpanKind::Heading, lvl));
         }
         Tag::BlockQuote(kind) => {
@@ -425,9 +587,10 @@ fn open_frame(
             let alert = gfm_alert_line(source, &range);
             match (kind, alert) {
                 (Some(k), alert) => {
-                    let idx = reserve(result, BlockKind::Callout, callout_kind(*k) as u32, NO_INFO);
+                    let idx =
+                        reserve(result, BlockKind::Callout, callout_kind(*k) as u32, NO_INFO)?;
                     if let Some(alert) = alert {
-                        apply_alert_title(result, &mut frame, idx, alert);
+                        apply_alert_title(result, &mut frame, idx, alert)?;
                     }
                     frame.block = Some(idx);
                 }
@@ -435,16 +598,16 @@ fn open_frame(
                     // pulldown only names a flavour when `[!NOTE]` is the whole
                     // line. `> [!NOTE] Custom` is a BlockQuote to it; we still
                     // owe the reader a callout whose strip can show the title.
-                    let idx = reserve(result, BlockKind::Callout, alert.kind as u32, NO_INFO);
+                    let idx = reserve(result, BlockKind::Callout, alert.kind as u32, NO_INFO)?;
                     frame.extra_markers.push(alert.tag);
                     if let Some((title, title_range)) = alert.title {
-                        result.blocks[idx].info = result.intern(&title);
+                        result.blocks[idx].info = result.intern(title)?;
                         frame.extra_markers.push(title_range);
                     }
                     frame.block = Some(idx);
                 }
                 (None, None) => {
-                    frame.block = Some(reserve(result, BlockKind::BlockQuote, 0, NO_INFO));
+                    frame.block = Some(reserve(result, BlockKind::BlockQuote, 0, NO_INFO)?);
                 }
             }
         }
@@ -455,7 +618,7 @@ fn open_frame(
                     let info = if lang.is_empty() {
                         NO_INFO
                     } else {
-                        result.intern(lang)
+                        result.intern(lang)?
                     };
                     // Routed by kind so the editor never string-compares.
                     if lang.eq_ignore_ascii_case("mermaid") {
@@ -471,7 +634,7 @@ fn open_frame(
                     (BlockKind::CodeBlock, NO_INFO)
                 }
             };
-            frame.block = Some(reserve(result, block_kind, 0, info));
+            frame.block = Some(reserve(result, block_kind, 0, info)?);
         }
         Tag::List(first) => {
             frame.block = Some(reserve(
@@ -479,23 +642,23 @@ fn open_frame(
                 BlockKind::List,
                 u32::from(first.is_some()),
                 NO_INFO,
-            ));
+            )?);
         }
-        Tag::Item => frame.block = Some(reserve(result, BlockKind::ListItem, 0, NO_INFO)),
+        Tag::Item => frame.block = Some(reserve(result, BlockKind::ListItem, 0, NO_INFO)?),
         Tag::Table(alignments) => {
-            tables.open(alignments);
+            tables.open(alignments)?;
             // The column count rides on the table so a renderer can size the
             // grid without walking every row first.
             let columns = alignments.len() as u32;
-            frame.block = Some(reserve(result, BlockKind::Table, columns, NO_INFO));
+            frame.block = Some(reserve(result, BlockKind::Table, columns, NO_INFO)?);
         }
         Tag::TableHead => {
             tables.new_row();
-            frame.block = Some(reserve(result, BlockKind::TableHead, 0, NO_INFO));
+            frame.block = Some(reserve(result, BlockKind::TableHead, 0, NO_INFO)?);
         }
         Tag::TableRow => {
             tables.new_row();
-            frame.block = Some(reserve(result, BlockKind::TableRow, 0, NO_INFO));
+            frame.block = Some(reserve(result, BlockKind::TableRow, 0, NO_INFO)?);
         }
         Tag::TableCell => {
             // The cell's column index and alignment, packed so one `data`
@@ -507,18 +670,18 @@ fn open_frame(
                 BlockKind::TableCell,
                 (column << TABLE_ALIGNMENT_BITS) | alignment,
                 NO_INFO,
-            ));
+            )?);
         }
-        Tag::HtmlBlock => frame.block = Some(reserve(result, BlockKind::HtmlBlock, 0, NO_INFO)),
+        Tag::HtmlBlock => frame.block = Some(reserve(result, BlockKind::HtmlBlock, 0, NO_INFO)?),
         Tag::FootnoteDefinition(label) => {
-            let info = result.intern(label);
-            frame.block = Some(reserve(result, BlockKind::FootnoteDefinition, 0, info))
+            let info = result.intern(label)?;
+            frame.block = Some(reserve(result, BlockKind::FootnoteDefinition, 0, info)?)
         }
         Tag::DefinitionList => {
-            frame.block = Some(reserve(result, BlockKind::DefinitionList, 0, NO_INFO))
+            frame.block = Some(reserve(result, BlockKind::DefinitionList, 0, NO_INFO)?)
         }
         Tag::DefinitionListTitle => {
-            frame.block = Some(reserve(result, BlockKind::DefinitionListTitle, 0, NO_INFO))
+            frame.block = Some(reserve(result, BlockKind::DefinitionListTitle, 0, NO_INFO)?)
         }
         Tag::DefinitionListDefinition => {
             frame.block = Some(reserve(
@@ -526,14 +689,14 @@ fn open_frame(
                 BlockKind::DefinitionListDefinition,
                 0,
                 NO_INFO,
-            ))
+            )?)
         }
         Tag::MetadataBlock(kind) => {
             let data = match kind {
                 MetadataBlockKind::YamlStyle => 0,
                 MetadataBlockKind::PlusesStyle => 1,
             };
-            frame.block = Some(reserve(result, BlockKind::Frontmatter, data, NO_INFO));
+            frame.block = Some(reserve(result, BlockKind::Frontmatter, data, NO_INFO)?);
         }
 
         // Inline constructs carry a span rather than a block.
@@ -547,7 +710,7 @@ fn open_frame(
             dest_url,
             ..
         } => {
-            let dest = result.intern(dest_url);
+            let dest = result.intern(dest_url)?;
             let kind = if matches!(link_type, LinkType::WikiLink { .. }) {
                 SpanKind::WikiLink
             } else {
@@ -556,7 +719,7 @@ fn open_frame(
             frame.span = Some((kind, dest));
         }
         Tag::Image { dest_url, .. } => {
-            let dest = result.intern(dest_url);
+            let dest = result.intern(dest_url)?;
             frame.span = Some((SpanKind::Image, dest));
         }
     }
@@ -565,7 +728,7 @@ fn open_frame(
     if let Some(idx) = frame.block {
         block_stack.push(idx);
     }
-    frame
+    Ok(frame)
 }
 
 /// Closes a frame: emits its span, finalises its block, and derives markers
@@ -575,9 +738,9 @@ fn close_frame(
     end: &TagEnd,
     source: &str,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block_stack: &mut Vec<usize>,
-) {
+) -> Result<(), ParseError> {
     let mut range = frame.range.clone();
     if frame.indented_code {
         range.start = indented_code_line_start(source, range.start);
@@ -590,7 +753,7 @@ fn close_frame(
         // Emptying the stack means this block was top-level: a boundary the
         // incremental parser can safely cut on.
         if block_stack.is_empty() {
-            result.top_level.push(range.clone());
+            result.push_top_level(range.clone())?;
         }
     }
 
@@ -605,32 +768,40 @@ fn close_frame(
         // The span covers only the content, not the surrounding delimiters,
         // so styling never bleeds onto hidden syntax.
         let (content_start, content_end) = content_bounds(&frame.covered, &range);
-        result.spans.push(StyleSpan {
+        result.push_span(StyleSpan {
             start: mapper.to_utf16(content_start),
             end: mapper.to_utf16(content_end),
             kind: kind as u16,
             depth: 0,
             data,
-        });
+        })?;
     }
 
-    for gap in gaps(&frame.covered, &range) {
-        mark(result, mapper, gap, owner);
+    let mut cursor = range.start;
+    for child in &frame.covered {
+        if child.start > cursor {
+            mark(result, mapper, cursor..child.start, owner)?;
+        }
+        cursor = cursor.max(child.end);
+    }
+    if cursor < range.end {
+        mark(result, mapper, cursor..range.end, owner)?;
     }
 
     // A blockquote's `>` on continuation lines sits inside the child
     // paragraph's range, so the gap rule cannot see it.
     if frame.is_block_quote {
-        mark_quote_prefixes(source, &range, mapper, result, owner);
+        mark_quote_prefixes(source, &range, mapper, result, owner)?;
     }
     if frame.indented_code {
-        mark_indented_code_prefixes(source, &range, mapper, result, owner);
+        mark_indented_code_prefixes(source, &range, mapper, result, owner)?;
     }
     for extra in frame.extra_markers {
-        mark(result, mapper, extra, owner);
+        mark(result, mapper, extra, owner)?;
     }
 
     let _ = end;
+    Ok(())
 }
 
 /// Byte range spanned by a frame's children, falling back to the frame itself.
@@ -639,22 +810,6 @@ fn content_bounds(covered: &[Range<usize>], range: &Range<usize>) -> (usize, usi
         (Some(first), Some(last)) => (first.start, last.end),
         _ => (range.start, range.end),
     }
-}
-
-/// The parts of `range` that `covered` leaves untouched.
-fn gaps(covered: &[Range<usize>], range: &Range<usize>) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    let mut cursor = range.start;
-    for child in covered {
-        if child.start > cursor {
-            out.push(cursor..child.start);
-        }
-        cursor = cursor.max(child.end);
-    }
-    if cursor < range.end {
-        out.push(cursor..range.end);
-    }
-    out
 }
 
 /// Records `range` as covered by the innermost open frame.
@@ -827,13 +982,13 @@ fn emit_delimited_leaf(
     kind: SpanKind,
     delim: usize,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block_stack: &[usize],
     inline_depth: u16,
-) {
+) -> Result<(), ParseError> {
     let inner = range.start + delim..range.end.saturating_sub(delim);
     if inner.start <= inner.end {
-        push_span(result, mapper, &inner, kind, inline_depth, 0);
+        push_span(result, mapper, &inner, kind, inline_depth, 0)?;
     }
     if delim > 0 {
         mark_current(
@@ -841,69 +996,73 @@ fn emit_delimited_leaf(
             mapper,
             range.start..range.start + delim,
             block_stack,
-        );
-        mark_current(result, mapper, range.end - delim..range.end, block_stack);
+        )?;
+        mark_current(result, mapper, range.end - delim..range.end, block_stack)?;
     }
     let _ = source;
+    Ok(())
 }
 
 fn push_span(
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     mapper: &Utf16Mapper,
     range: &Range<usize>,
     kind: SpanKind,
     depth: u16,
     data: u32,
-) {
-    result.spans.push(StyleSpan {
+) -> Result<(), ParseError> {
+    result.push_span(StyleSpan {
         start: mapper.to_utf16(range.start),
         end: mapper.to_utf16(range.end),
         kind: kind as u16,
         depth,
         data,
-    });
+    })
 }
 
 fn push_block(
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     mapper: &Utf16Mapper,
     range: &Range<usize>,
     kind: BlockKind,
     depth: u16,
     data: u32,
     info: u32,
-) -> u32 {
-    let idx = result.blocks.len() as u32;
-    result.blocks.push(BlockDescriptor {
+) -> Result<u32, ParseError> {
+    result.push_block(BlockDescriptor {
         start: mapper.to_utf16(range.start),
         end: mapper.to_utf16(range.end),
         kind: kind as u16,
         depth,
         data,
         info,
-    });
-    idx
+    })
 }
 
-fn mark(result: &mut ParseResult, mapper: &Utf16Mapper, range: Range<usize>, block: u32) {
+fn mark(
+    result: &mut ParseAccumulator,
+    mapper: &Utf16Mapper,
+    range: Range<usize>,
+    block: u32,
+) -> Result<(), ParseError> {
     if range.start >= range.end {
-        return;
+        return Ok(());
     }
-    result.markers.push(SyntaxMarker {
+    result.push_marker(SyntaxMarker {
         start: mapper.to_utf16(range.start),
         end: mapper.to_utf16(range.end),
         block,
-    });
+    })
 }
 
 fn mark_current(
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     mapper: &Utf16Mapper,
     range: Range<usize>,
     block_stack: &[usize],
-) {
+) -> Result<(), ParseError> {
     let owner = block_stack.last().copied().unwrap_or(0) as u32;
-    mark(result, mapper, range, owner);
+    mark(result, mapper, range, owner)
 }
 
 /// Byte offset of the label inside a footnote definition's `[^label]:` prefix.
@@ -912,11 +1071,17 @@ fn footnote_label_in_definition(
     range: &Range<usize>,
     label: &str,
 ) -> Option<Range<usize>> {
-    let prefix = format!("[^{label}]");
-    source
-        .get(range.clone())
-        .filter(|s| s.starts_with(&prefix))
-        .map(|_| range.start + 2..range.start + 2 + label.len())
+    let text = source.get(range.clone())?;
+    let bytes = text.as_bytes();
+    let label_end = 2usize.checked_add(label.len())?;
+    if bytes.get(0..2) == Some(b"[^")
+        && bytes.get(2..label_end) == Some(label.as_bytes())
+        && bytes.get(label_end) == Some(&b']')
+    {
+        Some(range.start + 2..range.start + label_end)
+    } else {
+        None
+    }
 }
 
 /// Start of the line holding `content_start`, when the prefix is indent.
@@ -943,9 +1108,9 @@ fn mark_indented_code_prefixes(
     source: &str,
     range: &Range<usize>,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block: u32,
-) {
+) -> Result<(), ParseError> {
     let bytes = source.as_bytes();
     let mut i = range.start;
     let mut at_line_start = true;
@@ -967,7 +1132,7 @@ fn mark_indented_code_prefixes(
                 }
             }
             if j > i {
-                mark(result, mapper, i..j, block);
+                mark(result, mapper, i..j, block)?;
                 i = j;
                 at_line_start = false;
                 continue;
@@ -976,25 +1141,32 @@ fn mark_indented_code_prefixes(
         at_line_start = bytes[i] == b'\n';
         i += 1;
     }
+    Ok(())
 }
 
-struct GfmAlertLine {
+struct GfmAlertLine<'a> {
     kind: CalloutKind,
     /// `[!NOTE]` (and an optional trailing `+` / `-`).
     tag: Range<usize>,
-    title: Option<(String, Range<usize>)>,
+    title: Option<(&'a str, Range<usize>)>,
 }
 
-fn apply_alert_title(result: &mut ParseResult, frame: &mut Frame, idx: usize, alert: GfmAlertLine) {
+fn apply_alert_title(
+    result: &mut ParseAccumulator,
+    frame: &mut Frame,
+    idx: usize,
+    alert: GfmAlertLine<'_>,
+) -> Result<(), ParseError> {
     if let Some((title, title_range)) = alert.title {
-        result.blocks[idx].info = result.intern(&title);
+        result.blocks[idx].info = result.intern(title)?;
         frame.extra_markers.push(title_range);
     }
+    Ok(())
 }
 
 /// First line of a blockquote that is a GFM alert, including the GitHub
 /// custom-title form pulldown-cmark leaves as a plain quote.
-fn gfm_alert_line(source: &str, range: &Range<usize>) -> Option<GfmAlertLine> {
+fn gfm_alert_line<'a>(source: &'a str, range: &Range<usize>) -> Option<GfmAlertLine<'a>> {
     let bytes = source.as_bytes();
     let end = range.end.min(bytes.len());
     let mut i = range.start.min(end);
@@ -1040,7 +1212,7 @@ fn gfm_alert_line(source: &str, range: &Range<usize>) -> Option<GfmAlertLine> {
     let title = if title_text.is_empty() {
         None
     } else {
-        Some((title_text.to_string(), i..line_end))
+        Some((title_text, i..line_end))
     };
     Some(GfmAlertLine { kind, tag, title })
 }
@@ -1052,10 +1224,14 @@ fn gfm_alert_line(source: &str, range: &Range<usize>) -> Option<GfmAlertLine> {
 /// while code, existing math, and link labels stay literal. The `$` currency
 /// and adjacency refusals are not reimplemented here — they already ran on
 /// the dollar events; this pass only claims constructs that scanner never sees.
-fn collect_delimited_math(source: &str, mapper: &Utf16Mapper, result: &mut ParseResult) {
+fn collect_delimited_math(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseAccumulator,
+) -> Result<(), ParseError> {
     let bytes = source.as_bytes();
     if !bytes.contains(&b'\\') {
-        return;
+        return Ok(());
     }
     let occupied = occupied_byte_ranges(mapper, result);
     let mut i = 0;
@@ -1071,22 +1247,23 @@ fn collect_delimited_math(source: &str, mapper: &Utf16Mapper, result: &mut Parse
             continue;
         }
 
-        let taken = take_delimited_math(source, mapper, result, &occupied, i, &mut added_block);
+        let taken = take_delimited_math(source, mapper, result, &occupied, i, &mut added_block)?;
         i = if taken > i { taken } else { i + 1 };
     }
     if added_block {
         resort_blocks(result);
     }
+    Ok(())
 }
 
 fn take_delimited_math(
     source: &str,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     occupied: &[(usize, usize)],
     i: usize,
     added_block: &mut bool,
-) -> usize {
+) -> Result<usize, ParseError> {
     let bytes = source.as_bytes();
     // Longer openers first so `\\[` is not eaten as `\[` starting one later.
     let candidates: [(&[u8], &[u8], bool); 4] = [
@@ -1115,14 +1292,14 @@ fn take_delimited_math(
             continue;
         }
         if display {
-            emit_delimited_math_block(mapper, result, i..full_end, opener.len(), closer.len());
+            emit_delimited_math_block(mapper, result, i..full_end, opener.len(), closer.len())?;
             *added_block = true;
         } else {
-            emit_delimited_math_span(mapper, result, i..full_end, opener.len(), closer.len());
+            emit_delimited_math_span(mapper, result, i..full_end, opener.len(), closer.len())?;
         }
-        return full_end;
+        return Ok(full_end);
     }
-    i
+    Ok(i)
 }
 
 fn find_math_closer(bytes: &[u8], from: usize, closer: &[u8], display: bool) -> Option<usize> {
@@ -1141,26 +1318,26 @@ fn find_math_closer(bytes: &[u8], from: usize, closer: &[u8], display: bool) -> 
 
 fn emit_delimited_math_span(
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
-) {
+) -> Result<(), ParseError> {
     let inner = range.start + opener_len..range.end - closer_len;
     let utf = mapper.to_utf16(range.start);
     let owner = innermost_block(result, utf).unwrap_or(0) as u32;
-    push_span(result, mapper, &inner, SpanKind::InlineMath, 0, 0);
-    mark(result, mapper, range.start..range.start + opener_len, owner);
-    mark(result, mapper, range.end - closer_len..range.end, owner);
+    push_span(result, mapper, &inner, SpanKind::InlineMath, 0, 0)?;
+    mark(result, mapper, range.start..range.start + opener_len, owner)?;
+    mark(result, mapper, range.end - closer_len..range.end, owner)
 }
 
 fn emit_delimited_math_block(
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
-) {
+) -> Result<(), ParseError> {
     let utf_start = mapper.to_utf16(range.start);
     let enclosing = innermost_block(result, utf_start);
     let depth = enclosing
@@ -1174,14 +1351,15 @@ fn emit_delimited_math_block(
         depth,
         0,
         NO_INFO,
-    );
+    )?;
     if enclosing.is_none() {
-        result.top_level.push(range.clone());
+        result.push_top_level(range.clone())?;
     }
-    mark(result, mapper, range.start..range.start + opener_len, block);
+    mark(result, mapper, range.start..range.start + opener_len, block)?;
     if range.end >= range.start + opener_len + closer_len {
-        mark(result, mapper, range.end - closer_len..range.end, block);
+        mark(result, mapper, range.end - closer_len..range.end, block)?;
     }
+    Ok(())
 }
 
 fn innermost_block(result: &ParseResult, utf16: u32) -> Option<usize> {
@@ -1259,8 +1437,8 @@ fn range_overlaps(occupied: &[(usize, usize)], start: usize, end: usize) -> bool
 fn collect_link_reference_definitions(
     source: &str,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
-) {
+    result: &mut ParseAccumulator,
+) -> Result<(), ParseError> {
     let occupied = merge_utf16_intervals(
         result
             .blocks
@@ -1273,18 +1451,19 @@ fn collect_link_reference_definitions(
     let mut found = false;
     for &(start, end) in &occupied {
         if start > cursor {
-            found |= emit_link_defs_in_span(source, mapper, result, cursor, start);
+            found |= emit_link_defs_in_span(source, mapper, result, cursor, start)?;
         }
         if end > cursor {
             cursor = end;
         }
     }
     if cursor < doc_end {
-        found |= emit_link_defs_in_span(source, mapper, result, cursor, doc_end);
+        found |= emit_link_defs_in_span(source, mapper, result, cursor, doc_end)?;
     }
     if found {
         resort_blocks(result);
     }
+    Ok(())
 }
 
 fn merge_utf16_intervals(intervals: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
@@ -1310,12 +1489,12 @@ fn merge_utf16_intervals(intervals: impl Iterator<Item = (u32, u32)>) -> Vec<(u3
 fn emit_link_defs_in_span(
     source: &str,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     utf_start: u32,
     utf_end: u32,
-) -> bool {
+) -> Result<bool, ParseError> {
     if utf_end <= utf_start {
-        return false;
+        return Ok(false);
     }
     let bytes = source.as_bytes();
     let span_end = mapper.to_byte(utf_end);
@@ -1332,16 +1511,16 @@ fn emit_link_defs_in_span(
             }
             let utf_s = mapper.to_utf16(i);
             let idx = result.blocks.len() as u32;
-            result.blocks.push(BlockDescriptor {
+            result.push_block(BlockDescriptor {
                 start: utf_s,
                 end: def_utf_end,
                 kind: BlockKind::LinkReferenceDefinition as u16,
                 depth: 0,
                 data: 0,
                 info: NO_INFO,
-            });
-            mark(result, mapper, i..def_end, idx);
-            result.top_level.push(i..def_end);
+            })?;
+            mark(result, mapper, i..def_end, idx)?;
+            result.push_top_level(i..def_end)?;
             found = true;
             i = def_end;
             continue;
@@ -1352,7 +1531,7 @@ fn emit_link_defs_in_span(
         }
         i = next;
     }
-    found
+    Ok(found)
 }
 
 fn next_line_start(source: &str, from: usize) -> usize {
@@ -1549,9 +1728,9 @@ fn mark_quote_prefixes(
     source: &str,
     range: &Range<usize>,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block: u32,
-) {
+) -> Result<(), ParseError> {
     let bytes = source.as_bytes();
     let mut i = range.start;
     let mut at_line_start = true;
@@ -1567,7 +1746,7 @@ fn mark_quote_prefixes(
                 if k < range.end && bytes[k] == b' ' {
                     k += 1;
                 }
-                mark(result, mapper, j..k, block);
+                mark(result, mapper, j..k, block)?;
                 i = k;
                 at_line_start = false;
                 continue;
@@ -1576,6 +1755,7 @@ fn mark_quote_prefixes(
         at_line_start = bytes[i] == b'\n';
         i += 1;
     }
+    Ok(())
 }
 
 /// Finds constructs `pulldown-cmark` does not model: `#tag` and `==highlight==`.
@@ -1586,9 +1766,9 @@ fn scan_text_extensions(
     source: &str,
     range: &Range<usize>,
     mapper: &Utf16Mapper,
-    result: &mut ParseResult,
+    result: &mut ParseAccumulator,
     block_stack: &[usize],
-) {
+) -> Result<(), ParseError> {
     let text = &source[range.clone()];
     let bytes = text.as_bytes();
     let base = range.start;
@@ -1614,9 +1794,9 @@ fn scan_text_extensions(
                         SpanKind::Highlight,
                         0,
                         0,
-                    );
-                    mark_current(result, mapper, base + i..base + i + 2, block_stack);
-                    mark_current(result, mapper, base + close..base + close + 2, block_stack);
+                    )?;
+                    mark_current(result, mapper, base + i..base + i + 2, block_stack)?;
+                    mark_current(result, mapper, base + close..base + close + 2, block_stack)?;
                     i = close + 2;
                     continue;
                 }
@@ -1636,13 +1816,14 @@ fn scan_text_extensions(
                 j += 1;
             }
             if j > start && text[start..j].bytes().any(|b| !b.is_ascii_digit()) {
-                push_span(result, mapper, &(base + i..base + j), SpanKind::Tag, 0, 0);
+                push_span(result, mapper, &(base + i..base + j), SpanKind::Tag, 0, 0)?;
                 i = j;
                 continue;
             }
         }
         i += 1;
     }
+    Ok(())
 }
 
 fn find_pair(bytes: &[u8], from: usize, delim: u8) -> Option<usize> {
@@ -1749,5 +1930,20 @@ fn callout_kind(k: BlockQuoteKind) -> CalloutKind {
         BlockQuoteKind::Important => CalloutKind::Important,
         BlockQuoteKind::Warning => CalloutKind::Warning,
         BlockQuoteKind::Caution => CalloutKind::Caution,
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn event_budget_accepts_the_exact_boundary_and_rejects_plus_one() {
+        let mut count = 0;
+        for _ in 0..MAX_PARSE_EVENTS {
+            charge_event(&mut count).expect("exact event budget");
+        }
+        assert_eq!(count, MAX_PARSE_EVENTS);
+        assert_eq!(charge_event(&mut count), Err(ParseError::TooManyEvents));
     }
 }

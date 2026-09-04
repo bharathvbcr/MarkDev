@@ -113,6 +113,73 @@ public struct Command: Identifiable, Sendable {
     }
 }
 
+/// Identity of one content-search request.
+///
+/// The index revision is part of the identity even when the visible query is
+/// unchanged. Without it, an edit that adds or removes a match leaves the
+/// palette showing the previous index snapshot until the reader types again.
+struct CommandPaletteSearchRequest: Hashable, Sendable {
+    let query: String
+    let contentRevision: UInt64
+    let shouldSearch: Bool
+}
+
+/// Bounded content-search state whose reads are side-effect free.
+///
+/// SwiftUI may evaluate a view's computed properties repeatedly and in no
+/// promised order. Keeping mutations in the request task, rather than in
+/// `results`, makes rendering idempotent. The generation rejects an old task
+/// even if requests cycle from A to B and back to A before A finishes.
+struct CommandPaletteSearchState {
+    private(set) var generation: UInt64 = 0
+    private(set) var request: CommandPaletteSearchRequest?
+    private var storedHits: [Command] = []
+    private var loading = false
+
+    @discardableResult
+    mutating func begin(_ request: CommandPaletteSearchRequest) -> UInt64 {
+        generation &+= 1
+        self.request = request
+        storedHits = []
+        loading = true
+        return generation
+    }
+
+    @discardableResult
+    mutating func complete(
+        _ hits: [Command],
+        for request: CommandPaletteSearchRequest,
+        generation: UInt64,
+        limit: Int
+    ) -> Bool {
+        guard self.request == request, self.generation == generation else { return false }
+        storedHits = Array(hits.prefix(max(0, limit)))
+        loading = false
+        return true
+    }
+
+    mutating func reset() {
+        generation &+= 1
+        request = nil
+        storedHits = []
+        loading = false
+    }
+
+    func hits(for request: CommandPaletteSearchRequest) -> [Command] {
+        guard self.request == request, !loading else { return [] }
+        return storedHits
+    }
+
+    func isLoading(_ request: CommandPaletteSearchRequest) -> Bool {
+        self.request == request && loading
+    }
+
+    /// Includes the first render before `.task(id:)` has begun the request.
+    func isPending(_ request: CommandPaletteSearchRequest) -> Bool {
+        request.shouldSearch && (self.request != request || loading)
+    }
+}
+
 /// Fuzzy-matched launcher for files and actions.
 ///
 /// Files and actions share one list on purpose. Splitting them makes the user
@@ -121,13 +188,16 @@ public struct Command: Identifiable, Sendable {
 public struct CommandPalette: View {
     @Binding public var isPresented: Bool
     public let commands: [Command]
-    /// Full-text search over note contents, asked once per query change.
+    /// Full-text search over note contents, asked once per eligible
+    /// query/index-revision pair after a short typing debounce.
     ///
     /// Filenames answer "which note was that"; this answers "where did I
     /// write that", which is the other half of why a palette exists. `nil` in
     /// a context with no vault — the palette still lists actions and open
     /// tabs there.
     public let contentSearch: ((String) -> [Command])?
+    /// Revision of the content index searched by ``contentSearch``.
+    public let contentRevision: UInt64
     public let onRun: (Command) -> Void
 
     /// What last moved the highlight.
@@ -147,6 +217,7 @@ public struct CommandPalette: View {
     /// A hover arriving at an unchanged point is the list having moved, not
     /// the pointer, and must not steal the highlight from the keyboard.
     @State private var pointerLocation: CGPoint?
+    @State private var contentState = CommandPaletteSearchState()
     @FocusState private var isFieldFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -156,42 +227,42 @@ public struct CommandPalette: View {
         isPresented: Binding<Bool>,
         commands: [Command],
         contentSearch: ((String) -> [Command])? = nil,
+        contentRevision: UInt64 = 0,
         onRun: @escaping (Command) -> Void
     ) {
         self._isPresented = isPresented
         self.commands = commands
         self.contentSearch = contentSearch
+        self.contentRevision = contentRevision
         self.onRun = onRun
     }
 
-    /// The expensive half of ``results``, asked at most once per query.
-    ///
-    /// `results` is computed several times per body evaluation, and every
-    /// call used to re-run the vault's full-text search — an FFI round trip
-    /// under the index lock — for the same query. One memo keyed on the
-    /// query turns the repeats into dictionary hits; a new query replaces
-    /// it. Bounded to one entry by construction.
-    @State private var contentMemo: (query: String, hits: [Command])?
-
-    private func contentHits(for query: String) -> [Command] {
-        if let contentMemo, contentMemo.query == query { return contentMemo.hits }
-        let hits = Array(contentSearch?(query).prefix(Self.maximumContentHits) ?? [])
-        contentMemo = (query, hits)
-        return hits
-    }
-
-    private var results: [Command] {
-        let matched = Array(FuzzyMatch.rank(commands, query: query) { command in
+    private var titleResults: [Command] {
+        Array(FuzzyMatch.rank(commands, query: query) { command in
             // Match on the subtitle too, so a file can be found by its folder.
             [command.title, command.subtitle ?? ""].joined(separator: " ")
         }.prefix(40))
+    }
+
+    private var searchRequest: CommandPaletteSearchRequest {
+        let matched = titleResults
+        return CommandPaletteSearchRequest(
+            query: query,
+            contentRevision: contentRevision,
+            shouldSearch: contentSearch != nil
+                && query.count >= 2
+                && matched.count < Self.contentThreshold)
+    }
+
+    private var results: [Command] {
+        let matched = titleResults
+        let request = searchRequest
 
         // Content hits join only once the query could plausibly be a word,
         // and never crowd out what a filename match already answers. A note
         // already surfaced by its title is not offered twice below by its
         // contents — the same file appearing in two shapes reads as a glitch.
-        guard let contentSearch, query.count >= 2, matched.count < Self.contentThreshold
-        else { return matched }
+        guard request.shouldSearch else { return matched }
 
         var seenURLs = Set(matched.compactMap { command -> URL? in
             switch command.kind {
@@ -200,7 +271,7 @@ public struct CommandPalette: View {
             case .action: nil
             }
         })
-        return matched + contentHits(for: query).filter { command in
+        return matched + contentState.hits(for: request).filter { command in
             switch command.kind {
             case .file(let url), .searchResult(let url, _):
                 seenURLs.insert(url).inserted
@@ -216,11 +287,20 @@ public struct CommandPalette: View {
     private static let maximumContentHits = 8
 
     public var body: some View {
+        let visibleResults = results
+        let request = searchRequest
         VStack(spacing: 0) {
             field
-            if !results.isEmpty {
+            if !visibleResults.isEmpty {
                 Divider().opacity(0.4)
-                resultList
+                resultList(visibleResults)
+                if contentState.isPending(request) {
+                    Divider().opacity(0.4)
+                    searchProgress
+                }
+            } else if contentState.isPending(request) {
+                Divider().opacity(0.4)
+                searchProgress
             } else if !query.isEmpty {
                 Text("No matches")
                     .font(.callout)
@@ -242,6 +322,9 @@ public struct CommandPalette: View {
             isFieldFocused = true
         }
         .onChange(of: query) { _, _ in resetHighlight() }
+        .task(id: request) {
+            await refreshContent(for: request)
+        }
         .onKeyPress(.upArrow) {
             moveHighlight(by: -1)
             return .handled
@@ -281,7 +364,7 @@ public struct CommandPalette: View {
         .padding(.vertical, GlassTheme.Spacing.regular)
     }
 
-    private var resultList: some View {
+    private func resultList(_ results: [Command]) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 2) {
@@ -307,6 +390,54 @@ public struct CommandPalette: View {
                     proxy.scrollTo(new, anchor: .center)
                 }
             }
+        }
+    }
+
+    private var searchProgress: some View {
+        HStack(spacing: GlassTheme.Spacing.tight) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Searching note contents…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, GlassTheme.Spacing.loose)
+        .padding(.vertical, GlassTheme.Spacing.snug)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Searching note contents")
+    }
+
+    /// Executes outside body evaluation and publishes only the latest result.
+    /// A short debounce gives rapid typing a real cancellation window before
+    /// entering the synchronous, bounded index query.
+    @MainActor
+    private func refreshContent(for request: CommandPaletteSearchRequest) async {
+        guard request.shouldSearch, let contentSearch else {
+            contentState.reset()
+            return
+        }
+        let generation = contentState.begin(request)
+        do {
+            try await Task.sleep(for: .milliseconds(80))
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        let hits = contentSearch(request.query)
+        guard !Task.isCancelled,
+            contentState.complete(
+                hits,
+                for: request,
+                generation: generation,
+                limit: Self.maximumContentHits)
+        else { return }
+
+        let count = results.count
+        if count == 0 {
+            highlighted = 0
+        } else if highlighted >= count {
+            highlighted = count - 1
         }
     }
 

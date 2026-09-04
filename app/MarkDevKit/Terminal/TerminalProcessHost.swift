@@ -6,8 +6,114 @@
 //
 
 import AppKit
+import Darwin
 import Foundation
 import SwiftTerm
+
+/// Recovers the real child status when SwiftTerm's non-blocking wait ran too
+/// early after its process-exit notification.
+///
+/// SwiftTerm 1.20.0 initializes the status to zero, calls `waitpid` with
+/// `WNOHANG`, and forwards the status without checking the return value. A
+/// child that is not waitable in that instant therefore looks like a clean
+/// exit. Nonzero statuses are already authoritative; zero is collected again
+/// for a short, bounded interval on a background task.
+enum TerminalExitStatusResolver {
+    enum WaitObservation: Equatable {
+        case exited(Int32)
+        case stillRunning
+        case interrupted
+        case alreadyCollected
+        case failed
+    }
+
+    private static let maximumPolls = 250
+    private static let pollDelay: useconds_t = 1_000
+
+    static func resolve(pid: pid_t, reportedStatus: Int32?) -> Int32? {
+        guard reportedStatus == 0 else { return reportedStatus }
+        guard pid > 0 else { return nil }
+        return resolve(
+            reportedStatus: reportedStatus,
+            maxPolls: maximumPolls,
+            poll: {
+                var status: Int32 = 0
+                let result = waitpid(pid, &status, WNOHANG)
+                if result == pid { return .exited(status) }
+                if result == 0 { return .stillRunning }
+                if errno == EINTR { return .interrupted }
+                if errno == ECHILD { return .alreadyCollected }
+                return .failed
+            },
+            pause: { usleep(pollDelay) })
+    }
+
+    /// Pure polling policy, injectable so the early-`WNOHANG` race and its
+    /// timeout can be exercised deterministically without forking a child.
+    static func resolve(
+        reportedStatus: Int32?,
+        maxPolls: Int,
+        poll: () -> WaitObservation,
+        pause: () -> Void
+    ) -> Int32? {
+        guard reportedStatus == 0 else { return reportedStatus }
+        guard maxPolls > 0 else { return nil }
+
+        for attempt in 0..<maxPolls {
+            switch poll() {
+            case .exited(let status):
+                return status
+            case .alreadyCollected:
+                // SwiftTerm won the waitpid race and the value it supplied is
+                // the only status still available.
+                return reportedStatus
+            case .failed:
+                return nil
+            case .interrupted:
+                continue
+            case .stillRunning:
+                if attempt + 1 < maxPolls { pause() }
+            }
+        }
+        // A process-exit event that never became collectable is contradictory.
+        // Report unknown instead of turning that uncertainty into success.
+        return nil
+    }
+}
+
+/// The one SwiftTerm view MarkDev uses for child processes.
+///
+/// Recovery happens before SwiftTerm forwards the callback to its public
+/// process delegate, keeping every app consumer on the same reliable seam.
+@MainActor
+final class MarkDevTerminalView: LocalProcessTerminalView {
+    override func processTerminated(_ source: LocalProcess, exitCode: Int32?) {
+        let pid = source.shellPid
+        guard exitCode == 0 else {
+            super.processTerminated(source, exitCode: exitCode)
+            return
+        }
+        guard pid > 0 else {
+            super.processTerminated(source, exitCode: nil)
+            return
+        }
+
+        Task { @MainActor [weak self, weak source] in
+            let resolved = await Task.detached(priority: .utility) {
+                TerminalExitStatusResolver.resolve(pid: pid, reportedStatus: exitCode)
+            }.value
+            guard let self, let source,
+                self.process === source,
+                source.shellPid == pid
+            else { return }
+            forwardTermination(source, exitCode: resolved)
+        }
+    }
+
+    private func forwardTermination(_ source: LocalProcess, exitCode: Int32?) {
+        super.processTerminated(source, exitCode: exitCode)
+    }
+}
 
 /// One shell's terminal view, owned above SwiftUI.
 ///
@@ -33,8 +139,13 @@ import SwiftTerm
 /// ``TerminalSessions/close(_:)`` and ``TerminalSessions/closeAll()`` — plus
 /// the process-wide backstop in ``LiveShells``, because a window closing is
 /// not a view being dismantled and app termination is not either.
+///
+/// SwiftTerm creates this view's `LocalProcess` on its default main dispatch
+/// queue, so its UI delegate callbacks belong on the main actor as well. The
+/// isolated conformance states that guarantee to Swift rather than allowing a
+/// nonisolated protocol witness to reach actor-owned session state.
 @MainActor
-public final class TerminalProcessHost: NSObject, LocalProcessTerminalViewDelegate {
+public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTerminalViewDelegate {
     /// The session this host belongs to. Held so a late callback from a dying
     /// pty can be routed to the right tab, or dropped.
     public let id: UUID
@@ -65,7 +176,7 @@ public final class TerminalProcessHost: NSObject, LocalProcessTerminalViewDelega
         self.generation = generation
         self.onTitleChange = onTitleChange
         self.onExit = onExit
-        view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        view = MarkDevTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
         super.init()
         view.processDelegate = self
         apply(theme: .standard)

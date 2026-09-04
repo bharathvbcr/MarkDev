@@ -59,7 +59,8 @@ public final class MarkdownPreviewController {
     /// older tool is still worth previewing, and Quick Look's alternative is a
     /// blank panel with no explanation.
     public func load(contentsOf url: URL) throws {
-        let data = try Data(contentsOf: url)
+        let data = try NoteTextCache.shared.read(
+            url, maximumBytes: MarkdownReadLimits.maximumPreviewBytes)
         let markdown =
             String(data: data, encoding: .utf8)
             ?? String(data: data, encoding: .isoLatin1)
@@ -67,12 +68,36 @@ public final class MarkdownPreviewController {
         show(markdown, directory: url.deletingLastPathComponent())
     }
 
+    /// What a reader sees instead of an empty panel when a file is refused.
+    ///
+    /// Deliberately Markdown, and deliberately short: it goes through the same
+    /// editor as any other document, and anything long enough to wrap would
+    /// need a width this panel does not promise.
+    static let refusalNotice = """
+        ## Cannot be previewed
+
+        This file is either larger than MarkDev can render safely, or it \
+        contains bytes that are not text.
+        """
+
     /// Previews `markdown`, resolving relative image paths against `directory`.
     public func show(_ markdown: String, directory: URL?) {
         // Set first: every embedded image resolves against it, and setting it
         // afterwards would invalidate the layout that was just built.
         textView.documentDirectory = directory
-        textView.setMarkdown(markdown)
+        if !textView.setMarkdown(markdown) {
+            // `load` already goes out of its way to avoid "a blank panel with
+            // no explanation" for a decoding failure, then handed the refusal
+            // path exactly that. Quick Look cannot raise an alert, but it can
+            // render a sentence — and this surface renders Markdown, so it
+            // costs nothing to say what happened.
+            //
+            // The notice resolves no pictures, so it takes no directory: left
+            // pointing at the refused file's folder, a relative path in the
+            // notice would resolve against a stranger's documents.
+            textView.documentDirectory = nil
+            textView.setMarkdown(Self.refusalNotice)
+        }
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         view.contentView.scroll(to: .zero)
     }

@@ -18,6 +18,7 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
   - AppKit & SwiftUI shell with Liquid Glass design
   - Value-type layout engines (`SplitLayout`)
   - Integrated terminal subsystem (`SwiftTerm` pty)
+  - Bounded diagnostics pipeline and support report export
 
 - [Editor Engine & Rendering Pipeline](./editor-engine.md)
   - TextKit 2 layout fragment architecture (`NSTextLayoutFragment`)
@@ -25,6 +26,7 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
   - GFM tables drawn as a grid (`TableGrid` / `TableRowLayout`)
   - Native rich block rendering (LaTeX via SwiftMath, Mermaid via BeautifulMermaid)
   - Incremental shift parsing vs full reparsing
+  - AI-assisted writing/proofreading panel data ownership checks
 
 - [Vault Indexing & Knowledge Graph](./vault-and-graph.md)
   - Note metadata extraction and tag indexing

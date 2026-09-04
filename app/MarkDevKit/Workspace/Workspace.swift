@@ -18,13 +18,23 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
     /// baseline lets dirty state clear when an undo returns to it, and lets a
     /// save detect an edit made by another process before overwriting it.
     var persistedText: String?
+    /// Stable identity of the regular file behind `url`. Paths alone cannot
+    /// make a symlink and its target (or two hard links) one document.
+    var fileIdentity: LocalFileIdentity?
 
-    public init(id: UUID = UUID(), url: URL? = nil, text: String = "", hasUnsavedChanges: Bool = false) {
+    public init(
+        id: UUID = UUID(),
+        url: URL? = nil,
+        text: String = "",
+        hasUnsavedChanges: Bool = false
+    ) {
         self.id = id
-        self.url = url
+        let resolved = url.flatMap { try? LocalFileSystem.resolveExisting($0) }
+        self.url = resolved?.url ?? url?.standardizedFileURL
         self.text = text
         self.hasUnsavedChanges = hasUnsavedChanges
         self.persistedText = url == nil || hasUnsavedChanges ? nil : text
+        self.fileIdentity = resolved?.identity
     }
 
     /// Whether `text` is exactly what was last read from or written to disk.
@@ -46,6 +56,12 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
         copy.text = text
         copy.persistedText = text
         copy.hasUnsavedChanges = false
+        if let url = copy.url,
+            let resolved = try? LocalFileSystem.resolveExisting(url)
+        {
+            copy.url = resolved.url
+            copy.fileIdentity = resolved.identity
+        }
         return copy
     }
 
@@ -55,16 +71,13 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
     /// moves bytes, it does not edit them.
     public func retargeted(to newURL: URL) -> OpenDocument {
         var copy = self
-        copy.url = newURL
-        return copy
-    }
-
-    /// This document's own text adopted as the baseline, for when the reader
-    /// has chosen it over what the disk holds now.
-    public func keepingLocal() -> OpenDocument {
-        var copy = self
-        copy.persistedText = copy.text
-        copy.hasUnsavedChanges = false
+        if let resolved = try? LocalFileSystem.resolveExisting(newURL) {
+            copy.url = resolved.url
+            copy.fileIdentity = resolved.identity
+        } else {
+            copy.url = newURL.standardizedFileURL
+            copy.fileIdentity = nil
+        }
         return copy
     }
 
@@ -79,12 +92,53 @@ public struct OpenDocument: Identifiable, Sendable, Equatable {
         var copy = self
         copy.persistedText = diskText
         copy.hasUnsavedChanges = copy.text != diskText
+        if let url = copy.url,
+            let resolved = try? LocalFileSystem.resolveExisting(url)
+        {
+            copy.url = resolved.url
+            copy.fileIdentity = resolved.identity
+        }
         return copy
     }
 
     /// Title for the tab. Untitled documents still need a stable label.
     public var title: String {
         url?.deletingPathExtension().lastPathComponent ?? "Untitled"
+    }
+}
+
+/// What ``Workspace/apply(text:in:)`` did with an edit.
+///
+/// Exists because the `Bool` it replaces could not tell a caller whether a
+/// refusal cost the reader anything. Both "no document is open" and "this edit
+/// would exceed the parser's limit" answered `false`, and only the second
+/// means text the reader typed is about to vanish: the model keeps the old
+/// string, SwiftUI pushes it back into the editor, and the paste is reverted
+/// with nothing said.
+public enum TextUpdateOutcome: Equatable, Sendable {
+    /// The document now holds the new text.
+    case applied
+    /// The document already held exactly this text.
+    case unchanged
+    /// No document is open in that pane. Benign, and not worth reporting.
+    case noDocument
+    /// The edit would take the document past ``MarkdownReadLimits``.
+    case refusedTooLarge(byteCount: Int, limit: Int)
+
+    /// Whether the model reflects the caller's text — the old `Bool`.
+    public var didApply: Bool {
+        switch self {
+        case .applied, .unchanged: true
+        case .noDocument, .refusedTooLarge: false
+        }
+    }
+
+    /// What to tell the reader, or nil when there is nothing they can act on.
+    public var readerMessage: String? {
+        guard case let .refusedTooLarge(_, limit) = self else { return nil }
+        let readable = ByteCountFormatter.string(fromByteCount: Int64(limit), countStyle: .file)
+        return "That edit would make this document larger than \(readable), "
+            + "which is more than MarkDev can edit safely. The document has been left as it was."
     }
 }
 
@@ -96,24 +150,32 @@ public enum WorkspaceError: Error, Equatable, LocalizedError {
     case destinationAlreadyOpen(URL)
     case destinationExists(URL)
     case documentChangedOnDisk(URL)
+    case documentTooLarge(maximumBytes: Int)
+    case unsafeDestination(URL)
     case unsupportedLocation(URL)
 
     public var errorDescription: String? {
         switch self {
         case .noDocument:
-            "There is no document to save."
+            return "There is no document to save."
         case .paneUnavailable:
-            "The target editor is no longer open."
+            return "The target editor is no longer open."
         case .needsSaveDestination:
-            "Choose a name and location before saving this document."
+            return "Choose a name and location before saving this document."
         case .destinationAlreadyOpen(let url):
-            "\(url.lastPathComponent) is already open in this workspace."
+            return "\(url.lastPathComponent) is already open in this workspace."
         case .destinationExists(let url):
-            "\(url.lastPathComponent) already exists."
+            return "\(url.lastPathComponent) already exists."
         case .documentChangedOnDisk(let url):
-            "\(url.lastPathComponent) changed on disk. Reload it or use Save As to preserve both versions."
+            return "\(url.lastPathComponent) changed on disk. Reload it or use Save As to preserve both versions."
+        case .documentTooLarge(let maximumBytes):
+            let readable = ByteCountFormatter.string(
+                fromByteCount: Int64(maximumBytes), countStyle: .file)
+            return "This document is too large to edit or save safely. The limit is \(readable)."
+        case .unsafeDestination(let url):
+            return "\(url.lastPathComponent) is not a safe regular-file destination."
         case .unsupportedLocation(let url):
-            "MarkDev can only open files on this Mac, and \(url.scheme ?? "that location") is not one."
+            return "MarkDev can only open files on this Mac, and \(url.scheme ?? "that location") is not one."
         }
     }
 }
@@ -160,13 +222,18 @@ public final class Workspace {
     public private(set) var panes: [PaneID: PaneState]
     public var focusedPane: PaneID
     public var vaultRoot: URL?
+    private let diagnostics: DiagnosticsEmitter
 
-    public init(vaultRoot: URL? = nil) {
+    public init(
+        vaultRoot: URL? = nil,
+        diagnostics: DiagnosticsEmitter = .shared
+    ) {
         let first = PaneID()
         self.layout = SplitLayout(pane: first)
         self.panes = [first: PaneState(documents: [OpenDocument()], selection: nil)]
         self.focusedPane = first
         self.vaultRoot = vaultRoot
+        self.diagnostics = diagnostics
 
         if let document = panes[first]?.documents.first {
             panes[first]?.selection = document.id
@@ -227,7 +294,9 @@ public final class Workspace {
     /// Reusing an open tab rather than stacking duplicates is the behaviour
     /// every editor has; opening the same note five times is never intended.
     public func open(_ url: URL, in pane: PaneID) throws {
-        guard var state = panes[pane] else { return }
+        guard var state = panes[pane], layout.panes.contains(pane) else {
+            throw WorkspaceError.paneUnavailable
+        }
 
         let document = try resolvedDocument(for: url)
         if let existing = state.documents.first(where: { $0.id == document.id }) {
@@ -272,15 +341,50 @@ public final class Workspace {
     }
 
     /// Updates the text of the document shown in `pane`.
-    public func updateText(_ text: String, in pane: PaneID) {
-        guard let state = panes[pane], let current = state.current else { return }
-        guard let index = state.documents.firstIndex(where: { $0.id == current.id }) else { return }
-        guard state.documents[index].text != text else { return }
+    ///
+    /// The `Bool` folds four outcomes into two, which is enough for a caller
+    /// that only needs to know whether the model moved. A caller that has to
+    /// *tell the reader something* wants ``apply(text:in:)`` instead: refusing
+    /// an oversized edit and having no document open are both `false` here,
+    /// and only one of them costs somebody their paste.
+    @discardableResult
+    public func updateText(_ text: String, in pane: PaneID) -> Bool {
+        apply(text: text, in: pane).didApply
+    }
+
+    /// Updates the text of the document shown in `pane`, saying what happened.
+    @discardableResult
+    public func apply(text: String, in pane: PaneID) -> TextUpdateOutcome {
+        let byteCount = text.utf8.count
+        guard MarkdownReadLimits.acceptedDocumentByteCount(text) != nil else {
+            // The editor's binding pushes text in on every keystroke, so this
+            // is the paste that would take the document past the limit. The
+            // model keeps the old text, SwiftUI pushes it back, and the
+            // editor *reverts* — silently, before this was reported. Losing
+            // work with no explanation is the one outcome worth a diagnostic
+            // on a per-keystroke path; it fires only on the refusal.
+            diagnostics.emit(
+                severity: .warning,
+                subsystem: .workspace,
+                code: .workspaceEditRefused,
+                operationID: DiagnosticOperationID(),
+                metadata: DiagnosticMetadata([
+                    .byteCount: .integer(Int64(clamping: byteCount))
+                ]))
+            return .refusedTooLarge(
+                byteCount: byteCount, limit: MarkdownReadLimits.maximumDocumentBytes)
+        }
+        guard let state = panes[pane], let current = state.current else { return .noDocument }
+        guard let index = state.documents.firstIndex(where: { $0.id == current.id }) else {
+            return .noDocument
+        }
+        guard state.documents[index].text != text else { return .unchanged }
 
         var document = state.documents[index]
         document.text = text
         document.hasUnsavedChanges = document.persistedText.map { $0 != text } ?? !text.isEmpty
         propagate(document)
+        return .applied
     }
 
     /// Atomically saves the selected document, optionally assigning a new URL.
@@ -294,40 +398,144 @@ public final class Workspace {
         to requestedURL: URL? = nil,
         overwrite: Bool = false
     ) throws -> URL {
-        guard let current = document(in: pane) else { throw WorkspaceError.noDocument }
-        guard let destination = (requestedURL ?? current.url)?.standardizedFileURL else {
+        guard let current = document(in: pane) else {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .workspace,
+                code: .workspaceSaveFailed,
+                operationID: DiagnosticOperationID())
+            throw WorkspaceError.noDocument
+        }
+        return try save(document: current.id, to: requestedURL, overwrite: overwrite)
+    }
+
+    /// Atomically saves one exact document identity, whether or not its tab is
+    /// frontmost. Close and quit review operate on documents, not selections;
+    /// routing those actions through `save(in:)` can otherwise save a clean
+    /// foreground tab and then discard the dirty background tab the alert
+    /// named.
+    @discardableResult
+    public func save(
+        document documentID: OpenDocument.ID,
+        to requestedURL: URL? = nil,
+        overwrite: Bool = false
+    ) throws -> URL {
+        let operationID = DiagnosticOperationID()
+        do {
+            guard let current = allDocuments.first(where: { $0.id == documentID }) else {
+                throw WorkspaceError.noDocument
+            }
+            guard let requestedDestination = requestedURL ?? current.url else {
+                throw WorkspaceError.needsSaveDestination
+            }
+            guard requestedDestination.isFileURL else {
+                throw WorkspaceError.unsupportedLocation(requestedDestination)
+            }
+            let resolvedDestination: (url: URL, identity: LocalFileIdentity?)
+            do {
+                resolvedDestination = try LocalFileSystem.resolveDestination(requestedDestination)
+            } catch LocalFileResolutionError.notAFileURL {
+                throw WorkspaceError.unsupportedLocation(requestedDestination)
+            } catch LocalFileResolutionError.unsupportedFile {
+                throw WorkspaceError.unsafeDestination(requestedDestination)
+            } catch LocalFileResolutionError.unsafeDestination {
+                throw WorkspaceError.unsafeDestination(requestedDestination)
+            } catch let LocalFileResolutionError.posix(url, code) {
+                throw Self.posixError(at: url, code: code)
+            }
+            let destination = resolvedDestination.url
+
+            if allDocuments.contains(where: { document in
+                guard document.id != current.id else { return false }
+                if document.url?.standardizedFileURL == destination.standardizedFileURL {
+                    return true
+                }
+                return resolvedDestination.identity != nil
+                    && document.fileIdentity == resolvedDestination.identity
+            }) {
+                throw WorkspaceError.destinationAlreadyOpen(destination)
+            }
+
+            let isSavingOriginal = current.url?.standardizedFileURL
+                == destination.standardizedFileURL
+                || (resolvedDestination.identity != nil
+                    && current.fileIdentity == resolvedDestination.identity)
+            let writeDestination = isSavingOriginal ? (current.url ?? destination) : destination
+            if isSavingOriginal {
+                let diskText: String
+                do {
+                    diskText = try NoteTextCache.shared.utf8Text(
+                        at: writeDestination,
+                        maximumBytes: MarkdownReadLimits.maximumDocumentBytes)
+                } catch {
+                    throw WorkspaceError.documentChangedOnDisk(writeDestination)
+                }
+                guard diskText == current.persistedText else {
+                    throw WorkspaceError.documentChangedOnDisk(writeDestination)
+                }
+            } else if resolvedDestination.identity != nil, !overwrite {
+                throw WorkspaceError.destinationExists(destination)
+            }
+
+            guard MarkdownReadLimits.acceptedDocumentByteCount(current.text) != nil else {
+                throw WorkspaceError.documentTooLarge(
+                    maximumBytes: MarkdownReadLimits.maximumDocumentBytes)
+            }
+
+            // `atomically: true` writes a sibling temporary file before replacing
+            // the destination, so an interrupted write cannot leave a half-file.
+            try current.text.write(to: writeDestination, atomically: true, encoding: .utf8)
+
+            var saved = current
+            if let written = try? LocalFileSystem.resolveExisting(writeDestination) {
+                saved.url = written.url
+                saved.fileIdentity = written.identity
+            } else {
+                saved.url = writeDestination
+                saved.fileIdentity = nil
+            }
+            saved.persistedText = saved.text
+            saved.hasUnsavedChanges = false
+            propagate(saved)
+            diagnostics.emit(
+                severity: .info,
+                subsystem: .workspace,
+                code: .workspaceSaveSucceeded,
+                operationID: operationID)
+            return writeDestination
+        } catch {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .workspace,
+                code: .workspaceSaveFailed,
+                operationID: operationID)
+            throw error
+        }
+    }
+
+    /// Keeps the in-memory version after an external edit without pretending
+    /// it has already been written. The current disk bytes become the new
+    /// baseline, so the document remains dirty and the next guarded save or
+    /// autosave may replace exactly that version—never an unknown later edit.
+    public func keepLocal(document documentID: OpenDocument.ID) throws {
+        guard let current = allDocuments.first(where: { $0.id == documentID }) else {
+            throw WorkspaceError.noDocument
+        }
+        guard let requestedURL = current.url else {
             throw WorkspaceError.needsSaveDestination
         }
-
-        if allDocuments.contains(where: { $0.id != current.id && $0.url == destination }) {
-            throw WorkspaceError.destinationAlreadyOpen(destination)
+        guard requestedURL.isFileURL else {
+            throw WorkspaceError.unsupportedLocation(requestedURL)
         }
-
-        let isSavingOriginal = current.url?.standardizedFileURL == destination
-        if isSavingOriginal {
-            let diskText: String
-            do {
-                diskText = try String(contentsOf: destination, encoding: .utf8)
-            } catch {
-                throw WorkspaceError.documentChangedOnDisk(destination)
-            }
-            guard diskText == current.persistedText else {
-                throw WorkspaceError.documentChangedOnDisk(destination)
-            }
-        } else if FileManager.default.fileExists(atPath: destination.path), !overwrite {
-            throw WorkspaceError.destinationExists(destination)
+        let url = requestedURL.standardizedFileURL
+        let diskText: String
+        do {
+            diskText = try NoteTextCache.shared.utf8Text(
+                at: url, maximumBytes: MarkdownReadLimits.maximumDocumentBytes)
+        } catch {
+            throw WorkspaceError.documentChangedOnDisk(url)
         }
-
-        // `atomically: true` writes a sibling temporary file before replacing
-        // the destination, so an interrupted write cannot leave a half-file.
-        try current.text.write(to: destination, atomically: true, encoding: .utf8)
-
-        var saved = current
-        saved.url = destination
-        saved.persistedText = saved.text
-        saved.hasUnsavedChanges = false
-        propagate(saved)
-        return destination
+        propagate(current.rebased(on: diskText))
     }
 
     public func select(_ document: OpenDocument.ID, in pane: PaneID) {
@@ -351,26 +559,79 @@ public final class Workspace {
     /// data loss wearing a convenience's name.
     @discardableResult
     public func autosave() -> Int {
+        var attempted = 0
         var written = 0
+        var conflicts = 0
+        var failures = 0
         for document in allDocuments {
             guard document.hasUnsavedChanges, let url = document.url else { continue }
+            attempted += 1
             // Same closed door as ``save(in:to:overwrite:)``: only write over
             // exactly the bytes this document was read from.
-            if let persisted = document.persistedText,
-                (try? String(contentsOf: url, encoding: .utf8)) != persisted
-            {
+            guard url.isFileURL else {
+                failures += 1
+                continue
+            }
+            guard let persisted = document.persistedText else {
+                conflicts += 1
+                continue
+            }
+            guard MarkdownReadLimits.acceptedDocumentByteCount(document.text) != nil else {
+                failures += 1
+                continue
+            }
+            let diskText: String
+            do {
+                diskText = try NoteTextCache.shared.utf8Text(
+                    at: url, maximumBytes: MarkdownReadLimits.maximumDocumentBytes)
+            } catch {
+                failures += 1
+                continue
+            }
+            guard diskText == persisted else {
+                conflicts += 1
                 continue
             }
             do {
                 try document.text.write(to: url, atomically: true, encoding: .utf8)
             } catch {
+                failures += 1
                 continue
             }
             var saved = document
+            if let written = try? LocalFileSystem.resolveExisting(url) {
+                saved.url = written.url
+                saved.fileIdentity = written.identity
+            }
             saved.persistedText = saved.text
             saved.hasUnsavedChanges = false
             propagate(saved)
             written += 1
+        }
+
+        guard attempted > 0 else { return written }
+        let operationID = DiagnosticOperationID()
+        let metadata = DiagnosticMetadata([
+            .attemptedCount: .integer(Int64(attempted)),
+            .succeededCount: .integer(Int64(written)),
+            .conflictCount: .integer(Int64(conflicts)),
+            .failedCount: .integer(Int64(failures)),
+        ])
+        if conflicts > 0 {
+            diagnostics.emit(
+                severity: .warning,
+                subsystem: .workspace,
+                code: .workspaceAutosaveConflict,
+                operationID: operationID,
+                metadata: metadata)
+        }
+        if failures > 0 {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .workspace,
+                code: .workspaceAutosaveFailed,
+                operationID: operationID,
+                metadata: metadata)
         }
         return written
     }
@@ -429,8 +690,9 @@ public final class Workspace {
     /// new pane opens on something rather than blank.
     @discardableResult
     public func split(_ pane: PaneID, edge: SplitEdge) -> PaneID {
+        guard panes[pane] != nil, layout.panes.contains(pane) else { return focusedPane }
         let new = PaneID()
-        layout.split(pane, edge: edge, with: new)
+        guard layout.split(pane, edge: edge, with: new) else { return pane }
 
         let document = panes[pane]?.current ?? OpenDocument()
         panes[new] = PaneState(documents: [document], selection: document.id)
@@ -499,8 +761,21 @@ public final class Workspace {
         guard requestedURL.isFileURL else {
             throw WorkspaceError.unsupportedLocation(requestedURL)
         }
-        let url = requestedURL.standardizedFileURL
-        if let existing = allDocuments.first(where: { $0.url == url }) {
+        let resolved: ResolvedLocalFile
+        do {
+            resolved = try LocalFileSystem.resolveExisting(requestedURL)
+        } catch LocalFileResolutionError.notAFileURL {
+            throw WorkspaceError.unsupportedLocation(requestedURL)
+        } catch LocalFileResolutionError.unsupportedFile {
+            throw NoteTextReadError.unsupportedFile(requestedURL)
+        } catch let LocalFileResolutionError.posix(url, code) {
+            throw Self.posixError(at: url, code: code)
+        }
+        let url = resolved.url
+        if let existing = allDocuments.first(where: { document in
+            document.fileIdentity == resolved.identity
+                || document.url?.standardizedFileURL == url.standardizedFileURL
+        }) {
             return existing
         }
         // Through the cache, which serves the bytes only when the file's size
@@ -509,8 +784,11 @@ public final class Workspace {
         // local disk that saves a millisecond; on iCloud Drive or a network
         // volume it is the difference between opening a note and waiting on a
         // volume with the main actor held.
-        let text = try NoteTextCache.shared.utf8Text(at: url)
-        return OpenDocument(url: url, text: text)
+        let loaded = try NoteTextCache.shared.utf8TextResult(
+            at: url, maximumBytes: MarkdownReadLimits.maximumDocumentBytes)
+        var document = OpenDocument(url: url, text: loaded.text)
+        document.fileIdentity = loaded.stamp.identity
+        return document
     }
 
     /// Replaces every view of `document`, wherever it is open.
@@ -518,8 +796,13 @@ public final class Workspace {
     /// The one public door onto ``propagate``: accepting an external version
     /// of a note must reach every split showing it, which is the same rule
     /// editing through a binding already follows.
-    public func replace(document: OpenDocument) {
+    @discardableResult
+    public func replace(document: OpenDocument) -> Bool {
+        guard MarkdownReadLimits.acceptedDocumentByteCount(document.text) != nil else {
+            return false
+        }
         propagate(document)
+        return true
     }
 
     /// Replaces every view of `document` so split panes can never drift.
@@ -540,6 +823,13 @@ public final class Workspace {
             count += state.documents.lazy.filter { $0.id == document }.count
         }
     }
+
+    private static func posixError(at url: URL, code: Int32) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSFilePathErrorKey: url.path])
+    }
 }
 
 extension Workspace {
@@ -553,9 +843,13 @@ extension Workspace {
             let documents = state.documents.compactMap { document in
                 document.url.map { DocumentSnapshot(url: $0.absoluteString) }
             }
-            let selection = state.documents.first(where: { $0.id == state.selection })?
-                .url != nil ? state.selection : nil
-            return PaneSnapshot(pane: pane, documents: documents, selection: selection)
+            let selectedURL = state.documents.first(where: { $0.id == state.selection })?
+                .url?.absoluteString
+            return PaneSnapshot(
+                pane: pane,
+                documents: documents,
+                selection: nil,
+                selectedDocumentURL: selectedURL)
         }
         return WorkspaceSnapshot(
             layout: layout,
@@ -586,7 +880,11 @@ extension Workspace {
                 else { continue }
                 if documents.contains(where: { $0.id == resolved.id }) { continue }
                 documents.append(resolved)
-                if resolved.id == entry.selection { restoredSelection = resolved.id }
+                if resolved.url?.absoluteString == entry.selectedDocumentURL
+                    || resolved.id == entry.selection
+                {
+                    restoredSelection = resolved.id
+                }
             }
             if documents.isEmpty {
                 let pristine = OpenDocument()

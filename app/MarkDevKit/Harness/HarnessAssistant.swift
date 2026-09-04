@@ -157,6 +157,16 @@ public final class HarnessAssistant {
     @ObservationIgnored public var vaultURL: URL?
 
     @ObservationIgnored private var task: Task<Void, Never>?
+    /// The one discovery allowed to consume filesystem or shell resources.
+    /// Replacing it propagates cancellation through ``HarnessLocator``.
+    @ObservationIgnored private var searchTask: Task<Void, Never>?
+    @ObservationIgnored private let locateHarness: @Sendable (String?) async -> HarnessLocation?
+    /// Invalidates callbacks from a run that was stopped or replaced. Process
+    /// cancellation is cooperative; identity is the final authority over who
+    /// may publish into this panel.
+    @ObservationIgnored private var activeRunID: UUID?
+    /// The exact editor snapshot the visible answer was generated from.
+    @ObservationIgnored private var resultSource: AssistedEditSource?
     @ObservationIgnored private var nextActivityID = 0
     /// Which availability search is the newest; see ``refreshAvailability()``.
     @ObservationIgnored private var searchSerial = 0
@@ -170,8 +180,21 @@ public final class HarnessAssistant {
     /// spinning.
     @ObservationIgnored private var openToolRows: [Int] = []
 
-    public init(settings: HarnessSettings = HarnessSettings()) {
+    public convenience init(settings: HarnessSettings = HarnessSettings()) {
+        self.init(settings: settings) { configured in
+            await HarnessLocator.locate(configured: configured)
+        }
+    }
+
+    init(
+        settings: HarnessSettings,
+        locateHarness: @escaping @Sendable (String?) async -> HarnessLocation?
+    ) {
         self.settings = settings
+        self.locateHarness = locateHarness
+        settings.binarySelectionDidChange = { [weak self] in
+            self?.binarySelectionChanged()
+        }
     }
 
     public func attach(to surface: MarkdownTextView) {
@@ -202,22 +225,36 @@ public final class HarnessAssistant {
         // make the panel claim whatever finished last rather than whatever
         // was asked for most recently. Each search carries its number, and
         // only the newest may speak.
+        searchTask?.cancel()
+        searchTask = nil
         searchSerial += 1
         let serial = searchSerial
 
+        settings.bindExecutable(nil)
         availability = .searching
         let configured = settings.binaryPath
-        Task { [weak self] in
-            let found = await HarnessLocator.locate(configured: configured)
+        let locateHarness = locateHarness
+        searchTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(75))
+            } catch {
+                return
+            }
+            let found = await locateHarness(configured)
+            guard !Task.isCancelled else { return }
             guard let self else { return }
             guard serial == self.searchSerial else { return }
-            if let found {
+            self.searchTask = nil
+            if let found, found.matches(configured: self.settings.binaryPath) {
+                self.settings.bindExecutable(found)
                 self.availability = .found(found)
-            } else if !configured.trimmingCharacters(in: .whitespaces).isEmpty {
+            } else if !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.settings.revokeExecutableConsent()
                 self.availability = .missing(
-                    "There is no executable at \(configured). Correct the path, or clear it to "
-                        + "let MarkDev search.")
+                    "There is no executable at the configured MANVI path. Correct it, or clear "
+                        + "the field to let MarkDev search.")
             } else {
+                self.settings.revokeExecutableConsent()
                 self.availability = .missing(
                     "MarkDev couldn’t find `manvi` on your PATH or in the usual install "
                         + "directories. Set its path below.")
@@ -229,6 +266,12 @@ public final class HarnessAssistant {
 
     /// Runs `task` against the open note.
     public func run(_ task: HarnessTask) {
+        do {
+            try HarnessPrompt.validate(task)
+        } catch {
+            state = .failed(error.localizedDescription)
+            return
+        }
         guard let surface else {
             state = .failed("There is no document open.")
             return
@@ -236,6 +279,20 @@ public final class HarnessAssistant {
         guard case .found(let location) = availability else {
             state = .failed("MANVI isn’t available. Check its path below.")
             refreshAvailability()
+            return
+        }
+        guard location.matches(configured: settings.binaryPath),
+            HarnessLocator.isCurrent(location)
+        else {
+            settings.revokeExecutableConsent()
+            availability = .unknown
+            state = .failed("The MANVI executable changed. Check it before running again.")
+            refreshAvailability()
+            return
+        }
+        settings.bindExecutable(location)
+        if let blocker = settings.runBlocker {
+            state = .failed(blocker)
             return
         }
 
@@ -252,11 +309,18 @@ public final class HarnessAssistant {
             documentURL?.deletingLastPathComponent() ?? vaultURL
             ?? URL(fileURLWithPath: NSHomeDirectory())
 
-        let (prompt, noteTruncated) = HarnessPrompt.prompt(
-            for: task,
-            note: note,
-            documentPath: documentURL?.lastPathComponent,
-            vaultPath: vaultURL?.path)
+        let prompt: String
+        let noteTruncated: Bool
+        do {
+            (prompt, noteTruncated) = try HarnessPrompt.prompt(
+                for: task,
+                note: note,
+                documentPath: documentURL?.lastPathComponent,
+                vaultPath: vaultURL?.path)
+        } catch {
+            state = .failed(error.localizedDescription)
+            return
+        }
 
         let request = HarnessRunRequest(
             binary: location.url,
@@ -266,15 +330,23 @@ public final class HarnessAssistant {
             timeout: .seconds(HarnessSettings.clampMinutes(settings.timeoutMinutes) * 60),
             environment: settings.environment())
 
+        self.task?.cancel()
+        self.task = nil
+        activeRunID = nil
         reset()
         state = .running(task)
+        resultSource = AssistedEditSource(surface)
+        let runID = UUID()
+        activeRunID = runID
 
-        self.task?.cancel()
         self.task = Task { [weak self] in
             let result = await HarnessRun.run(request) { event in
-                self?.absorb(event)
+                guard let self, self.activeRunID == runID else { return }
+                self.absorb(event)
             }
-            guard let self, !Task.isCancelled else { return }
+            guard let self, !Task.isCancelled, self.activeRunID == runID else { return }
+            self.activeRunID = nil
+            self.task = nil
             self.answer = HarnessAnswer.clean(result.answer)
             self.transcriptTruncated = result.truncated
             switch result.outcome {
@@ -296,9 +368,18 @@ public final class HarnessAssistant {
     }
 
     public func stop() {
+        activeRunID = nil
         task?.cancel()
         task = nil
         if isRunning { state = .idle }
+    }
+
+    private func binarySelectionChanged() {
+        searchTask?.cancel()
+        searchTask = nil
+        searchSerial += 1
+        settings.bindExecutable(nil)
+        availability = .unknown
     }
 
     private func reset() {
@@ -309,6 +390,7 @@ public final class HarnessAssistant {
         inputTokens = 0
         outputTokens = 0
         transcriptTruncated = false
+        resultSource = nil
     }
 
     /// Folds one event into what the panel shows.
@@ -359,8 +441,10 @@ public final class HarnessAssistant {
                 HarnessActivity(id: nextID(), kind: .note(event.text), isFinished: true))
 
         case .usage:
-            inputTokens += event.inputTokens
-            outputTokens += event.outputTokens
+            inputTokens = Self.saturatingTokenTotal(
+                inputTokens, adding: event.inputTokens)
+            outputTokens = Self.saturatingTokenTotal(
+                outputTokens, adding: event.outputTokens)
 
         case .reasoning, .turnStart, .turnEnd, .approvalRequest, .approvalDecided, .lease, .none:
             return
@@ -378,6 +462,13 @@ public final class HarnessAssistant {
     private func nextID() -> Int {
         nextActivityID += 1
         return nextActivityID
+    }
+
+    private static func saturatingTokenTotal(_ current: Int, adding increment: Int) -> Int {
+        let nonnegativeCurrent = max(0, current)
+        guard increment > 0 else { return nonnegativeCurrent }
+        let (sum, overflow) = nonnegativeCurrent.addingReportingOverflow(increment)
+        return overflow ? .max : sum
     }
 
     /// The one argument worth showing beside a tool's name.
@@ -400,14 +491,18 @@ public final class HarnessAssistant {
     /// behind a disabled one — unfinished work offered honestly, per this
     /// codebase's standing rule that a cap must be *reported*, not enforced.
     public var canApply: Bool {
-        guard let task = finishedTask, let surface, surface.acceptsAssistedEdits else {
+        guard let task = finishedTask,
+            resultSource?.validate(attachedTo: surface) == .current
+        else {
             return false
         }
         return task.output == .rewrite && !answer.isEmpty
     }
 
     public var canInsert: Bool {
-        guard let task = finishedTask, let surface, surface.acceptsAssistedEdits else {
+        guard let task = finishedTask,
+            resultSource?.validate(attachedTo: surface) == .current
+        else {
             return false
         }
         return task.output != .answer && !answer.isEmpty
@@ -421,7 +516,9 @@ public final class HarnessAssistant {
     /// the editor's own path, so ⌘Z takes it back like any other edit.
     @discardableResult
     public func apply() -> Bool {
-        guard canApply, let surface else { return false }
+        guard canApply, let surface = resultSource?.resolve(attachedTo: surface) else {
+            return false
+        }
         let length = (surface.markdown as NSString).length
         return surface.applyAssistedEdit(
             range: NSRange(location: 0, length: length),
@@ -432,7 +529,9 @@ public final class HarnessAssistant {
     /// Puts the answer in at the caret.
     @discardableResult
     public func insertAtCaret() -> Bool {
-        guard canInsert, let surface else { return false }
+        guard canInsert, let surface = resultSource?.resolve(attachedTo: surface) else {
+            return false
+        }
         let caret = surface.selectedRange()
         return surface.applyAssistedEdit(
             range: caret,
@@ -444,6 +543,16 @@ public final class HarnessAssistant {
         guard !answer.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(answer, forType: .string)
+    }
+
+    /// Why a visible edit result cannot currently be applied, if it is one.
+    public var applicationRefusal: String? {
+        guard let task = finishedTask,
+            task.output != .answer,
+            !answer.isEmpty,
+            let resultSource
+        else { return nil }
+        return resultSource.validate(attachedTo: surface).message
     }
 }
 

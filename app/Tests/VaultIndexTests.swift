@@ -31,6 +31,14 @@ final class VaultIndexTests: XCTestCase {
         vault.open(root)
 
         XCTAssertEqual(vault.noteCount, 2)
+        let status = try XCTUnwrap(vault.initialScanStatus)
+        XCTAssertTrue(status.isComplete)
+        XCTAssertTrue(status.scanPerformed)
+        XCTAssertEqual(status.discoveredFiles, 2)
+        XCTAssertEqual(status.selectedFiles, 2)
+        XCTAssertEqual(status.indexedFiles, 2)
+        XCTAssertEqual(status.skippedFiles, 0)
+        XCTAssertEqual(status.indexedBytes, status.selectedBytes)
         XCTAssertEqual(Set(vault.notePaths()), ["Alpha.md", "Beta.md"])
         XCTAssertEqual(vault.backlinks(for: "Beta.md").map(\.path), ["Alpha.md"])
         XCTAssertEqual(vault.outline(for: "Beta.md").map(\.text), ["Béta", "Details"])
@@ -50,9 +58,72 @@ final class VaultIndexTests: XCTestCase {
         vault.open(root)
         XCTAssertTrue(vault.backlinks(for: "Beta.md").isEmpty)
 
-        vault.update(path: "Alpha.md", text: "# Alpha\n\n[[Beta]]")
+        XCTAssertEqual(
+            vault.update(path: "Alpha.md", text: "# Alpha\n\n[[Beta]]"), .changed)
 
         XCTAssertEqual(vault.backlinks(for: "Beta.md").map(\.path), ["Alpha.md"])
+    }
+
+    func testUpdateIsLengthDelimitedAndNoOpDoesNotInvalidateReaders() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Alpha\n", to: root.appendingPathComponent("Alpha.md"))
+
+        let vault = VaultIndex()
+        vault.open(root)
+        let initialRevision = vault.contentRevision
+        XCTAssertEqual(vault.update(path: "Alpha.md", text: "# Alpha\n"), .unchanged)
+        XCTAssertEqual(vault.contentRevision, initialRevision)
+
+        let embeddedNUL = "# Alpha\nbefore\0needle-after-nul"
+        XCTAssertEqual(vault.update(path: "Alpha.md", text: embeddedNUL), .changed)
+        XCTAssertEqual(vault.search("needle-after-nul").map(\.path), ["Alpha.md"])
+        let changedRevision = vault.contentRevision
+        XCTAssertEqual(vault.update(path: "Alpha.md", text: embeddedNUL), .unchanged)
+        XCTAssertEqual(vault.contentRevision, changedRevision)
+    }
+
+    func testVaultBoundaryRejectsOversizedPathsTextAndQueries() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Alpha\n", to: root.appendingPathComponent("Alpha.md"))
+
+        let vault = VaultIndex()
+        vault.open(root)
+        let revision = vault.contentRevision
+        XCTAssertEqual(
+            vault.update(path: String(repeating: "p", count: 4_097), text: "# nope"),
+            .rejected)
+        XCTAssertEqual(
+            vault.update(
+                path: "Alpha.md",
+                text: String(repeating: "x", count: FileTree.defaultMaximumNoteBytes + 1)),
+            .rejected)
+        XCTAssertEqual(vault.contentRevision, revision)
+        XCTAssertTrue(vault.search(String(repeating: "q", count: 4_097)).isEmpty)
+        XCTAssertNil(vault.resolve(target: "Alpha\0ignored"))
+    }
+
+    func testInitialScanStatusReportsSkippedOversizedNoteAsIncomplete() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Small", to: root.appendingPathComponent("Small.md"))
+        let oversized = root.appendingPathComponent("Oversized.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: oversized.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: UInt64(FileTree.defaultMaximumNoteBytes + 1))
+        try handle.close()
+
+        let vault = VaultIndex()
+        vault.open(root)
+
+        let status = try XCTUnwrap(vault.initialScanStatus)
+        XCTAssertFalse(status.isComplete)
+        XCTAssertEqual(status.discoveredFiles, 2)
+        XCTAssertEqual(status.selectedFiles, 1)
+        XCTAssertEqual(status.indexedFiles, 1)
+        XCTAssertEqual(status.skippedFiles, 1)
+        XCTAssertEqual(status.oversizedFiles, 1)
     }
 
     // MARK: - Rename with link rewriting
@@ -72,6 +143,8 @@ final class VaultIndexTests: XCTestCase {
 
         XCTAssertEqual(outcome.rewrittenNotes, 1)
         XCTAssertEqual(outcome.rewrittenLinks, 2)
+        XCTAssertEqual(outcome.failedRewrites, 0)
+        XCTAssertTrue(outcome.isComplete)
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("Roadmap.md").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("Plans/Map.md").path))
 

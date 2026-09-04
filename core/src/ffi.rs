@@ -22,16 +22,33 @@
 use std::ffi::{c_char, CString};
 use std::ptr;
 
-use crate::highlight::HighlightSpan;
-use crate::md::{parse, BlockDescriptor, Document, ParseResult, Reparse, StyleSpan, SyntaxMarker};
-use crate::vault::Vault;
+use crate::highlight::{
+    highlight_checked, supports_checked, HighlightSpan, MAX_HIGHLIGHT_CODE_BYTES,
+    MAX_HIGHLIGHT_LANGUAGE_BYTES,
+};
+use crate::html::render_document;
+use crate::md::{
+    parse_checked, BlockDescriptor, Document, ParseResult, Reparse, StyleSpan, SyntaxMarker,
+    MAX_DOCUMENT_BYTES,
+};
+use crate::vault::{Vault, DEFAULT_MAX_NOTE_BYTES};
+
+/// Maximum UTF-8 bytes accepted for any vault-relative or root path.
+pub const VAULT_MAX_PATH_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 bytes accepted for search, tag, target, anchor, and graph filters.
+pub const VAULT_MAX_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum number of search results materialized across the FFI.
+pub const VAULT_MAX_SEARCH_RESULTS: u32 = 1_000;
+/// `md_vault_update` rejected malformed, invalid UTF-8, or oversized input.
+pub const VAULT_UPDATE_REJECTED: u8 = 0;
+/// `md_vault_update` accepted input identical to the indexed note.
+pub const VAULT_UPDATE_UNCHANGED: u8 = 1;
+/// `md_vault_update` changed the index.
+pub const VAULT_UPDATE_CHANGED: u8 = 2;
 
 /// Opaque handle owning one document's parse result.
 pub struct ParseHandle {
     result: ParseResult,
-    /// Null-terminated copies of the interned strings, built once so
-    /// `md_string` can hand out stable `const char*`.
-    c_strings: Vec<CString>,
 }
 
 /// Parses UTF-8 Markdown into a handle.
@@ -44,24 +61,13 @@ pub struct ParseHandle {
 /// `bytes` must point to at least `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn md_parse(bytes: *const u8, len: usize) -> *mut ParseHandle {
-    if bytes.is_null() {
-        return ptr::null_mut();
-    }
-    let slice = std::slice::from_raw_parts(bytes, len);
-    let Ok(source) = std::str::from_utf8(slice) else {
+    let Some(source) = read_bounded_bytes(bytes, len, MAX_DOCUMENT_BYTES) else {
         return ptr::null_mut();
     };
-
-    let result = parse(source);
-    let c_strings = result
-        .strings
-        .iter()
-        // Interior NULs cannot appear in valid Markdown source, but a lossy
-        // fallback is still cheaper than risking a panic across the boundary.
-        .map(|s| CString::new(s.as_str()).unwrap_or_default())
-        .collect();
-
-    Box::into_raw(Box::new(ParseHandle { result, c_strings }))
+    let Ok(result) = parse_checked(source) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(ParseHandle { result }))
 }
 
 /// Releases a handle. Passing null is a no-op; passing the same handle twice
@@ -89,15 +95,14 @@ pub unsafe extern "C" fn md_spans(
     handle: *const ParseHandle,
     count: *mut usize,
 ) -> *const StyleSpan {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.result.spans.len();
-    }
+    *count = h.result.spans.len();
     h.result.spans.as_ptr()
 }
 
@@ -111,15 +116,14 @@ pub unsafe extern "C" fn md_markers(
     handle: *const ParseHandle,
     count: *mut usize,
 ) -> *const SyntaxMarker {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.result.markers.len();
-    }
+    *count = h.result.markers.len();
     h.result.markers.as_ptr()
 }
 
@@ -133,31 +137,44 @@ pub unsafe extern "C" fn md_blocks(
     handle: *const ParseHandle,
     count: *mut usize,
 ) -> *const BlockDescriptor {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.result.blocks.len();
-    }
+    *count = h.result.blocks.len();
     h.result.blocks.as_ptr()
 }
 
-/// Borrows an interned string by index, or null when out of range.
+/// Borrows one length-delimited interned UTF-8 string by index.
 ///
 /// # Safety
 ///
-/// `handle` must be live.
+/// `handle` must be live and `length` must be writable.
 #[no_mangle]
-pub unsafe extern "C" fn md_string(handle: *const ParseHandle, index: u32) -> *const c_char {
+pub unsafe extern "C" fn md_string(
+    handle: *const ParseHandle,
+    index: u32,
+    length: *mut usize,
+) -> *const u8 {
+    if length.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
+        *length = 0;
         return ptr::null();
     };
-    match h.c_strings.get(index as usize) {
-        Some(s) => s.as_ptr(),
-        None => ptr::null(),
+    match h.result.strings.get(index as usize) {
+        Some(string) => {
+            *length = string.len();
+            string.as_ptr()
+        }
+        None => {
+            *length = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -168,7 +185,7 @@ pub unsafe extern "C" fn md_string(handle: *const ParseHandle, index: u32) -> *c
 /// `handle` must be live.
 #[no_mangle]
 pub unsafe extern "C" fn md_string_count(handle: *const ParseHandle) -> usize {
-    handle.as_ref().map_or(0, |h| h.c_strings.len())
+    handle.as_ref().map_or(0, |h| h.result.strings.len())
 }
 
 /// Semantic version of the FFI contract.
@@ -177,7 +194,87 @@ pub unsafe extern "C" fn md_string_count(handle: *const ParseHandle) -> usize {
 /// launch instead of silently misreading struct layouts.
 #[no_mangle]
 pub extern "C" fn md_abi_version() -> u32 {
-    1
+    3
+}
+
+// ---------------------------------------------------------------------------
+// Safe standalone HTML export
+// ---------------------------------------------------------------------------
+
+/// Opaque, length-delimited UTF-8 HTML. A byte buffer rather than a C string
+/// keeps ownership explicit and makes embedded-NUL handling testable.
+pub struct HTMLHandle {
+    bytes: Box<[u8]>,
+}
+
+/// Renders Markdown and a title into a complete, inert HTML document.
+///
+/// Returns null for invalid UTF-8, an invalid pointer/length pair, or a source
+/// that exceeds the renderer's bounds.
+///
+/// # Safety
+///
+/// Non-null pointers must each address at least their corresponding length.
+#[no_mangle]
+pub unsafe extern "C" fn md_html_render(
+    source: *const u8,
+    source_len: usize,
+    title: *const u8,
+    title_len: usize,
+) -> *mut HTMLHandle {
+    let Some(source) = read_utf8(source, source_len) else {
+        return ptr::null_mut();
+    };
+    let Some(title) = read_utf8(title, title_len) else {
+        return ptr::null_mut();
+    };
+    let Ok(html) = render_document(source, title) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(HTMLHandle {
+        bytes: html.into_bytes().into_boxed_slice(),
+    }))
+}
+
+/// Borrows the rendered bytes until `md_html_free` is called.
+///
+/// # Safety
+///
+/// `handle` must be live and `count` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn md_html_bytes(handle: *const HTMLHandle, count: *mut usize) -> *const u8 {
+    if count.is_null() {
+        return ptr::null();
+    }
+    let Some(handle) = handle.as_ref() else {
+        *count = 0;
+        return ptr::null();
+    };
+    *count = handle.bytes.len();
+    handle.bytes.as_ptr()
+}
+
+/// Releases an HTML handle. Passing null is a no-op.
+///
+/// # Safety
+///
+/// `handle` must come from `md_html_render` and must not be freed twice.
+#[no_mangle]
+pub unsafe extern "C" fn md_html_free(handle: *mut HTMLHandle) {
+    if !handle.is_null() {
+        drop(Box::from_raw(handle));
+    }
+}
+
+/// Reads a possibly-empty UTF-8 byte slice without ever forming a null slice.
+unsafe fn read_utf8<'a>(pointer: *const u8, len: usize) -> Option<&'a str> {
+    if len == 0 {
+        return Some("");
+    }
+    if pointer.is_null() {
+        return None;
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(pointer, len)).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,19 +289,6 @@ pub extern "C" fn md_abi_version() -> u32 {
 /// drift would apply later edits at the wrong offsets.
 pub struct DocumentHandle {
     document: Document,
-    c_strings: Vec<CString>,
-}
-
-impl DocumentHandle {
-    fn refresh_strings(&mut self) {
-        self.c_strings = self
-            .document
-            .result()
-            .strings
-            .iter()
-            .map(|s| CString::new(s.as_str()).unwrap_or_default())
-            .collect();
-    }
 }
 
 /// Creates a document from UTF-8 bytes. Returns null on invalid UTF-8.
@@ -214,22 +298,13 @@ impl DocumentHandle {
 /// `bytes` must point to at least `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn md_document_new(bytes: *const u8, len: usize) -> *mut DocumentHandle {
-    let text = if bytes.is_null() || len == 0 {
-        ""
-    } else {
-        let slice = std::slice::from_raw_parts(bytes, len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s,
-            Err(_) => return ptr::null_mut(),
-        }
+    let Some(text) = read_bounded_bytes(bytes, len, MAX_DOCUMENT_BYTES) else {
+        return ptr::null_mut();
     };
-
-    let mut handle = DocumentHandle {
-        document: Document::new(text),
-        c_strings: Vec::new(),
+    let Ok(document) = Document::try_from_str(text) else {
+        return ptr::null_mut();
     };
-    handle.refresh_strings();
-    Box::into_raw(Box::new(handle))
+    Box::into_raw(Box::new(DocumentHandle { document }))
 }
 
 /// Releases a document handle.
@@ -246,9 +321,8 @@ pub unsafe extern "C" fn md_document_free(handle: *mut DocumentHandle) {
 
 /// Replaces the UTF-16 range `[start, end)` with `replacement`.
 ///
-/// Returns 1 when the edit was absorbed by shifting offsets (no reparse), and
-/// 0 when the document was reparsed in full. Both outcomes leave the result
-/// correct; the distinction is only useful for metrics.
+/// Returns 0 when rejected without mutation, 1 when offsets shifted without a
+/// reparse, and 2 when the whole document was reparsed.
 ///
 /// # Safety
 ///
@@ -266,24 +340,20 @@ pub unsafe extern "C" fn md_document_replace(
         return 0;
     };
 
-    let text = if replacement.is_null() || replacement_len == 0 {
-        ""
-    } else {
-        let slice = std::slice::from_raw_parts(replacement, replacement_len);
-        match std::str::from_utf8(slice) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        }
+    let Some(text) = read_bounded_bytes(replacement, replacement_len, MAX_DOCUMENT_BYTES) else {
+        return 0;
     };
-
+    if start > end || end > handle.document.len_utf16() {
+        return 0;
+    }
     let start_byte = handle.document.byte_offset(start);
-    let end_byte = handle.document.byte_offset(end.max(start));
+    let end_byte = handle.document.byte_offset(end);
     let outcome = handle.document.replace(start_byte..end_byte, text);
-    handle.refresh_strings();
 
     match outcome {
+        Reparse::Rejected => 0,
         Reparse::Shifted(_) => 1,
-        Reparse::Full => 0,
+        Reparse::Full => 2,
     }
 }
 
@@ -307,15 +377,14 @@ pub unsafe extern "C" fn md_document_spans(
     handle: *const DocumentHandle,
     count: *mut usize,
 ) -> *const StyleSpan {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.document.result().spans.len();
-    }
+    *count = h.document.result().spans.len();
     h.document.result().spans.as_ptr()
 }
 
@@ -329,15 +398,14 @@ pub unsafe extern "C" fn md_document_markers(
     handle: *const DocumentHandle,
     count: *mut usize,
 ) -> *const SyntaxMarker {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.document.result().markers.len();
-    }
+    *count = h.document.result().markers.len();
     h.document.result().markers.as_ptr()
 }
 
@@ -351,34 +419,44 @@ pub unsafe extern "C" fn md_document_blocks(
     handle: *const DocumentHandle,
     count: *mut usize,
 ) -> *const BlockDescriptor {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = h.document.result().blocks.len();
-    }
+    *count = h.document.result().blocks.len();
     h.document.result().blocks.as_ptr()
 }
 
-/// Borrows an interned string by index, or null when out of range.
+/// Borrows one length-delimited interned UTF-8 string by index.
 ///
 /// # Safety
 ///
-/// `handle` must be live.
+/// `handle` must be live and `length` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn md_document_string(
     handle: *const DocumentHandle,
     index: u32,
-) -> *const c_char {
+    length: *mut usize,
+) -> *const u8 {
+    if length.is_null() {
+        return ptr::null();
+    }
     let Some(h) = handle.as_ref() else {
+        *length = 0;
         return ptr::null();
     };
-    match h.c_strings.get(index as usize) {
-        Some(s) => s.as_ptr(),
-        None => ptr::null(),
+    match h.document.result().strings.get(index as usize) {
+        Some(string) => {
+            *length = string.len();
+            string.as_ptr()
+        }
+        None => {
+            *length = 0;
+            ptr::null()
+        }
     }
 }
 
@@ -389,7 +467,9 @@ pub unsafe extern "C" fn md_document_string(
 /// `handle` must be live.
 #[no_mangle]
 pub unsafe extern "C" fn md_document_string_count(handle: *const DocumentHandle) -> usize {
-    handle.as_ref().map_or(0, |h| h.c_strings.len())
+    handle
+        .as_ref()
+        .map_or(0, |h| h.document.result().strings.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -447,12 +527,46 @@ pub unsafe extern "C" fn md_vault_clone(handle: *const VaultHandle) -> *mut Vaul
     }))
 }
 
-/// Reads a C string argument, or `None` when null or not UTF-8.
-unsafe fn read_str<'a>(pointer: *const c_char) -> Option<&'a str> {
+/// Reads at most `maximum_bytes + 1` positions from a promised C string.
+/// This caps work for a valid readable C buffer; as with every C ABI, the
+/// caller still owns pointer validity.
+unsafe fn read_bounded_str<'a>(pointer: *const c_char, maximum_bytes: usize) -> Option<&'a str> {
     if pointer.is_null() {
         return None;
     }
-    std::ffi::CStr::from_ptr(pointer).to_str().ok()
+    for length in 0..=maximum_bytes {
+        if *pointer.add(length) == 0 {
+            let bytes = std::slice::from_raw_parts(pointer.cast::<u8>(), length);
+            return std::str::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
+
+unsafe fn read_optional_bounded_str<'a>(
+    pointer: *const c_char,
+    maximum_bytes: usize,
+) -> Result<Option<&'a str>, ()> {
+    if pointer.is_null() {
+        Ok(None)
+    } else {
+        read_bounded_str(pointer, maximum_bytes).map(Some).ok_or(())
+    }
+}
+
+/// Reads a length-delimited UTF-8 buffer, accepting null only for empty data.
+unsafe fn read_bounded_bytes<'a>(
+    pointer: *const u8,
+    length: usize,
+    maximum_bytes: usize,
+) -> Option<&'a str> {
+    if length > maximum_bytes || (pointer.is_null() && length != 0) {
+        return None;
+    }
+    if length == 0 {
+        return Some("");
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(pointer, length)).ok()
 }
 
 /// Indexes every Markdown file under `path`.
@@ -462,9 +576,12 @@ unsafe fn read_str<'a>(pointer: *const c_char) -> Option<&'a str> {
 /// `path` must be a NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn md_vault_open(path: *const c_char) -> *mut VaultHandle {
-    let Some(path) = read_str(path) else {
+    let Some(path) = read_bounded_str(path, VAULT_MAX_PATH_BYTES) else {
         return ptr::null_mut();
     };
+    if path.is_empty() || !std::path::Path::new(path).is_absolute() {
+        return ptr::null_mut();
+    }
     Box::into_raw(Box::new(VaultHandle {
         vault: Vault::open(path),
         scratch: None,
@@ -493,22 +610,50 @@ pub unsafe extern "C" fn md_vault_note_count(handle: *const VaultHandle) -> u32 
     handle.as_ref().map_or(0, |h| h.vault.notes().len() as u32)
 }
 
+/// JSON coverage status for the initial filesystem scan.
+///
+/// # Safety
+///
+/// `handle` must be live. The returned pointer is borrowed until the next
+/// query on this handle.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_scan_status(handle: *mut VaultHandle) -> *const c_char {
+    let Some(handle) = handle.as_mut() else {
+        return ptr::null();
+    };
+    let status = handle.vault.scan_status();
+    handle.serve(&status)
+}
+
 /// Re-indexes one note from text the caller already has in memory.
 ///
 /// # Safety
 ///
-/// `handle` must be live; `path` and `text` must be NUL-terminated UTF-8.
+/// `handle` must be live. `path` and `text` must each point to their stated
+/// number of readable bytes; a null pointer is valid only for zero bytes.
 #[no_mangle]
 pub unsafe extern "C" fn md_vault_update(
     handle: *mut VaultHandle,
-    path: *const c_char,
-    text: *const c_char,
-) {
-    let (Some(handle), Some(path), Some(text)) = (handle.as_mut(), read_str(path), read_str(text))
-    else {
-        return;
+    path: *const u8,
+    path_len: usize,
+    text: *const u8,
+    text_len: usize,
+) -> u8 {
+    let (Some(handle), Some(path), Some(text)) = (
+        handle.as_mut(),
+        read_bounded_bytes(path, path_len, VAULT_MAX_PATH_BYTES),
+        read_bounded_bytes(text, text_len, DEFAULT_MAX_NOTE_BYTES),
+    ) else {
+        return VAULT_UPDATE_REJECTED;
     };
-    handle.vault.update(path, text);
+    if crate::vault::index::validated_relative_path(path).is_none() {
+        return VAULT_UPDATE_REJECTED;
+    }
+    if handle.vault.update(path, text) {
+        VAULT_UPDATE_CHANGED
+    } else {
+        VAULT_UPDATE_UNCHANGED
+    }
 }
 
 /// Drops `path` from the index after its file has left the disk.
@@ -523,18 +668,27 @@ pub unsafe extern "C" fn md_vault_update(
 /// `handle` must be live; `path` must be NUL-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn md_vault_remove(handle: *mut VaultHandle, path: *const c_char) {
-    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+    let (Some(handle), Some(path)) = (
+        handle.as_mut(),
+        read_bounded_str(path, VAULT_MAX_PATH_BYTES),
+    ) else {
         return;
     };
+    if crate::vault::index::validated_relative_path(path).is_none() {
+        return;
+    }
     handle.vault.remove(path);
 }
 
 /// Moves the note at `from` to `to`, rewriting every link that resolved to
-/// it, and answers JSON `{rewritten_notes, rewritten_links}`.
+/// it, and answers JSON `{rewritten_notes, rewritten_links, failed_rewrites,
+/// complete}`.
 ///
 /// The file itself is moved by this call. Null comes back when the move was
 /// refused — unknown source, destination already taken, or a file error — so
-/// the caller can say "no" rather than guessing why.
+/// the caller can say "no" rather than guessing why. A non-null response with
+/// `complete: false` means the source moved but at least one staged link
+/// rewrite could not be committed; callers must surface that partial result.
 ///
 /// # Safety
 ///
@@ -545,8 +699,11 @@ pub unsafe extern "C" fn md_vault_rename(
     from: *const c_char,
     to: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(from), Some(to)) = (handle.as_mut(), read_str(from), read_str(to))
-    else {
+    let (Some(handle), Some(from), Some(to)) = (
+        handle.as_mut(),
+        read_bounded_str(from, VAULT_MAX_PATH_BYTES),
+        read_bounded_str(to, VAULT_MAX_PATH_BYTES),
+    ) else {
         return ptr::null();
     };
     match handle.vault.rename_note(from, to) {
@@ -568,7 +725,10 @@ pub unsafe extern "C" fn md_vault_backlinks(
     handle: *mut VaultHandle,
     path: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+    let (Some(handle), Some(path)) = (
+        handle.as_mut(),
+        read_bounded_str(path, VAULT_MAX_PATH_BYTES),
+    ) else {
         return ptr::null();
     };
     let value = handle.vault.backlinks(path);
@@ -591,7 +751,10 @@ pub unsafe extern "C" fn md_vault_links(
     handle: *mut VaultHandle,
     path: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+    let (Some(handle), Some(path)) = (
+        handle.as_mut(),
+        read_bounded_str(path, VAULT_MAX_PATH_BYTES),
+    ) else {
         return ptr::null();
     };
     let value = handle.vault.links(path);
@@ -608,7 +771,10 @@ pub unsafe extern "C" fn md_vault_unlinked_mentions(
     handle: *mut VaultHandle,
     path: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+    let (Some(handle), Some(path)) = (
+        handle.as_mut(),
+        read_bounded_str(path, VAULT_MAX_PATH_BYTES),
+    ) else {
         return ptr::null();
     };
     let value = handle.vault.unlinked_mentions(path);
@@ -625,7 +791,10 @@ pub unsafe extern "C" fn md_vault_outline(
     handle: *mut VaultHandle,
     path: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(path)) = (handle.as_mut(), read_str(path)) else {
+    let (Some(handle), Some(path)) = (
+        handle.as_mut(),
+        read_bounded_str(path, VAULT_MAX_PATH_BYTES),
+    ) else {
         return ptr::null();
     };
     let value = handle
@@ -647,10 +816,15 @@ pub unsafe extern "C" fn md_vault_search(
     query: *const c_char,
     limit: u32,
 ) -> *const c_char {
-    let (Some(handle), Some(query)) = (handle.as_mut(), read_str(query)) else {
+    let (Some(handle), Some(query)) = (
+        handle.as_mut(),
+        read_bounded_str(query, VAULT_MAX_QUERY_BYTES),
+    ) else {
         return ptr::null();
     };
-    let value = handle.vault.search(query, limit as usize);
+    let value = handle
+        .vault
+        .search(query, limit.min(VAULT_MAX_SEARCH_RESULTS) as usize);
     handle.serve(&value)
 }
 
@@ -680,7 +854,10 @@ pub unsafe extern "C" fn md_vault_notes_with_tag(
     handle: *mut VaultHandle,
     tag: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(tag)) = (handle.as_mut(), read_str(tag)) else {
+    let (Some(handle), Some(tag)) = (
+        handle.as_mut(),
+        read_bounded_str(tag, VAULT_MAX_QUERY_BYTES),
+    ) else {
         return ptr::null();
     };
     let value = handle.vault.notes_with_tag(tag);
@@ -699,10 +876,15 @@ pub unsafe extern "C" fn md_vault_resolve(
     target: *const c_char,
     anchor: *const c_char,
 ) -> *const c_char {
-    let (Some(handle), Some(target)) = (handle.as_mut(), read_str(target)) else {
+    let (Some(handle), Some(target)) = (
+        handle.as_mut(),
+        read_bounded_str(target, VAULT_MAX_QUERY_BYTES),
+    ) else {
         return ptr::null();
     };
-    let anchor = read_str(anchor);
+    let Ok(anchor) = read_optional_bounded_str(anchor, VAULT_MAX_QUERY_BYTES) else {
+        return ptr::null();
+    };
     let value = handle.vault.resolve(target, anchor);
     handle.serve(&value)
 }
@@ -754,11 +936,18 @@ pub unsafe extern "C" fn md_vault_graph(
     let Some(handle) = handle.as_mut() else {
         return ptr::null();
     };
+    let (Ok(focus), Ok(tag), Ok(folder)) = (
+        read_optional_bounded_str(focus, VAULT_MAX_QUERY_BYTES),
+        read_optional_bounded_str(tag, VAULT_MAX_QUERY_BYTES),
+        read_optional_bounded_str(folder, VAULT_MAX_PATH_BYTES),
+    ) else {
+        return ptr::null();
+    };
     let query = crate::vault::GraphQuery {
-        focus: read_str(focus),
+        focus,
         depth,
-        tag: read_str(tag),
-        folder: read_str(folder),
+        tag,
+        folder,
     };
     let graph = crate::vault::Graph::build(&handle.vault, &query);
     handle.serve(&graph)
@@ -783,24 +972,27 @@ pub struct HighlightHandle {
 ///
 /// # Safety
 ///
-/// `language` must be NUL-terminated UTF-8; `code` must point to `code_len`
-/// readable bytes.
+/// Each non-null pointer must address at least its corresponding length.
+/// Null is accepted only with a zero length.
 #[no_mangle]
 pub unsafe extern "C" fn md_highlight(
-    language: *const c_char,
+    language: *const u8,
+    language_len: usize,
     code: *const u8,
     code_len: usize,
 ) -> *mut HighlightHandle {
-    let language: &str = read_str(language).unwrap_or_default();
-    let code = if code.is_null() || code_len == 0 {
-        ""
-    } else {
-        std::str::from_utf8(std::slice::from_raw_parts(code, code_len)).unwrap_or_default()
+    let Some(language) = read_bounded_bytes(language, language_len, MAX_HIGHLIGHT_LANGUAGE_BYTES)
+    else {
+        return ptr::null_mut();
+    };
+    let Some(code) = read_bounded_bytes(code, code_len, MAX_HIGHLIGHT_CODE_BYTES) else {
+        return ptr::null_mut();
+    };
+    let Ok(spans) = highlight_checked(language, code) else {
+        return ptr::null_mut();
     };
 
-    Box::into_raw(Box::new(HighlightHandle {
-        spans: crate::highlight::highlight(language, code),
-    }))
+    Box::into_raw(Box::new(HighlightHandle { spans }))
 }
 
 /// Releases a highlight handle.
@@ -825,15 +1017,14 @@ pub unsafe extern "C" fn md_highlight_spans(
     handle: *const HighlightHandle,
     count: *mut usize,
 ) -> *const HighlightSpan {
+    if count.is_null() {
+        return ptr::null();
+    }
     let Some(handle) = handle.as_ref() else {
-        if !count.is_null() {
-            *count = 0;
-        }
+        *count = 0;
         return ptr::null();
     };
-    if !count.is_null() {
-        *count = handle.spans.len();
-    }
+    *count = handle.spans.len();
     handle.spans.as_ptr()
 }
 
@@ -841,11 +1032,12 @@ pub unsafe extern "C" fn md_highlight_spans(
 ///
 /// # Safety
 ///
-/// `language` must be NUL-terminated UTF-8, or null.
+/// `language` must address `language_len` readable bytes. Null is accepted
+/// only with a zero length.
 #[no_mangle]
-pub unsafe extern "C" fn md_highlight_supports(language: *const c_char) -> u8 {
-    match read_str(language) {
-        Some(value) if crate::highlight::supports(value) => 1,
+pub unsafe extern "C" fn md_highlight_supports(language: *const u8, language_len: usize) -> u8 {
+    match read_bounded_bytes(language, language_len, MAX_HIGHLIGHT_LANGUAGE_BYTES) {
+        Some(value) if supports_checked(value) == Ok(true) => 1,
         _ => 0,
     }
 }
@@ -861,6 +1053,14 @@ mod tests {
             return None;
         }
         unsafe { Some(CStr::from_ptr(s).to_string_lossy().into_owned()) }
+    }
+
+    fn read_bytes(pointer: *const u8, length: usize) -> Option<String> {
+        if pointer.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
     }
 
     #[test]
@@ -890,11 +1090,13 @@ mod tests {
         let src = "```swift\nlet x = 1\n```";
         let handle = unsafe { md_parse(src.as_ptr(), src.len()) };
         assert_eq!(unsafe { md_string_count(handle) }, 1);
+        let mut length = 0usize;
         assert_eq!(
-            read(unsafe { md_string(handle, 0) }).as_deref(),
+            read_bytes(unsafe { md_string(handle, 0, &mut length) }, length).as_deref(),
             Some("swift")
         );
-        assert!(unsafe { md_string(handle, 99) }.is_null());
+        assert!(unsafe { md_string(handle, 99, &mut length) }.is_null());
+        assert_eq!(length, 0);
         unsafe { md_free(handle) };
     }
 
@@ -907,13 +1109,18 @@ mod tests {
 
     #[test]
     fn null_inputs_are_handled() {
-        assert!(unsafe { md_parse(ptr::null(), 0) }.is_null());
+        let empty = unsafe { md_parse(ptr::null(), 0) };
+        assert!(!empty.is_null());
+        unsafe { md_free(empty) };
+        assert!(unsafe { md_parse(ptr::null(), 1) }.is_null());
         let mut count = 7usize;
         assert!(unsafe { md_spans(ptr::null(), &mut count) }.is_null());
         assert_eq!(count, 0, "count must be zeroed when the handle is null");
         assert!(unsafe { md_markers(ptr::null(), &mut count) }.is_null());
         assert!(unsafe { md_blocks(ptr::null(), &mut count) }.is_null());
         assert_eq!(unsafe { md_string_count(ptr::null()) }, 0);
+        assert!(unsafe { md_spans(ptr::null(), ptr::null_mut()) }.is_null());
+        assert!(unsafe { md_string(ptr::null(), 0, ptr::null_mut()) }.is_null());
         unsafe { md_free(ptr::null_mut()) };
     }
 
@@ -929,7 +1136,22 @@ mod tests {
 
     #[test]
     fn abi_version_is_stable() {
-        assert_eq!(md_abi_version(), 1);
+        assert_eq!(md_abi_version(), 3);
+    }
+
+    #[test]
+    fn html_bytes_require_a_writable_count_and_zero_it_for_a_null_handle() {
+        let source = b"body";
+        let title = b"title";
+        let handle =
+            unsafe { md_html_render(source.as_ptr(), source.len(), title.as_ptr(), title.len()) };
+        assert!(!handle.is_null());
+        assert!(unsafe { md_html_bytes(handle, ptr::null_mut()) }.is_null());
+
+        let mut count = usize::MAX;
+        assert!(unsafe { md_html_bytes(ptr::null(), &mut count) }.is_null());
+        assert_eq!(count, 0);
+        unsafe { md_html_free(handle) };
     }
 
     // --- incremental document ---
@@ -976,7 +1198,7 @@ mod tests {
         let fence = "```\n";
         let at = src.find("plain").expect("anchor") as u32;
         let shifted = unsafe { md_document_replace(handle, at, at, fence.as_ptr(), fence.len()) };
-        assert_eq!(shifted, 0, "an opening fence must force a full reparse");
+        assert_eq!(shifted, 2, "an opening fence must force a full reparse");
         unsafe { md_document_free(handle) };
     }
 
@@ -1055,10 +1277,183 @@ mod tests {
     }
 
     #[test]
+    fn vault_update_preserves_embedded_nul_bytes_in_note_text() {
+        let root = std::env::temp_dir().join(format!(
+            "markdev-ffi-nul-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create");
+        std::fs::write(root.join("A.md"), "# A\n").expect("write");
+
+        let root_path = CString::new(root.to_string_lossy().as_ref()).expect("path");
+        let handle = unsafe { md_vault_open(root_path.as_ptr()) };
+        assert!(!handle.is_null());
+        let path = CString::new("A.md").expect("path");
+        let text = b"# A\0after-nul-token\0";
+
+        let update = unsafe {
+            md_vault_update(
+                handle,
+                path.as_bytes().as_ptr(),
+                path.as_bytes().len(),
+                text.as_ptr(),
+                text.len() - 1,
+            )
+        };
+        let query = CString::new("after-nul-token").expect("query");
+        let hits = read(unsafe { md_vault_search(handle, query.as_ptr(), 10) }).expect("json");
+
+        unsafe { md_vault_free(handle) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(update, VAULT_UPDATE_CHANGED);
+        assert!(
+            hits.contains("A.md"),
+            "text after NUL was discarded: {hits}"
+        );
+    }
+
+    #[test]
+    fn vault_update_distinguishes_rejected_unchanged_and_changed() {
+        let root = std::env::temp_dir().join(format!(
+            "markdev-ffi-update-status-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create");
+        let original = "# A\n";
+        std::fs::write(root.join("A.md"), original).expect("write");
+        let root_path = CString::new(root.to_string_lossy().as_ref()).expect("path");
+        let handle = unsafe { md_vault_open(root_path.as_ptr()) };
+        let path = b"A.md";
+
+        let unchanged = unsafe {
+            md_vault_update(
+                handle,
+                path.as_ptr(),
+                path.len(),
+                original.as_ptr(),
+                original.len(),
+            )
+        };
+        let replacement = "# A\n\nchanged";
+        let changed = unsafe {
+            md_vault_update(
+                handle,
+                path.as_ptr(),
+                path.len(),
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        let unchanged_again = unsafe {
+            md_vault_update(
+                handle,
+                path.as_ptr(),
+                path.len(),
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+        let hostile_path = b"../Escape.md";
+        let rejected = unsafe {
+            md_vault_update(
+                handle,
+                hostile_path.as_ptr(),
+                hostile_path.len(),
+                replacement.as_ptr(),
+                replacement.len(),
+            )
+        };
+
+        unsafe { md_vault_free(handle) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(unchanged, VAULT_UPDATE_UNCHANGED);
+        assert_eq!(changed, VAULT_UPDATE_CHANGED);
+        assert_eq!(unchanged_again, VAULT_UPDATE_UNCHANGED);
+        assert_eq!(rejected, VAULT_UPDATE_REJECTED);
+    }
+
+    #[test]
+    fn vault_ffi_rejects_oversized_paths_queries_and_update_text() {
+        let root = std::env::temp_dir().join(format!(
+            "markdev-ffi-bounds-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create");
+        std::fs::write(root.join("A.md"), "# A\n").expect("write");
+        let root_path = CString::new(root.to_string_lossy().as_ref()).expect("path");
+        let handle = unsafe { md_vault_open(root_path.as_ptr()) };
+        let oversized_path = vec![b'p'; VAULT_MAX_PATH_BYTES + 1];
+        let text = b"body";
+        let oversized_text = vec![b'x'; DEFAULT_MAX_NOTE_BYTES + 1];
+        let oversized_query = vec![b'q'; VAULT_MAX_QUERY_BYTES + 1];
+
+        assert_eq!(
+            unsafe {
+                md_vault_update(
+                    handle,
+                    oversized_path.as_ptr(),
+                    oversized_path.len(),
+                    text.as_ptr(),
+                    text.len(),
+                )
+            },
+            VAULT_UPDATE_REJECTED
+        );
+        assert_eq!(
+            unsafe {
+                md_vault_update(
+                    handle,
+                    b"A.md".as_ptr(),
+                    4,
+                    oversized_text.as_ptr(),
+                    oversized_text.len(),
+                )
+            },
+            VAULT_UPDATE_REJECTED
+        );
+        assert!(unsafe { md_vault_search(handle, oversized_query.as_ptr().cast(), 10) }.is_null());
+
+        unsafe { md_vault_free(handle) };
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vault_initial_scan_status_crosses_ffi_without_losing_coverage_counts() {
+        let root = std::env::temp_dir().join(format!(
+            "markdev-ffi-scan-status-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create");
+        std::fs::write(root.join("A.md"), "# A\n").expect("write");
+        let root_path = CString::new(root.to_string_lossy().as_ref()).expect("path");
+        let handle = unsafe { md_vault_open(root_path.as_ptr()) };
+
+        let json = read(unsafe { md_vault_scan_status(handle) }).expect("status JSON");
+        let status: crate::vault::VaultScanStatus = serde_json::from_str(&json).expect("decode");
+
+        unsafe { md_vault_free(handle) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(status.is_complete());
+        assert_eq!(status.discovered_files, 1);
+        assert_eq!(status.selected_files, 1);
+        assert_eq!(status.indexed_files, 1);
+        assert_eq!(status.skipped_files, 0);
+    }
+
+    #[test]
     fn highlighting_round_trips_across_the_ffi() {
-        let language = CString::new("rust").expect("language");
+        let language = b"rust";
         let code = "fn main() { let x = 1; }";
-        let handle = unsafe { md_highlight(language.as_ptr(), code.as_ptr(), code.len()) };
+        let handle =
+            unsafe { md_highlight(language.as_ptr(), language.len(), code.as_ptr(), code.len()) };
         assert!(!handle.is_null());
 
         let mut count = 0usize;
@@ -1073,14 +1468,18 @@ mod tests {
         }
 
         unsafe { md_highlight_free(handle) };
-        assert_eq!(unsafe { md_highlight_supports(language.as_ptr()) }, 1);
+        assert_eq!(
+            unsafe { md_highlight_supports(language.as_ptr(), language.len()) },
+            1
+        );
     }
 
     #[test]
     fn highlighting_handles_unknown_languages_and_null() {
-        let unknown = CString::new("klingon").expect("language");
+        let unknown = b"klingon";
         let code = "fn main() {}";
-        let handle = unsafe { md_highlight(unknown.as_ptr(), code.as_ptr(), code.len()) };
+        let handle =
+            unsafe { md_highlight(unknown.as_ptr(), unknown.len(), code.as_ptr(), code.len()) };
         assert!(
             !handle.is_null(),
             "an unknown language still yields a handle"
@@ -1089,15 +1488,19 @@ mod tests {
         let mut count = 9usize;
         unsafe { md_highlight_spans(handle, &mut count) };
         assert_eq!(count, 0);
+        assert!(unsafe { md_highlight_spans(handle, ptr::null_mut()) }.is_null());
         unsafe { md_highlight_free(handle) };
 
-        assert_eq!(unsafe { md_highlight_supports(ptr::null()) }, 0);
+        assert_eq!(unsafe { md_highlight_supports(ptr::null(), 0) }, 0);
+        assert_eq!(unsafe { md_highlight_supports(ptr::null(), 1) }, 0);
         assert!(unsafe { md_highlight_spans(ptr::null(), &mut count) }.is_null());
         unsafe { md_highlight_free(ptr::null_mut()) };
 
-        let handle = unsafe { md_highlight(ptr::null(), ptr::null(), 0) };
-        assert!(!handle.is_null());
-        unsafe { md_highlight_free(handle) };
+        let empty_language = unsafe { md_highlight(ptr::null(), 0, code.as_ptr(), code.len()) };
+        assert!(!empty_language.is_null());
+        unsafe { md_highlight_free(empty_language) };
+        assert!(unsafe { md_highlight(ptr::null(), 1, ptr::null(), 0) }.is_null());
+        assert!(unsafe { md_highlight(unknown.as_ptr(), unknown.len(), ptr::null(), 1) }.is_null());
     }
 
     #[test]

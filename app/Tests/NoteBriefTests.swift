@@ -153,4 +153,25 @@ final class NoteBriefEditTests: XCTestCase {
         XCTAssertTrue(assistant.insertKeyPoints())
         XCTAssertTrue(view.markdown.hasSuffix("- One\n- Two"))
     }
+
+    /// The inspector is shared by every split pane. A brief generated for one
+    /// note must never become an edit offered against whichever note happens
+    /// to receive focus next.
+    func testABriefCannotBeAppliedToAnotherEditor() {
+        let (assistant, source) = makeAssistant("Source body.\n")
+        assistant.brief = NoteBrief(
+            summary: "Source summary", keyPoints: ["Source point"],
+            title: "Source title", tags: ["source"])
+
+        let other = MarkdownTextView.make()
+        other.setMarkdown("Other body.\n")
+        assistant.attach(to: other)
+
+        XCTAssertFalse(assistant.applyTitle())
+        XCTAssertFalse(assistant.insertTags())
+        XCTAssertFalse(assistant.insertKeyPoints())
+        XCTAssertFalse(assistant.insertSummary())
+        XCTAssertEqual(source.markdown, "Source body.\n")
+        XCTAssertEqual(other.markdown, "Other body.\n")
+    }
 }

@@ -36,7 +36,7 @@ final class TerminalProcessTests: XCTestCase {
     private func run(_ executable: String, _ args: [String], timeout: TimeInterval = 10)
         -> TerminalExit
     {
-        let view = LocalProcessTerminalView(
+        let view = MarkDevTerminalView(
             frame: NSRect(x: 0, y: 0, width: 400, height: 200))
         let recorder = Recorder()
         view.processDelegate = recorder
@@ -112,5 +112,85 @@ final class TerminalExitTests: XCTestCase {
         XCTAssertEqual(TerminalExit.code(7).summary, "exited (7)")
         XCTAssertEqual(TerminalExit.signal(9).summary, "killed (signal 9)")
         XCTAssertEqual(TerminalExit.unknown.summary, "ended")
+    }
+}
+
+final class TerminalExitStatusResolverTests: XCTestCase {
+    func testAProvisionalZeroIsReplacedByTheStatusCollectedAfterTheExitEvent() {
+        var observations: [TerminalExitStatusResolver.WaitObservation] = [
+            .stillRunning,
+            .interrupted,
+            .exited(21 << 8),
+        ]
+        var pauses = 0
+
+        let status = TerminalExitStatusResolver.resolve(
+            reportedStatus: 0,
+            maxPolls: observations.count,
+            poll: { observations.removeFirst() },
+            pause: { pauses += 1 })
+
+        XCTAssertEqual(TerminalExit(waitStatus: status), .code(21))
+        XCTAssertEqual(pauses, 1, "only a genuinely running child should delay the next poll")
+    }
+
+    func testAProvisionalZeroFailsClosedWhenCollectionNeverCompletes() {
+        var polls = 0
+        let status = TerminalExitStatusResolver.resolve(
+            reportedStatus: 0,
+            maxPolls: 3,
+            poll: {
+                polls += 1
+                return .stillRunning
+            },
+            pause: {})
+
+        XCTAssertNil(status, "an uncollected status must not masquerade as exit code zero")
+        XCTAssertEqual(polls, 3, "status collection must stay bounded")
+    }
+
+    func testAStatusSwiftTermAlreadyCollectedRemainsAuthoritative() {
+        var polled = false
+        let reported = Int32(37 << 8)
+
+        let status = TerminalExitStatusResolver.resolve(
+            reportedStatus: reported,
+            maxPolls: 3,
+            poll: {
+                polled = true
+                return .alreadyCollected
+            },
+            pause: {})
+
+        XCTAssertEqual(status, reported)
+        XCTAssertFalse(polled, "a nonzero wait status cannot be the zero-initialization race")
+    }
+
+    func testACleanStatusAlreadyCollectedBySwiftTermRemainsClean() {
+        let status = TerminalExitStatusResolver.resolve(
+            reportedStatus: 0,
+            maxPolls: 1,
+            poll: { .alreadyCollected },
+            pause: { XCTFail("an already-collected child must not be delayed") })
+
+        XCTAssertEqual(TerminalExit(waitStatus: status), .code(0))
+    }
+
+    func testAWaitFailureDoesNotMasqueradeAsSuccess() {
+        let status = TerminalExitStatusResolver.resolve(
+            reportedStatus: 0,
+            maxPolls: 1,
+            poll: { .failed },
+            pause: { XCTFail("a failed wait must not be retried as if the child were running") })
+
+        XCTAssertNil(status)
+    }
+
+    func testAProvisionalZeroWithoutAChildPIDFailsClosed() {
+        XCTAssertNil(TerminalExitStatusResolver.resolve(pid: 0, reportedStatus: 0))
+        XCTAssertEqual(
+            TerminalExitStatusResolver.resolve(pid: 0, reportedStatus: 7 << 8),
+            7 << 8,
+            "only a provisional zero needs a child to resolve it")
     }
 }

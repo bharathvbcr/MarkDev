@@ -122,14 +122,49 @@ final class NoteTextCacheTests: XCTestCase {
 
     // MARK: - Bounds
 
-    func testAFileTooLargeToHoldIsStillReadableButNotCached() throws {
+    func testAFileTooLargeToHoldIsRefusedAndNotCached() throws {
         let cache = NoteTextCache(maximumFileBytes: 16)
         let url = try write(String(repeating: "x", count: 64), to: "big.md")
 
-        XCTAssertEqual(try cache.utf8Text(at: url).count, 64)
+        XCTAssertThrowsError(try cache.utf8Text(at: url))
         XCTAssertNil(cache.cached(url))
         XCTAssertNil(cache.warm(url), "and the warmer declines it up front")
         XCTAssertEqual(cache.cachedBytes, 0)
+    }
+
+    func testABoundedReadRefusesOneBytePastTheLimit() throws {
+        let cache = NoteTextCache(maximumFileBytes: 128)
+        let url = try write(String(repeating: "x", count: 65), to: "too-large.md")
+
+        XCTAssertThrowsError(try cache.read(url, maximumBytes: 64)) { error in
+            guard let typed = error as? NoteTextReadError,
+                case .fileTooLarge(let refused, let maximumBytes) = typed
+            else { return XCTFail("unexpected error: \(error)") }
+            XCTAssertEqual(refused.lastPathComponent, url.lastPathComponent)
+            XCTAssertEqual(maximumBytes, 64)
+        }
+        XCTAssertNil(cache.cached(url), "refused input must not enter the shared cache")
+    }
+
+    func testABoundedReadAcceptsTheExactLimit() throws {
+        let cache = NoteTextCache(maximumFileBytes: 64)
+        let url = try write(String(repeating: "x", count: 64), to: "edge.md")
+
+        XCTAssertEqual(try cache.read(url, maximumBytes: 64).count, 64)
+    }
+
+    func testACachedEntryCannotBypassASmallerCallSiteLimit() throws {
+        let cache = NoteTextCache(maximumFileBytes: 128)
+        let url = try write(String(repeating: "x", count: 65), to: "cached.md")
+        XCTAssertEqual(try cache.read(url, maximumBytes: 65).count, 65)
+
+        XCTAssertThrowsError(try cache.read(url, maximumBytes: 64)) { error in
+            guard let typed = error as? NoteTextReadError,
+                case .fileTooLarge(let refused, let maximumBytes) = typed
+            else { return XCTFail("unexpected error: \(error)") }
+            XCTAssertEqual(refused.lastPathComponent, url.lastPathComponent)
+            XCTAssertEqual(maximumBytes, 64)
+        }
     }
 
     func testTheCacheIsBoundedByTotalBytes() throws {
@@ -149,12 +184,25 @@ final class NoteTextCacheTests: XCTestCase {
         // The eviction loop stops at one entry so it can never drop what it is
         // in the middle of returning; the size guard is what keeps that from
         // pinning something bigger than the budget forever.
-        let cache = NoteTextCache(maximumFileBytes: 10, maximumTotalBytes: 10)
+        let cache = NoteTextCache(maximumFileBytes: 100, maximumTotalBytes: 10)
         let url = try write(String(repeating: "x", count: 50), to: "a.md")
 
-        _ = try cache.read(url)
+        _ = try cache.read(url, maximumBytes: 50)
 
         XCTAssertEqual(cache.cachedBytes, 0)
+    }
+
+    func testASpecialFileIsRefusedWithoutWaitingForAWriter() throws {
+        let cache = NoteTextCache(maximumFileBytes: 64)
+        let url = directory.appendingPathComponent("pipe.md")
+        XCTAssertEqual(url.path.withCString { Darwin.mkfifo($0, 0o600) }, 0)
+
+        XCTAssertThrowsError(try cache.read(url)) { error in
+            guard let typed = error as? NoteTextReadError,
+                case .unsupportedFile(let refused) = typed
+            else { return XCTFail("unexpected error: \(error)") }
+            XCTAssertEqual(refused.lastPathComponent, url.lastPathComponent)
+        }
     }
 
     func testTheSamePathSpelledDifferentlyIsOneEntry() throws {

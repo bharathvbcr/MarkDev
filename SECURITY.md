@@ -41,3 +41,4 @@ If you discover a security vulnerability or potential exploit in MarkDev, please
 - **No Remote Fetching**: MarkDev never downloads remote images or scripts dynamically during Markdown rendering. Image resolution is strictly confined to local paths.
 - **Terminal Isolation**: The integrated terminal emulator runs with user-scoped standard permissions and does not expose open ports or unauthenticated inter-process bridges.
 - **Sandboxed FFI Boundary**: Rust/Swift FFI bridges pass validated data buffers without direct memory leaks or unsafe raw pointer escapes across actors.
+- **Local-Only Diagnostics**: diagnostic reports are generated from local runtime telemetry only and are designed for support workflows; they do not include file bodies or unbounded path payloads.

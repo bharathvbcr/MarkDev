@@ -8,6 +8,48 @@
 
 import Foundation
 
+/// Result of one file-open attempt at the UI boundary.
+///
+/// Success is explicit rather than inferred from whether an alert happens to
+/// be present. An alert may describe an earlier item or operation and is not a
+/// reliable return channel for document state.
+public enum DocumentOpenAttempt: Equatable, Sendable {
+    case opened
+    case failed(String)
+
+    public var didOpen: Bool {
+        if case .opened = self { return true }
+        return false
+    }
+
+    public var failureMessage: String? {
+        guard case .failed(let message) = self else { return nil }
+        return message
+    }
+}
+
+/// Accumulates a multi-file open without allowing one item's error UI to stand
+/// in for another item's result.
+public struct DocumentOpenBatchOutcome: Equatable, Sendable {
+    public private(set) var openedCount = 0
+    public private(set) var failureMessage: String?
+
+    public init() {}
+
+    public mutating func record(_ attempt: DocumentOpenAttempt) {
+        switch attempt {
+        case .opened:
+            openedCount += 1
+        case .failed(let message):
+            // Preserve the prior behaviour for multiple genuine failures: the
+            // last attempted file is the one named by the resulting alert.
+            failureMessage = message
+        }
+    }
+
+    public var openedAnything: Bool { openedCount > 0 }
+}
+
 /// Files to open, and what was left out.
 public struct DocumentOpenRequest: Equatable, Sendable {
     public let urls: [URL]
@@ -213,6 +255,17 @@ public final class DocumentInbox {
     /// scheme, a synchronous network fetch on the main thread.
     public func receive(_ urls: [URL]) {
         enqueue(urls.filter(\.isFileURL))
+        deliverPending()
+    }
+
+    /// Puts a request previously accepted by a surface back at the head.
+    ///
+    /// The full value is required: re-enqueuing only `urls` silently drops the
+    /// count of files already refused by the batch bound, and appending them as
+    /// new arrivals also lets later requests overtake them.
+    public func requeue(_ request: DocumentOpenRequest) {
+        guard !request.isEmpty else { return }
+        restore(request)
         deliverPending()
     }
 

@@ -39,7 +39,17 @@ Constructs that consist *entirely* of syntax (such as `- [ ]` checkboxes and `--
 
 ---
 
-## 3. Custom Text Layout Fragments (`MarkdownLayoutFragment`)
+## 3. Assisted Editing and AI Safety
+
+AI-assisted writing and proofreading features share the same document graph as native edits, but only apply changes when source identity checks still match:
+
+- `WritingAssistant` verifies the exact snapshot before replacement.
+- `DocumentAssistant` validates selection offsets before applying corrections.
+- If content mutates while a model task is in-flight, the result is discarded or surfaced as stale rather than applying out-of-date edits.
+
+---
+
+## 4. Custom Text Layout Fragments (`MarkdownLayoutFragment`)
 
 TextKit 2 breaks text into `NSTextLayoutFragment` instances corresponding to layout paragraphs. MarkDev provides a custom `MarkdownLayoutFragment` subclass that handles custom background panels, borders, and embedded drawings.
 
@@ -61,7 +71,7 @@ TextKit 2 breaks text into `NSTextLayoutFragment` instances corresponding to lay
 
 ---
 
-## 4. GFM Tables as a Grid
+## 5. GFM Tables as a Grid
 
 A table row's source is collapsed and its cells are drawn as a real grid (`TableGrid` / `TableRowLayout`). Kerning the `|` separators cannot wrap a cell: a row is one paragraph, `NSParagraphStyle` has one `headIndent`, and a cell wider than the container wrapped back to the row's leading edge.
 
@@ -69,7 +79,7 @@ Columns are solved by lowering a common ceiling until the table fits, so a table
 
 ---
 
-## 5. Inline LaTeX and Mermaid Rendering
+## 6. Inline LaTeX and Mermaid Rendering
 
 For mathematical formulas (`$E=mc^2$` / `$$\int f(x)dx$$`) and Mermaid diagrams, `RichContentRenderer` renders high-resolution bitmaps directly into layout fragments.
 

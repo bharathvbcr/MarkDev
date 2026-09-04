@@ -48,19 +48,43 @@ public struct HighlightSpan: Sendable, Equatable {
 public final class SyntaxHighlighter {
     public static let shared = SyntaxHighlighter()
 
+    public static let maximumCodeBytes = Int(MDMAX_HIGHLIGHT_CODE_BYTES)
+    public static let maximumLanguageBytes = Int(MDMAX_HIGHLIGHT_LANGUAGE_BYTES)
+    public static let maximumSpans = Int(MDMAX_HIGHLIGHT_SPANS)
+    public static let maximumCachedBytes = 16 * 1_024 * 1_024
+    public static let maximumCachedEntries = 256
+
     private struct Key: Hashable {
         let language: String
         let code: String
     }
 
-    private var cache: [Key: [HighlightSpan]] = [:]
+    private struct Entry {
+        let spans: [HighlightSpan]
+        let cost: Int
+    }
+
+    private var cache: [Key: Entry] = [:]
     /// Recency order, least recently used first; see ``touch``.
     private var order: [Key] = []
     /// Bounded so a long session cannot accumulate every code block ever
     /// scrolled past.
-    private let limit = 256
+    private let maximumEntries: Int
+    private let maximumBytes: Int
+    private(set) var cachedByteCost = 0
 
-    public init() {}
+    public convenience init() {
+        self.init(
+            maximumEntries: Self.maximumCachedEntries,
+            maximumBytes: Self.maximumCachedBytes)
+    }
+
+    init(maximumEntries: Int, maximumBytes: Int) {
+        self.maximumEntries = max(0, maximumEntries)
+        self.maximumBytes = max(0, maximumBytes)
+    }
+
+    var cachedEntryCount: Int { cache.count }
 
     /// Empties the cache.
     ///
@@ -71,12 +95,17 @@ public final class SyntaxHighlighter {
     func removeAllCachedSpans() {
         cache.removeAll()
         order.removeAll()
+        cachedByteCost = 0
     }
 
     /// Whether a grammar exists for `language`.
     public func supports(_ language: String) -> Bool {
         #if canImport(CMarkDev)
-            return language.withCString { md_highlight_supports($0) } == 1
+            guard language.utf8.count <= Self.maximumLanguageBytes else { return false }
+            var bytes = Array(language.utf8)
+            return bytes.withUnsafeMutableBufferPointer { buffer in
+                md_highlight_supports(buffer.baseAddress, UInt(buffer.count)) == 1
+            }
         #else
             return false
         #endif
@@ -92,21 +121,19 @@ public final class SyntaxHighlighter {
 
     /// Highlights `code`, or returns empty when the language is unknown.
     public func spans(language: String?, code: String) -> [HighlightSpan] {
-        guard let language, !language.isEmpty, !code.isEmpty else { return [] }
+        guard let language, !language.isEmpty, !code.isEmpty,
+            language.utf8.count <= Self.maximumLanguageBytes,
+            code.utf8.count <= Self.maximumCodeBytes
+        else { return [] }
 
         let key = Key(language: language, code: code)
         if let cached = cache[key] {
             touch(key)
-            return cached
+            return cached.spans
         }
 
-        let computed = compute(language: language, code: code)
-        cache[key] = computed
-        order.append(key)
-        if order.count > limit {
-            let evicted = order.removeFirst()
-            cache.removeValue(forKey: evicted)
-        }
+        guard let computed = compute(language: language, code: code) else { return [] }
+        admit(computed, for: key)
         return computed
     }
 
@@ -123,29 +150,75 @@ public final class SyntaxHighlighter {
         order.append(key)
     }
 
-    private func compute(language: String, code: String) -> [HighlightSpan] {
+    private func admit(_ spans: [HighlightSpan], for key: Key) {
+        let spanBytes = spans.count.multipliedReportingOverflow(
+            by: MemoryLayout<HighlightSpan>.stride)
+        guard !spanBytes.overflow else { return }
+        let first = key.language.utf8.count.addingReportingOverflow(key.code.utf8.count)
+        guard !first.overflow else { return }
+        let total = first.partialValue.addingReportingOverflow(spanBytes.partialValue)
+        guard !total.overflow, total.partialValue <= maximumBytes, maximumEntries > 0 else { return }
+
+        while cache.count >= maximumEntries || cachedByteCost > maximumBytes - total.partialValue {
+            guard let evicted = order.first else { return }
+            order.removeFirst()
+            if let removed = cache.removeValue(forKey: evicted) {
+                cachedByteCost -= removed.cost
+            }
+        }
+        let entry = Entry(spans: spans, cost: total.partialValue)
+        cache[key] = entry
+        order.append(key)
+        cachedByteCost += entry.cost
+    }
+
+    /// `nil` means the core refused malformed or oversized output. A valid
+    /// unknown language is the distinct successful value `[]` and may cache.
+    private func compute(language: String, code: String) -> [HighlightSpan]? {
         #if canImport(CMarkDev)
+            guard language.utf8.count <= Self.maximumLanguageBytes,
+                code.utf8.count <= Self.maximumCodeBytes
+            else { return nil }
+            var languageBytes = Array(language.utf8)
             var bytes = Array(code.utf8)
-            guard
-                let handle = language.withCString({ languagePointer in
-                    bytes.withUnsafeMutableBufferPointer { buffer in
-                        md_highlight(languagePointer, buffer.baseAddress, UInt(buffer.count))
+            guard let handle = languageBytes.withUnsafeMutableBufferPointer({ languageBuffer in
+                bytes.withUnsafeMutableBufferPointer { codeBuffer in
+                    md_highlight(
+                        languageBuffer.baseAddress,
+                        UInt(languageBuffer.count),
+                        codeBuffer.baseAddress,
+                        UInt(codeBuffer.count))
                     }
                 })
-            else { return [] }
+            else { return nil }
             defer { md_highlight_free(handle) }
 
-            var count: UInt = 0
-            guard let base = md_highlight_spans(handle, &count), count > 0 else { return [] }
+            var rawCount: UInt = 0
+            let base = md_highlight_spans(handle, &rawCount)
+            guard let count = MarkdownBridge.acceptedCount(
+                rawCount, maximum: Self.maximumSpans)
+            else { return nil }
+            guard count == 0 || base != nil else { return nil }
+            guard let base else { return [] }
 
-            return UnsafeBufferPointer(start: base, count: Int(count)).compactMap { raw in
-                guard let kind = HighlightKind(rawValue: raw.kind) else { return nil }
-                return HighlightSpan(
-                    range: NSRange(location: Int(raw.start), length: Int(raw.end - raw.start)),
-                    kind: kind)
+            let codeLength = (code as NSString).length
+            var result: [HighlightSpan] = []
+            result.reserveCapacity(count)
+            for raw in UnsafeBufferPointer(start: base, count: count) {
+                guard let kind = HighlightKind(rawValue: raw.kind),
+                    raw.end >= raw.start,
+                    let start = Int(exactly: raw.start),
+                    let end = Int(exactly: raw.end),
+                    end <= codeLength
+                else { return nil }
+                result.append(
+                    HighlightSpan(
+                        range: NSRange(location: start, length: end - start),
+                        kind: kind))
             }
+            return result
         #else
-            return []
+            return nil
         #endif
     }
 }

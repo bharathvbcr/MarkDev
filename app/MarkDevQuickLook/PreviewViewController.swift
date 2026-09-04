@@ -27,7 +27,8 @@ final class PreviewViewController: NSViewController, QLPreviewingController {
         // live on a slow or network volume, and blocking the main thread of a
         // preview extension is what makes Space feel broken.
         let data = try await Task.detached(priority: .userInitiated) {
-            try Data(contentsOf: url)
+            try NoteTextCache.shared.read(
+                url, maximumBytes: MarkdownReadLimits.maximumPreviewBytes)
         }.value
 
         // Latin-1 as a fallback rather than a thrown error: a note saved by an

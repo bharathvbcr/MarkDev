@@ -55,8 +55,10 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
 
     @ObservationIgnored public weak var surface: MarkdownTextView?
     @ObservationIgnored private var sourceRange = NSRange(location: 0, length: 0)
+    @ObservationIgnored private var source: AssistedEditSource?
     @ObservationIgnored private let request = IntelligenceRequest()
     @ObservationIgnored private var popover: NSPopover?
+    @ObservationIgnored private var generation: UInt64 = 0
 
     public init(service: IntelligenceService) {
         self.service = service
@@ -65,7 +67,7 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
     /// Whether a rewrite is on screen and the editor will take it.
     public var canApply: Bool {
         guard case .finished = phase else { return false }
-        return !output.isEmpty && (surface?.acceptsAssistedEdits ?? false)
+        return !output.isEmpty && source?.validate(attachedTo: surface) == .current
     }
 
     public var isRunning: Bool { phase == .running }
@@ -83,12 +85,15 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
     /// off — is shown in the panel where the action was expected.
     public func open() {
         guard let surface else { return }
+        generation &+= 1
+        request.cancel()
         service.refreshAvailability()
         service.prewarm()
 
         output = ""
         customInstruction = ""
         activeTask = nil
+        source = nil
 
         let text = surface.markdown as NSString
         let scope = AssistScope.resolve(
@@ -101,6 +106,7 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
         } else if let range = scope.range {
             sourceRange = range
             sourceText = text.substring(with: range)
+            source = AssistedEditSource(surface)
             phase = .ready
         } else {
             sourceRange = NSRange(location: surface.selectedRange().location, length: 0)
@@ -140,6 +146,7 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
 
     /// Closes the panel and abandons anything in flight.
     public func close() {
+        generation &+= 1
         request.cancel()
         popover?.performClose(nil)
     }
@@ -147,10 +154,12 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
     public func popoverDidClose(_ notification: Notification) {
         // Reached by Escape and by clicking away as well as by ``close()``,
         // so the cancellation has to live here rather than only there.
+        generation &+= 1
         request.cancel()
         phase = .ready
         output = ""
         activeTask = nil
+        source = nil
     }
 
     // MARK: - Running
@@ -175,28 +184,40 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
             phase = .blocked(AssistScope.empty.explanation)
             return
         }
+        guard source?.validate(attachedTo: surface, requiresEditing: false) == .current else {
+            phase = .failed(
+                source?.validate(attachedTo: surface, requiresEditing: false).message
+                    ?? "The source document is no longer available.")
+            return
+        }
 
         output = ""
         activeTask = task
         phase = .running
 
         let text = sourceText
+        generation &+= 1
+        let operationGeneration = generation
         request.start { [weak self] in
             guard let self else { return }
             do {
                 let final = try await self.service.rewrite(task: task, text: text) { partial in
+                    guard self.generation == operationGeneration else { return }
                     self.output = partial
                 }
                 try Task.checkCancellation()
+                guard self.generation == operationGeneration else { return }
                 self.output = final
                 self.phase = final.isEmpty
                     ? .failed("Apple Intelligence returned nothing for that.")
                     : .finished
             } catch is CancellationError {
+                guard self.generation == operationGeneration else { return }
                 self.phase = self.request.didTimeOut
                     ? .failed(IntelligenceFailure.timedOut.localizedDescription)
                     : .ready
             } catch {
+                guard self.generation == operationGeneration else { return }
                 self.phase = .failed(error.localizedDescription)
             }
         }
@@ -208,6 +229,7 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
     /// stopped two sentences in is often exactly what was wanted, and throwing
     /// it away would make the stop button feel like a punishment.
     public func stop() {
+        generation &+= 1
         request.cancel()
         phase = output.isEmpty ? .ready : .finished
     }
@@ -252,6 +274,11 @@ public final class WritingAssistant: NSObject, NSPopoverDelegate {
     /// against is overwriting the wrong paragraph. Checked rather than
     /// assumed, and refused loudly when it does not hold.
     private func verifiedSourceRange(in surface: MarkdownTextView) -> NSRange? {
+        let validation = source?.validate(attachedTo: surface) ?? .unavailable
+        guard validation == .current else {
+            phase = .failed(validation.message ?? "That result can’t be applied.")
+            return nil
+        }
         let text = surface.markdown as NSString
         guard sourceRange.location >= 0,
             sourceRange.location + sourceRange.length <= text.length,

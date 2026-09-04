@@ -70,6 +70,12 @@ public struct ParsedDocument: Sendable, Equatable {
     /// because a short marker sits between it and the probe.
     private let markerPrefixMaxEnd: [Int]
 
+    /// Prefix maximum for the full span array. Unlike task/math subsets,
+    /// general Markdown spans can nest and overlap, so start-only binary
+    /// search is insufficient when a short inner span follows a long outer
+    /// span.
+    private let spanPrefixMaxEnd: [Int]
+
     /// An empty result, used for empty documents and as a safe fallback when
     /// the source cannot be parsed.
     public static let empty = ParsedDocument(spans: [], markers: [], blocks: [])
@@ -96,15 +102,8 @@ public struct ParsedDocument: Sendable, Equatable {
         self.taskMarkerSpans = spans.filter { $0.kind == .taskMarker }
         self.inlineMathSpans = spans.filter { $0.kind == .inlineMath }
 
-        var running = 0
-        var prefix: [Int] = []
-        prefix.reserveCapacity(markers.count + 1)
-        prefix.append(0)
-        for marker in markers {
-            running = max(running, NSMaxRange(marker.range))
-            prefix.append(running)
-        }
-        self.markerPrefixMaxEnd = prefix
+        self.markerPrefixMaxEnd = Self.prefixMaximumEnds(markers)
+        self.spanPrefixMaxEnd = Self.prefixMaximumEnds(spans)
     }
 
     /// The GFM table containing `range`, found by binary search.
@@ -134,19 +133,21 @@ public struct ParsedDocument: Sendable, Equatable {
     private static func firstIntersecting<T: RangedValue>(
         _ entries: [T], _ range: NSRange
     ) -> T? {
-        guard !entries.isEmpty else { return nil }
+        guard !entries.isEmpty, let rangeEnd = checkedEnd(of: range) else { return nil }
         var low = 0
         var high = entries.count
         while low < high {
             let mid = low + (high - low) / 2
-            if NSMaxRange(entries[mid].range) <= range.location {
+            if (checkedEnd(of: entries[mid].range) ?? 0) <= range.location {
                 low = mid + 1
             } else {
                 high = mid
             }
         }
         guard low < entries.count,
-            NSIntersectionRange(entries[low].range, range).length > 0
+            let entryEnd = checkedEnd(of: entries[low].range),
+            entries[low].range.location < rangeEnd,
+            entryEnd > range.location
         else { return nil }
         return entries[low]
     }
@@ -166,43 +167,17 @@ public struct ParsedDocument: Sendable, Equatable {
     /// a prefix-max-end table so a long run (`[!IMPORTANT]`, a link definition)
     /// is not skipped because a short marker sits between it and the probe.
     public func markerIndices(overlapping range: NSRange) -> Range<Int> {
-        guard range.length > 0, !markers.isEmpty else { return 0..<0 }
-        let end = range.location + range.length
+        Self.overlapWindow(markers, prefixMaximumEnds: markerPrefixMaxEnd, range: range)
+    }
 
-        // First marker starting at or after `end` — everything from there on
-        // begins past the range.
-        var upper = markers.count
-        var low = 0
-        var high = markers.count - 1
-        while low <= high {
-            let mid = (low + high) / 2
-            if markers[mid].range.location >= end {
-                upper = mid
-                high = mid - 1
-            } else {
-                low = mid + 1
-            }
-        }
-
-        // First marker starting at or after `range.location`, then widened
-        // back over any earlier marker that still reaches into the range.
-        var lower = upper
-        low = 0
-        high = upper - 1
-        while low <= high {
-            let mid = (low + high) / 2
-            if markers[mid].range.location >= range.location {
-                lower = mid
-                high = mid - 1
-            } else {
-                low = mid + 1
-            }
-        }
-        while lower > 0, markerPrefixMaxEnd[lower] > range.location {
-            lower -= 1
-        }
-
-        return lower..<upper
+    /// The spans that can overlap `range`, as an index window into ``spans``.
+    ///
+    /// The window may include a non-overlapping nested neighbour between two
+    /// matches; callers already inspect the returned ranges. Its important
+    /// guarantee is that an earlier long span is never missed merely because
+    /// a later short span ends before the query begins.
+    public func spanIndices(overlapping range: NSRange) -> Range<Int> {
+        Self.overlapWindow(spans, prefixMaximumEnds: spanPrefixMaxEnd, range: range)
     }
 
     /// The destination a link-like span points at.
@@ -220,39 +195,110 @@ public struct ParsedDocument: Sendable, Equatable {
             return nil
         }
     }
+
+    fileprivate static func checkedEnd(of range: NSRange) -> Int? {
+        guard range.location >= 0, range.length >= 0 else { return nil }
+        let (end, overflow) = range.location.addingReportingOverflow(range.length)
+        return overflow ? nil : end
+    }
+
+    private static func prefixMaximumEnds<T: RangedValue>(_ entries: [T]) -> [Int] {
+        var running = 0
+        var prefix: [Int] = []
+        prefix.reserveCapacity(entries.count + 1)
+        prefix.append(0)
+        for entry in entries {
+            // Invalid manually-constructed ranges must not trap. FFI-created
+            // documents reject them before initialization.
+            running = max(running, checkedEnd(of: entry.range) ?? Int.max)
+            prefix.append(running)
+        }
+        return prefix
+    }
+
+    private static func overlapWindow<T: RangedValue>(
+        _ entries: [T], prefixMaximumEnds: [Int], range: NSRange
+    ) -> Range<Int> {
+        guard range.length > 0, !entries.isEmpty, let end = checkedEnd(of: range) else {
+            return 0..<0
+        }
+
+        var upper = entries.count
+        var low = 0
+        var high = entries.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if entries[mid].range.location >= end {
+                upper = mid
+                high = mid
+            } else {
+                low = mid + 1
+            }
+        }
+
+        var lower = upper
+        low = 0
+        high = upper
+        while low < high {
+            let mid = low + (high - low) / 2
+            if entries[mid].range.location >= range.location {
+                lower = mid
+                high = mid
+            } else {
+                low = mid + 1
+            }
+        }
+        while lower > 0, prefixMaximumEnds[lower] > range.location {
+            lower -= 1
+        }
+        return lower..<upper
+    }
 }
 
-extension ParsedDocument {
-    /// Parses `source` via the Rust core.
-    ///
-    /// Returns ``empty`` if the core rejects the input. That only happens for
-    /// invalid UTF-8, which a `String` cannot contain — so in practice this
-    /// never fails, and failing soft is better than trapping inside a text
-    /// view's edit cycle.
-    public static func parse(_ source: String) -> ParsedDocument {
-        #if canImport(CMarkDev)
-            var utf8 = Array(source.utf8)
-            // `md_parse` tolerates a null pointer, but an empty Swift array
-            // can yield one, so short-circuit rather than rely on that.
-            guard !utf8.isEmpty else { return .empty }
+/// A checked parse distinguishes a valid document with no structure from a
+/// resource or ABI refusal. Callers that can surface degradation should use
+/// this result rather than equating both cases with ``ParsedDocument/empty``.
+public enum ParsedDocumentParseOutcome: Sendable, Equatable {
+    case parsed(ParsedDocument)
+    case rejected
+}
 
+extension SyntaxMarker: RangedValue {}
+
+extension ParsedDocument {
+    /// Parses `source` via the bounded Rust ABI.
+    public static func parseChecked(_ source: String) -> ParsedDocumentParseOutcome {
+        #if canImport(CMarkDev)
+            let byteCount = source.utf8.count
+            let utf16Count = (source as NSString).length
+            guard byteCount <= Int(MDMAX_DOCUMENT_BYTES), UInt32(exactly: utf16Count) != nil else {
+                return .rejected
+            }
+
+            var utf8 = Array(source.utf8)
             guard let handle = utf8.withUnsafeMutableBufferPointer({ buffer in
                 md_parse(buffer.baseAddress, UInt(buffer.count))
             }) else {
-                return .empty
+                return .rejected
             }
             defer { md_free(handle) }
-
-            let strings = readStrings(handle)
-            return ParsedDocument(
-                spans: readSpans(handle),
-                markers: readMarkers(handle),
-                blocks: readBlocks(handle, strings: strings),
-                strings: strings
-            )
+            guard let parsed = MarkdownBridge.parse(handle, documentLength: utf16Count) else {
+                return .rejected
+            }
+            return .parsed(parsed)
         #else
-            return .empty
+            return .rejected
         #endif
+    }
+
+    /// Compatibility surface for renderers whose safe refusal is plain source.
+    /// A rejected parse returns ``empty`` so authored text remains visible;
+    /// callers that report status must use ``parseChecked(_:)``.
+    public static func parse(_ source: String) -> ParsedDocument {
+        switch parseChecked(source) {
+        case .parsed(let document): document
+        case .rejected: .empty
+        }
     }
 }
 
@@ -265,7 +311,7 @@ extension ParsedDocument {
     /// as an error. Failing at startup makes that a build problem, not a
     /// debugging mystery.
     public enum MarkDevCore {
-        public static let expectedABIVersion: UInt32 = 1
+        public static let expectedABIVersion: UInt32 = 3
 
         public static var actualABIVersion: UInt32 { md_abi_version() }
 
@@ -293,79 +339,268 @@ extension ParsedDocument {
     /// Shared by the one-shot parse and the incremental document so the two
     /// can never disagree about how a `MDStyleSpan` becomes a `StyleSpan`.
     enum MarkdownBridge {
-        static func spans(_ base: UnsafePointer<MDStyleSpan>?, _ count: Int) -> [StyleSpan] {
-            guard let base, count > 0 else { return [] }
-            return UnsafeBufferPointer(start: base, count: count).compactMap { raw in
-                // An unknown kind means the Rust enum gained a case this build
-                // does not know. Dropping it degrades styling rather than
-                // crashing, and the ABI check catches the real cause.
-                guard let kind = SpanKind(rawValue: raw.kind) else { return nil }
-                return StyleSpan(
-                    range: NSRange(location: Int(raw.start), length: Int(raw.end - raw.start)),
-                    kind: kind,
-                    depth: raw.depth,
-                    data: raw.data
-                )
-            }
+        private static let maximumRecords = Int(MDMAX_STRUCTURAL_RECORDS)
+        private static let maximumStrings = Int(MDMAX_INTERNED_STRINGS)
+        private static let maximumStringBytes = Int(MDMAX_INTERNED_STRING_BYTES)
+        private static let maximumTotalStringBytes = Int(MDMAX_TOTAL_STRING_BYTES)
+        private static let maximumNesting = UInt16(MDMAX_PARSE_NESTING)
+
+        static func parse(_ handle: OpaquePointer, documentLength: Int) -> ParsedDocument? {
+            var spanCount: UInt = 0
+            let spanBase = md_spans(handle, &spanCount)
+            var markerCount: UInt = 0
+            let markerBase = md_markers(handle, &markerCount)
+            var blockCount: UInt = 0
+            let blockBase = md_blocks(handle, &blockCount)
+            return decode(
+                documentLength: documentLength,
+                spanBase: spanBase,
+                spanCount: spanCount,
+                markerBase: markerBase,
+                markerCount: markerCount,
+                blockBase: blockBase,
+                blockCount: blockCount,
+                stringCount: md_string_count(handle),
+                stringAt: { index, length in md_string(handle, index, length) }
+            )
         }
 
-        static func markers(_ base: UnsafePointer<MDSyntaxMarker>?, _ count: Int) -> [SyntaxMarker] {
-            guard let base, count > 0 else { return [] }
-            return UnsafeBufferPointer(start: base, count: count).map { raw in
-                SyntaxMarker(
-                    range: NSRange(location: Int(raw.start), length: Int(raw.end - raw.start)),
-                    block: Int(raw.block)
-                )
-            }
+        static func document(_ handle: OpaquePointer, documentLength: Int) -> ParsedDocument? {
+            var spanCount: UInt = 0
+            let spanBase = md_document_spans(handle, &spanCount)
+            var markerCount: UInt = 0
+            let markerBase = md_document_markers(handle, &markerCount)
+            var blockCount: UInt = 0
+            let blockBase = md_document_blocks(handle, &blockCount)
+            return decode(
+                documentLength: documentLength,
+                spanBase: spanBase,
+                spanCount: spanCount,
+                markerBase: markerBase,
+                markerCount: markerCount,
+                blockBase: blockBase,
+                blockCount: blockCount,
+                stringCount: md_document_string_count(handle),
+                stringAt: { index, length in md_document_string(handle, index, length) }
+            )
         }
 
-        static func blocks(
+        private static func decode(
+            documentLength: Int,
+            spanBase: UnsafePointer<MDStyleSpan>?,
+            spanCount rawSpanCount: UInt,
+            markerBase: UnsafePointer<MDSyntaxMarker>?,
+            markerCount rawMarkerCount: UInt,
+            blockBase: UnsafePointer<MDBlockDescriptor>?,
+            blockCount rawBlockCount: UInt,
+            stringCount rawStringCount: UInt,
+            stringAt: (UInt32, UnsafeMutablePointer<UInt>) -> UnsafePointer<UInt8>?
+        ) -> ParsedDocument? {
+            guard documentLength >= 0,
+                let spanCount = acceptedCount(rawSpanCount, maximum: maximumRecords),
+                let markerCount = acceptedCount(rawMarkerCount, maximum: maximumRecords),
+                let blockCount = acceptedCount(rawBlockCount, maximum: maximumRecords),
+                let firstTotal = checkedAdd(spanCount, markerCount),
+                let recordTotal = checkedAdd(firstTotal, blockCount),
+                recordTotal <= maximumRecords,
+                let strings = strings(count: rawStringCount, at: stringAt),
+                let spans = spans(
+                    spanBase,
+                    count: spanCount,
+                    documentLength: documentLength,
+                    stringCount: strings.count),
+                let blocks = blocks(
+                    blockBase,
+                    count: blockCount,
+                    documentLength: documentLength,
+                    strings: strings),
+                let markers = markers(
+                    markerBase,
+                    count: markerCount,
+                    documentLength: documentLength,
+                    blockCount: blocks.count)
+            else { return nil }
+
+            return ParsedDocument(
+                spans: spans,
+                markers: markers,
+                blocks: blocks,
+                strings: strings)
+        }
+
+        static func acceptedCount(_ raw: UInt, maximum: Int) -> Int? {
+            guard let count = Int(exactly: raw), count <= maximum else { return nil }
+            return count
+        }
+
+        private static func checkedAdd(_ left: Int, _ right: Int) -> Int? {
+            let (sum, overflow) = left.addingReportingOverflow(right)
+            return overflow ? nil : sum
+        }
+
+        private static func strings(
+            count rawCount: UInt,
+            at stringAt: (UInt32, UnsafeMutablePointer<UInt>) -> UnsafePointer<UInt8>?
+        ) -> [String]? {
+            guard let count = acceptedCount(rawCount, maximum: maximumStrings) else { return nil }
+            var result: [String] = []
+            result.reserveCapacity(count)
+            var totalBytes = 0
+            for index in 0..<count {
+                guard let rawIndex = UInt32(exactly: index) else { return nil }
+                var rawLength: UInt = 0
+                guard let base = stringAt(rawIndex, &rawLength),
+                    let length = acceptedCount(rawLength, maximum: maximumStringBytes),
+                    let nextTotal = checkedAdd(totalBytes, length),
+                    nextTotal <= maximumTotalStringBytes,
+                    let string = String(
+                        bytes: UnsafeBufferPointer(start: base, count: length),
+                        encoding: .utf8)
+                else { return nil }
+                result.append(string)
+                totalBytes = nextTotal
+            }
+            return result
+        }
+
+        private static func spans(
+            _ base: UnsafePointer<MDStyleSpan>?,
+            count: Int,
+            documentLength: Int,
+            stringCount: Int
+        ) -> [StyleSpan]? {
+            guard count == 0 || base != nil else { return nil }
+            guard let base else { return [] }
+            var result: [StyleSpan] = []
+            result.reserveCapacity(count)
+            for raw in UnsafeBufferPointer(start: base, count: count) {
+                guard let kind = SpanKind(rawValue: raw.kind),
+                    raw.depth <= maximumNesting,
+                    let range = range(start: raw.start, end: raw.end, limit: documentLength)
+                else { return nil }
+                if kind == .link || kind == .wikiLink || kind == .image
+                    || kind == .footnoteReference
+                {
+                    guard UInt64(raw.data) < UInt64(stringCount) else { return nil }
+                }
+                result.append(
+                    StyleSpan(range: range, kind: kind, depth: raw.depth, data: raw.data))
+            }
+            guard isSortedByStartThenEnd(result) else { return nil }
+            return result
+        }
+
+        private static func markers(
+            _ base: UnsafePointer<MDSyntaxMarker>?,
+            count: Int,
+            documentLength: Int,
+            blockCount: Int
+        ) -> [SyntaxMarker]? {
+            guard count == 0 || base != nil else { return nil }
+            guard let base else { return [] }
+            var result: [SyntaxMarker] = []
+            result.reserveCapacity(count)
+            for raw in UnsafeBufferPointer(start: base, count: count) {
+                guard let range = range(start: raw.start, end: raw.end, limit: documentLength),
+                    let block = Int(exactly: raw.block),
+                    block >= 0,
+                    block < blockCount
+                else { return nil }
+                result.append(SyntaxMarker(range: range, block: block))
+            }
+            guard isSortedByStartThenEnd(result) else { return nil }
+            return result
+        }
+
+        private static func blocks(
             _ base: UnsafePointer<MDBlockDescriptor>?,
-            _ count: Int,
+            count: Int,
+            documentLength: Int,
             strings: [String]
-        ) -> [BlockDescriptor] {
-            guard let base, count > 0 else { return [] }
-            return UnsafeBufferPointer(start: base, count: count).compactMap { raw in
-                guard let kind = BlockKind(rawValue: raw.kind) else { return nil }
-                let index = Int(raw.info)
-                let info = raw.info == MDNO_INFO || !strings.indices.contains(index)
-                    ? nil : strings[index]
-                return BlockDescriptor(
-                    range: NSRange(location: Int(raw.start), length: Int(raw.end - raw.start)),
-                    kind: kind,
-                    depth: raw.depth,
-                    data: raw.data,
-                    info: info
-                )
+        ) -> [BlockDescriptor]? {
+            guard count == 0 || base != nil else { return nil }
+            guard let base else { return [] }
+            var result: [BlockDescriptor] = []
+            result.reserveCapacity(count)
+            for raw in UnsafeBufferPointer(start: base, count: count) {
+                guard let kind = BlockKind(rawValue: raw.kind),
+                    raw.depth <= maximumNesting,
+                    let range = range(start: raw.start, end: raw.end, limit: documentLength)
+                else { return nil }
+                let info: String?
+                if raw.info == MDNO_INFO {
+                    info = nil
+                } else {
+                    guard let index = Int(exactly: raw.info), strings.indices.contains(index) else {
+                        return nil
+                    }
+                    info = strings[index]
+                }
+                result.append(
+                    BlockDescriptor(
+                        range: range,
+                        kind: kind,
+                        depth: raw.depth,
+                        data: raw.data,
+                        info: info))
+            }
+            guard isSortedByStart(result) else { return nil }
+            return result
+        }
+
+        private static func range(start: UInt32, end: UInt32, limit: Int) -> NSRange? {
+            guard end >= start,
+                let location = Int(exactly: start),
+                let upper = Int(exactly: end),
+                upper <= limit
+            else { return nil }
+            return NSRange(location: location, length: upper - location)
+        }
+
+        /// Spans and markers only.
+        ///
+        /// `core/src/md/parse.rs` sorts both explicitly by `(start, end)`
+        /// before handing them over, so the tie-break is part of their
+        /// contract and worth asserting.
+        private static func isSortedByStartThenEnd<T: RangedValue>(_ values: [T]) -> Bool {
+            zip(values, values.dropFirst()).allSatisfy { left, right in
+                left.range.location < right.range.location
+                    || (left.range.location == right.range.location
+                        && (ParsedDocument.checkedEnd(of: left.range) ?? Int.max)
+                            <= (ParsedDocument.checkedEnd(of: right.range) ?? Int.max))
             }
         }
-    }
 
-    private func readStrings(_ handle: OpaquePointer) -> [String] {
-        let count = md_string_count(handle)
-        guard count > 0 else { return [] }
-        return (0..<count).map { index in
-            guard let c = md_string(handle, UInt32(index)) else { return "" }
-            return String(cString: c)
+        /// Blocks, which are **not** sorted by `(start, end)` and must not be.
+        ///
+        /// The core never sorts `blocks` at all: a descriptor is pushed when
+        /// its construct *opens*, so the array is a pre-order walk in which a
+        /// container precedes its contents. At a shared start that puts the
+        /// wider parent first — `list(0, 22)` ahead of `listItem(0, 7)` — and
+        /// its end is therefore the *larger* of the two, the exact opposite of
+        /// the span ordering.
+        ///
+        /// Asserting the span rule here rejected every nested construct in the
+        /// language. An ordered list, a table, a task list and a display
+        /// formula each failed the check, `decode` returned nil, and
+        /// `setMarkdown` refused the document and left the editor **blank** —
+        /// a silent, total failure for ordinary notes. A single-item list
+        /// passed only by coincidence, its one child ending exactly where its
+        /// parent does.
+        ///
+        /// Pre-order is load-bearing elsewhere (a container's contents are the
+        /// contiguous slice that follows it), so the fix belongs here rather
+        /// than in a sort upstream. What the binary searches actually require
+        /// is this and nothing more: starts never go backwards.
+        /// `prefixMaximumEnds` exists precisely because the ends do not rise
+        /// with them. The stronger nesting property is pinned in the core, in
+        /// `core/tests/incremental.rs`, where a violation fails a test instead
+        /// of blanking a reader's document.
+        private static func isSortedByStart<T: RangedValue>(_ values: [T]) -> Bool {
+            zip(values, values.dropFirst()).allSatisfy { left, right in
+                left.range.location <= right.range.location
+            }
         }
-    }
-
-    private func readSpans(_ handle: OpaquePointer) -> [StyleSpan] {
-        var count: UInt = 0
-        let base = md_spans(handle, &count)
-        return MarkdownBridge.spans(base, Int(count))
-    }
-
-    private func readMarkers(_ handle: OpaquePointer) -> [SyntaxMarker] {
-        var count: UInt = 0
-        let base = md_markers(handle, &count)
-        return MarkdownBridge.markers(base, Int(count))
-    }
-
-    private func readBlocks(_ handle: OpaquePointer, strings: [String]) -> [BlockDescriptor] {
-        var count: UInt = 0
-        let base = md_blocks(handle, &count)
-        return MarkdownBridge.blocks(base, Int(count), strings: strings)
     }
 
 #endif

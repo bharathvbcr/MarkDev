@@ -208,15 +208,102 @@ fn clearing_the_document_stays_correct() {
     check_edit(DOC, 0..DOC.len(), "");
 }
 
-#[test]
-fn invalid_ranges_leave_the_document_untouched() {
-    let mut doc = Document::new(DOC);
-    let before = doc.text().to_string();
+/// Asserts that `edit` is refused and that *neither* the text nor the parse
+/// moved. Both halves matter: committing text while keeping the old model is
+/// the exact corruption `Reparse::Rejected` exists to prevent, and it is
+/// invisible to a test that only compares the text.
+#[track_caller]
+fn assert_rejected(
+    doc: &mut Document,
+    range: std::ops::Range<usize>,
+    replacement: &str,
+    why: &str,
+) {
+    let text_before = doc.text().to_string();
+    let blocks_before = doc.result().blocks.clone();
+    let spans_before = doc.result().spans.clone();
+    let markers_before = doc.result().markers.clone();
+
     assert_eq!(
-        doc.replace(DOC.len() + 10..DOC.len() + 20, "x"),
-        Reparse::Full
+        doc.replace(range, replacement),
+        Reparse::Rejected,
+        "{why} must be refused, not applied"
     );
-    assert_eq!(doc.text(), before, "an out-of-range edit must not corrupt");
+
+    assert_eq!(doc.text(), text_before, "{why} must not corrupt the text");
+    assert_eq!(
+        doc.result().blocks,
+        blocks_before,
+        "{why} must not disturb the parse"
+    );
+    assert_eq!(
+        doc.result().spans,
+        spans_before,
+        "{why} must not disturb the parse"
+    );
+    assert_eq!(
+        doc.result().markers,
+        markers_before,
+        "{why} must not disturb the parse"
+    );
+}
+
+#[test]
+// `10..4` is the point of the case below, not a mistake: a host that computes
+// a backwards range must be refused rather than obeyed. Clippy reads any
+// literal reversed range as an iteration bug and would have it written
+// `(4..10).rev()`, which is a different, *valid* range and tests nothing.
+#[allow(clippy::reversed_empty_ranges)]
+fn invalid_ranges_leave_the_document_untouched() {
+    // A refused edit reports `Rejected`, never `Full`. The distinction is the
+    // whole point: `Full` promises the caller a document that now reflects the
+    // edit, and a caller that shifts its own offsets on that promise walks off
+    // the end of a buffer that never changed.
+    let mut doc = Document::new(DOC);
+
+    assert_rejected(
+        &mut doc,
+        DOC.len() + 10..DOC.len() + 20,
+        "x",
+        "a wholly out-of-range edit",
+    );
+    assert_rejected(
+        &mut doc,
+        DOC.len() - 2..DOC.len() + 5,
+        "x",
+        "an edit running past the end",
+    );
+    assert_rejected(&mut doc, 10..4, "x", "a reversed range");
+    assert_rejected(&mut doc, 0..usize::MAX, "x", "an end that would overflow");
+
+    // The document still takes ordinary edits after refusing four.
+    assert_eq!(doc.replace(0..0, "x"), Reparse::Full);
+    assert!(doc.text().starts_with('x'));
+}
+
+#[test]
+fn an_edit_splitting_a_character_is_refused() {
+    // A UTF-16 host can compute a byte offset that lands mid-character; the
+    // parser must refuse rather than build a string with a broken scalar.
+    let mut doc = Document::new("Caf\u{e9} note with an emoji \u{1F389} here.\n");
+    let cafe = doc.text().find("Caf").expect("anchor") + 3;
+    let end = doc.text().len();
+    assert!(!doc.text().is_char_boundary(cafe + 1));
+
+    assert_rejected(
+        &mut doc,
+        cafe + 1..end,
+        "x",
+        "a start inside a 2-byte scalar",
+    );
+
+    let emoji = doc.text().find('\u{1F389}').expect("anchor");
+    assert_rejected(
+        &mut doc,
+        emoji..emoji + 2,
+        "x",
+        "an end inside a 4-byte scalar",
+    );
 }
 
 #[test]

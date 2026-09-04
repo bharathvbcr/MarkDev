@@ -41,12 +41,15 @@
 
 use std::ops::Range;
 
-use super::model::ParseResult;
-use super::parse::parse;
+use super::model::{ParseResult, MAX_DOCUMENT_BYTES};
+use super::parse::{parse_checked, ParseError};
 
 /// What a [`Document::replace`] actually did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reparse {
+    /// The edit was invalid or would exceed a parser/resource bound. The text
+    /// and the previous parse are unchanged.
+    Rejected,
     /// The whole document was reparsed.
     Full,
     /// No reparse was needed; offsets were shifted. Carries the byte range of
@@ -62,11 +65,25 @@ pub struct Document {
 }
 
 impl Document {
-    /// Creates a document, parsing it in full.
+    /// Creates a known-bounded document, parsing it in full.
+    ///
+    /// Untrusted input must use [`Document::try_from_str`]. This compatibility
+    /// entry point panics on rejection rather than manufacturing an empty
+    /// document that callers could mistake for a successful parse.
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
-        let result = parse(&text);
+        let result = parse_checked(&text).expect("Markdown source exceeds the parser contract");
         Self { text, result }
+    }
+
+    /// Creates a document from untrusted text without allocating its owned
+    /// copy until the parser has accepted the complete input.
+    pub fn try_from_str(text: &str) -> Result<Self, ParseError> {
+        let result = parse_checked(text)?;
+        Ok(Self {
+            text: text.to_owned(),
+            result,
+        })
     }
 
     pub fn text(&self) -> &str {
@@ -115,7 +132,20 @@ impl Document {
         if !valid {
             // Refuse to corrupt the buffer: leave it untouched rather than
             // silently mangling it.
-            return Reparse::Full;
+            return Reparse::Rejected;
+        }
+
+        let removed_bytes = range.end - range.start;
+        let Some(new_byte_count) = self
+            .text
+            .len()
+            .checked_sub(removed_bytes)
+            .and_then(|count| count.checked_add(replacement.len()))
+        else {
+            return Reparse::Rejected;
+        };
+        if new_byte_count > MAX_DOCUMENT_BYTES {
+            return Reparse::Rejected;
         }
 
         let shiftable = self.is_shiftable(&range, replacement);
@@ -124,12 +154,21 @@ impl Document {
         let edit_start_u16 = count_utf16(&self.text[..range.start]);
         let removed_u16 = count_utf16(&self.text[range.clone()]);
 
-        self.text.replace_range(range.clone(), replacement);
-
         if !shiftable {
-            self.result = parse(&self.text);
+            // Parse a prospective copy first. Any event, nesting, record, or
+            // string-table rejection leaves both the old text and old model
+            // intact instead of committing text with a stale parse.
+            let mut candidate = self.text.clone();
+            candidate.replace_range(range, replacement);
+            let Ok(parsed) = parse_checked(&candidate) else {
+                return Reparse::Rejected;
+            };
+            self.text = candidate;
+            self.result = parsed;
             return Reparse::Full;
         }
+
+        self.text.replace_range(range.clone(), replacement);
 
         let added_u16 = count_utf16(replacement);
         let delta_u16 = added_u16 as i64 - removed_u16 as i64;

@@ -48,7 +48,7 @@ class ReleaseTests(unittest.TestCase):
         binary_dir.mkdir()
         fake = binary_dir / "fake"
         fake.write_text('''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, plistlib, sys
 root = pathlib.Path.cwd()
 state_path = root / "state.json"
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
@@ -66,6 +66,17 @@ if name == "xcodebuild":
 elif name == "codesign":
     if state.get("signature_fail"):
         sys.exit(1)
+    if "--entitlements" in args:
+        if "MarkDevQuickLook.appex" in args[-1]:
+            entitlements = {
+                "com.apple.security.app-sandbox": not state.get("quicklook_unsandboxed", False),
+                "com.apple.security.files.user-selected.read-only": not state.get("quicklook_no_read", False),
+            }
+            if state.get("quicklook_read_write"):
+                entitlements["com.apple.security.files.user-selected.read-write"] = True
+        else:
+            entitlements = {"com.apple.security.app-sandbox": True} if state.get("main_sandboxed") else {}
+        print(plistlib.dumps(entitlements).decode())
 elif name == "lipo":
     print(state.get("architecture", "arm64"))
 elif name == "ditto":
@@ -144,6 +155,22 @@ elif name == "gh":
 
     def test_signature_failure_is_rejected(self):
         self.state(signature_fail=True)
+        self.assertNotEqual(self.run_recipe("release-stage").returncode, 0)
+
+    def test_missing_quicklook_sandbox_entitlement_is_rejected(self):
+        self.state(quicklook_unsandboxed=True)
+        self.assertNotEqual(self.run_recipe("release-stage").returncode, 0)
+
+    def test_missing_quicklook_read_entitlement_is_rejected(self):
+        self.state(quicklook_no_read=True)
+        self.assertNotEqual(self.run_recipe("release-stage").returncode, 0)
+
+    def test_quicklook_write_entitlement_is_rejected(self):
+        self.state(quicklook_read_write=True)
+        self.assertNotEqual(self.run_recipe("release-stage").returncode, 0)
+
+    def test_sandboxing_the_main_app_is_rejected(self):
+        self.state(main_sandboxed=True)
         self.assertNotEqual(self.run_recipe("release-stage").returncode, 0)
 
     def test_settings_failure_is_rejected(self):

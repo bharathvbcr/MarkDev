@@ -250,6 +250,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDev.QuickLook
+        CODE_SIGN_ENTITLEMENTS: app/MarkDevQuickLook/MarkDevQuickLook.entitlements
+        ENABLE_APP_SANDBOX: true
         SKIP_INSTALL: true
 
   # ---------------------------------------------------------------------

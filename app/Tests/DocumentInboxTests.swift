@@ -462,6 +462,40 @@ final class DocumentInboxTests: XCTestCase {
         XCTAssertNotNil(delivered?.truncationMessage)
     }
 
+    func testDeferredRequestRequeuePreservesArrivalOrderAndTruncationCount() {
+        let (inbox, _) = makeInbox()
+        let earlier = DocumentOpenRequest(
+            urls: [url("/vault/A.md"), url("/vault/B.md")],
+            dropped: 7)
+        inbox.receive([url("/vault/Later.md")])
+
+        inbox.requeue(earlier)
+
+        let restored = inbox.drain()
+        XCTAssertEqual(restored.urls.map(\.lastPathComponent), ["A.md", "B.md", "Later.md"])
+        XCTAssertEqual(restored.dropped, 7)
+        XCTAssertEqual(restored.truncationMessage, "Opened 3 files; 7 more were not opened.")
+    }
+
+    func testMixedFailureThenSuccessStillReportsAnOpenedItemAndTheBatchFailure() {
+        var outcome = DocumentOpenBatchOutcome()
+
+        outcome.record(.failed("A.md could not be read."))
+        outcome.record(.opened)
+
+        XCTAssertTrue(outcome.openedAnything)
+        XCTAssertEqual(outcome.failureMessage, "A.md could not be read.")
+    }
+
+    func testSuccessfulOpenDoesNotAuthorizeAStaleErrorButDoesAuthorizeItsFollowUp() {
+        var outcome = DocumentOpenBatchOutcome()
+        outcome.record(.opened)
+
+        XCTAssertNil(outcome.failureMessage)
+        XCTAssertTrue(DocumentOpenAttempt.opened.didOpen)
+        XCTAssertFalse(DocumentOpenAttempt.failed("Unreadable").didOpen)
+    }
+
     func testAnUntruncatedBatchHasNothingToSay() {
         let request = DocumentOpenRequest(urls: [url("/a.md")])
         XCTAssertNil(request.truncationMessage)

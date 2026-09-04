@@ -67,6 +67,20 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(workspace.state(for: pane), before)
     }
 
+    func testOpeningIntoAClosedPaneFailsLoudly() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Note.md")
+        try write("body", to: file)
+
+        let workspace = Workspace()
+        let missingPane = PaneID()
+
+        XCTAssertThrowsError(try workspace.open(file, in: missingPane)) { error in
+            XCTAssertEqual(error as? WorkspaceError, .paneUnavailable)
+        }
+    }
+
     func testOpeningARemoteLocationIsRefusedRatherThanFetched() {
         // `String(contentsOf:)` takes an `https:` URL and fetches it,
         // synchronously, on the main actor. Every open funnels through this
@@ -93,6 +107,26 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(workspace.layout, layout)
     }
 
+    /// A file handed in by Finder is untrusted input. Letting one enormous
+    /// Markdown file flow into Data, String, the parser, and TextKit on the
+    /// main actor can exhaust the process before an error can be shown.
+    func testOpeningAnOversizedDocumentIsRefusedBeforeTheWorkspaceChanges() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Huge.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 17 * 1_024 * 1_024)
+        try handle.close()
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        let before = workspace.state(for: pane)
+
+        XCTAssertThrowsError(try workspace.open(file, in: pane))
+        XCTAssertEqual(workspace.state(for: pane), before)
+    }
+
     func testOpeningTheSameFileTwiceFocusesTheExistingTab() throws {
         let root = try makeVault()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -108,6 +142,70 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(
             workspace.state(for: pane).documents.count, countAfterFirst,
             "reopening a file must not stack duplicate tabs")
+    }
+
+    func testOpeningASymlinkAndItsTargetReusesOneCanonicalDocumentIdentity() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Target.md")
+        let alias = root.appendingPathComponent("Alias.md")
+        try write("body", to: target)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        try workspace.open(alias, in: pane)
+        let firstID = try XCTUnwrap(workspace.document(in: pane)?.id)
+        try workspace.open(target, in: pane)
+
+        XCTAssertEqual(workspace.state(for: pane).documents.count, 1)
+        XCTAssertEqual(workspace.document(in: pane)?.id, firstID)
+        XCTAssertEqual(
+            workspace.document(in: pane)?.url,
+            target.resolvingSymlinksInPath().standardizedFileURL)
+    }
+
+    func testSavingADocumentOpenedThroughASymlinkPreservesTheLinkAndWritesItsTarget() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Target.md")
+        let alias = root.appendingPathComponent("Alias.md")
+        try write("before", to: target)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        try workspace.open(alias, in: pane)
+        workspace.updateText("after", in: pane)
+        try workspace.save(in: pane)
+
+        XCTAssertTrue(
+            try alias.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true,
+            "saving through an alias must not replace the alias itself")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "after")
+    }
+
+    func testSaveAsCannotBypassAnAlreadyOpenDestinationThroughASymlinkSpelling() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Target.md")
+        let alias = root.appendingPathComponent("Alias.md")
+        try write("target", to: target)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        try workspace.open(target, in: pane)
+        _ = workspace.newDocument(in: pane)
+        workspace.updateText("other", in: pane)
+
+        XCTAssertThrowsError(try workspace.save(in: pane, to: alias, overwrite: true)) { error in
+            guard case WorkspaceError.destinationAlreadyOpen(let refused) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(refused, target.resolvingSymlinksInPath().standardizedFileURL)
+        }
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "target")
     }
 
     func testEditingMarksTheDocumentDirty() {
@@ -228,6 +326,67 @@ final class WorkspaceTests: XCTestCase {
         }
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "external edit")
         XCTAssertTrue(workspace.document(in: pane)?.hasUnsavedChanges ?? false)
+    }
+
+    func testSaveRefusesANonFileDestination() {
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        workspace.updateText("private draft", in: pane)
+        let remote = URL(string: "https://example.com/note.md")!
+
+        XCTAssertThrowsError(try workspace.save(in: pane, to: remote)) { error in
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(remote))
+        }
+        XCTAssertTrue(workspace.document(in: pane)?.hasUnsavedChanges ?? false)
+    }
+
+    func testSavingABackgroundDocumentSavesThatIdentityNotTheSelectedTab() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = root.appendingPathComponent("First.md")
+        let second = root.appendingPathComponent("Second.md")
+        try write("first on disk", to: first)
+        try write("second on disk", to: second)
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        try workspace.open(first, in: pane)
+        let firstID = try XCTUnwrap(workspace.document(in: pane)?.id)
+        workspace.updateText("first edited", in: pane)
+        try workspace.open(second, in: pane)
+        let selectedBefore = workspace.state(for: pane).selection
+
+        try workspace.save(document: firstID)
+
+        XCTAssertEqual(try String(contentsOf: first, encoding: .utf8), "first edited")
+        XCTAssertEqual(try String(contentsOf: second, encoding: .utf8), "second on disk")
+        XCTAssertEqual(workspace.state(for: pane).selection, selectedBefore)
+        XCTAssertFalse(
+            workspace.state(for: pane).documents.first(where: { $0.id == firstID })?
+                .hasUnsavedChanges ?? true)
+    }
+
+    func testKeepingMineRebasesOnDiskAndKeepsTheLocalCopyDirty() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Note.md")
+        try write("original", to: file)
+
+        let workspace = Workspace()
+        let pane = workspace.focusedPane
+        try workspace.open(file, in: pane)
+        workspace.updateText("mine", in: pane)
+        let documentID = try XCTUnwrap(workspace.document(in: pane)?.id)
+        try write("theirs", to: file)
+
+        try workspace.keepLocal(document: documentID)
+
+        let kept = try XCTUnwrap(workspace.document(in: pane))
+        XCTAssertEqual(kept.text, "mine")
+        XCTAssertTrue(kept.hasUnsavedChanges)
+        XCTAssertTrue(workspace.requiresConfirmationBeforeClosing(documentID, in: pane))
+        XCTAssertEqual(workspace.autosave(), 1)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "mine")
     }
 
     func testClosingTheLastTabLeavesAnEmptyOne() {

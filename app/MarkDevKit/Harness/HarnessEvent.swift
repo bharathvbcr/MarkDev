@@ -116,8 +116,12 @@ public struct HarnessEvent: Sendable, Equatable {
 
     private static func string(_ value: Any?) -> String { value as? String ?? "" }
     private static func integer(_ value: Any?) -> Int {
-        if let int = value as? Int { return int }
-        if let double = value as? Double { return Int(double) }
+        if let int = value as? Int { return max(0, int) }
+        if let double = value as? Double {
+            guard double.isFinite, double > 0 else { return 0 }
+            guard double < Double(Int.max) else { return .max }
+            return Int(double)
+        }
         return 0
     }
 }

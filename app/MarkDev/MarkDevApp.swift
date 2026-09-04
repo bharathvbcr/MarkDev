@@ -26,6 +26,12 @@ struct MarkDevApp: App {
         // A stale libmarkdev.a would misread struct layouts and produce
         // subtly wrong text ranges. Fail at launch instead.
         MarkDevCore.verifyABI()
+        Task {
+            await DiagnosticsCenter.shared.recordVerifiedABILaunch()
+        }
+        // Apply the persisted value before the first window is drawn. The
+        // settings view handles subsequent changes through the same typed value.
+        EditorPreferences.storedAppearance().apply()
     }
 
     var body: some Scene {

@@ -645,6 +645,24 @@ final class MarkdownPreviewTests: XCTestCase {
         XCTAssertEqual(controller.markdown, "café")
     }
 
+    func testLoadingAnOversizedFileIsRefusedBeforeRendering() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevPreview-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let note = directory.appendingPathComponent("Huge.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: note.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: note)
+        try handle.truncate(atOffset: UInt64(MarkdownReadLimits.maximumPreviewBytes + 1))
+        try handle.close()
+
+        let controller = makeController()
+        controller.show("# Existing", directory: nil)
+        XCTAssertThrowsError(try controller.load(contentsOf: note))
+        XCTAssertEqual(controller.markdown, "# Existing", "a refused load must not clear the preview")
+    }
+
     func testShowingASecondDocumentReplacesTheFirst() throws {
         // Quick Look reuses a preview controller across files when the user
         // arrows through a Finder selection.
@@ -653,5 +671,44 @@ final class MarkdownPreviewTests: XCTestCase {
         controller.show("# Second", directory: nil)
 
         XCTAssertEqual(controller.markdown, "# Second")
+    }
+
+    // MARK: - A refused file
+
+    /// Quick Look's failure mode is a blank panel, and this type's own `load`
+    /// falls back to Latin-1 specifically to avoid one. The refusal path
+    /// produced exactly that blank panel anyway.
+    func testARefusedFileExplainsItselfRatherThanShowingAnEmptyPanel() throws {
+        let controller = makeController()
+        controller.show("before\0after", directory: nil)
+        let view = try textView(of: controller)
+
+        XCTAssertFalse(
+            view.markdown.isEmpty,
+            "a refused file must not render as an empty preview — indistinguishable "
+                + "from an empty note, and Quick Look cannot raise an alert to say otherwise")
+        XCTAssertTrue(view.markdown.contains("Cannot be previewed"))
+    }
+
+    /// The notice must not resolve pictures against the refused file's folder.
+    ///
+    /// A relative path in the notice would otherwise be looked up inside a
+    /// directory chosen by whoever owns the file being previewed.
+    func testTheRefusalNoticeResolvesNothingAgainstTheRefusedFilesFolder() throws {
+        let controller = makeController()
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+        controller.show("bad\0file", directory: directory)
+        let view = try textView(of: controller)
+
+        XCTAssertNil(view.documentDirectory)
+    }
+
+    /// An ordinary file is untouched by any of this.
+    func testAnOrdinaryFileIsNotGivenTheNotice() throws {
+        let controller = makeController()
+        controller.show("# Real\n\n- one\n- two\n", directory: nil)
+        let view = try textView(of: controller)
+
+        XCTAssertEqual(view.markdown, "# Real\n\n- one\n- two\n")
     }
 }

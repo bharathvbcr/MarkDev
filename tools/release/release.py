@@ -55,8 +55,38 @@ def preflight(tag):
     return result
 
 
+def signed_entitlements(bundle):
+    result = run("codesign", "--display", "--entitlements", ":-", str(bundle))
+    output = result.stdout + result.stderr
+    start = output.find("<?xml")
+    end = output.rfind("</plist>")
+    if start == -1 or end == -1:
+        return {}
+    try:
+        value = plistlib.loads(output[start:end + len("</plist>")].encode())
+    except plistlib.InvalidFileException as error:
+        raise ReleaseError(f"cannot decode signed entitlements for {bundle}: {error}") from error
+    if not isinstance(value, dict):
+        raise ReleaseError(f"signed entitlements for {bundle} are not a dictionary")
+    return value
+
+
 def verify_bundle(app, expected):
     run("codesign", "--verify", "--deep", "--strict", str(app))
+    main_entitlements = signed_entitlements(app)
+    if main_entitlements.get("com.apple.security.app-sandbox") is True:
+        raise ReleaseError("main app must remain unsandboxed for terminal and arbitrary-vault access")
+    quicklook = app / "Contents/PlugIns/MarkDevQuickLook.appex"
+    quicklook_entitlements = signed_entitlements(quicklook)
+    required_quicklook = {
+        "com.apple.security.app-sandbox": True,
+        "com.apple.security.files.user-selected.read-only": True,
+    }
+    for key, value in required_quicklook.items():
+        if quicklook_entitlements.get(key) is not value:
+            raise ReleaseError(f"Quick Look signed entitlement {key} must be true")
+    if quicklook_entitlements.get("com.apple.security.files.user-selected.read-write") is True:
+        raise ReleaseError("Quick Look extension must not receive user-selected write access")
     bundles = [
         (app / "Contents/Info.plist", app / "Contents/MacOS/MarkDev", "dev.markdev.MarkDev"),
         (app / "Contents/PlugIns/MarkDevQuickLook.appex/Contents/Info.plist",

@@ -21,17 +21,20 @@ public struct GraphPanel: View {
     public var onDismiss: () -> Void
 
     @State private var graph: VaultGraph = .empty
-    @State private var scope: Scope = .local
+    @State private var scope: Scope
     @State private var depth = 2
     @State private var tag: String?
     /// Solved graphs by ``rebuildKey``, so flipping scope or hopping depth —
     /// the two controls a reader actually works — answers from memory instead
     /// of re-running the force simulation they already watched finish.
-    @State private var solved: [String: VaultGraph] = [:]
+    @State private var solved: [RebuildIdentity: VaultGraph] = [:]
     /// Insertion order for ``solved``'s eviction, which a dictionary cannot
     /// remember on its own.
-    @State private var solvedOrder: [String] = []
+    @State private var solvedOrder: [RebuildIdentity] = []
     @State private var isComputing = false
+    /// Invalidates older asynchronous solves even when a newer request is
+    /// fulfilled from cache before the older one returns.
+    @State private var rebuildGeneration: UInt64 = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// How much of the vault to draw.
@@ -47,6 +50,14 @@ public struct GraphPanel: View {
         var label: String { self == .whole ? "Whole Vault" : "Around This Note" }
     }
 
+    struct RebuildIdentity: Hashable {
+        let scope: Scope
+        let depth: Int
+        let tag: String?
+        let current: String?
+        let contentRevision: UInt64
+    }
+
     public init(
         vault: VaultIndex,
         current: String?,
@@ -57,6 +68,7 @@ public struct GraphPanel: View {
         self.current = current
         self.onOpen = onOpen
         self.onDismiss = onDismiss
+        self._scope = State(initialValue: Self.resolvedScope(.local, current: current))
     }
 
     public var body: some View {
@@ -74,6 +86,9 @@ public struct GraphPanel: View {
         // than no graph. The rebuild awaits, so a slower scope change cancels
         // the layout of the faster one it replaced instead of racing it.
         .task(id: rebuildKey) { await rebuild() }
+        .onChange(of: current) { _, newCurrent in
+            if newCurrent == nil { scope = .whole }
+        }
         .onKeyPress(.escape) {
             onDismiss()
             return .handled
@@ -83,8 +98,51 @@ public struct GraphPanel: View {
     /// Everything the drawn graph depends on. Collapsed into one value so the
     /// rebuild is expressed once rather than as four `onChange` handlers that
     /// can fall out of step.
-    private var rebuildKey: String {
-        "\(scope.rawValue)|\(depth)|\(tag ?? "")|\(current ?? "")|\(vault.noteCount)"
+    private var rebuildKey: RebuildIdentity {
+        Self.rebuildIdentity(
+            scope: scope,
+            depth: depth,
+            tag: tag,
+            current: current,
+            contentRevision: vault.contentRevision)
+    }
+
+    static func resolvedScope(_ requested: Scope, current: String?) -> Scope {
+        current == nil ? .whole : requested
+    }
+
+    static func rebuildIdentity(
+        scope: Scope,
+        depth: Int,
+        tag: String?,
+        current: String?,
+        contentRevision: UInt64
+    ) -> RebuildIdentity {
+        let resolved = resolvedScope(scope, current: current)
+        return RebuildIdentity(
+            scope: resolved,
+            depth: depth,
+            tag: tag,
+            current: resolved == .local ? current : nil,
+            contentRevision: contentRevision)
+    }
+
+    static func graphAfterRebuild(previous _: VaultGraph, computed: VaultGraph) -> VaultGraph {
+        computed
+    }
+
+    /// The single publish rule for asynchronous solves. Both the generation
+    /// and full identity are required: a cached newer request can advance the
+    /// generation without changing inputs, while a content edit can change
+    /// the identity before a view-state update advances the generation.
+    static func acceptsRebuildResult(
+        request: RebuildIdentity,
+        generation: UInt64,
+        current: RebuildIdentity,
+        currentGeneration: UInt64,
+        isCancelled: Bool
+    ) -> Bool {
+        !isCancelled && generation == currentGeneration && request == current
     }
 
     private var controls: some View {
@@ -94,7 +152,12 @@ public struct GraphPanel: View {
             Text("Graph")
                 .font(.headline)
 
-            Picker("Scope", selection: $scope) {
+            Picker(
+                "Scope",
+                selection: Binding(
+                    get: { Self.resolvedScope(scope, current: current) },
+                    set: { scope = $0 })
+            ) {
                 ForEach(Scope.allCases) { scope in
                     Text(scope.label).tag(scope)
                 }
@@ -106,7 +169,7 @@ public struct GraphPanel: View {
             // only honest scope is the whole vault.
             .disabled(current == nil)
 
-            if scope == .local, current != nil {
+            if Self.resolvedScope(scope, current: current) == .local {
                 Stepper(value: $depth, in: 1...5) {
                     Text("\(depth) hop\(depth == 1 ? "" : "s")")
                         .font(.caption)
@@ -183,28 +246,59 @@ public struct GraphPanel: View {
     private var emptyReason: String {
         if vault.noteCount == 0 { return "No vault open." }
         if tag != nil { return "No notes tagged \(tag ?? "")." }
-        if scope == .local, current == nil { return "Open a note to see what it connects to." }
         return "Nothing linked yet — use [[wikilinks]] to connect notes."
     }
 
     private func rebuild() async {
         let key = rebuildKey
+        rebuildGeneration &+= 1
+        let generation = rebuildGeneration
+
         if let solved = solved[key] {
             graph = solved
+            isComputing = false
             return
         }
 
+        // Never show a graph for a previous filter or index revision while a
+        // new solve is pending. An empty or failed solve must leave it empty.
+        graph = .empty
         isComputing = true
-        defer { isComputing = false }
 
-        let focus = scope == .local ? current : nil
-        let computed = await vault.graphOffMain(focus: focus, depth: depth, tag: tag)
-        guard !computed.isEmpty else { return }
+        // Editing can advance the index on every keystroke. Debounce before
+        // cloning so superseded requests do not fan out force simulations.
+        do {
+            try await Task.sleep(for: .milliseconds(150))
+        } catch {
+            return
+        }
+        guard Self.acceptsRebuildResult(
+            request: key,
+            generation: generation,
+            current: rebuildKey,
+            currentGeneration: rebuildGeneration,
+            isCancelled: Task.isCancelled)
+        else { return }
+
+        let computed = await vault.graphOffMain(
+            focus: key.scope == .local ? key.current : nil,
+            depth: key.depth,
+            tag: key.tag)
 
         // The key changed mid-flight: a newer rebuild owns the canvas now,
         // and assigning would flash this graph over theirs before that one
-        // lands. The solve is still cached under its own key either way.
-        if !Task.isCancelled { graph = computed }
+        // lands. Stale results are discarded rather than cached as current.
+        guard Self.acceptsRebuildResult(
+            request: key,
+            generation: generation,
+            current: rebuildKey,
+            currentGeneration: rebuildGeneration,
+            isCancelled: Task.isCancelled)
+        else { return }
+        isComputing = false
+        graph = Self.graphAfterRebuild(previous: graph, computed: computed)
+        guard !computed.isEmpty else { return }
+
         if solved[key] == nil { solvedOrder.append(key) }
         solved[key] = computed
 

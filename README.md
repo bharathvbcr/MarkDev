@@ -49,6 +49,11 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 - **GFM Tables as Grids**: Pipe tables are drawn as a real grid with per-column alignment, without modifying raw text.
 - **Interactive Checkboxes**: Clickable GFM task list checkboxes rendered directly into gutter fragments.
 
+### 🛠️ Safety, Support, and Automation
+- **Bounded HTML Export**: Notes export as browser-ready HTML through a safe Rust path that enforces payload size limits and destination-safe rendering.
+- **Diagnostics Pipeline**: Privacy-preserving, bounded diagnostics with rotating local file/event sinks and one-click support report export from Settings.
+- **AI-Assisted Editing Controls**: Writing and proofreading tools verify source-document ownership before applying model output.
+
 ### 🧠 Knowledge Vault & Link Graph
 - **Obsidian-Compatible Wikilinks**: Full `[[Note]]`, `[[Note#Heading]]`, and `[[Note|Alias]]` link resolution with deterministic tie-breaking (shallowest path first).
 - **Backlinks & Unlinked Mentions**: Fast inverted index that tracks backlinks and extracts whole-word unlinked mentions across the entire vault.
@@ -187,7 +192,7 @@ investigation and is never silently replaced.
 | `⌘ \` | Toggle File Navigator Sidebar |
 | `⌥ ⌘ I` | Toggle Metadata & Backlinks Inspector |
 | `⌘ J` | Toggle Terminal Drawer |
-| `⇧ ⌘ G` | Toggle Vault Graph View |
+| `⌥ ⌘ G` | Toggle Vault Graph View |
 | `⌘ F` | Find in Document |
 | `⌥ ⌘ F` | Find and Replace |
 | `⌘ G` / `⇧ ⌘ G` | Find Next / Previous Match |

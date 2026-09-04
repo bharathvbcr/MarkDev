@@ -26,7 +26,8 @@ public struct TextEdit: Sendable, Equatable {
 
     /// The range this edit replaced, in the pre-edit document's coordinates.
     public var replacedRange: NSRange {
-        NSRange(location: range.location, length: max(0, range.length - delta))
+        let (length, overflow) = range.length.subtractingReportingOverflow(delta)
+        return NSRange(location: range.location, length: overflow ? 0 : max(0, length))
     }
 }
 
@@ -43,6 +44,9 @@ public struct TextEdit: Sendable, Equatable {
 /// engine.
 @MainActor
 public final class MarkdownTextView: ScrollingTextView {
+    /// Where a refused document is reported. Injectable for tests.
+    public var diagnostics: DiagnosticsEmitter = .shared
+
     /// Visual configuration. Setting it restyles.
     public var theme: EditorTheme = .standard {
         didSet {
@@ -83,6 +87,7 @@ public final class MarkdownTextView: ScrollingTextView {
     public private(set) var parsed: ParsedDocument = .empty {
         didSet {
             listItems = parsed.blocks.filter { $0.kind == .listItem }
+            listItemLevels = Self.nestingLevels(of: listItems)
             tableBlocks = parsed.tables
             codeBlocks = parsed.blocks.filter { Self.holdsCode($0.kind) }
             // The solved grids describe the previous parse's offsets, so they
@@ -158,6 +163,16 @@ public final class MarkdownTextView: ScrollingTextView {
     /// ``MarkdownStyler``. Blocks arrive in open order, so this is sorted by
     /// start offset and can be searched.
     private var listItems: [BlockDescriptor] = []
+    /// How many list items enclose each entry of ``listItems``, in step with it.
+    ///
+    /// The bullet a level gets cannot be read off `depth`, which counts *every*
+    /// ancestor block: a blockquote adds one, so a first-level list inside a
+    /// quote asked for the second-level glyph. Items arrive in document order
+    /// and nest properly, so one sweep with a stack of open ends answers it —
+    /// the same shape `tableBlocks` uses, and for the same reason a per-item
+    /// scan of the array would be the quadratic this codebase has paid for
+    /// four times already.
+    private var listItemLevels: [Int] = []
 
     /// Called after every reparse, for observers such as the outline view.
     public var onParse: ((ParsedDocument) -> Void)?
@@ -338,6 +353,12 @@ public final class MarkdownTextView: ScrollingTextView {
     /// The edit the text view announced through `shouldChangeText`, waiting
     /// for the `didChangeText` that applies it.
     private var announcedEdit: TextEdit?
+
+    /// UTF-8 size of the last accepted buffer and the post-edit value computed
+    /// before AppKit mutates it. Keeping the running total makes the ordinary
+    /// keystroke boundary proportional to the edit, not the whole document.
+    private var acceptedUTF8ByteCount = 0
+    private var announcedUTF8ByteCount: Int?
 
     /// A change the storage has made that no reparse has accounted for yet.
     /// Cleared by ``reparse(edit:)``; anything still here when the catch-up
@@ -524,12 +545,39 @@ public final class MarkdownTextView: ScrollingTextView {
     // MARK: - Content
 
     /// Replaces the document text and reparses from scratch.
-    public func setMarkdown(_ markdown: String) {
-        guard let storage = textStorage else { return }
+    @discardableResult
+    public func setMarkdown(_ markdown: String) -> Bool {
+        guard let byteCount = MarkdownReadLimits.acceptedDocumentByteCount(markdown),
+            let storage = textStorage,
+            document.rebuild(from: markdown)
+        else {
+            // A refusal leaves the view holding whatever it had — for a fresh
+            // editor, nothing at all. That is indistinguishable from an empty
+            // note, and for a long time it was the *only* trace: no error, no
+            // log line, a reader looking at a blank page for a file they can
+            // see has content. Record it before returning, so the support
+            // export can say the document was refused rather than empty.
+            //
+            // The byte count is the one thing that separates the two reachable
+            // causes — a note past `maximumDocumentBytes`, or one the parser
+            // refused for its content (a NUL byte is the reachable case; it
+            // survives a UTF-8 read and dies at the FFI).
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .editor,
+                code: .editorDocumentRejected,
+                operationID: DiagnosticOperationID(),
+                metadata: DiagnosticMetadata([
+                    .byteCount: .integer(Int64(clamping: markdown.utf8.count))
+                ]))
+            return false
+        }
         isReplacingDocument = true
         defer { isReplacingDocument = false }
         // Any edit still in flight described the document being replaced.
         announcedEdit = nil
+        announcedUTF8ByteCount = nil
+        acceptedUTF8ByteCount = byteCount
         unparsedChange = nil
         storage.setAttributedString(NSAttributedString(string: markdown))
         // A wholesale replacement is a different document as far as the
@@ -550,12 +598,12 @@ public final class MarkdownTextView: ScrollingTextView {
         contentPrefetcher.cancel()
         warmedGeometry = nil
         warmedContents = []
-        document.rebuild(from: markdown)
         parsed = document.parsed
         refreshRevealedBlocks()
         restyle()
         prefetchRenderedContent()
         onParse?(parsed)
+        return true
     }
 
     /// The current document text.
@@ -1212,6 +1260,14 @@ public final class MarkdownTextView: ScrollingTextView {
         guard !isReplacingDocument else { return }
         let edit = announcedEdit
         announcedEdit = nil
+        if let byteCount = announcedUTF8ByteCount {
+            acceptedUTF8ByteCount = byteCount
+        } else if let byteCount = MarkdownReadLimits.acceptedDocumentByteCount(markdown) {
+            // Undo/redo bypasses `shouldChangeText`; this is its bounded
+            // catch-up path.
+            acceptedUTF8ByteCount = byteCount
+        }
+        announcedUTF8ByteCount = nil
         reparse(edit: edit)
         // After the reparse, and not on the replacement path: `setMarkdown`
         // has already cleared the issues and told observers, so reporting
@@ -1250,8 +1306,17 @@ public final class MarkdownTextView: ScrollingTextView {
 
         let edited = storage.editedRange
         let delta = storage.changeInLength
-        if edited.location >= 0, edited.length >= 0, NSMaxRange(edited) <= storage.length,
-            edited.length - delta >= 0
+        if let byteCount = announcedUTF8ByteCount {
+            acceptedUTF8ByteCount = byteCount
+        } else if let byteCount = MarkdownReadLimits.acceptedDocumentByteCount(storage.string) {
+            // Undo/redo and direct storage edits have no preflight record, so
+            // their uncommon catch-up path measures the authoritative buffer.
+            acceptedUTF8ByteCount = byteCount
+        }
+        let (editedEnd, endOverflow) = edited.location.addingReportingOverflow(edited.length)
+        let (replacedLength, lengthOverflow) = edited.length.subtractingReportingOverflow(delta)
+        if edited.location >= 0, edited.length >= 0, !endOverflow,
+            editedEnd <= storage.length, !lengthOverflow, replacedLength >= 0
         {
             unparsedChange = .scoped(
                 TextEdit(
@@ -1285,11 +1350,37 @@ public final class MarkdownTextView: ScrollingTextView {
         in affectedCharRange: NSRange,
         replacementString: String?
     ) -> Bool {
+        guard let storage = textStorage,
+            affectedCharRange.location >= 0,
+            affectedCharRange.length >= 0
+        else { return false }
+        let (rangeEnd, rangeOverflow) = affectedCharRange.location.addingReportingOverflow(
+            affectedCharRange.length)
+        guard !rangeOverflow, rangeEnd <= storage.length else { return false }
+
+        let replacement = replacementString ?? ""
+        let removed = (storage.string as NSString)
+            .substring(with: affectedCharRange).utf8.count
+        let (withoutRemoved, subtractOverflow) = acceptedUTF8ByteCount
+            .subtractingReportingOverflow(removed)
+        let (proposedByteCount, addOverflow) = withoutRemoved.addingReportingOverflow(
+            replacement.utf8.count)
+        guard !subtractOverflow, withoutRemoved >= 0, !addOverflow,
+            proposedByteCount <= MarkdownReadLimits.maximumDocumentBytes
+        else {
+            announcedEdit = nil
+            announcedUTF8ByteCount = nil
+            return false
+        }
+
         if let replacementString, !isStyling {
             let inserted = (replacementString as NSString).length
+            let (delta, deltaOverflow) = inserted.subtractingReportingOverflow(
+                affectedCharRange.length)
+            guard !deltaOverflow else { return false }
             announcedEdit = TextEdit(
                 range: NSRange(location: affectedCharRange.location, length: inserted),
-                delta: inserted - affectedCharRange.length,
+                delta: delta,
                 replacement: replacementString)
 
             // Carried through the edit rather than thrown away, so fixing one
@@ -1308,12 +1399,15 @@ public final class MarkdownTextView: ScrollingTextView {
 
         let allowed = super.shouldChangeText(
             in: affectedCharRange, replacementString: replacementString)
-        if !allowed {
+        if allowed {
+            announcedUTF8ByteCount = proposedByteCount
+        } else {
             // A refused edit never reaches `didChangeText`, so its record would
             // sit here and be consumed by whatever edit came next — describing
             // a change to the document that never happened, at offsets that
             // mean something else now.
             announcedEdit = nil
+            announcedUTF8ByteCount = nil
         }
         return allowed
     }
@@ -1354,9 +1448,9 @@ public final class MarkdownTextView: ScrollingTextView {
         actionName: String
     ) -> Bool {
         guard isEditable, let storage = textStorage else { return false }
-        guard range.location >= 0, range.length >= 0,
-            range.location + range.length <= storage.length
-        else { return false }
+        guard range.location >= 0, range.length >= 0 else { return false }
+        let (rangeEnd, overflow) = range.location.addingReportingOverflow(range.length)
+        guard !overflow, rangeEnd <= storage.length else { return false }
         guard shouldChangeText(in: range, replacementString: replacement) else { return false }
 
         undoManager?.setActionName(actionName)
@@ -2323,6 +2417,15 @@ extension MarkdownTextView {
             if edge.roundsTop, opensWithHiddenLine {
                 fragment.blockLabel = calloutLabel(kind: kind, at: range)
             }
+            // A callout is a *container*, and the label names the callout
+            // rather than the line — so a fragment can owe both stand-ins at
+            // once. Falling out of the switch here instead meant a list inside
+            // a callout kept its `- ` hidden and drew nothing in its place,
+            // the same stack of indented sentences a quoted list showed. A
+            // task item is unaffected: `BlockDecoration` resolves those before
+            // the innermost-block search, so one arrives as `.task` and takes
+            // the checkbox branch rather than this one.
+            fragment.listMarker = listMarker(forFragmentAt: range, in: text)
         case .task:
             // The checkbox is the stand-in; a bullet beside it would be a
             // second marker for one item.
@@ -2351,25 +2454,55 @@ extension MarkdownTextView {
     /// marker is collapsed: a wrapped item's later lines carry no marker, and
     /// a revealed item is showing its own `- ` already.
     private func listMarker(forFragmentAt range: NSRange, in text: NSString) -> String? {
-        guard let item = listItem(startingIn: range) else { return nil }
+        guard let index = listItemIndex(startingIn: range) else { return nil }
+        let item = listItems[index]
 
-        // The marker as written, so `7.` stays 7 and `*` still nests like `-`.
+        // Read the marker from where the *item* starts, not where its line
+        // does. Everything between the two belongs to a container: `> ` for a
+        // quote or a callout, indentation for a nested list. Scanning from the
+        // line start meant the first character seen inside a quote was `>`,
+        // which is not a list marker, so no bullet was drawn at all — and a
+        // list whose `- ` is hidden with nothing in its place renders as a
+        // stack of indented sentences, which is precisely the outcome
+        // `RevealPolicy.markersRequiringReplacement` exists to forbid.
         let line = text.lineRange(for: NSRange(location: item.range.location, length: 0))
         let content = HiddenRanges.contentRange(of: line, in: text)
-        let source = text.substring(with: content)
+        let start = max(content.location, item.range.location)
+        guard start < NSMaxRange(content) else { return nil }
+        // The marker as written, so `7.` stays 7 and `*` still nests like `-`.
+        let source = text.substring(
+            with: NSRange(location: start, length: NSMaxRange(content) - start))
         guard let written = Self.writtenListMarker(in: source) else { return nil }
 
         // Leading indentation is spaces and tabs, so its character count is
         // also its length in the UTF-16 units storage is indexed by.
         let indent = source.prefix { $0 == " " || $0 == "\t" }.count
-        let marker = NSRange(
-            location: content.location + indent, length: (written as NSString).length)
+        let marker = NSRange(location: start + indent, length: (written as NSString).length)
         guard hiddenRanges.covers(marker) else { return nil }
 
         if written.first?.isNumber == true { return written }
-        // Nesting alternates list, item, so each level of indentation is two
-        // blocks deep. The glyph changes with it, the way a printed list does.
-        return Self.bullets[Int(item.depth) / 2 % Self.bullets.count]
+        // The glyph follows how many lists deep the item is, the way a printed
+        // list does — counted from the items enclosing it, not from `depth`.
+        let level = index < listItemLevels.count ? listItemLevels[index] : 0
+        return Self.bullets[level % Self.bullets.count]
+    }
+
+    /// Enclosing-item count for every item, in one pass.
+    ///
+    /// Items are in document order and properly nested, so an item's level is
+    /// the number of items still open when it starts.
+    private static func nestingLevels(of items: [BlockDescriptor]) -> [Int] {
+        var levels: [Int] = []
+        levels.reserveCapacity(items.count)
+        var openEnds: [Int] = []
+        for item in items {
+            while let last = openEnds.last, last <= item.range.location {
+                openEnds.removeLast()
+            }
+            levels.append(openEnds.count)
+            openEnds.append(NSMaxRange(item.range))
+        }
+        return levels
     }
 
     /// The first list item beginning inside `range`, found by binary search.
@@ -2377,7 +2510,7 @@ extension MarkdownTextView {
     /// Items nest, so two can begin at the same offset — `- - a` opens an
     /// outer item and an inner one on one line. The outer one is taken,
     /// because the marker read off that line is the outer one's.
-    private func listItem(startingIn range: NSRange) -> BlockDescriptor? {
+    private func listItemIndex(startingIn range: NSRange) -> Int? {
         var low = 0
         var high = listItems.count
         while low < high {
@@ -2391,7 +2524,7 @@ extension MarkdownTextView {
         guard low < listItems.count,
             listItems[low].range.location < NSMaxRange(range)
         else { return nil }
-        return listItems[low]
+        return low
     }
 
     /// Bullets by nesting level, filled then hollow then square — the

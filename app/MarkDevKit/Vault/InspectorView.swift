@@ -256,11 +256,18 @@ public struct InspectorView: View {
 
     /// One outbound link. A resolved one opens its target; a broken one says
     /// so and offers nothing, because the only place to go is the text itself.
+    static func targetRevealOffset(for _: OutgoingLink) -> UInt32 {
+        // `OutgoingLink.offset` belongs to the source note. Until the index
+        // supplies a resolved target heading offset, the only truthful target
+        // position is the beginning of the target document.
+        0
+    }
+
     @ViewBuilder
     private func outgoingLink(_ link: OutgoingLink) -> some View {
         if let path = link.path {
             Button {
-                onOpenNote(path, link.offset)
+                onOpenNote(path, Self.targetRevealOffset(for: link))
             } label: {
                 HStack(spacing: GlassTheme.Spacing.tight) {
                     Image(systemName: "arrow.turn.up.right")

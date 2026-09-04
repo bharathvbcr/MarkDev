@@ -9,6 +9,44 @@ import XCTest
 
 @testable import MarkDevKit
 
+private final class LockedSuccessCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+final class SessionStoreConcurrencyTests: XCTestCase {
+    /// SwiftUI can construct windows concurrently. The process-wide restore
+    /// claim is a compare-and-set, not two unsynchronised read/write steps:
+    /// otherwise several windows can all clone the same session.
+    func testConcurrentRestoreClaimsHaveExactlyOneWinner() {
+        for round in 0..<50 {
+            let claim = SessionRestoreClaim()
+            let winners = LockedSuccessCounter()
+
+            DispatchQueue.concurrentPerform(iterations: 64) { _ in
+                if claim.claim() { winners.increment() }
+            }
+
+            XCTAssertEqual(
+                winners.value, 1,
+                "more than one window won restore round \(round)")
+            XCTAssertFalse(claim.claim(), "a completed claim must remain one-shot")
+        }
+    }
+}
+
 @MainActor
 final class SessionStateTests: XCTestCase {
     private func makeVault() throws -> URL {

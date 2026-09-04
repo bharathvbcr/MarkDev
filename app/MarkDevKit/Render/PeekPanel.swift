@@ -158,7 +158,7 @@ public enum PeekLoader {
     /// A peek is meant to be instant. Reading and laying out a multi-megabyte
     /// file on a key-down is not, and the reader is left holding a key while
     /// nothing happens.
-    public static let maximumBytes = 4 * 1024 * 1024
+    public static let maximumBytes = MarkdownReadLimits.maximumPreviewBytes
 
     public static func read(_ url: URL) -> Result<String, PeekLoadFailure> {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -171,7 +171,14 @@ public enum PeekLoader {
         // Bytes rather than text from the cache: a peek accepts an encoding
         // that opening the document does not, and a cache of decoded strings
         // would have to settle on one policy for both.
-        guard let data = try? NoteTextCache.shared.read(url) else {
+        let data: Data
+        do {
+            data = try NoteTextCache.shared.read(url, maximumBytes: maximumBytes)
+        } catch is NoteTextReadError {
+            let readable = ByteCountFormatter.string(
+                fromByteCount: Int64(maximumBytes), countStyle: .file)
+            return .failure(PeekLoadFailure(reason: "Too large to preview (limit \(readable))"))
+        } catch {
             return .failure(PeekLoadFailure(reason: "Could not read \(url.lastPathComponent)"))
         }
         // Latin-1 as a fallback, matching the Quick Look extension: a note

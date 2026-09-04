@@ -405,9 +405,28 @@ final class AppearanceTests: XCTestCase {
 
     private func runFlipStorm(seed: UInt64, rounds: Int) throws {
         let view = makeView(Self.richDocument, appearance: .aqua)
+
+        // The storm scrolls to a random offset, so it divides by the
+        // document's length. An empty document therefore makes this a
+        // `% 0` — a *trap*, not a failure, which takes the whole runner
+        // down; XCTest then resumes at the next test and reports the short
+        // run as a passing one, exactly as this repository's notes warn.
+        //
+        // And an empty document here is not hypothetical: it is what a bug in
+        // the FFI bridge produces, so the harness would crash hardest at the
+        // moment it had the most to say. Assert the fixture loaded, once, and
+        // this stays a failure with a name on it.
+        XCTAssertFalse(
+            view.markdown.isEmpty,
+            "the fixture did not load — the editor refused it, and every "
+                + "assertion below would be about an empty document")
+        guard !view.markdown.isEmpty else { return }
+
         var seed = seed
         func next(_ modulus: UInt64) -> UInt64 {
             seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            // Belt and braces: no arithmetic in a stress harness may trap.
+            guard modulus > 0 else { return 0 }
             return (seed >> 33) % modulus
         }
 

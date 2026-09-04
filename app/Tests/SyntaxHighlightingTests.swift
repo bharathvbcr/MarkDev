@@ -27,6 +27,40 @@ final class SyntaxHighlightingTests: XCTestCase {
             first.contains { $0.kind == .string && NSIntersectionRange($0.range, emoji) == emoji })
     }
 
+    func testHighlighterRejectsCodeAndLanguageAtPlusOneBeforeCaching() {
+        let highlighter = SyntaxHighlighter()
+        let exactCode = String(repeating: " ", count: SyntaxHighlighter.maximumCodeBytes)
+        XCTAssertTrue(highlighter.spans(language: "rust", code: exactCode).isEmpty)
+        XCTAssertTrue(highlighter.isCached(language: "rust", code: exactCode))
+
+        let oversizedCode = exactCode + " "
+        XCTAssertTrue(highlighter.spans(language: "rust", code: oversizedCode).isEmpty)
+        XCTAssertFalse(highlighter.isCached(language: "rust", code: oversizedCode))
+
+        let exactLanguage = String(repeating: "q", count: SyntaxHighlighter.maximumLanguageBytes)
+        XCTAssertTrue(highlighter.spans(language: exactLanguage, code: "x").isEmpty)
+        XCTAssertTrue(highlighter.isCached(language: exactLanguage, code: "x"))
+        let oversizedLanguage = exactLanguage + "q"
+        XCTAssertTrue(highlighter.spans(language: oversizedLanguage, code: "x").isEmpty)
+        XCTAssertFalse(highlighter.isCached(language: oversizedLanguage, code: "x"))
+    }
+
+    func testCacheEvictsByRetainedBytesAsWellAsEntryCount() {
+        let highlighter = SyntaxHighlighter(maximumEntries: 10, maximumBytes: 1_000)
+        let first = String(repeating: "a", count: 600)
+        let second = String(repeating: "b", count: 600)
+
+        _ = highlighter.spans(language: "unknown", code: first)
+        _ = highlighter.spans(language: "unknown", code: second)
+
+        XCTAssertLessThanOrEqual(highlighter.cachedByteCost, 1_000)
+        XCTAssertEqual(highlighter.cachedEntryCount, 1)
+        XCTAssertFalse(highlighter.isCached(language: "unknown", code: first))
+        XCTAssertTrue(highlighter.isCached(language: "unknown", code: second))
+        highlighter.removeAllCachedSpans()
+        XCTAssertEqual(highlighter.cachedByteCost, 0)
+    }
+
     func testEditorAppliesTreeSitterColoursInsideAFencedBlock() throws {
         let source = "```rust\nfn main() { let value = 42; }\n```"
         let view = MarkdownTextView.make()

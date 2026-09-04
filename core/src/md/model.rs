@@ -14,6 +14,23 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum Markdown source accepted by the parser, in UTF-8 bytes.
+pub const MAX_DOCUMENT_BYTES: usize = 16 * 1_048_576;
+/// Maximum events consumed from pulldown-cmark for one document.
+pub const MAX_PARSE_EVENTS: usize = 2_000_000;
+/// Maximum simultaneously-open Markdown constructs.
+pub const MAX_PARSE_NESTING: usize = 256;
+/// Maximum combined spans, markers, and block descriptors in one result.
+pub const MAX_STRUCTURAL_RECORDS: usize = 1_000_000;
+/// Maximum number of distinct strings interned in one result.
+pub const MAX_INTERNED_STRINGS: usize = 65_536;
+/// Maximum UTF-8 length of one interned string.
+pub const MAX_INTERNED_STRING_BYTES: usize = 4 * 1024;
+/// Maximum combined UTF-8 length of the string table.
+pub const MAX_TOTAL_STRING_BYTES: usize = 4 * 1_048_576;
+/// Target byte stride between UTF-8/UTF-16 mapping checkpoints.
+pub const UTF16_CHECKPOINT_BYTES: usize = 64;
+
 /// Inline construct that carries character attributes.
 ///
 /// Discriminants are part of the FFI contract — append, never renumber.
@@ -192,17 +209,6 @@ pub struct ParseResult {
     pub top_level: Vec<std::ops::Range<usize>>,
 }
 
-impl ParseResult {
-    /// Interns `s`, returning its string-table index.
-    pub fn intern(&mut self, s: &str) -> u32 {
-        if let Some(i) = self.strings.iter().position(|existing| existing == s) {
-            return i as u32;
-        }
-        self.strings.push(s.to_owned());
-        (self.strings.len() - 1) as u32
-    }
-}
-
 /// Converts byte offsets into UTF-16 code unit offsets.
 ///
 /// `pulldown-cmark` reports byte offsets into the source `&str`; `NSTextStorage`
@@ -212,31 +218,44 @@ impl ParseResult {
 ///
 /// Pure-ASCII documents (the common case) skip the table entirely, since the
 /// two offsets coincide.
-pub struct Utf16Mapper {
+pub struct Utf16Mapper<'a> {
+    source: &'a str,
     /// `None` when the source is ASCII and offsets map one-to-one.
     checkpoints: Option<Vec<(u32, u32)>>,
     len_utf16: u32,
 }
 
-impl Utf16Mapper {
-    pub fn new(source: &str) -> Self {
+impl<'a> Utf16Mapper<'a> {
+    pub fn new(source: &'a str) -> Self {
         if source.is_ascii() {
             return Self {
+                source,
                 checkpoints: None,
                 len_utf16: source.len() as u32,
             };
         }
 
-        // One entry per character boundary: (byte offset, utf16 offset).
-        let mut checkpoints = Vec::with_capacity(source.chars().count() + 1);
+        // Sparse character-boundary checkpoints. Mapping scans at most roughly
+        // one checkpoint stride from the preceding entry, while even a
+        // 16-MiB all-non-ASCII document allocates O(bytes / 64), not one tuple
+        // per scalar.
+        let capacity = source.len() / UTF16_CHECKPOINT_BYTES + 2;
+        let mut checkpoints = Vec::with_capacity(capacity);
         let mut utf16 = 0u32;
+        let mut last_checkpoint = 0usize;
         for (byte, ch) in source.char_indices() {
-            checkpoints.push((byte as u32, utf16));
+            if byte == 0 || byte.saturating_sub(last_checkpoint) >= UTF16_CHECKPOINT_BYTES {
+                checkpoints.push((byte as u32, utf16));
+                last_checkpoint = byte;
+            }
             utf16 += ch.len_utf16() as u32;
         }
-        checkpoints.push((source.len() as u32, utf16));
+        if checkpoints.last().map(|&(byte, _)| byte as usize) != Some(source.len()) {
+            checkpoints.push((source.len() as u32, utf16));
+        }
 
         Self {
+            source,
             checkpoints: Some(checkpoints),
             len_utf16: utf16,
         }
@@ -251,13 +270,25 @@ impl Utf16Mapper {
         let Some(checkpoints) = &self.checkpoints else {
             return (utf16 as usize).min(self.len_utf16 as usize);
         };
-        match checkpoints.binary_search_by_key(&utf16, |&(_, u)| u) {
-            Ok(i) => checkpoints[i].0 as usize,
-            // Mid-character: the character containing this code unit
-            // starts at the previous checkpoint.
+        let target = utf16.min(self.len_utf16);
+        let index = match checkpoints.binary_search_by_key(&target, |&(_, units)| units) {
+            Ok(index) => return checkpoints[index].0 as usize,
             Err(0) => 0,
-            Err(i) => checkpoints[i - 1].0 as usize,
+            Err(index) => index - 1,
+        };
+        let (start_byte, mut units) = checkpoints[index];
+        for (relative, character) in self.source[start_byte as usize..].char_indices() {
+            let byte = start_byte as usize + relative;
+            if units >= target {
+                return byte;
+            }
+            let next = units + character.len_utf16() as u32;
+            if next > target {
+                return byte;
+            }
+            units = next;
         }
+        self.source.len()
     }
 
     /// Total length of the source in UTF-16 code units.
@@ -274,12 +305,23 @@ impl Utf16Mapper {
         let Some(checkpoints) = &self.checkpoints else {
             return (byte as u32).min(self.len_utf16);
         };
-        match checkpoints.binary_search_by_key(&(byte as u32), |&(b, _)| b) {
-            Ok(i) => checkpoints[i].1,
-            // Landed inside a multi-byte character: snap to its start.
+        let target = byte.min(self.source.len());
+        let index = match checkpoints.binary_search_by_key(&(target as u32), |&(b, _)| b) {
+            Ok(index) => return checkpoints[index].1,
             Err(0) => 0,
-            Err(i) => checkpoints[i - 1].1,
+            Err(index) => index - 1,
+        };
+        let (start_byte, mut utf16) = checkpoints[index];
+        for (relative, character) in self.source[start_byte as usize..].char_indices() {
+            let character_start = start_byte as usize + relative;
+            if character_start >= target
+                || character_start.saturating_add(character.len_utf8()) > target
+            {
+                break;
+            }
+            utf16 += character.len_utf16() as u32;
         }
+        utf16.min(self.len_utf16)
     }
 }
 
@@ -333,11 +375,38 @@ mod tests {
     }
 
     #[test]
-    fn interning_deduplicates() {
-        let mut r = ParseResult::default();
-        assert_eq!(r.intern("swift"), 0);
-        assert_eq!(r.intern("rust"), 1);
-        assert_eq!(r.intern("swift"), 0);
-        assert_eq!(r.strings.len(), 2);
+    fn reverse_mapping_snaps_surrogate_and_out_of_range_offsets_safely() {
+        let source = "a𝄞éz";
+        let mapper = Utf16Mapper::new(source);
+        assert_eq!(mapper.to_byte(0), 0);
+        assert_eq!(mapper.to_byte(1), 1);
+        assert_eq!(mapper.to_byte(2), 1, "inside a surrogate pair snaps left");
+        assert_eq!(mapper.to_byte(3), 5);
+        assert_eq!(mapper.to_byte(4), 7);
+        assert_eq!(mapper.to_byte(99), source.len());
+    }
+
+    #[test]
+    fn non_ascii_mapping_uses_sparse_bounded_checkpoints() {
+        let source = "𝄞é".repeat(100_000);
+        let mapper = Utf16Mapper::new(&source);
+        let checkpoints = mapper.checkpoints.as_ref().expect("non-ASCII table");
+        assert!(
+            checkpoints.len() <= source.len() / UTF16_CHECKPOINT_BYTES + 2,
+            "one checkpoint per scalar would recreate an input-sized allocation"
+        );
+        for pair in checkpoints.windows(2) {
+            let distance = pair[1].0 - pair[0].0;
+            assert!(
+                distance <= (UTF16_CHECKPOINT_BYTES + 3) as u32,
+                "a mapping scan crossed more than one stride: {distance}"
+            );
+        }
+        for byte in [0, 1, 63, 64, 65, source.len() / 2, source.len()] {
+            let units = mapper.to_utf16(byte);
+            let snapped = mapper.to_byte(units);
+            assert!(snapped <= byte.min(source.len()));
+            assert!(byte.min(source.len()) - snapped <= 3);
+        }
     }
 }

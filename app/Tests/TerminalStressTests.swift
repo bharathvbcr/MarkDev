@@ -36,7 +36,7 @@ final class TerminalProcessStressTests: XCTestCase {
     }
 
     private func makeView() -> LocalProcessTerminalView {
-        LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
+        MarkDevTerminalView(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
     }
 
     /// Runs one command to completion and returns how it ended.
@@ -107,19 +107,8 @@ final class TerminalProcessStressTests: XCTestCase {
     func testAFloodOfOutputDoesNotStallTheShell() {
         // A build log or a `find /` is tens of thousands of lines. If the read
         // side ever blocked, this would time out rather than fail.
-        //
-        // The property here is throughput: termination arrives within
-        // budget. What the exit *decodes* to rides SwiftTerm's status
-        // reporting, which races the child's collection under load (this
-        // suite has measured it answering nil for a clean `exit 0`) — the
-        // deterministic decode assertions live in the sequential and
-        // concurrent tests above, where no flood competes for the pty.
         let exit = run("for i in $(seq 1 20000); do echo \"line $i of output padding\"; done; exit 0")
-        if exit != .unknown {
-            XCTAssertEqual(
-                exit, .code(0),
-                "a reported status for a clean flood must decode clean")
-        }
+        XCTAssertEqual(exit, .code(0), "a clean flood must not lose its exit status")
     }
 
     func testAShellEmittingControlSequencesStillExitsCleanly() {
@@ -156,13 +145,6 @@ final class TerminalProcessStressTests: XCTestCase {
     func testAMissingExecutableTerminatesRatherThanHanging() {
         // A resolver bug that hands over a path that is not there must surface
         // as a dead session, not as a terminal that never prompts.
-        //
-        // Only *that* is asserted. The reported status is not trustworthy for
-        // this path: SwiftTerm's `processTerminated` declares `var n: Int32 = 0`
-        // and passes it on after a `waitpid(..., WNOHANG)` whose result it does
-        // not check, so when the child has already gone the status stays zero
-        // and a failed launch reports a clean exit. Asserting a non-zero code
-        // here failed roughly one run in three. See the note in CLAUDE.md.
         let view = makeView()
         let recorder = Recorder()
         view.processDelegate = recorder
@@ -171,7 +153,9 @@ final class TerminalProcessStressTests: XCTestCase {
 
         view.startProcess(executable: "/nonexistent/shell", args: [])
         wait(for: [finished], timeout: 20)
-        XCTAssertNotNil(recorder.status, "termination must be reported at all")
+        XCTAssertEqual(
+            TerminalExit(waitStatus: recorder.status ?? nil), .code(127),
+            "exec failure must not masquerade as a clean exit")
     }
 
     func testLaunchingIntoADeletedDirectoryStillProducesAWorkingShell() throws {

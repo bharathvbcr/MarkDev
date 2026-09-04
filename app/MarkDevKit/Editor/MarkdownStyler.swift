@@ -389,64 +389,31 @@ public enum MarkdownStyler {
         )
     }
 
-    /// Task-marker ranges, in document order, for answering "is this a task
-    /// item" without rescanning every span.
-    ///
-    /// Built once per styling pass and searched, rather than scanned inside
-    /// the block loop. Both list items and spans grow with the document, so
-    /// the scan this replaced was O(blocks × spans) — a genuine quadratic
-    /// that stayed invisible in the keystroke tests, where the scope is a
-    /// block or two, and only showed up on open: 10,000 lines cost 8x what
-    /// 2,500 did, against 4x the text.
-    private static func taskMarkers(in document: ParsedDocument) -> [StyleSpan] {
-        document.spans
-            .lazy
-            .filter { $0.kind == .taskMarker }
-            .sorted { $0.range.location < $1.range.location }
-    }
-
-    /// The `- [ ]` marker overlapping `range`, if this item is a task.
-    ///
-    /// `range` must be the item's *own* text — see ``ownText(of:among:limit:)``
-    /// — not the parsed ListItem extent. A parent item contains nested
-    /// children, so searching the whole block would pick up a child's `[x]`
-    /// and strike the parent.
-    ///
-    /// Task markers never overlap, so sorting by location also sorts by
-    /// end, which is what lets this binary-search.
-    private static func taskMarker(
-        overlapping range: NSRange, in markers: [StyleSpan]
-    ) -> StyleSpan? {
-        guard range.length > 0 else { return nil }
-        var low = 0
-        var high = markers.count
-        while low < high {
-            let mid = low + (high - low) / 2
-            if NSMaxRange(markers[mid].range) <= range.location {
-                low = mid + 1
-            } else {
-                high = mid
-            }
-        }
-        guard low < markers.count else { return nil }
-        let marker = markers[low]
-        guard NSIntersectionRange(marker.range, range).length > 0 else { return nil }
-        return marker
-    }
-
     /// The item's own text, stopping before a nested list so a checked parent
     /// does not strike an unchecked child.
+    ///
+    /// `listBlocks` is the ordered list/list-item subset built once for the
+    /// styling pass. Binary-searching it is important: scanning every block
+    /// once per list item made opening a representative 10,000-line document
+    /// superlinear even though every other styling layer was bounded.
     private static func ownText(
-        of item: BlockDescriptor, among blocks: [BlockDescriptor], limit: NSRange
+        of item: BlockDescriptor, among listBlocks: [BlockDescriptor], limit: NSRange
     ) -> NSRange {
         var end = NSMaxRange(item.range)
-        for other in blocks {
-            guard other.range.location > item.range.location,
-                NSMaxRange(other.range) <= NSMaxRange(item.range)
-            else { continue }
-            if other.kind == .list || other.kind == .listItem {
-                end = min(end, other.range.location)
-                break
+        var low = 0
+        var high = listBlocks.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            if listBlocks[middle].range.location <= item.range.location {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        if low < listBlocks.count {
+            let descendant = listBlocks[low]
+            if NSMaxRange(descendant.range) <= NSMaxRange(item.range) {
+                end = min(end, descendant.range.location)
             }
         }
         return NSIntersectionRange(
@@ -463,10 +430,11 @@ public enum MarkdownStyler {
         scope: NSRange,
         theme: EditorTheme
     ) {
-        // Built on first use, not up front: a scoped restyle usually covers a
-        // block or two, and one holding no list items should not pay to walk
-        // the document's spans at all.
-        var taskMarkers: [StyleSpan]?
+        // Built once, then searched per list item. Re-filtering or scanning
+        // all blocks in that inner loop is quadratic for list-heavy notes.
+        let listBlocks = document.blocks.filter { block in
+            block.kind == .list || block.kind == .listItem
+        }
         let text = storage.string as NSString
 
         for block in blocks {
@@ -543,15 +511,8 @@ public enum MarkdownStyler {
                 var indent = CGFloat(block.depth) * 8 + 16
                 // A task item needs a gutter for its drawn checkbox, since
                 // the `- [ ]` it replaces has been collapsed to nothing.
-                let markers: [StyleSpan]
-                if let built = taskMarkers {
-                    markers = built
-                } else {
-                    markers = Self.taskMarkers(in: document)
-                    taskMarkers = markers
-                }
-                let own = ownText(of: block, among: blocks, limit: limit)
-                let marker = taskMarker(overlapping: own, in: markers)
+                let own = ownText(of: block, among: listBlocks, limit: limit)
+                let marker = document.taskMarker(overlapping: own)
                 if marker != nil {
                     indent += MarkdownLayoutFragment.Metrics.checkboxGutter
                 }

@@ -37,9 +37,9 @@ final class VaultReconciliationTests: XCTestCase {
         try "# Late\n\n[[Seed]]".write(
             to: root.appendingPathComponent("Late.md"), atomically: true, encoding: .utf8)
 
-        let changed = await index.reconcileWithDisk()
+        let result = await index.reconcileWithDisk()
 
-        XCTAssertGreaterThan(changed, 0)
+        XCTAssertGreaterThan(result.changedNotes, 0)
         XCTAssertEqual(index.resolve(target: "Late")?.path, "Late.md")
         XCTAssertEqual(
             index.backlinks(for: "Seed.md").count, 1,
@@ -68,6 +68,18 @@ final class VaultReconciliationTests: XCTestCase {
         XCTAssertEqual(index.links(for: "Seed.md").first?.target, "Elsewhere")
     }
 
+    func testUnchangedCompleteSweepReportsNoChangeAndDoesNotInvalidateReaders() async {
+        let revision = index.contentRevision
+
+        let result = await index.reconcileWithDisk()
+
+        XCTAssertTrue(result.isComplete)
+        XCTAssertEqual(result.changedNotes, 0, "a scanned file is not necessarily a changed file")
+        XCTAssertEqual(
+            index.contentRevision, revision,
+            "an idempotent catch-up must not invalidate graph and palette snapshots")
+    }
+
     /// An open document's buffer outranks its file — the same rule per-event
     /// handling follows. The sweep must not drag disk text under a buffer
     /// the reader is editing.
@@ -78,9 +90,9 @@ final class VaultReconciliationTests: XCTestCase {
         // What the editor holds:
         index.update(path: "Seed.md", text: "# Editor version")
 
-        let changed = await index.reconcileWithDisk(excluding: [seed])
+        let result = await index.reconcileWithDisk(excluding: [seed])
 
-        XCTAssertEqual(changed, 0, "nothing else exists to touch")
+        XCTAssertEqual(result.changedNotes, 0, "nothing else exists to touch")
         XCTAssertEqual(
             index.search("Editor version").count, 1,
             "the editor's text survived the sweep")
@@ -111,6 +123,78 @@ final class VaultReconciliationTests: XCTestCase {
         XCTAssertNotNil(
             index.resolve(target: "Seed"),
             "an unreadable-but-present note was treated as deleted")
+    }
+
+    func testIncompleteBoundedSweepNeverDeletesAnUnseenIndexedNote() async throws {
+        index.update(path: "Unseen.md", text: "# Unseen")
+        XCTAssertEqual(index.resolve(target: "Unseen")?.path, "Unseen.md")
+
+        let result = await index.reconcileWithDisk(
+            excluding: [],
+            scanLimits: FileTree.ScanLimits(maxDepth: 48, maxEntries: 0))
+
+        XCTAssertFalse(result.isComplete, "a capped walk was reported as complete")
+        XCTAssertTrue(result.scan.hitEntryLimit)
+        XCTAssertEqual(
+            index.resolve(target: "Unseen")?.path, "Unseen.md",
+            "absence from a capped sample was treated as proven deletion")
+    }
+
+    func testTotalByteCappedSweepNeverDeletesUnseenNotesAndReportsActualBytes() async throws {
+        try "12345678".write(
+            to: root.appendingPathComponent("Another.md"), atomically: true, encoding: .utf8)
+        index.update(path: "Unseen.md", text: "# Unseen")
+
+        let result = await index.reconcileWithDisk(
+            excluding: [],
+            scanLimits: FileTree.ScanLimits(
+                maxDepth: 48,
+                maxEntries: 100,
+                maxNoteBytes: 1_024,
+                maxTotalBytes: 8))
+
+        XCTAssertFalse(result.isComplete)
+        XCTAssertTrue(result.scan.hitTotalByteLimit)
+        XCTAssertEqual(result.scan.discoveredFiles, 2)
+        XCTAssertEqual(result.scan.skippedFiles, 1)
+        XCTAssertLessThanOrEqual(result.bytesRead, 8)
+        XCTAssertEqual(
+            index.resolve(target: "Unseen")?.path, "Unseen.md",
+            "absence from a byte-capped sample was treated as proof of deletion")
+    }
+
+    func testOversizedNoteMakesSweepIncompleteWithoutDeletingItsIndexEntry() async throws {
+        let huge = root.appendingPathComponent("Huge.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: huge.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: huge)
+        try handle.truncate(atOffset: 32 * 1024 * 1024)
+        try handle.close()
+        index.update(path: "Huge.md", text: "# Indexed before it grew")
+
+        let result = await index.reconcileWithDisk(
+            excluding: [],
+            scanLimits: FileTree.ScanLimits(
+                maxDepth: 48, maxEntries: 100, maxNoteBytes: 1_048_576))
+
+        XCTAssertFalse(result.isComplete)
+        XCTAssertEqual(result.scan.oversizedFiles, 1)
+        XCTAssertEqual(
+            index.resolve(target: "Huge")?.path, "Huge.md",
+            "an oversized skipped note was mistaken for a deleted note")
+    }
+
+    func testVaultRootReplacedByAFileCannotAuthorizeDeletingTheIndex() async throws {
+        XCTAssertEqual(index.resolve(target: "Seed")?.path, "Seed.md")
+        try FileManager.default.removeItem(at: root)
+        try "not a directory".write(to: root, atomically: true, encoding: .utf8)
+
+        let result = await index.reconcileWithDisk()
+
+        XCTAssertFalse(result.isComplete, "a non-directory vault root is not a complete scan")
+        XCTAssertGreaterThan(result.scan.unreadableDirectories, 0)
+        XCTAssertEqual(
+            index.resolve(target: "Seed")?.path, "Seed.md",
+            "an invalid root was mistaken for proof that every note was deleted")
     }
 
     private func setPermissions(_ mode: Int, on url: URL) -> Bool {
@@ -147,6 +231,25 @@ final class FileTreeWalkTests: XCTestCase {
         XCTAssertEqual(names, ["Top.md", "Deep.markdown"])
     }
 
+    func testWalkUsesTheSameFilesystemHiddenPolicyAsTheNavigator() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkHidden-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let visible = root.appendingPathComponent("Visible.md")
+        var hidden = root.appendingPathComponent("FinderHidden.md")
+        try "visible".write(to: visible, atomically: true, encoding: .utf8)
+        try "hidden".write(to: hidden, atomically: true, encoding: .utf8)
+        var values = URLResourceValues()
+        values.isHidden = true
+        try hidden.setResourceValues(values)
+
+        let scan = FileTree.scanMarkdownFiles(under: root)
+
+        XCTAssertEqual(scan.files.map(\.lastPathComponent), ["Visible.md"])
+        XCTAssertEqual(FileTree.children(of: root).map(\.url.lastPathComponent), ["Visible.md"])
+    }
+
     /// `link -> parent` is the classic eternal directory. The walk must end,
     /// having found the real files exactly once each.
     func testDirectorySymlinkLoopTerminatesWithoutDuplicates() throws {
@@ -163,5 +266,180 @@ final class FileTreeWalkTests: XCTestCase {
         let files = FileTree.markdownFiles(under: root)
 
         XCTAssertEqual(files.map(\.lastPathComponent), ["Real.md"])
+    }
+
+    func testWalkNeverFollowsADirectorySymlinkOutsideTheVault() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevOutsideLink-\(UUID().uuidString)")
+        let root = sandbox.appendingPathComponent("vault")
+        let outside = sandbox.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        try "# Inside".write(
+            to: root.appendingPathComponent("Inside.md"), atomically: true, encoding: .utf8)
+        try "# Secret".write(
+            to: outside.appendingPathComponent("Secret.md"), atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("linked-outside"), withDestinationURL: outside)
+
+        let relative = FileTree.markdownFiles(under: root).map {
+            $0.path.replacingOccurrences(of: root.path + "/", with: "")
+        }
+
+        XCTAssertEqual(relative, ["Inside.md"])
+        XCTAssertFalse(
+            FileTree.children(of: root).contains { $0.name == "linked-outside" },
+            "the navigator exposed a traversable portal outside the vault")
+    }
+
+    func testWalkDoesNotFollowSelfParentOrChainedDirectorySymlinks() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevSymlinkChains-\(UUID().uuidString)")
+        let root = sandbox.appendingPathComponent("vault")
+        let real = root.appendingPathComponent("real")
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        try "# One".write(
+            to: real.appendingPathComponent("One.md"), atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("self"), withDestinationURL: root)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("parent"), withDestinationURL: sandbox)
+        try FileManager.default.createSymbolicLink(
+            atPath: root.appendingPathComponent("chain-a").path,
+            withDestinationPath: "chain-b")
+        try FileManager.default.createSymbolicLink(
+            atPath: root.appendingPathComponent("chain-b").path,
+            withDestinationPath: "real")
+
+        let relative = FileTree.markdownFiles(under: root).map {
+            $0.path.replacingOccurrences(of: root.path + "/", with: "")
+        }
+
+        XCTAssertEqual(relative, ["real/One.md"])
+    }
+
+    func testWalkDepthLimitIsBoundedAndReportedIncomplete() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkDepth-\(UUID().uuidString)")
+        let root = sandbox.appendingPathComponent("vault")
+        let nested = root.appendingPathComponent("one/two/three")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        try "# Top".write(
+            to: root.appendingPathComponent("Top.md"), atomically: true, encoding: .utf8)
+        try "# One".write(
+            to: root.appendingPathComponent("one/One.md"), atomically: true, encoding: .utf8)
+        try "# Two".write(
+            to: root.appendingPathComponent("one/two/Two.md"), atomically: true, encoding: .utf8)
+        try "# Too deep".write(
+            to: nested.appendingPathComponent("TooDeep.md"), atomically: true, encoding: .utf8)
+
+        let scan = FileTree.scanMarkdownFiles(
+            under: root,
+            limits: FileTree.ScanLimits(maxDepth: 1, maxEntries: 100))
+        let relative = scan.files.map {
+            $0.path.replacingOccurrences(of: root.path + "/", with: "")
+        }
+
+        XCTAssertEqual(relative, ["Top.md", "one/One.md"])
+        XCTAssertTrue(scan.hitDepthLimit)
+        XCTAssertFalse(scan.isComplete)
+    }
+
+    func testWalkHugeFanoutStopsAtEntryLimitAndReportsTheCap() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkFanout-\(UUID().uuidString)")
+        let root = sandbox.appendingPathComponent("vault")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        for index in 0..<512 {
+            try "# note".write(
+                to: root.appendingPathComponent(String(format: "Note-%04d.md", index)),
+                atomically: true,
+                encoding: .utf8)
+        }
+
+        let scan = FileTree.scanMarkdownFiles(
+            under: root,
+            limits: FileTree.ScanLimits(maxDepth: 48, maxEntries: 64))
+
+        XCTAssertEqual(scan.visitedEntries, 64)
+        XCTAssertLessThanOrEqual(scan.files.count, 64)
+        XCTAssertTrue(scan.hitEntryLimit)
+        XCTAssertFalse(scan.isComplete)
+    }
+
+    func testWalkAndBoundedReadRefuseAnOversizedNoteWithoutAllocatingItsSize() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkOversized-\(UUID().uuidString)")
+        let root = sandbox.appendingPathComponent("vault")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        try "# Small".write(
+            to: root.appendingPathComponent("Small.md"), atomically: true, encoding: .utf8)
+        let huge = root.appendingPathComponent("Huge.md")
+        XCTAssertTrue(FileManager.default.createFile(atPath: huge.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: huge)
+        try handle.truncate(atOffset: 32 * 1024 * 1024)
+        try handle.close()
+
+        let limits = FileTree.ScanLimits(
+            maxDepth: 48, maxEntries: 100, maxNoteBytes: 1_048_576)
+        let scan = FileTree.scanMarkdownFiles(under: root, limits: limits)
+
+        XCTAssertEqual(scan.files.map(\.lastPathComponent), ["Small.md"])
+        XCTAssertEqual(scan.oversizedFiles, 1)
+        XCTAssertFalse(scan.isComplete)
+        guard case .oversized = FileTree.readUTF8File(
+            at: huge, inside: root, maximumBytes: limits.maxNoteBytes)
+        else {
+            return XCTFail("bounded read accepted an oversized note")
+        }
+    }
+
+    func testBoundedReaderRejectsFIFOWithoutWaitingForAWriter() throws {
+        let sandbox = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkFIFO-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let fifo = sandbox.appendingPathComponent("Swapped.md")
+        XCTAssertEqual(Darwin.mkfifo(fifo.path, 0o600), 0)
+
+        let started = ContinuousClock.now
+        let result = FileTree.openVerifiedRegularFile(at: fifo)
+        let elapsed = started.duration(to: .now)
+
+        XCTAssertNil(result)
+        XCTAssertLessThan(elapsed, .milliseconds(100), "opening a FIFO blocked")
+    }
+
+    func testWalkTotalByteBudgetCarriesExactIncompleteCoverage() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevWalkTotalBytes-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for name in ["A.md", "B.md", "C.md"] {
+            try "12345678".write(
+                to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+
+        let scan = FileTree.scanMarkdownFiles(
+            under: root,
+            limits: FileTree.ScanLimits(
+                maxDepth: 48, maxEntries: 100, maxNoteBytes: 1_024, maxTotalBytes: 10))
+
+        XCTAssertEqual(scan.discoveredFiles, 3)
+        XCTAssertEqual(scan.discoveredBytes, 24)
+        XCTAssertEqual(scan.files.count, 1)
+        XCTAssertEqual(scan.selectedBytes, 8)
+        XCTAssertEqual(scan.skippedFiles, 2)
+        XCTAssertTrue(scan.hitTotalByteLimit)
+        XCTAssertFalse(scan.isComplete)
     }
 }

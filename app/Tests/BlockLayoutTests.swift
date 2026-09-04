@@ -173,6 +173,74 @@ final class BlockLayoutTests: XCTestCase {
         XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["1)", "2)"])
     }
 
+    // MARK: - Lists that sit inside a container
+
+    /// A list inside a quote drew no bullet at all.
+    ///
+    /// The marker was read from the start of the *line*, and inside a quote
+    /// the line starts `> `. The first character seen was therefore `>`, which
+    /// is not a list marker, so nothing was drawn — while the `- ` stayed
+    /// hidden. That is the exact outcome
+    /// `RevealPolicy.markersRequiringReplacement` exists to forbid: a list
+    /// rendered as a stack of indented sentences. It is read off the *item's*
+    /// own start now, which the parser places after any container prefix.
+    func testAListInsideAQuoteStillDrawsItsBullets() throws {
+        let view = makeView("> An ordinary block quote\n> - containing a list\n> - with two items\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["•", "•"])
+    }
+
+    func testAListInsideACalloutStillDrawsItsBullets() throws {
+        let view = makeView("> [!NOTE]\n> - one\n> - two\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["•", "•"])
+    }
+
+    /// The glyph follows how many *lists* deep an item is, not how many blocks.
+    ///
+    /// `depth` counts every ancestor, and a quote is one of them — so a
+    /// first-level list inside a quote asked for the second-level glyph and a
+    /// reader saw `◦` where every other first-level list shows `•`.
+    /// A task inside a callout gets a checkbox and *not* also a bullet.
+    ///
+    /// `BlockDecoration` resolves task items before the innermost-block
+    /// search, so one inside a callout arrives as `.task` rather than
+    /// `.callout` and never reaches the bullet branch. Two stand-ins for one
+    /// item would be a second marker where the author wrote one.
+    func testATaskInsideACalloutDrawsOnlyItsCheckbox() throws {
+        let view = makeView("> [!NOTE]\n> - [ ] todo\n> - [x] done\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), [])
+        XCTAssertEqual(
+            fragments(view).compactMap(\.decoration.taskChecked), [false, true],
+            "the checkbox is the stand-in, and it must still be drawn")
+    }
+
+    func testAQuotedListStartsAtTheFirstLevelGlyphNotTheSecond() throws {
+        let plain = makeView("- one\n  - two\n")
+        let quoted = makeView("> - one\n>   - two\n")
+
+        XCTAssertEqual(fragments(plain).compactMap(\.listMarker), ["•", "◦"])
+        XCTAssertEqual(
+            fragments(quoted).compactMap(\.listMarker), ["•", "◦"],
+            "a quote is not a list level; it must not shift the bullet")
+    }
+
+    func testAQuotedOrderedListKeepsTheNumbersTheAuthorWrote() throws {
+        let view = makeView("> 1. first\n> 2. second\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["1.", "2."])
+    }
+
+    /// A quoted paragraph is not a list, and must not sprout a bullet.
+    func testAPlainQuotedParagraphDrawsNoBullet() throws {
+        let view = makeView("> just prose\n> across two lines\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), [])
+    }
+
+    /// A list nested inside a list item, which is the case that already worked
+    /// — pinned so the level rewrite cannot regress it.
+    func testAListInsideAListItemKeepsSteppingItsGlyph() throws {
+        let view = makeView("- outer\n\n  - inner\n")
+        XCTAssertEqual(fragments(view).compactMap(\.listMarker), ["•", "◦"])
+    }
+
     func testADefinitionIsIndentedUnderItsTerm() throws {
         let view = makeView("Term\n: A longer definition of the term\n")
         let term = try XCTUnwrap(lineStyle(view, containing: "Term"))

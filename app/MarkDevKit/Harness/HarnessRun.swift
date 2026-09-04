@@ -5,15 +5,16 @@
 //  Driving one `manvi run --json` turn from inside the app.
 //
 
+import Darwin
 import Foundation
 
 /// One turn to ask the harness for.
 public struct HarnessRunRequest: Sendable {
     public var binary: URL
     public var prompt: String
-    /// The directory the harness runs in. Everything it can read is resolved
-    /// from here, and under ``HarnessAuthority/editing`` everything it may
-    /// write is bounded by it.
+    /// The directory the harness runs in, supplied as task context and as the
+    /// base for relative paths. It is not a security boundary: authority is
+    /// enforced by the separately configured harness posture and policy gate.
     public var workingDirectory: URL
     public var maxSteps: Int
     public var timeout: Duration
@@ -65,6 +66,77 @@ public struct HarnessRunResult: Sendable {
     }
 }
 
+/// Single-use writer for the run's stdin pipe.
+///
+/// `FileHandle` is not `Sendable`, and this is the honest way past that: the
+/// handle has exactly one writer, which writes once and closes, and never
+/// touches anything else. The wrapper exists to say so in types rather than
+/// in a comment nobody can enforce.
+private struct StdinWriter: @unchecked Sendable {
+    let handle: FileHandle
+
+    func write(_ data: Data) -> Bool {
+        // A child is free to close stdin immediately. Without the descriptor-
+        // local suppression, Darwin delivers SIGPIPE and kills the entire app
+        // before FileHandle can surface EPIPE as an ordinary write failure.
+        guard Darwin.fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            try? handle.close()
+            return false
+        }
+        do {
+            try handle.write(contentsOf: data)
+            try handle.close()
+            return true
+        } catch {
+            try? handle.close()
+            return false
+        }
+    }
+}
+
+final class HarnessPipeLossState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var droppedSinceLastCheck = false
+    private var everDropped = false
+
+    var hasDropped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return everDropped
+    }
+
+    func markDropped() {
+        lock.lock()
+        droppedSinceLastCheck = true
+        everDropped = true
+        lock.unlock()
+    }
+
+    func takeDropped() -> Bool {
+        lock.lock()
+        let result = droppedSinceLastCheck
+        droppedSinceLastCheck = false
+        lock.unlock()
+        return result
+    }
+}
+
+struct HarnessPipeByteStream: Sendable {
+    let chunks: AsyncStream<Data>
+    let loss: HarnessPipeLossState
+}
+
+private struct HarnessTranscriptCollection: Sendable {
+    let events: [HarnessEvent]
+    let answer: String
+    let truncated: Bool
+}
+
+private struct HarnessNoteCollection: Sendable {
+    let text: String
+    let truncated: Bool
+}
+
 /// A child process, owned on the main actor.
 ///
 /// `Process` is not `Sendable`, and the two things that have to be able to end
@@ -77,21 +149,6 @@ public struct HarnessRunResult: Sendable {
 /// It also keeps the main actor unblocked. `waitUntilExit()` is a blocking
 /// call, and waiting on a local 27B for ten minutes with it would freeze the
 /// window; ``waitForExit()`` suspends on `terminationHandler` instead.
-/// Single-use writer for the run's stdin pipe.
-///
-/// `FileHandle` is not `Sendable`, and this is the honest way past that: the
-/// handle has exactly one writer, which writes once and closes, and never
-/// touches anything else. The wrapper exists to say so in types rather than
-/// in a comment nobody can enforce.
-private struct StdinWriter: @unchecked Sendable {
-    let handle: FileHandle
-
-    func write(_ data: Data) {
-        try? handle.write(contentsOf: data)
-        try? handle.close()
-    }
-}
-
 @MainActor
 final class HarnessProcess {
     private let process = Process()
@@ -176,17 +233,29 @@ final class HarnessProcess {
 /// tool results without limit, and a panel that grows with them takes the
 /// window down long before the run ends.
 public enum HarnessRun {
+    /// Public callers can construct requests without going through
+    /// `HarnessPrompt`, so the process boundary enforces its own byte cap.
+    public static let maximumInputBytes = 1 * 1_024 * 1_024
     /// The most stdout bytes kept. Beyond it the stream is still *read* — a
     /// pipe nobody drains blocks the child — but nothing more is recorded.
     public static let maximumTranscriptBytes = 4 * 1024 * 1024
+    /// The unread stdout awaiting the consumer is bounded independently from
+    /// the retained transcript, so a faster child cannot fill application
+    /// memory while stdin delivery or event parsing is catching up.
+    public static let maximumBufferedStdoutBytes = 512 * 1024
     /// The most events kept.
     public static let maximumEvents = 20_000
     /// The most stderr bytes kept. Diagnostics are a few lines; anything past
     /// this is a stuck loop printing.
     public static let maximumNoteBytes = 128 * 1024
+    public static let maximumBufferedStderrBytes = 128 * 1024
     /// How far past the harness's own `--timeout` MarkDev waits before ending
     /// the process itself.
     public static let backstopGrace: Duration = .seconds(30)
+    static let inputTooLargeMessage =
+        "The harness input is larger than MarkDev’s 1 MiB safety limit."
+    static let inputRejectedMessage =
+        "The harness closed its input before accepting the prompt."
 
     /// Runs one turn, reporting events as they arrive.
     ///
@@ -197,22 +266,115 @@ public enum HarnessRun {
     @MainActor
     public static func run(
         _ request: HarnessRunRequest,
+        diagnostics: DiagnosticsEmitter = .shared,
+        backstopGrace: Duration = HarnessRun.backstopGrace,
         onEvent: @MainActor @escaping (HarnessEvent) -> Void
     ) async -> HarnessRunResult {
+        let operationID = DiagnosticOperationID()
+        let inputByteCount = request.prompt.utf8.count
+        guard inputByteCount <= maximumInputBytes else {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .harness,
+                code: .harnessTerminalInputTooLarge,
+                operationID: operationID,
+                metadata: DiagnosticMetadata([
+                    .byteCount: .integer(Int64(inputByteCount)),
+                    .available: .boolean(false),
+                ]))
+            return HarnessRunResult(
+                outcome: .failed(inputTooLargeMessage),
+                answer: "", events: [], notes: "", truncated: false)
+        }
         let input = Pipe()
         let output = Pipe()
         let errors = Pipe()
-        let chunks = Self.stream(from: output.fileHandleForReading)
-        let noteChunks = Self.stream(from: errors.fileHandleForReading)
+        let outputStream = Self.stream(
+            from: output.fileHandleForReading,
+            maximumBufferedBytes: maximumBufferedStdoutBytes)
+        let noteStream = Self.stream(
+            from: errors.fileHandleForReading,
+            maximumBufferedBytes: maximumBufferedStderrBytes)
 
         let child = HarnessProcess()
         do {
             try child.start(request, input: input, output: output, errors: errors)
         } catch {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .harness,
+                code: .harnessTerminalFailed,
+                operationID: operationID,
+                metadata: DiagnosticMetadata([.available: .boolean(false)]))
             return HarnessRunResult(
                 outcome: .failed(
                     "Couldn’t start \(request.binary.path): \(error.localizedDescription)"),
                 answer: "", events: [], notes: "", truncated: false)
+        }
+
+        // Start stderr draining and the independent backstop before stdin.
+        // A hostile child can fill stderr without reading stdin, or never read
+        // stdin at all; neither case may leave this task waiting forever.
+        let noteCollector = Task<HarnessNoteCollection, Never> { @MainActor in
+            var text = ""
+            var bytes = 0
+            var wasTruncated = false
+            for await chunk in noteStream.chunks {
+                if noteStream.loss.takeDropped() {
+                    wasTruncated = true
+                    text.removeAll(keepingCapacity: false)
+                }
+                bytes = saturatingByteCount(bytes, adding: chunk.count)
+                guard bytes <= maximumNoteBytes else {
+                    wasTruncated = true
+                    continue
+                }
+                text += String(decoding: chunk, as: UTF8.self)
+            }
+            if noteStream.loss.takeDropped() { wasTruncated = true }
+            return HarnessNoteCollection(text: text, truncated: wasTruncated)
+        }
+        let backstop = Task { @MainActor in
+            try? await Task.sleep(for: request.timeout + backstopGrace)
+            guard !Task.isCancelled else { return }
+            child.terminateIfRunning()
+        }
+
+        let transcriptCollector = Task<HarnessTranscriptCollection, Never> { @MainActor in
+            var events: [HarnessEvent] = []
+            var answer = ""
+            var pending = Data()
+            var transcriptBytes = 0
+            var truncated = false
+
+            for await chunk in outputStream.chunks {
+                if outputStream.loss.takeDropped() {
+                    truncated = true
+                    pending.removeAll(keepingCapacity: false)
+                }
+                absorbTranscriptChunk(
+                    chunk,
+                    pending: &pending,
+                    transcriptBytes: &transcriptBytes,
+                    events: &events,
+                    answer: &answer,
+                    truncated: &truncated,
+                    onEvent: onEvent)
+            }
+            if outputStream.loss.takeDropped() {
+                truncated = true
+                pending.removeAll(keepingCapacity: false)
+            }
+            absorbFinalTranscriptRecord(
+                pending: &pending,
+                events: &events,
+                answer: &answer,
+                truncated: &truncated,
+                onEvent: onEvent)
+            return HarnessTranscriptCollection(
+                events: events,
+                answer: answer,
+                truncated: truncated)
         }
 
         // The prompt goes in on stdin rather than as an argument. A note is the
@@ -227,72 +389,25 @@ public enum HarnessRun {
         // read loop cares) without holding the actor hostage.
         let writer = StdinWriter(handle: input.fileHandleForWriting)
         let payload = Data(request.prompt.utf8)
-        await Task.detached(priority: .userInitiated) {
+        let writerTask = Task.detached(priority: .userInitiated) {
             writer.write(payload)
-        }.value
-
-        // Drained on its own task so stderr is emptied while stdout is read.
-        // Two pipes and one reader is a deadlock waiting for a verbose run: the
-        // child blocks writing to the pipe nobody is emptying, and the panel
-        // shows a run that has simply stopped.
-        let noteCollector = Task<String, Never> {
-            var text = ""
-            var bytes = 0
-            for await chunk in noteChunks {
-                bytes += chunk.count
-                guard bytes <= maximumNoteBytes else { continue }
-                text += String(decoding: chunk, as: UTF8.self)
-            }
-            return text
         }
-
-        let backstop = Task { @MainActor in
-            try? await Task.sleep(for: request.timeout + backstopGrace)
-            guard !Task.isCancelled else { return }
-            child.terminateIfRunning()
-        }
-
-        var events: [HarnessEvent] = []
-        var answer = ""
-        var pending = Data()
-        var transcriptBytes = 0
-        var truncated = false
-
-        await withTaskCancellationHandler {
-            for await chunk in chunks {
-                transcriptBytes += chunk.count
-                if transcriptBytes > maximumTranscriptBytes || events.count >= maximumEvents {
-                    truncated = true
-                    continue
-                }
-                pending.append(chunk)
-                // Split on newlines, keeping whatever follows the last one for
-                // the next chunk — a JSON object is regularly delivered in two
-                // reads, and a half-decoded line dropped here is a tool call
-                // the panel never shows.
-                while let newline = pending.firstIndex(of: 0x0A) {
-                    let line = pending[pending.startIndex..<newline]
-                    pending = pending[pending.index(after: newline)...]
-                    guard
-                        let event = HarnessEvent.decode(
-                            line: String(decoding: line, as: UTF8.self))
-                    else { continue }
-                    // `assistant.text` arrives as deltas, not as the answer so
-                    // far — measured against a real run, where "The note
-                    // mentions apples" came back as seven events. Joined here
-                    // so every consumer sees one answer.
-                    if event.kind == .text { answer += event.text }
-                    events.append(event)
-                    onEvent(event)
-                }
-            }
+        let inputAndTranscript = await withTaskCancellationHandler {
+            let inputWasAccepted = await writerTask.value
+            let transcript = await transcriptCollector.value
+            return (inputWasAccepted, transcript)
         } onCancel: {
             Task { @MainActor in child.terminateIfRunning() }
         }
 
-        backstop.cancel()
         await child.waitForExit()
-        let notes = await noteCollector.value
+        backstop.cancel()
+        let noteCollection = await noteCollector.value
+        let inputWasAccepted = inputAndTranscript.0
+        let events = inputAndTranscript.1.events
+        let answer = inputAndTranscript.1.answer
+        let notes = noteCollection.text
+        let truncated = inputAndTranscript.1.truncated || noteCollection.truncated
 
         let outcome: HarnessOutcome
         if Task.isCancelled {
@@ -310,9 +425,45 @@ public enum HarnessRun {
             // signal to have actually landed ties the verdict to what
             // happened, not to what we asked for.
             outcome = .timedOut
+        } else if !inputWasAccepted {
+            outcome = .failed(inputRejectedMessage)
         } else {
             outcome = HarnessOutcome(exitStatus: child.status, notes: notes)
         }
+
+        let severity: DiagnosticSeverity
+        let code: DiagnosticCode
+        switch outcome {
+        case .finished:
+            severity = .info
+            code = .harnessTerminalSucceeded
+        case .cancelled:
+            severity = .notice
+            code = .harnessTerminalCancelled
+        case .timedOut:
+            severity = .error
+            code = .harnessTerminalTimedOut
+        case .failed where !inputWasAccepted:
+            severity = .error
+            code = .harnessTerminalInputRejected
+        case .failed, .stepsExhausted, .outputCapped:
+            severity = .error
+            code = .harnessTerminalFailed
+        }
+        var metadata: [DiagnosticMetadataKey: DiagnosticMetadataValue] = [
+            .exitStatus: .integer(Int64(child.status)),
+            .truncated: .boolean(truncated),
+            .available: .boolean(true),
+        ]
+        if child.endedBySignal {
+            metadata[.signal] = .integer(Int64(child.status))
+        }
+        diagnostics.emit(
+            severity: severity,
+            subsystem: .harness,
+            code: code,
+            operationID: operationID,
+            metadata: DiagnosticMetadata(metadata))
 
         return HarnessRunResult(
             outcome: outcome,
@@ -320,6 +471,82 @@ public enum HarnessRun {
             events: events,
             notes: notes,
             truncated: truncated)
+    }
+
+    /// Incorporates one stdout read while enforcing both bounds at the point
+    /// each event is appended. The outer stream continues draining after this
+    /// marks the transcript truncated, so the child never blocks on a full
+    /// pipe merely because MarkDev stopped retaining its output.
+    @MainActor
+    static func absorbTranscriptChunk(
+        _ chunk: Data,
+        pending: inout Data,
+        transcriptBytes: inout Int,
+        events: inout [HarnessEvent],
+        answer: inout String,
+        truncated: inout Bool,
+        onEvent: @MainActor (HarnessEvent) -> Void
+    ) {
+        transcriptBytes = saturatingByteCount(transcriptBytes, adding: chunk.count)
+        guard transcriptBytes <= maximumTranscriptBytes, events.count < maximumEvents else {
+            truncated = true
+            pending.removeAll(keepingCapacity: false)
+            return
+        }
+        pending.append(chunk)
+
+        // Split on newlines, keeping whatever follows the last one for the
+        // next chunk — a JSON object is regularly delivered in two reads, and
+        // a half-decoded line dropped here is a tool call the panel never sees.
+        while let newline = pending.firstIndex(of: 0x0A) {
+            guard events.count < maximumEvents else {
+                truncated = true
+                pending.removeAll(keepingCapacity: false)
+                return
+            }
+            let line = pending[pending.startIndex..<newline]
+            pending = pending[pending.index(after: newline)...]
+            guard
+                let event = HarnessEvent.decode(
+                    line: String(decoding: line, as: UTF8.self))
+            else { continue }
+            // `assistant.text` arrives as deltas, not as the answer so far.
+            if event.kind == .text { answer += event.text }
+            events.append(event)
+            onEvent(event)
+        }
+    }
+
+    /// Decodes the last NDJSON record after EOF. A final newline is customary,
+    /// not part of the protocol contract; discarding a valid unterminated
+    /// record can lose the final answer or run report.
+    @MainActor
+    static func absorbFinalTranscriptRecord(
+        pending: inout Data,
+        events: inout [HarnessEvent],
+        answer: inout String,
+        truncated: inout Bool,
+        onEvent: @MainActor (HarnessEvent) -> Void
+    ) {
+        guard !pending.isEmpty else { return }
+        defer { pending.removeAll(keepingCapacity: false) }
+        guard events.count < maximumEvents else {
+            truncated = true
+            return
+        }
+        guard
+            let event = HarnessEvent.decode(
+                line: String(decoding: pending, as: UTF8.self))
+        else { return }
+        if event.kind == .text { answer += event.text }
+        events.append(event)
+        onEvent(event)
+    }
+
+    nonisolated static func saturatingByteCount(_ current: Int, adding increment: Int) -> Int {
+        guard current >= 0, increment >= 0 else { return .max }
+        let (sum, overflow) = current.addingReportingOverflow(increment)
+        return overflow ? .max : sum
     }
 
     /// Bridges a pipe to an async sequence of chunks.
@@ -331,21 +558,47 @@ public enum HarnessRun {
     /// consumer that stopped at process exit instead would lose whatever the
     /// child wrote in its last moments, which for `manvi run` is the run
     /// report.
-    static func stream(from handle: FileHandle) -> AsyncStream<Data> {
-        AsyncStream { continuation in
+    static func stream(
+        from handle: FileHandle,
+        maximumBufferedBytes requestedByteLimit: Int
+    ) -> HarnessPipeByteStream {
+        let byteLimit = min(max(1, requestedByteLimit), maximumTranscriptBytes)
+        let chunkLimit = min(64 * 1024, byteLimit)
+        let elementLimit = max(1, byteLimit / chunkLimit)
+        let loss = HarnessPipeLossState()
+        let chunks = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(elementLimit)) {
+            continuation in
             handle.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
                     handle.readabilityHandler = nil
                     continuation.finish()
                 } else {
-                    continuation.yield(data)
+                    var start = data.startIndex
+                    while start < data.endIndex {
+                        let remaining = data.distance(from: start, to: data.endIndex)
+                        let end = data.index(start, offsetBy: min(chunkLimit, remaining))
+                        let chunk = Data(data[start..<end])
+                        switch continuation.yield(chunk) {
+                        case .enqueued:
+                            break
+                        case .dropped:
+                            loss.markDropped()
+                        case .terminated:
+                            handle.readabilityHandler = nil
+                            return
+                        @unknown default:
+                            loss.markDropped()
+                        }
+                        start = end
+                    }
                 }
             }
             continuation.onTermination = { _ in
                 handle.readabilityHandler = nil
             }
         }
+        return HarnessPipeByteStream(chunks: chunks, loss: loss)
     }
 
     /// A `Duration` in the spelling Go's `time.ParseDuration` accepts.

@@ -1,6 +1,7 @@
 """Check effective Xcode settings so target presets cannot override release metadata."""
 import json
 from pathlib import Path
+import plistlib
 import re
 import unittest
 
@@ -22,6 +23,24 @@ class ProjectVersionTests(unittest.TestCase):
                     with self.subTest(configuration=configuration, target=item["target"]):
                         self.assertEqual(item["buildSettings"]["CURRENT_PROJECT_VERSION"], expected["build"])
                         self.assertEqual(item["buildSettings"]["MARKETING_VERSION"], expected["version"])
+
+    def test_main_app_stays_unsandboxed_and_quicklook_is_read_only_sandboxed(self):
+        with Path("app/MarkDevQuickLook/MarkDevQuickLook.entitlements").open("rb") as stream:
+            entitlements = plistlib.load(stream)
+        self.assertEqual(entitlements, {
+            "com.apple.security.app-sandbox": True,
+            "com.apple.security.files.user-selected.read-only": True,
+        })
+
+        settings = json.loads(run("xcodebuild", "-project", "MarkDev.xcodeproj", "-alltargets",
+                                  "-configuration", "Release", "-showBuildSettings", "-json").stdout)
+        by_target = {item["target"]: item["buildSettings"] for item in settings}
+        self.assertEqual(by_target["MarkDev"].get("ENABLE_APP_SANDBOX"), "NO")
+        self.assertEqual(by_target["MarkDev"].get("CODE_SIGN_ENTITLEMENTS", ""), "")
+        self.assertEqual(by_target["MarkDevQuickLook"].get("ENABLE_APP_SANDBOX"), "YES")
+        self.assertEqual(
+            by_target["MarkDevQuickLook"].get("CODE_SIGN_ENTITLEMENTS"),
+            "app/MarkDevQuickLook/MarkDevQuickLook.entitlements")
 
 
 if __name__ == "__main__":

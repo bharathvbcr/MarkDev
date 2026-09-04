@@ -24,6 +24,8 @@ Before proposing or implementing changes, you must understand MarkDev's core des
 6. **Rebuild Over Patching for Vault Graph**: Vault link updates rebuild the local graph rather than applying partial delta patches. At personal vault scale (~10k notes), a complete Rust rebuild takes microseconds and eliminates stale edge bugs.
 7. **No Remote Image Loads**: Opening a note must never trigger arbitrary network requests. All image resolution is strictly local to the vault filesystem.
 8. **Code-Defined Brand Geometry**: The app and document icons are rendered directly from `MarkDevLogo.swift` via `tools/icongen`. Never check in manual PNG or `.imageset` files.
+9. **Bounded and typed diagnostics first**: emit only through `DiagnosticsEmitter`, with bounded queues and typed event metadata. Do not use diagnostics as control flow.
+10. **Assisted edit safety**: any model-assisted replacement must validate source identity and document generation before mutating text.
 
 ---
 
@@ -31,8 +33,8 @@ Before proposing or implementing changes, you must understand MarkDev's core des
 
 ### Prerequisites
 
-1. **macOS 15.0+**
-2. **Xcode 16.0+**
+1. **macOS 26.0+**
+2. **Xcode 26.x**
 3. **Rust 1.80+** (`rustup default stable`)
 4. **Command Tools**:
    ```bash

@@ -77,6 +77,11 @@ public final class DocumentAssistant {
 
     @ObservationIgnored private let reviewRequest = IntelligenceRequest()
     @ObservationIgnored private let readingRequest = IntelligenceRequest()
+    /// Snapshot that the visible brief belongs to. It is refreshed when a
+    /// reading starts and invalidated when focus moves to another editor.
+    @ObservationIgnored private var briefSource: AssistedEditSource?
+    @ObservationIgnored private var reviewGeneration: UInt64 = 0
+    @ObservationIgnored private var readingGeneration: UInt64 = 0
 
     public init(service: IntelligenceService) {
         self.service = service
@@ -91,7 +96,15 @@ public final class DocumentAssistant {
     /// pane's edits rewriting the mirror for the foreground one.
     public func attach(to surface: MarkdownTextView) {
         guard self.surface !== surface else { return }
+        reviewGeneration &+= 1
+        readingGeneration &+= 1
+        reviewRequest.cancel()
+        readingRequest.cancel()
         self.surface = surface
+        review = .idle
+        reading = .idle
+        brief = NoteBrief(summary: "", keyPoints: [], title: "", tags: [])
+        briefSource = AssistedEditSource(surface)
         issues = surface.issues
         surface.onIssues = { [weak self, weak surface] updated in
             guard let self, let surface, self.surface === surface else { return }
@@ -136,14 +149,21 @@ public final class DocumentAssistant {
         let chunks = Array(planned.prefix(Self.maximumPasses))
         surface.issues = .none
         review = .running(checked: 0, total: planned.count)
+        reviewGeneration &+= 1
+        let generation = reviewGeneration
 
-        reviewRequest.start { [weak self] in
-            guard let self else { return }
+        reviewRequest.start { [weak self, weak surface] in
+            guard let self, self.reviewGeneration == generation else { return }
+            guard let surface, self.surface === surface else {
+                self.review = .failed("The document changed while it was being checked.")
+                return
+            }
             var found = ProofreadingIssues.none
             var unplaced = 0
 
             for (index, chunk) in chunks.enumerated() {
-                guard let surface = self.surface else {
+                guard self.reviewGeneration == generation else { return }
+                guard self.surface === surface else {
                     // The editor detached mid-pass (pane closed, focus moved).
                     // Ending without a terminal state left the panel showing
                     // progress forever — every other exit writes one, so this
@@ -166,6 +186,7 @@ public final class DocumentAssistant {
                 do {
                     let report = try await self.service.proofread(text.substring(with: chunk))
                     try Task.checkCancellation()
+                    guard self.reviewGeneration == generation else { return }
                     let placed = ProofreadingIssues.locate(
                         report.findings, in: text, within: chunk)
                     found = found.merging(placed.issues)
@@ -175,11 +196,13 @@ public final class DocumentAssistant {
                     surface.issues = found
                     self.review = .running(checked: index + 1, total: planned.count)
                 } catch is CancellationError {
+                    guard self.reviewGeneration == generation else { return }
                     self.review = .done(
                         checked: index, total: planned.count, found: found.count,
                         unplaced: unplaced)
                     return
                 } catch {
+                    guard self.reviewGeneration == generation else { return }
                     self.review = .failed(error.localizedDescription)
                     return
                 }
@@ -192,8 +215,10 @@ public final class DocumentAssistant {
     }
 
     public func stopReview() {
+        let stoppedReview = review
+        reviewGeneration &+= 1
         reviewRequest.cancel()
-        if case .running(let checked, let total) = review {
+        if case .running(let checked, let total) = stoppedReview {
             review = .done(checked: checked, total: total, found: issues.count, unplaced: 0)
         }
     }
@@ -273,28 +298,44 @@ public final class DocumentAssistant {
             return
         }
 
+        let source = AssistedEditSource(surface)
+        briefSource = source
+        brief = NoteBrief(summary: "", keyPoints: [], title: "", tags: [])
         reading = .running
+        readingGeneration &+= 1
+        let generation = readingGeneration
         readingRequest.start { [weak self] in
-            guard let self else { return }
+            guard let self, self.readingGeneration == generation else { return }
             do {
                 let found = try await self.service.brief(text)
                 try Task.checkCancellation()
+                guard self.readingGeneration == generation else { return }
+                let validation = source.validate(
+                    attachedTo: self.surface, requiresEditing: false)
+                guard validation == .current else {
+                    self.reading = .failed(
+                        validation.message ?? "The source document is no longer available.")
+                    return
+                }
                 self.brief = found
                 self.reading =
                     found.isEmpty
                     ? .failed("Apple Intelligence returned nothing for that.")
                     : .ready(truncated: truncated)
             } catch is CancellationError {
+                guard self.readingGeneration == generation else { return }
                 self.reading = self.readingRequest.didTimeOut
                     ? .failed(IntelligenceFailure.timedOut.localizedDescription)
                     : .idle
             } catch {
+                guard self.readingGeneration == generation else { return }
                 self.reading = .failed(error.localizedDescription)
             }
         }
     }
 
     public func stopReading() {
+        readingGeneration &+= 1
         readingRequest.cancel()
         reading = .idle
     }
@@ -313,46 +354,70 @@ public final class DocumentAssistant {
     /// do — and a note with two H1s is a note whose outline is now wrong.
     @discardableResult
     public func applyTitle() -> Bool {
-        guard let surface, surface.acceptsAssistedEdits, !brief.title.isEmpty else { return false }
+        guard let surface = validatedBriefSurface(), !brief.title.isEmpty else { return false }
         let existing = Self.leadingHeadingRange(in: surface.markdown)
-        return surface.applyAssistedEdit(
+        let applied = surface.applyAssistedEdit(
             range: existing ?? NSRange(location: 0, length: 0),
             replacement: existing == nil ? "# \(brief.title)\n\n" : "# \(brief.title)",
             actionName: existing == nil ? "Insert Title" : "Replace Title")
+        rebaseBriefSource(after: applied, on: surface)
+        return applied
     }
 
     /// Inserts the tags as a line at the caret.
     @discardableResult
     public func insertTags() -> Bool {
-        guard let surface, surface.acceptsAssistedEdits, !brief.tags.isEmpty else { return false }
-        return surface.applyAssistedEdit(
+        guard let surface = validatedBriefSurface(), !brief.tags.isEmpty else { return false }
+        let applied = surface.applyAssistedEdit(
             range: surface.selectedRange(),
             replacement: brief.tagLine,
             actionName: "Insert Tags")
+        rebaseBriefSource(after: applied, on: surface)
+        return applied
     }
 
     /// Inserts the key points as a bullet list at the caret.
     @discardableResult
     public func insertKeyPoints() -> Bool {
-        guard let surface, surface.acceptsAssistedEdits, !brief.keyPoints.isEmpty else {
+        guard let surface = validatedBriefSurface(), !brief.keyPoints.isEmpty else {
             return false
         }
-        return surface.applyAssistedEdit(
+        let applied = surface.applyAssistedEdit(
             range: surface.selectedRange(),
             replacement: brief.keyPointList,
             actionName: "Insert Key Points")
+        rebaseBriefSource(after: applied, on: surface)
+        return applied
     }
 
     /// Inserts the summary at the caret.
     @discardableResult
     public func insertSummary() -> Bool {
-        guard let surface, surface.acceptsAssistedEdits, !brief.summary.isEmpty else {
+        guard let surface = validatedBriefSurface(), !brief.summary.isEmpty else {
             return false
         }
-        return surface.applyAssistedEdit(
+        let applied = surface.applyAssistedEdit(
             range: surface.selectedRange(),
             replacement: brief.summary,
             actionName: "Insert Summary")
+        rebaseBriefSource(after: applied, on: surface)
+        return applied
+    }
+
+    private func validatedBriefSurface() -> MarkdownTextView? {
+        let validation = briefSource?.validate(attachedTo: surface) ?? .unavailable
+        guard validation == .current else {
+            reading = .failed(validation.message ?? "That result can’t be applied.")
+            return nil
+        }
+        return briefSource?.surface
+    }
+
+    /// Applying one field is an authorized change by this brief, so the other
+    /// fields remain usable. Only that successful, known edit may advance the
+    /// snapshot; arbitrary typing still makes the remaining actions stale.
+    private func rebaseBriefSource(after applied: Bool, on surface: MarkdownTextView) {
+        if applied { briefSource = AssistedEditSource(surface) }
     }
 
     /// The range of a leading ATX heading, if the note opens with one.

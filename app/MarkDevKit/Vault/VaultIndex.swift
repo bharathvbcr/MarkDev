@@ -11,6 +11,30 @@ import Foundation
     import CMarkDev
 #endif
 
+private enum VaultBoundary {
+    static let maximumPathBytes = 4 * 1_024
+    static let maximumQueryBytes = 4 * 1_024
+    static let maximumSearchResults = 1_000
+
+    static func acceptsCString(_ value: String, maximumBytes: Int, allowEmpty: Bool = false)
+        -> Bool
+    {
+        (allowEmpty || !value.isEmpty)
+            && !value.utf8.contains(0)
+            && value.utf8.count <= maximumBytes
+    }
+
+    static func acceptsOptionalCString(_ value: String?, maximumBytes: Int) -> Bool {
+        guard let value, !value.isEmpty else { return true }
+        return acceptsCString(value, maximumBytes: maximumBytes)
+    }
+}
+
+private func vaultSaturatedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? Int.max : sum
+}
+
 /// A link pointing at the current note.
 public struct Backlink: Codable, Identifiable, Sendable, Hashable {
     public let path: String
@@ -67,10 +91,102 @@ public struct SearchHit: Codable, Identifiable, Sendable, Hashable {
 public struct RenameOutcome: Equatable, Sendable {
     public let rewrittenNotes: Int
     public let rewrittenLinks: Int
+    /// Rewrites that failed after the source note had already moved.
+    public let failedRewrites: Int
+    /// False means the file move happened but one or more link rewrites did
+    /// not, so callers must surface a partial result rather than success.
+    public let isComplete: Bool
 
-    public init(rewrittenNotes: Int, rewrittenLinks: Int) {
+    public init(
+        rewrittenNotes: Int,
+        rewrittenLinks: Int,
+        failedRewrites: Int = 0,
+        isComplete: Bool = true
+    ) {
         self.rewrittenNotes = rewrittenNotes
         self.rewrittenLinks = rewrittenLinks
+        self.failedRewrites = failedRewrites
+        self.isComplete = isComplete
+    }
+}
+
+/// Whether an editor-buffer update crossed and changed the Rust index.
+public enum VaultUpdateResult: Equatable, Sendable {
+    case rejected
+    case unchanged
+    case changed
+}
+
+/// Exact coverage of the bounded scan performed when a Rust vault opens.
+public struct VaultInitialScanStatus: Codable, Equatable, Sendable {
+    public let scanPerformed: Bool
+    public let visitedEntries: UInt64
+    public let discoveredFiles: UInt64
+    public let discoveredBytes: UInt64
+    public let selectedFiles: UInt64
+    public let selectedBytes: UInt64
+    public let indexedFiles: UInt64
+    public let indexedBytes: UInt64
+    public let skippedFiles: UInt64
+    public let skippedSymlinks: UInt64
+    public let unreadableDirectories: UInt64
+    public let unreadableEntries: UInt64
+    public let unreadableFiles: UInt64
+    public let oversizedFiles: UInt64
+    public let hitDepthLimit: Bool
+    public let hitEntryLimit: Bool
+    public let hitTotalByteLimit: Bool
+
+    public var isComplete: Bool {
+        scanPerformed && !hitDepthLimit && !hitEntryLimit && !hitTotalByteLimit
+            && skippedFiles == 0 && unreadableDirectories == 0 && unreadableEntries == 0
+            && unreadableFiles == 0 && oversizedFiles == 0
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case scanPerformed = "scan_performed"
+        case visitedEntries = "visited_entries"
+        case discoveredFiles = "discovered_files"
+        case discoveredBytes = "discovered_bytes"
+        case selectedFiles = "selected_files"
+        case selectedBytes = "selected_bytes"
+        case indexedFiles = "indexed_files"
+        case indexedBytes = "indexed_bytes"
+        case skippedFiles = "skipped_files"
+        case skippedSymlinks = "skipped_symlinks"
+        case unreadableDirectories = "unreadable_directories"
+        case unreadableEntries = "unreadable_entries"
+        case unreadableFiles = "unreadable_files"
+        case oversizedFiles = "oversized_files"
+        case hitDepthLimit = "hit_depth_limit"
+        case hitEntryLimit = "hit_entry_limit"
+        case hitTotalByteLimit = "hit_total_byte_limit"
+    }
+}
+
+/// What a catch-up sweep changed and whether it covered the whole vault.
+public struct VaultReconciliationResult: Equatable, Sendable {
+    public let changedNotes: Int
+    public let scan: FileTree.ScanResult
+    public let unreadableFiles: Int
+    /// Files that passed the inventory size check but exceeded the bound when
+    /// opened, for example because another process grew them between phases.
+    public let oversizedFilesDuringRead: Int
+    /// Actual UTF-8 bytes accepted during the read phase.
+    public let bytesRead: Int
+    /// A file grew beyond the aggregate allowance after inventory.
+    public let hitTotalByteLimitDuringRead: Bool
+
+    public var oversizedFiles: Int {
+        let (sum, overflow) = scan.oversizedFiles.addingReportingOverflow(
+            oversizedFilesDuringRead)
+        return overflow ? Int.max : sum
+    }
+
+    /// `false` means absence from the scan was not used as proof of deletion.
+    public var isComplete: Bool {
+        scan.isComplete && unreadableFiles == 0 && oversizedFilesDuringRead == 0
+            && !hitTotalByteLimitDuringRead
     }
 }
 
@@ -79,6 +195,8 @@ public struct RenameOutcome: Equatable, Sendable {
 private struct RenameOutcomePayload: Decodable {
     let rewritten_notes: UInt32
     let rewritten_links: UInt32
+    let failed_rewrites: UInt32
+    let complete: Bool
 }
 
 /// A heading, for the outline.
@@ -126,6 +244,15 @@ public struct LinkResolution: Codable, Sendable, Hashable {
 public final class VaultIndex {
     public private(set) var root: URL?
     public private(set) var noteCount: Int = 0
+    /// Advances whenever graph-relevant indexed content may have changed,
+    /// including edits and renames that leave the number of notes unchanged.
+    public private(set) var contentRevision: UInt64 = 0
+    /// Retains coverage evidence for diagnostics and callers using the legacy
+    /// integer-returning reconciliation entry point.
+    public private(set) var lastReconciliationResult: VaultReconciliationResult?
+    /// Coverage of the Rust scan that populated this instance at open time.
+    public private(set) var initialScanStatus: VaultInitialScanStatus?
+    private let diagnostics: DiagnosticsEmitter
 
     #if canImport(CMarkDev)
         // Every dereference of `handle` — on the main actor or off it, via
@@ -141,7 +268,9 @@ public final class VaultIndex {
         nonisolated(unsafe) private var handle: OpaquePointer?
     #endif
 
-    public init() {}
+    public init(diagnostics: DiagnosticsEmitter = .shared) {
+        self.diagnostics = diagnostics
+    }
 
     deinit {
         #if canImport(CMarkDev)
@@ -160,31 +289,64 @@ public final class VaultIndex {
     /// personal vault indexes in the time it takes the window to appear.
     public func open(_ root: URL) {
         let root = root.standardizedFileURL.resolvingSymlinksInPath()
+        lastReconciliationResult = nil
         #if canImport(CMarkDev)
             coreLock.lock()
             if let handle { md_vault_free(handle) }
-            handle = root.path.withCString { md_vault_open($0) }
+            if VaultBoundary.acceptsCString(
+                root.path, maximumBytes: VaultBoundary.maximumPathBytes)
+            {
+                handle = root.path.withCString { md_vault_open($0) }
+            } else {
+                handle = nil
+            }
             noteCount = handle.map { Int(md_vault_note_count($0)) } ?? 0
+            initialScanStatus = handle.flatMap { decode(md_vault_scan_status($0)) }
             coreLock.unlock()
             self.root = root
+            contentRevision &+= 1
         #else
             self.root = root
+            initialScanStatus = nil
         #endif
     }
 
     /// Re-indexes one note from text held in the editor rather than on disk,
     /// so backlinks track what is on screen and not the last save.
-    public func update(path: String, text: String) {
+    @discardableResult
+    public func update(path: String, text: String) -> VaultUpdateResult {
         #if canImport(CMarkDev)
+            guard !path.isEmpty,
+                path.utf8.count <= VaultBoundary.maximumPathBytes,
+                text.utf8.count <= FileTree.defaultMaximumNoteBytes
+            else { return .rejected }
+            let pathBytes = Array(path.utf8)
+            let textBytes = Array(text.utf8)
             coreLock.lock()
             defer { coreLock.unlock() }
-            guard let handle else { return }
-            path.withCString { pathPointer in
-                text.withCString { textPointer in
-                    md_vault_update(handle, pathPointer, textPointer)
+            guard let handle else { return .rejected }
+            let rawResult = pathBytes.withUnsafeBytes { pathBuffer in
+                textBytes.withUnsafeBytes { textBuffer in
+                    md_vault_update(
+                        handle,
+                        pathBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(pathBuffer.count),
+                        textBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(textBuffer.count))
                 }
             }
-            noteCount = Int(md_vault_note_count(handle))
+            switch rawResult {
+            case 2:
+                noteCount = Int(md_vault_note_count(handle))
+                contentRevision &+= 1
+                return .changed
+            case 1:
+                return .unchanged
+            default:
+                return .rejected
+            }
+        #else
+            return .rejected
         #endif
     }
 
@@ -246,8 +408,11 @@ public final class VaultIndex {
 
     public func search(_ text: String, limit: Int = 50) -> [SearchHit] {
         #if canImport(CMarkDev)
-            guard !text.isEmpty, limit > 0 else { return [] }
-            let boundedLimit = UInt32(min(limit, Int(UInt32.max)))
+            guard limit > 0,
+                VaultBoundary.acceptsCString(
+                    text, maximumBytes: VaultBoundary.maximumQueryBytes)
+            else { return [] }
+            let boundedLimit = UInt32(min(limit, VaultBoundary.maximumSearchResults))
             return coreLock.withLock {
                 guard let handle else { return [] }
                 return text.withCString { decode(md_vault_search(handle, $0, boundedLimit)) }
@@ -261,6 +426,11 @@ public final class VaultIndex {
     /// Resolves a `[[wikilink]]` target and optional `#anchor`.
     public func resolve(target: String, anchor: String? = nil) -> LinkResolution? {
         #if canImport(CMarkDev)
+            guard VaultBoundary.acceptsCString(
+                target, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    anchor, maximumBytes: VaultBoundary.maximumQueryBytes)
+            else { return nil }
             return coreLock.withLock { resolveLocked(handle, target: target, anchor: anchor) }
         #else
             return nil
@@ -303,11 +473,15 @@ public final class VaultIndex {
     /// the second of them.
     public func removeNote(_ path: String) {
         #if canImport(CMarkDev)
+            guard VaultBoundary.acceptsCString(
+                path, maximumBytes: VaultBoundary.maximumPathBytes)
+            else { return }
             coreLock.lock()
             defer { coreLock.unlock() }
             guard let handle else { return }
             path.withCString { md_vault_remove(handle, $0) }
             noteCount = Int(md_vault_note_count(handle))
+            contentRevision &+= 1
         #endif
     }
 
@@ -327,64 +501,204 @@ public final class VaultIndex {
     /// authoritative over what any file says (the same rule
     /// per-event handling follows).
     ///
-    /// - Returns: how many notes were added, changed or removed.
+    /// Reconciles with explicit traversal limits and returns coverage evidence.
+    /// Missing paths are removed only after a complete inventory; a capped or
+    /// unreadable walk can update what it did see, but never turns unseen into
+    /// deleted.
+    ///
+    /// - Returns: both the number of changed notes and proof of scan coverage.
+    ///   Callers must not reduce an incomplete walk to a successful empty one.
     @discardableResult
-    public func reconcileWithDisk(excluding: Set<URL> = []) async -> Int {
-        guard let root else { return 0 }
+    public func reconcileWithDisk(
+        excluding: Set<URL> = [], scanLimits: FileTree.ScanLimits = .standard
+    ) async -> VaultReconciliationResult {
+        let operationID = DiagnosticOperationID()
+        guard let root else {
+            let result = VaultReconciliationResult(
+                changedNotes: 0,
+                scan: FileTree.ScanResult(
+                    files: [],
+                    visitedEntries: 0,
+                    discoveredFiles: 0,
+                    discoveredBytes: 0,
+                    selectedBytes: 0,
+                    skippedSymlinks: 0,
+                    unreadableDirectories: 1,
+                    unreadableEntries: 0,
+                    oversizedFiles: 0,
+                    hitDepthLimit: false,
+                    hitEntryLimit: false,
+                    hitTotalByteLimit: false),
+                unreadableFiles: 0,
+                oversizedFilesDuringRead: 0,
+                bytesRead: 0,
+                hitTotalByteLimitDuringRead: false)
+            lastReconciliationResult = result
+            recordIncompleteReconciliation(result, operationID: operationID)
+            return result
+        }
         let excluded = Set(excluding.map(\.standardizedFileURL.path))
 
         // Read off the main actor. The snapshot carries bytes, not parsed
         // results, so the apply step below cannot mistake a stale read for a
         // fresh one.
-        struct DiskNote {
-            let path: String
+        struct DiskNote: Sendable {
             let url: URL
-            let text: String?
+            let text: String
         }
-        let snapshot: [DiskNote] = await Task.detached(priority: .utility) {
-            FileTree.markdownFiles(under: root).compactMap { url in
-                let standardized = url.standardizedFileURL.path
-                guard !excluded.contains(standardized) else { return nil }
-                return DiskNote(
-                    path: standardized,
-                    url: url,
-                    text: try? String(contentsOf: url, encoding: .utf8))
-            }
-        }.value
+        let readResult: (FileTree.ScanResult, [DiskNote], Int, Int, Int, Bool) =
+            await Task.detached(priority: .utility) {
+                let scan = FileTree.scanMarkdownFiles(under: root, limits: scanLimits)
+                let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+                let rootPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
+                var unreadableFiles = 0
+                var oversizedFilesDuringRead = 0
+                var bytesRead = 0
+                var hitTotalByteLimitDuringRead = false
+                var snapshot: [DiskNote] = []
+                snapshot.reserveCapacity(scan.files.count)
+                for url in scan.files {
+                    let standardized = url.standardizedFileURL.path
+                    guard !excluded.contains(standardized) else { continue }
+                    let values = try? url.resourceValues(forKeys: [
+                        .isRegularFileKey, .isSymbolicLinkKey,
+                    ])
+                    let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+                    guard values?.isRegularFile == true,
+                        values?.isSymbolicLink != true,
+                        resolved.hasPrefix(rootPrefix)
+                    else {
+                        unreadableFiles = vaultSaturatedAdd(unreadableFiles, 1)
+                        continue
+                    }
+                    let remainingBytes = max(0, scanLimits.maxTotalBytes - bytesRead)
+                    let maximumBytes = min(scanLimits.maxNoteBytes, remainingBytes)
+                    switch FileTree.readUTF8File(
+                        at: url, inside: root, maximumBytes: maximumBytes)
+                    {
+                    case .text(let text):
+                        let count = text.utf8.count
+                        let nextBytes = vaultSaturatedAdd(bytesRead, count)
+                        guard nextBytes <= scanLimits.maxTotalBytes else {
+                            hitTotalByteLimitDuringRead = true
+                            continue
+                        }
+                        bytesRead = nextBytes
+                        snapshot.append(DiskNote(url: url, text: text))
+                    case .oversized:
+                        if remainingBytes < scanLimits.maxNoteBytes {
+                            hitTotalByteLimitDuringRead = true
+                        } else {
+                            oversizedFilesDuringRead = vaultSaturatedAdd(
+                                oversizedFilesDuringRead, 1)
+                        }
+                    case .unreadable:
+                        unreadableFiles = vaultSaturatedAdd(unreadableFiles, 1)
+                    }
+                }
+                return (
+                    scan,
+                    snapshot,
+                    unreadableFiles,
+                    oversizedFilesDuringRead,
+                    bytesRead,
+                    hitTotalByteLimitDuringRead)
+            }.value
+        let scan = readResult.0
+        let snapshot = readResult.1
+        var unreadableFiles = readResult.2
+        let oversizedFilesDuringRead = readResult.3
+        let bytesRead = readResult.4
+        let hitTotalByteLimitDuringRead = readResult.5
 
         var touched = 0
-        var onDisk = Set<String>()
+        let onDisk = Set(scan.files.map(\.standardizedFileURL.path))
         for note in snapshot {
-            onDisk.insert(note.path)
-            guard let text = note.text else { continue }  // unreadable: keep what we have
             if let relative = relativePath(for: note.url) {
-                update(path: relative, text: text)
-                touched += 1
+                switch update(path: relative, text: note.text) {
+                case .changed:
+                    touched = vaultSaturatedAdd(touched, 1)
+                case .unchanged:
+                    break
+                case .rejected:
+                    unreadableFiles = vaultSaturatedAdd(unreadableFiles, 1)
+                }
+            } else {
+                unreadableFiles = vaultSaturatedAdd(unreadableFiles, 1)
             }
         }
 
         // A note gone from the disk is gone from the index — but only on
         // proven absence. A read that failed for permission reasons must not
         // masquerade as a deletion.
-        for path in notePaths() {
-            guard let url = url(for: path) else { continue }
-            if !onDisk.contains(url.standardizedFileURL.path),
-                !FileManager.default.fileExists(atPath: url.path)
-            {
-                removeNote(path)
-                touched += 1
+        let scanWasComplete =
+            scan.isComplete && unreadableFiles == 0 && oversizedFilesDuringRead == 0
+            && !hitTotalByteLimitDuringRead
+        if scanWasComplete {
+            for path in notePaths() {
+                guard let url = url(for: path) else { continue }
+                let absolutePath = url.standardizedFileURL.path
+                if !excluded.contains(absolutePath),
+                    !onDisk.contains(absolutePath),
+                    !FileManager.default.fileExists(atPath: url.path)
+                {
+                    removeNote(path)
+                    touched = vaultSaturatedAdd(touched, 1)
+                }
             }
         }
-        return touched
+        let result = VaultReconciliationResult(
+            changedNotes: touched,
+            scan: scan,
+            unreadableFiles: unreadableFiles,
+            oversizedFilesDuringRead: oversizedFilesDuringRead,
+            bytesRead: bytesRead,
+            hitTotalByteLimitDuringRead: hitTotalByteLimitDuringRead)
+        lastReconciliationResult = result
+        if !result.isComplete {
+            recordIncompleteReconciliation(result, operationID: operationID)
+        }
+        return result
+    }
+
+    private func recordIncompleteReconciliation(
+        _ result: VaultReconciliationResult,
+        operationID: DiagnosticOperationID
+    ) {
+        diagnostics.emit(
+            severity: .warning,
+            subsystem: .vault,
+            code: .vaultReconciliationIncomplete,
+            operationID: operationID,
+            metadata: DiagnosticMetadata([
+                .changedCount: .integer(Int64(result.changedNotes)),
+                .discoveredFileCount: .integer(Int64(result.scan.discoveredFiles)),
+                .visitedEntryCount: .integer(Int64(result.scan.visitedEntries)),
+                .skippedSymlinkCount: .integer(Int64(result.scan.skippedSymlinks)),
+                .unreadableDirectoryCount: .integer(
+                    Int64(result.scan.unreadableDirectories)),
+                .unreadableEntryCount: .integer(Int64(result.scan.unreadableEntries)),
+                .unreadableFileCount: .integer(Int64(result.unreadableFiles)),
+                .oversizedFileCount: .integer(Int64(result.oversizedFiles)),
+                .hitDepthLimit: .boolean(result.scan.hitDepthLimit),
+                .hitEntryLimit: .boolean(result.scan.hitEntryLimit),
+            ]))
     }
 
     /// Moves a note and rewrites every link that resolved to it.
     ///
     /// - Returns: how many notes and individual links were rewritten, or
     ///   `nil` when the move was refused (unknown source, destination taken,
-    ///   file error). `nil` means nothing happened on disk either.
+    ///   file error). `nil` means nothing happened on disk either. A non-nil
+    ///   result whose ``RenameOutcome/isComplete`` is false means the source
+    ///   moved but one or more link rewrites failed and must be surfaced.
     public func renameNote(from: String, to: String) -> RenameOutcome? {
         #if canImport(CMarkDev)
+            guard VaultBoundary.acceptsCString(
+                from, maximumBytes: VaultBoundary.maximumPathBytes),
+                VaultBoundary.acceptsCString(
+                    to, maximumBytes: VaultBoundary.maximumPathBytes)
+            else { return nil }
             return coreLock.withLock {
                 guard let handle else { return nil }
                 let payload: RenameOutcomePayload? = from.withCString { fromPointer in
@@ -393,9 +707,12 @@ public final class VaultIndex {
                     }
                 }
                 guard let payload else { return nil }
+                contentRevision &+= 1
                 return RenameOutcome(
                     rewrittenNotes: Int(payload.rewritten_notes),
-                    rewrittenLinks: Int(payload.rewritten_links))
+                    rewrittenLinks: Int(payload.rewritten_links),
+                    failedRewrites: Int(payload.failed_rewrites),
+                    isComplete: payload.complete)
             }
         #else
             return nil
@@ -424,11 +741,10 @@ public final class VaultIndex {
     /// the lock (see `md_vault_clone`) — microseconds — and holds nothing
     /// while it simulates.
     ///
-    /// Cancellation is honoured at the boundary: a rebuild superseded by a
-    /// newer one cancels this work before the clone is made. A simulation
-    /// already in flight runs to completion — Rust cannot be interrupted
-    /// mid-loop — but it now costs only its own thread, never the reader's
-    /// keystrokes.
+    /// Cancellation is honoured before and after every cancellable boundary.
+    /// A simulation already inside Rust runs to completion because that ABI is
+    /// synchronous, but its result is discarded and it holds only its private
+    /// clone — never the live index lock or the reader's canvas.
     ///
     /// Determinism makes this safe to prefer over ``graph(focus:depth:tag:
     /// folder:)`` wherever a caller can await: same inputs, same picture,
@@ -439,16 +755,19 @@ public final class VaultIndex {
         tag: String? = nil,
         folder: String? = nil
     ) async -> VaultGraph {
-        await withTaskCancellationHandler {
-            await Task.detached(priority: .userInitiated) { [self] in
-                clonedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
-            }.value
+        guard !Task.isCancelled else { return .empty }
+        let worker = Task.detached(priority: .userInitiated) { [self] in
+            clonedGraph(focus: focus, depth: depth, tag: tag, folder: folder)
+        }
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { worker.cancel() }
+            let result = await worker.value
+            return Task.isCancelled ? .empty : result
         } onCancel: {
-            // Nothing to do here on purpose: the inner task checks
-            // `Task.isCancelled` before starting, and cancellation of *that*
-            // task is what this handler's absence used to drop entirely.
-            // Marking the outer cancelled is enough for a not-yet-started
-            // clone to be skipped.
+            // Detached tasks do not inherit cancellation. Explicitly forward
+            // it so queued work can stop before cloning and completed stale
+            // work can never be returned to a superseded caller.
+            worker.cancel()
         }
     }
 
@@ -473,19 +792,29 @@ public final class VaultIndex {
         folder: String?
     ) -> VaultGraph {
         #if canImport(CMarkDev)
-            guard !Task.isCancelled else { return .empty }
+            guard !Task.isCancelled,
+                VaultBoundary.acceptsOptionalCString(
+                    focus, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    tag, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    folder, maximumBytes: VaultBoundary.maximumPathBytes)
+            else { return .empty }
 
             coreLock.lock()
             let snapshot = handle.map { md_vault_clone($0) }
             coreLock.unlock()
-            guard let snapshot else { return .empty }
+            guard !Task.isCancelled, let snapshot else {
+                if let snapshot { md_vault_free(snapshot) }
+                return .empty
+            }
             defer { md_vault_free(snapshot) }
 
             let bounded = UInt32(max(0, min(depth, 16)))
             // Nested `withCString` rather than a helper: the pointers must all
             // stay alive across the single call, and a helper returning them
             // would hand back memory already freed.
-            return withOptionalCString(focus) { focusPointer in
+            let graph: VaultGraph = withOptionalCString(focus) { focusPointer in
                 withOptionalCString(tag) { tagPointer in
                     withOptionalCString(folder) { folderPointer in
                         decode(
@@ -495,6 +824,7 @@ public final class VaultIndex {
                     }
                 }
             }
+            return Task.isCancelled ? .empty : graph
         #else
             return .empty
         #endif
@@ -508,6 +838,13 @@ public final class VaultIndex {
         folder: String?
     ) -> VaultGraph {
         #if canImport(CMarkDev)
+            guard VaultBoundary.acceptsOptionalCString(
+                focus, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    tag, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    folder, maximumBytes: VaultBoundary.maximumPathBytes)
+            else { return .empty }
             coreLock.lock()
             defer { coreLock.unlock() }
             guard let handle else { return .empty }
@@ -549,9 +886,14 @@ public final class VaultIndex {
             _ path: String,
             _ call: (OpaquePointer, UnsafePointer<CChar>) -> UnsafePointer<CChar>?
         ) -> [T] {
-            coreLock.withLock {
+            guard VaultBoundary.acceptsCString(
+                path, maximumBytes: VaultBoundary.maximumPathBytes)
+            else { return [] }
+            return coreLock.withLock {
                 guard let handle else { return [] }
-                return path.withCString { decode(call(handle, $0)) } ?? []
+                return path.withCString { pointer -> [T]? in
+                    decode(call(handle, pointer))
+                } ?? []
             }
         }
 
@@ -578,13 +920,11 @@ public final class VaultIndex {
             guard let pointer else { return nil }
             let json = String(cString: pointer)
             guard let data = json.data(using: .utf8) else { return nil }
-            // One decoder for the type, not one per query: these run on the
-            // keystroke path whenever backlinks and mentions refresh, and
-            // `JSONDecoder()` has no reason to be rebuilt each time.
-            return try? VaultIndex.decoder.decode(T.self, from: data)
+            // JSONDecoder does not document concurrent-use safety. Queries
+            // can decode simultaneously against independent cloned handles,
+            // so each decode owns its mutable decoder state.
+            return try? JSONDecoder().decode(T.self, from: data)
         }
-
-        private nonisolated static let decoder = JSONDecoder()
     #else
         private func query<T: Decodable>(_ path: String, _ call: (Never, Never) -> Never?) -> [T] {
             []
