@@ -590,8 +590,7 @@ final class RenderedBlockTests: XCTestCase {
             #"see <img src="a.svg"> here"#,
             "<img>",
             #"<img alt="no source">"#,
-            "<!-- <img src=\"a.svg\"> -->",
-            "<table><tr><td>x</td></tr></table>",
+            "<video src=\"a.mp4\"></video>",
             "<script>alert(1)</script>",
             // A `<br>` cannot be drawn, only inserted, and collapsed syntax
             // shrinks rather than being replaced — so there is nothing to put
@@ -605,6 +604,18 @@ final class RenderedBlockTests: XCTestCase {
             XCTAssertTrue(
                 rendered.entries.isEmpty,
                 "\(markup.debugDescription) is markup, not a picture")
+        }
+    }
+
+    func testHTMLTableIsRenderedAsBlock() {
+        let source = "before\n\n<table><tr><td>x</td></tr></table>\n\nafter\n"
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        XCTAssertEqual(rendered.entries.count, 1)
+        if case .htmlFlow = rendered.entries.first?.content.kind {
+            // expected
+        } else {
+            XCTFail("expected htmlFlow, got \(String(describing: rendered.entries.first?.content.kind))")
         }
     }
 

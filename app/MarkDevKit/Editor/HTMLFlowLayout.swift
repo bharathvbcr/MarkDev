@@ -18,6 +18,19 @@ struct HTMLFlowLayout: @unchecked Sendable {
         case image(CGImage, CGRect)
         case badge(line: CTLine, rect: CGRect, fill: CGColor, ink: CGColor)
         case text(line: CTLine, origin: CGPoint)
+
+        func offset(dx: CGFloat, dy: CGFloat) -> Piece {
+            switch self {
+            case .image(let image, let rect):
+                return .image(image, rect.offsetBy(dx: dx, dy: dy))
+            case .badge(let line, let rect, let fill, let ink):
+                return .badge(
+                    line: line, rect: rect.offsetBy(dx: dx, dy: dy), fill: fill, ink: ink)
+            case .text(let line, let origin):
+                return .text(
+                    line: line, origin: CGPoint(x: origin.x + dx, y: origin.y + dy))
+            }
+        }
     }
 
     let pieces: [Piece]
@@ -45,7 +58,7 @@ struct HTMLFlowLayout: @unchecked Sendable {
         ink: NSColor
     ) -> HTMLFlowLayout {
         let column = max(columnWidth, 1)
-        let bodyFont = theme.bodyFont
+        let bodyFont = flow.headingLevel.map { theme.headingFont(level: $0) } ?? theme.bodyFont
         let boldFont =
             NSFont(
                 descriptor: bodyFont.fontDescriptor.withSymbolicTraits(.bold),
@@ -54,12 +67,18 @@ struct HTMLFlowLayout: @unchecked Sendable {
             NSFont(
                 descriptor: bodyFont.fontDescriptor.withSymbolicTraits(.italic),
                 size: bodyFont.pointSize) ?? bodyFont
+        let monoFont = theme.monoFont
         let badgeFont = CTFontCreateUIFontForLanguage(.smallSystem, 11, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, 11, nil)
         let inkColor = ink.cgColor
         let linkColor = theme.linkColor.cgColor
         let badgeFill = theme.secondaryColor.withAlphaComponent(0.14).cgColor
         let badgeInk = theme.secondaryColor.cgColor
+
+        if let rows = flow.rows {
+            return layoutTable(
+                rows, column: column, directory: directory, theme: theme, ink: ink)
+        }
 
         var pieces: [Piece] = []
         var y: CGFloat = 0
@@ -92,12 +111,55 @@ struct HTMLFlowLayout: @unchecked Sendable {
                 let (textPieces, textHeight) = layoutText(
                     runs, at: y, column: column, alignment: flow.alignment,
                     bodyFont: bodyFont, boldFont: boldFont, italicFont: italicFont,
+                    monoFont: monoFont,
                     ink: inkColor, link: linkColor, lineSpacing: theme.lineSpacing)
                 pieces.append(contentsOf: textPieces)
                 y += textHeight
             }
         }
 
+        return HTMLFlowLayout(
+            pieces: pieces,
+            height: max(ceil(y), 0),
+            primaryImage: imageCount == 1 ? primary : nil)
+    }
+
+    @MainActor
+    private static func layoutTable(
+        _ rows: [[HTMLFlow]],
+        column: CGFloat,
+        directory: URL?,
+        theme: EditorTheme,
+        ink: NSColor
+    ) -> HTMLFlowLayout {
+        let columns = rows.map(\.count).max() ?? 0
+        guard columns > 0 else {
+            return HTMLFlowLayout(pieces: [], height: 0, primaryImage: nil)
+        }
+        let gap = Metrics.imageGap
+        let colWidth = max((column - gap * CGFloat(columns - 1)) / CGFloat(columns), 24)
+        var pieces: [Piece] = []
+        var y: CGFloat = 0
+        var imageCount = 0
+        var primary: RenderedContent?
+
+        for (index, row) in rows.enumerated() {
+            if index > 0 { y += gap }
+            var rowHeight: CGFloat = 0
+            var rowPieces: [Piece] = []
+            for (columnIndex, cell) in row.enumerated() {
+                let layout = make(
+                    flow: cell, columnWidth: colWidth, directory: directory,
+                    theme: theme, ink: ink)
+                let x = CGFloat(columnIndex) * (colWidth + gap)
+                rowPieces.append(contentsOf: layout.pieces.map { $0.offset(dx: x, dy: y) })
+                rowHeight = max(rowHeight, layout.height)
+                imageCount += cell.images.count
+                if primary == nil { primary = layout.primaryImage }
+            }
+            pieces.append(contentsOf: rowPieces)
+            y += rowHeight
+        }
         return HTMLFlowLayout(
             pieces: pieces,
             height: max(ceil(y), 0),
@@ -242,6 +304,7 @@ struct HTMLFlowLayout: @unchecked Sendable {
         bodyFont: NSFont,
         boldFont: NSFont,
         italicFont: NSFont,
+        monoFont: NSFont,
         ink: CGColor,
         link: CGColor,
         lineSpacing: CGFloat
@@ -249,7 +312,8 @@ struct HTMLFlowLayout: @unchecked Sendable {
         let text = NSMutableAttributedString()
         for run in runs {
             let font: NSFont
-            if run.bold { font = boldFont }
+            if run.mono { font = monoFont }
+            else if run.bold { font = boldFont }
             else if run.italic { font = italicFont }
             else { font = bodyFont }
             var attributes: [NSAttributedString.Key: Any] = [

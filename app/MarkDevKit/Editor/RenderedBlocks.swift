@@ -19,6 +19,9 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
         /// A GitHub-README HTML fragment: badges, a centred tagline, a hero
         /// image. Drawn by the fragment, not rasterised as one bitmap.
         case htmlFlow(HTMLFlow)
+        /// An HTML comment. GitHub draws nothing for it; the source collapses
+        /// and nothing stands in its place.
+        case htmlComment
     }
 
     public let kind: Kind
@@ -56,6 +59,8 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
                     kind: .image(alt: $0.alt), source: $0.source, width: $0.width,
                     fillsColumn: $0.fillsColumn)
             }
+        case .htmlComment:
+            return []
         default:
             return [self]
         }
@@ -333,12 +338,14 @@ public struct RenderedBlocks: Sendable, Equatable {
         return text.character(at: last) == 0x29  // )
     }
 
-    /// A block that is one `<img>` tag, or a GitHub-README HTML fragment.
+    /// A block that is one `<img>` tag, a GitHub-README HTML fragment, or an
+    /// HTML comment.
     ///
-    /// The lone-tag path is the cheap one and runs first. A fragment is
-    /// recognised only so that the source it replaces is certainly something
-    /// this can draw: anything ``HTMLFlow`` refuses stays on the page as the
-    /// markup the author wrote.
+    /// The lone-tag path is the cheap one and runs first. Comments collapse
+    /// with nothing drawn — GitHub does the same. A fragment is recognised
+    /// only so that the source it replaces is certainly something this can
+    /// draw: anything ``HTMLFlow`` refuses stays on the page as the markup
+    /// the author wrote.
     ///
     /// The two cheap tests come first and read characters straight out of the
     /// string, for the reason ``looksLikeAnImage(_:in:)`` does: this is asked
@@ -347,6 +354,7 @@ public struct RenderedBlocks: Sendable, Equatable {
     /// to look at it would be that allocation per block per keystroke.
     private static func htmlContent(_ range: NSRange, in text: NSString) -> RenderedBlock? {
         if let picture = htmlImage(range, in: text) { return picture }
+        if htmlComment(range, in: text) { return RenderedBlock(kind: .htmlComment, source: "") }
         guard let body = clamp(range, to: text.length),
             body.length <= HTMLFlow.maximumLength,
             looksLikeHTMLFlow(body, in: text),
@@ -440,10 +448,38 @@ public struct RenderedBlocks: Sendable, Equatable {
         return text.character(at: last) == 0x3E  // >
     }
 
+    /// Whether `body` is an HTML comment, and nothing else.
+    private static func htmlComment(_ range: NSRange, in text: NSString) -> Bool {
+        guard let body = clamp(range, to: text.length),
+            body.length <= HTMLComment.maximumLength,
+            looksLikeHTMLComment(body, in: text)
+        else { return false }
+        return HTMLComment.parse(text.substring(with: body))
+    }
+
+    /// Whether `body` opens with `<!--`.
+    ///
+    /// Four characters, and the decision for everything that is not a
+    /// comment: a `<div>`, a doctype, a processing instruction. ``HTMLComment/parse``
+    /// decides for what gets past it.
+    private static func looksLikeHTMLComment(_ body: NSRange, in text: NSString) -> Bool {
+        guard body.length >= 4 else { return false }
+        var first = body.location
+        let end = NSMaxRange(body)
+        while first < end, isWhitespace(text.character(at: first)) { first += 1 }
+        guard first + 3 < end,
+            text.character(at: first) == 0x3C,  // <
+            text.character(at: first + 1) == 0x21,  // !
+            text.character(at: first + 2) == 0x2D,  // -
+            text.character(at: first + 3) == 0x2D  // -
+        else { return false }
+        return true
+    }
+
     /// Whether `body` opens with a tag ``HTMLFlow`` might accept.
     ///
     /// Five or six characters, and the decision for everything that is not
-    /// README chrome: a `<table>`, a comment, a `<script>`. ``HTMLFlow/parse``
+    /// README chrome: a `<table>`, a `<script>`. ``HTMLFlow/parse``
     /// decides for what gets past it.
     private static func looksLikeHTMLFlow(_ body: NSRange, in text: NSString) -> Bool {
         guard body.length >= 3 else { return false }
@@ -455,7 +491,8 @@ public struct RenderedBlocks: Sendable, Equatable {
         guard first < end else { return false }
         let letter = text.character(at: first) | 0x20
         switch letter {
-        case 0x70, 0x61, 0x62, 0x64, 0x65, 0x69, 0x73:  // p a b d e i s
+        case 0x70, 0x61, 0x62, 0x64, 0x65, 0x69, 0x73, 0x68, 0x63, 0x74:
+            // p a b d e i s h c t — headings, center, table, details
             return true
         default:
             return false
@@ -485,8 +522,26 @@ public struct RenderedBlocks: Sendable, Equatable {
         let paragraph = text.substring(with: body).trimmingCharacters(in: .whitespacesAndNewlines)
         guard paragraph.hasPrefix("!["), paragraph.hasSuffix(")") else { return nil }
 
-        let alt = clamp(span.range, to: text.length).map { text.substring(with: $0) } ?? ""
+        let alt = markdownImageAlt(paragraph)
         return RenderedBlock(kind: .image(alt: alt), source: source)
+    }
+
+    /// `http(s):` and protocol-relative URLs. Opening a note must not fetch.
+    static func isRemoteReference(_ source: String) -> Bool {
+        let trimmed = source.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("//") { return true }
+        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased() else {
+            return false
+        }
+        return scheme == "http" || scheme == "https"
+    }
+
+    /// The `alt` inside `![alt](…)`, not the whole construct.
+    private static func markdownImageAlt(_ paragraph: String) -> String {
+        guard paragraph.hasPrefix("!["), let close = paragraph.firstIndex(of: "]") else {
+            return ""
+        }
+        return String(paragraph[paragraph.index(paragraph.startIndex, offsetBy: 2)..<close])
     }
 
     /// The single span inside `range`, or `nil` if there are none or more than

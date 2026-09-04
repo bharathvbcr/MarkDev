@@ -114,7 +114,13 @@ final class BlockControlStressTests: XCTestCase {
             }
 
             // A sweep that found nothing would pass every assertion above.
-            if source.contains("```") { XCTAssertGreaterThan(chips, 0, "seed \(seed) drew no chip") }
+            // Empty fences and unrendered diagrams deliberately offer no copy chip.
+            let hasCopyableFence =
+                source.contains("let x = 1") || source.contains("echo hello")
+                || source.contains("plain fence") || source.contains("nested")
+            if hasCopyableFence {
+                XCTAssertGreaterThan(chips, 0, "seed \(seed) drew no chip")
+            }
         }
     }
 

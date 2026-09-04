@@ -711,7 +711,7 @@ public final class MarkdownTextView: ScrollingTextView {
 
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus,
-            rendered: renderedBlocks)
+            rendered: renderedBlocks, text: storage.string as NSString)
         // The styler grows the scope to whole lines and reports what it
         // actually wrote. Every layer below is scoped to *that*, not to
         // `scope`: the styler opens by clearing the range it settled on, so a
@@ -2419,6 +2419,12 @@ extension MarkdownTextView {
     func resolveRenderedContent(for fragment: MarkdownLayoutFragment) {
         fragment.htmlFlow = nil
         guard let block = fragment.decoration.rendered else {
+            fragment.renderedContent = nil
+            fragment.renderFailure = nil
+            return
+        }
+
+        if case .htmlComment = block.kind {
             fragment.renderedContent = nil
             fragment.renderFailure = nil
             return

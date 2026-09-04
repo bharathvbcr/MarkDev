@@ -82,6 +82,8 @@ public enum ZoomedContent {
             .mapError { failure in
                 alt.isEmpty ? failure : RenderFailure(reason: "\(alt) — \(failure.reason)")
             }
+        case .htmlComment:
+            return .failure(RenderFailure(reason: "Nothing to open large"))
         case .htmlFlow(let flow):
             guard flow.images.count == 1, let image = flow.images.first else {
                 return .failure(RenderFailure(reason: "Nothing to open large"))
@@ -111,6 +113,8 @@ public enum ZoomedContent {
         case .image:
             let name = (block.source as NSString).lastPathComponent
             return name.isEmpty ? "Image" : name
+        case .htmlComment:
+            return "Comment"
         case .htmlFlow(let flow):
             if flow.images.count == 1, let image = flow.images.first {
                 let name = (image.source as NSString).lastPathComponent

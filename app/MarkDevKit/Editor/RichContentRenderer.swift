@@ -253,6 +253,9 @@ public final class RichContentRenderer {
         case .htmlFlow:
             return .failure(
                 RenderFailure(reason: "HTML flow is drawn, not rasterised"))
+        case .htmlComment:
+            return .failure(
+                RenderFailure(reason: "HTML comments are hidden, not drawn"))
         }
     }
 
@@ -293,6 +296,8 @@ public final class RichContentRenderer {
                     request.context.width, Self.requestedWidth(for: request)))
         case .htmlFlow:
             return Key(kind: "htmlFlow", source: request.block.source, scale: 0, dark: false)
+        case .htmlComment:
+            return Key(kind: "htmlComment", source: "", scale: 0, dark: false)
         }
     }
 
@@ -728,14 +733,16 @@ public final class RichContentRenderer {
             // The zinc presets are the neutral pair; a themed diagram should
             // sit in the document, not shout a palette of its own.
             let theme: DiagramTheme = dark ? .zincDark : .zincLight
-            guard let prepared = try MermaidImageRenderer(theme: theme).prepare(from: source)
-            else {
-                let failure = RenderFailure(reason: "Unsupported diagram type")
-                store(failure, for: key)
-                return .failure(failure)
-            }
+            // README mermaid writes HTML inside labels; the native renderer
+            // paints those tags as text. Sanitize before layout so the
+            // picture shows the words GitHub would have formatted. Packing
+            // runs after layout: ELK stacks disconnected LR subgraphs into
+            // a column, which is not what `flowchart LR` asked for.
+            let mermaid = MermaidHTML.sanitized(source)
+            let positioned = MermaidSubgraphPack.applied(
+                to: try MermaidRenderer.layout(mermaid))
             guard let rendered = rasterise(
-                prepared, theme: theme, maxWidth: maxWidth, scale: scale)
+                positioned, theme: theme, maxWidth: maxWidth, scale: scale)
             else {
                 let failure = RenderFailure(reason: "Could not rasterise diagram")
                 store(failure, for: key)
@@ -793,17 +800,22 @@ public final class RichContentRenderer {
     /// and the glyphs come out upside down. (The library's `MermaidLayer` and
     /// `MermaidView` paths do flip, so only the image path is affected.)
     ///
-    /// Rendering the prepared diagram here rather than flipping the bitmap the
-    /// library hands back matters for more than tidiness: a post-flip would
-    /// silently invert the picture *again* the day the library is fixed, and
-    /// the failure would look exactly like this bug reappearing.
+    /// Rendering through `DiagramRenderer` here rather than flipping the bitmap
+    /// the library's image path hands back matters for more than tidiness: a
+    /// post-flip would silently invert the picture *again* the day the library
+    /// is fixed, and the failure would look exactly like this bug reappearing.
+    /// Going through the positioned graph also lets subgraph packing run
+    /// between layout and draw.
     private func rasterise(
-        _ prepared: PreparedDiagram,
+        _ positioned: PositionedGraph,
         theme: DiagramTheme,
         maxWidth: CGFloat,
         scale requested: CGFloat
     ) -> RenderedContent? {
-        let bounds = prepared.bounds
+        let bounds = CGRect(
+            x: 0, y: 0,
+            width: max(1, positioned.width),
+            height: max(1, positioned.height))
         // A layout can come back degenerate or non-finite from a malformed
         // source; `CGContext` would accept the NaN and paint nothing.
         guard bounds.width.isFinite, bounds.height.isFinite,
@@ -851,7 +863,7 @@ public final class RichContentRenderer {
             x: CGFloat(pixelWidth) / bounds.width, y: CGFloat(pixelHeight) / bounds.height)
         context.translateBy(x: -bounds.minX, y: -bounds.minY)
 
-        prepared.render(context, bounds)
+        DiagramRenderer(theme: theme).render(positioned, in: context, bounds: bounds)
 
         guard let image = context.makeImage() else { return nil }
         return Self.cropDiagramCanvas(

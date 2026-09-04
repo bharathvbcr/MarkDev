@@ -227,6 +227,10 @@ final class PictureStressTests: XCTestCase {
                     XCTAssertNotNil(
                         HTMLFlow.parse(hidden),
                         "step \(step) hid \(hidden.debugDescription), which is not a fragment")
+                case .htmlComment:
+                    XCTAssertTrue(
+                        HTMLComment.parse(hidden),
+                        "step \(step) hid \(hidden.debugDescription), which is not a comment")
                 default:
                     XCTFail("step \(step) hid \(hidden.debugDescription) as \(entry.content.kind)")
                 }
@@ -273,7 +277,7 @@ final class PictureStressTests: XCTestCase {
 
         for entry in rendered.entries {
             switch entry.content.kind {
-            case .image, .htmlFlow: break
+            case .image, .htmlFlow, .htmlComment: break
             default: continue
             }
             for offset in entry.range.location..<NSMaxRange(entry.range) {

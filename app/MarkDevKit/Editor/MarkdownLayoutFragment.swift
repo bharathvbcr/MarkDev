@@ -163,16 +163,18 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
                     return nil
                 }.joined(separator: " ")
                 return text.isEmpty ? "HTML content" : text
+            case .htmlComment:
+                return nil
             }
         }
         return nil
     }
 
     func accessibilityRole() -> NSAccessibility.Role? {
-        if decoration.rendered != nil {
-            return .image
+        switch decoration.rendered?.kind {
+        case .htmlComment, nil: return nil
+        default: return .image
         }
-        return nil
     }
 
     /// The view whose palette store this fragment draws from.
@@ -1237,7 +1239,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         case .diagram: "Diagram"
         case .image: "Image"
         case .htmlFlow: "Image"
-        case nil: nil
+        case .htmlComment, nil: nil
         }
     }
 

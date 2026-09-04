@@ -170,7 +170,8 @@ extension HiddenRanges {
         selection: NSRange,
         mode: EditorMode = .livePreview,
         isEditing: Bool = true,
-        rendered: RenderedBlocks = .none
+        rendered: RenderedBlocks = .none,
+        text: NSString? = nil
     ) {
         guard mode != .source else {
             self.init(merging: [])
@@ -201,7 +202,14 @@ extension HiddenRanges {
             guard block.kind == .frontmatter, !revealed.contains(index) else { return nil }
             return block.range
         }
-        let replaced = rendered.collapsedRanges(revealed: revealed) + tableRows + frontmatter
+        let comments: [NSRange]
+        if let text {
+            comments = Self.inlineHTMLComments(in: document, revealed: revealed, text: text)
+        } else {
+            comments = []
+        }
+        let replaced =
+            rendered.collapsedRanges(revealed: revealed) + tableRows + frontmatter + comments
 
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }
@@ -219,5 +227,38 @@ extension HiddenRanges {
             // reading reveal policy, but it must restore an ordinary line as
             // soon as the writer clicks back into it.
             compactsReplacedBlockSeparators: mode == .reading)
+    }
+
+    /// Inline `<!-- … -->` spans, hidden the same way a comment *block* is.
+    ///
+    /// A comment in a sentence is still a comment. The block that holds the
+    /// caret keeps it, so it can be edited; everywhere else it vanishes.
+    private static func inlineHTMLComments(
+        in document: ParsedDocument, revealed: Set<Int>, text: NSString
+    ) -> [NSRange] {
+        document.spans.compactMap { span -> NSRange? in
+            guard span.kind == .inlineHTML, span.range.length > 0,
+                span.range.location + span.range.length <= text.length
+            else { return nil }
+            if let block = innermostBlock(containing: span.range, in: document),
+                revealed.contains(block)
+            {
+                return nil
+            }
+            let body = text.substring(with: span.range)
+            return HTMLComment.parse(body) ? span.range : nil
+        }
+    }
+
+    private static func innermostBlock(containing range: NSRange, in document: ParsedDocument)
+        -> Int?
+    {
+        document.blocks.enumerated()
+            .filter {
+                NSIntersectionRange($0.element.range, range).length > 0
+                    || NSLocationInRange(range.location, $0.element.range)
+            }
+            .min { $0.element.range.length < $1.element.range.length }?
+            .offset
     }
 }

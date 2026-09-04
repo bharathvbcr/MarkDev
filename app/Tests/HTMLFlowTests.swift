@@ -106,15 +106,27 @@ final class HTMLFlowTests: XCTestCase {
 
     func testUnknownTagsKeepTheirSource() {
         for markup in [
-            "<table><tr><td>x</td></tr></table>",
+            "<video src=\"x.mp4\"></video>",
             "<script>alert(1)</script>",
             "<!-- comment -->",
-            "<p><span>x</span></p>",
+            "<p><canvas id=\"c\"></canvas></p>",
             "<p align=\"center\"><iframe src=\"x\"></iframe></p>",
-            "<h1 align=\"center\">Title</h1>",
+            "<form><input type=\"text\"></form>",
         ] {
             XCTAssertNil(HTMLFlow.parse(markup), markup)
         }
+    }
+
+    func testSupportedReadmeHTMLParses() throws {
+        let table = try XCTUnwrap(HTMLFlow.parse("<table><tr><td>x</td></tr></table>"))
+        XCTAssertEqual(table.rows?.count, 1)
+
+        let span = try XCTUnwrap(HTMLFlow.parse("<p><span>x</span></p>"))
+        XCTAssertEqual(span.items, [.run(HTMLFlow.Run(text: "x", bold: false, italic: false, mono: false, href: nil))])
+
+        let heading = try XCTUnwrap(HTMLFlow.parse("<h1 align=\"center\">Title</h1>"))
+        XCTAssertEqual(heading.headingLevel, 1)
+        XCTAssertEqual(heading.alignment, .center)
     }
 
     func testUnclosedEmphasisIsRefused() {

@@ -13,10 +13,10 @@ import Foundation
 ///
 /// The editor is not an HTML renderer. Recognising a fragment means hiding
 /// it, so this admits only the constructs a README uses to *present* a note
-/// — a centred paragraph of badges, a tagline with `<br>` and `<strong>`, a
-/// hero `<img width="100%">` — and refuses everything else. Unknown tags,
-/// comments, tables, scripts, and leftover text after a closer all keep
-/// their source, which is the honest answer for markup this cannot draw.
+/// — a centred heading, a badge row, a `<details>` block, an all-contributors
+/// table of linked avatars — and refuses everything else. Unknown tags,
+/// scripts, and leftover text after a closer keep their source. HTML comments
+/// are hidden separately: GitHub draws nothing for them.
 ///
 /// The grammar of each tag is CommonMark's, via ``HTMLTagScanner``. A
 /// looser reader would hide lines the core still calls text.
@@ -40,6 +40,7 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         public let text: String
         public let bold: Bool
         public let italic: Bool
+        public let mono: Bool
         public let href: String?
     }
 
@@ -51,6 +52,10 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
 
     public let alignment: Alignment
     public let items: [Item]
+    /// 1…6 when this fragment is an `<hN>`. `nil` is body text.
+    public let headingLevel: Int?
+    /// An HTML table of cells, each itself a fragment. `nil` is not a table.
+    public let rows: [[HTMLFlow]]?
 
     /// The most a fragment may measure before it is refused.
     ///
@@ -63,15 +68,26 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
     /// A pathological row of images is still a row, but not an unbounded one.
     public static let maximumItems = 64
 
+    /// All-contributors writes seven columns; a few extra is slack, not a grid.
+    public static let maximumColumns = 12
+
+    public static let maximumRows = 32
+
     public var images: [Image] {
-        items.compactMap { item in
+        if let rows {
+            return rows.flatMap { $0.flatMap(\.images) }
+        }
+        return items.compactMap { item in
             if case .image(let image) = item { return image }
             return nil
         }
     }
 
     public var hasVisibleContent: Bool {
-        items.contains { item in
+        if let rows {
+            return rows.contains { $0.contains { $0.hasVisibleContent } }
+        }
+        return items.contains { item in
             switch item {
             case .image: true
             case .run(let run): !run.text.isEmpty
@@ -80,9 +96,16 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         }
     }
 
-    public init(alignment: Alignment, items: [Item]) {
+    public init(
+        alignment: Alignment,
+        items: [Item],
+        headingLevel: Int? = nil,
+        rows: [[HTMLFlow]]? = nil
+    ) {
         self.alignment = alignment
         self.items = items
+        self.headingLevel = headingLevel
+        self.rows = rows
     }
 
     /// Parses `text` as a README HTML fragment, or `nil` if it is anything
@@ -91,16 +114,38 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         guard text.utf8.count <= maximumLength else { return nil }
 
         var scanner = HTMLTagScanner(HTMLTagScanner.trimmed(text))
+        let saved = scanner.cursor
+        if let (name, _, selfClosing) = scanner.openTag(), name == "table" {
+            guard !selfClosing else { return nil }
+            return parseTable(&scanner)
+        }
+        scanner.cursor = saved
+
         var alignment: Alignment = .leading
         var wrapper: String?
+        var headingLevel: Int?
 
-        let saved = scanner.cursor
-        if let (name, attributes, selfClosing) = scanner.openTag(),
-            name == "p" || name == "div"
-        {
-            guard !selfClosing else { return nil }
-            alignment = Self.alignment(from: attributes["align"])
-            wrapper = name
+        if let (name, attributes, selfClosing) = scanner.openTag() {
+            if selfClosing { return nil }
+            if name == "p" || name == "div" {
+                alignment = Self.alignment(from: attributes["align"])
+                wrapper = name
+            } else if name == "center" {
+                alignment = .center
+                wrapper = name
+            } else if let level = Self.headingLevel(name) {
+                alignment = Self.alignment(from: attributes["align"])
+                headingLevel = level
+                wrapper = name
+            } else if name == "details" {
+                guard let items = parseDetails(&scanner) else { return nil }
+                scanner.skipWhitespace()
+                guard scanner.isAtEnd else { return nil }
+                let flow = HTMLFlow(alignment: .leading, items: trimming(items))
+                return flow.hasVisibleContent ? flow : nil
+            } else {
+                scanner.cursor = saved
+            }
         } else {
             scanner.cursor = saved
         }
@@ -117,7 +162,8 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         guard scanner.isAtEnd else { return nil }
 
         items = trimming(items)
-        let flow = HTMLFlow(alignment: alignment, items: items)
+        let flow = HTMLFlow(
+            alignment: alignment, items: items, headingLevel: headingLevel)
         return flow.hasVisibleContent ? flow : nil
     }
 
@@ -163,6 +209,93 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         return items
     }
 
+    private static func parseDetails(_ scanner: inout HTMLTagScanner) -> [Item]? {
+        scanner.skipWhitespace()
+        var items: [Item] = []
+        let saved = scanner.cursor
+        if let (name, _, selfClosing) = scanner.openTag(), name == "summary" {
+            guard !selfClosing,
+                let summary = parseItems(
+                    &scanner, href: nil, until: "summary", closerRequired: true)
+            else { return nil }
+            items = summary.map { item in
+                if case .run(let run) = item {
+                    return .run(
+                        Run(
+                            text: run.text, bold: true, italic: run.italic,
+                            mono: run.mono, href: run.href))
+                }
+                return item
+            }
+            if !items.isEmpty { items.append(.lineBreak) }
+        } else {
+            scanner.cursor = saved
+        }
+        guard let body = parseItems(
+            &scanner, href: nil, until: "details", closerRequired: false)
+        else { return nil }
+        items.append(contentsOf: body)
+        return items
+    }
+
+    private static func parseTable(_ scanner: inout HTMLTagScanner) -> HTMLFlow? {
+        guard let rows = parseTableRows(&scanner, until: "table"),
+            rows.count <= maximumRows,
+            rows.contains(where: { $0.contains { $0.hasVisibleContent } })
+        else { return nil }
+        scanner.skipWhitespace()
+        guard scanner.isAtEnd else { return nil }
+        return HTMLFlow(alignment: .leading, items: [], rows: rows)
+    }
+
+    private static func parseTableRows(
+        _ scanner: inout HTMLTagScanner, until closer: String
+    ) -> [[HTMLFlow]]? {
+        var rows: [[HTMLFlow]] = []
+        while !scanner.isAtEnd {
+            scanner.skipWhitespace()
+            if scanner.closeTag(closer) { return rows }
+            let saved = scanner.cursor
+            guard let (name, _, selfClosing) = scanner.openTag(), !selfClosing else {
+                return nil
+            }
+            if name == "thead" || name == "tbody" || name == "tfoot" {
+                guard let inner = parseTableRows(&scanner, until: name) else { return nil }
+                rows.append(contentsOf: inner)
+                continue
+            }
+            if name == "tr" {
+                guard let row = parseTableRow(&scanner) else { return nil }
+                rows.append(row)
+                if rows.count > maximumRows { return nil }
+                continue
+            }
+            scanner.cursor = saved
+            return nil
+        }
+        return nil
+    }
+
+    private static func parseTableRow(_ scanner: inout HTMLTagScanner) -> [HTMLFlow]? {
+        var cells: [HTMLFlow] = []
+        while !scanner.isAtEnd {
+            scanner.skipWhitespace()
+            if scanner.closeTag("tr") { return cells }
+            guard let (name, attributes, selfClosing) = scanner.openTag(),
+                (name == "td" || name == "th"), !selfClosing
+            else { return nil }
+            guard let items = parseItems(
+                &scanner, href: nil, until: name, closerRequired: true)
+            else { return nil }
+            cells.append(
+                HTMLFlow(
+                    alignment: alignment(from: attributes["align"]),
+                    items: trimming(items)))
+            if cells.count > maximumColumns { return nil }
+        }
+        return nil
+    }
+
     private static func image(from tag: HTMLImageTag, href: String?) -> Image {
         Image(
             source: tag.source, alt: tag.alt, width: tag.width,
@@ -197,7 +330,11 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         }
         let bold = name == "strong" || name == "b"
         let italic = name == "em" || name == "i"
-        guard bold || italic, !selfClosing else {
+        let mono = name == "code" || name == "kbd"
+        let unwrap =
+            name == "span" || name == "sub" || name == "sup" || name == "small"
+            || name == "mark" || name == "u" || name == "s"
+        guard (bold || italic || mono || unwrap), !selfClosing else {
             scanner.cursor = saved
             return nil
         }
@@ -212,6 +349,7 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
                         text: run.text,
                         bold: run.bold || bold,
                         italic: run.italic || italic,
+                        mono: run.mono || mono,
                         href: run.href ?? href))
             case .image, .lineBreak:
                 return item
@@ -227,7 +365,7 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         }
         guard !raw.isEmpty else { return nil }
         let collapsed = collapseWhitespace(HTMLEntities.decoded(raw))
-        return Run(text: collapsed, bold: false, italic: false, href: href)
+        return Run(text: collapsed, bold: false, italic: false, mono: false, href: href)
     }
 
     /// HTML phrasing whitespace: newlines become spaces, and a run of spaces
@@ -268,5 +406,12 @@ public struct HTMLFlow: Equatable, Sendable, Hashable {
         case "left": return .leading
         default: return .leading
         }
+    }
+
+    private static func headingLevel(_ name: String) -> Int? {
+        guard name.count == 2, name.first == "h",
+            let digit = name.last?.wholeNumberValue, (1...6).contains(digit)
+        else { return nil }
+        return digit
     }
 }
