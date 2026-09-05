@@ -169,7 +169,7 @@ final class TerminalProcessStressTests: XCTestCase {
         XCTAssertEqual(session.workingDirectory, directory.standardizedFileURL.path)
 
         try FileManager.default.removeItem(at: directory)
-        let live = session.revalidated()
+        let live = try session.revalidated()
         XCTAssertEqual(live.workingDirectory, NSHomeDirectory(), "a gone folder falls back")
         XCTAssertEqual(run("exit 0", in: live.workingDirectory), .code(0))
     }
@@ -337,13 +337,13 @@ final class TerminalProcessStressTests: XCTestCase {
 final class TerminalPathStressTests: XCTestCase {
     private var root: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevPaths-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -494,8 +494,8 @@ final class TerminalPathStressTests: XCTestCase {
         let present = try directory(named: "present")
         let session = TerminalSession.resolve(document: nil, vault: present)
 
-        let once = session.revalidated()
-        let twice = once.revalidated()
+        let once = try session.revalidated()
+        let twice = try once.revalidated()
         XCTAssertEqual(once, twice, "revalidating a good session must change nothing")
         XCTAssertEqual(once, session)
     }

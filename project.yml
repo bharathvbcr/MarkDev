@@ -26,10 +26,9 @@ settings:
     # the old icon indefinitely. Bump when the type declarations or the icon
     # assets change.
     CURRENT_PROJECT_VERSION: "10"
-    ONLY_ACTIVE_ARCH: true
-    # Off for as long as the identity below is ad-hoc, and flipped back on in
-    # the same change that introduces a real one — the two are one decision,
-    # not two settings.
+    # The automated base stays off while its identity is ad-hoc. The manual
+    # `build-release-signed` recipe overrides both the identity and hardened
+    # runtime in one invocation — they remain one decision, not two settings.
     #
     # A hardened-runtime process will not load an ad-hoc signed library: dyld
     # reports "mapping process and mapped file (non-platform) have different
@@ -44,41 +43,58 @@ settings:
     # notarised build needs a Developer ID anyway. Turning it on without one
     # buys no protection; it only produces an app that cannot launch.
     ENABLE_HARDENED_RUNTIME: false
-    # Signed to run locally; a distribution identity replaces this at release.
+    # Automated draft artifacts intentionally remain ad-hoc, unhardened, and
+    # unnotarized. The manual `just build-release-signed` path can replace this
+    # with one exact Apple identity and re-enable hardened runtime.
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: true
     CODE_SIGNING_ALLOWED: true
+  configs:
+    # Iteration stays fast locally, while every distributable bundle contains
+    # the complete Intel and Apple Silicon compatibility surface.
+    debug:
+      ONLY_ACTIVE_ARCH: true
+    release:
+      ONLY_ACTIVE_ARCH: false
+      ARCHS: "arm64 x86_64"
+      # Release authority is exactly what each target declares. Xcode's base
+      # injection otherwise adds get-task-allow even to an ad-hoc Release.
+      CODE_SIGN_INJECT_BASE_ENTITLEMENTS: false
 
 packages:
   # LaTeX typesetting in pure Swift (a port of iosMath). Core Text only —
   # no WebView, which is the whole point of MarkDev's rendering.
   SwiftMath:
     url: https://github.com/mgriebling/SwiftMath
-    from: 1.7.3
+    exactVersion: 1.7.3
   # Native Mermaid rendering, laid out by a Swift port of the Eclipse Layout
   # Kernel. Covers flowchart, sequence, class, state, ER, and XY charts;
   # anything else is surfaced as unsupported rather than rendered wrongly.
   BeautifulMermaid:
     url: https://github.com/lukilabs/beautiful-mermaid-swift
-    from: 1.0.4
+    exactVersion: 1.0.4
   # The terminal drawer. A real VT100/xterm emulator in Swift — the point of
   # MarkDev's terminal is running coding CLIs, which need a working pty and
   # escape-sequence handling, not a text view that shells out.
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
-    from: 1.18.0
+    exactVersion: 1.20.0
 
 targets:
   # ---------------------------------------------------------------------
-  # Shared framework: the parser bridge, editor engine, and renderer.
-  # Both the app and the Quick Look extension link this, which is why the
-  # renderer must work without any app state.
+  # Shared application framework: parser bridge, editor, workspace, terminal,
+  # diagnostics, and renderer. Quick Look deliberately does not link this
+  # target: doing so would grant the extension every app-only dependency in
+  # the framework, including the terminal/process surface. Its target below
+  # compiles the canonical renderer source files under a read-only condition.
   # ---------------------------------------------------------------------
   MarkDevKit:
     type: framework
     platform: macOS
     sources:
       - path: app/MarkDevKit
+      - path: app/PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: SwiftMath
         product: SwiftMath
@@ -123,6 +139,8 @@ targets:
     platform: macOS
     sources:
       - path: app/MarkDev
+      - path: app/PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - target: MarkDevKit
       - target: MarkDevQuickLook
@@ -224,8 +242,48 @@ targets:
     platform: macOS
     sources:
       - path: app/MarkDevQuickLook
+      - path: app/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      # These are the canonical renderer sources, not a preview fork. The
+      # MARKDEV_QUICKLOOK condition removes editor mutation, pasteboard,
+      # diagnostics, background prefetch, and zoom-window code at compile
+      # time, leaving the parser and the one production rendering pipeline.
+      - path: app/MarkDevKit/Core/BoundedText.swift
+      - path: app/MarkDevKit/Core/BoundedRegularFileReader.swift
+      - path: app/MarkDevKit/Core/BoundedSVGValidator.swift
+      - path: app/MarkDevKit/Core/IncrementalDocument.swift
+      - path: app/MarkDevKit/Core/MarkdownModel.swift
+      - path: app/MarkDevKit/Core/MarkdownReadLimits.swift
+      - path: app/MarkDevKit/Core/ParsedDocument.swift
+      - path: app/MarkDevKit/Editor/BlockControl.swift
+      - path: app/MarkDevKit/Editor/BlockDecoration.swift
+      - path: app/MarkDevKit/Editor/CodeBlockSource.swift
+      - path: app/MarkDevKit/Editor/EditorTheme.swift
+      - path: app/MarkDevKit/Editor/FrontmatterLayout.swift
+      - path: app/MarkDevKit/Editor/HTMLComment.swift
+      - path: app/MarkDevKit/Editor/HTMLFlow.swift
+      - path: app/MarkDevKit/Editor/HTMLFlowLayout.swift
+      - path: app/MarkDevKit/Editor/HTMLImageTag.swift
+      - path: app/MarkDevKit/Editor/HiddenRanges.swift
+      - path: app/MarkDevKit/Editor/LaTeXNormalizer.swift
+      - path: app/MarkDevKit/Editor/MarkdownLayoutFragment.swift
+      - path: app/MarkDevKit/Editor/MarkdownStyler.swift
+      - path: app/MarkDevKit/Editor/MarkdownTextView.swift
+      - path: app/MarkDevKit/Editor/MermaidHTML.swift
+      - path: app/MarkDevKit/Editor/MermaidSubgraphPack.swift
+      - path: app/MarkDevKit/Editor/RenderedBlocks.swift
+      - path: app/MarkDevKit/Editor/RevealPolicy.swift
+      - path: app/MarkDevKit/Editor/RichContentRenderer.swift
+      - path: app/MarkDevKit/Editor/ScrollingTextView.swift
+      - path: app/MarkDevKit/Editor/SyntaxHighlighter.swift
+      - path: app/MarkDevKit/Editor/TableGrid.swift
+      - path: app/MarkDevKit/Editor/TableRowLayout.swift
+      - path: app/MarkDevKit/Render/MarkdownPreview.swift
     dependencies:
-      - target: MarkDevKit
+      - package: SwiftMath
+        product: SwiftMath
+      - package: BeautifulMermaid
+        product: BeautifulMermaid
     info:
       path: app/MarkDevQuickLook/Info.plist
       properties:
@@ -252,7 +310,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.markdev.MarkDev.QuickLook
         CODE_SIGN_ENTITLEMENTS: app/MarkDevQuickLook/MarkDevQuickLook.entitlements
         ENABLE_APP_SANDBOX: true
+        APPLICATION_EXTENSION_API_ONLY: true
+        DEAD_CODE_STRIPPING: true
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) MARKDEV_QUICKLOOK
+        OTHER_LDFLAGS: -lmarkdev
         SKIP_INSTALL: true
+      configs:
+        debug:
+          LIBRARY_SEARCH_PATHS: $(SRCROOT)/core/target/debug
+        release:
+          LIBRARY_SEARCH_PATHS: $(SRCROOT)/core/target/release
 
   # ---------------------------------------------------------------------
   # Tests.
@@ -262,6 +329,9 @@ targets:
     platform: macOS
     sources:
       - path: app/Tests
+      # Exercise the extension's actual authority boundary, not a test copy.
+      - path: app/MarkDevQuickLook/QuickLookFileReader.swift
+      - path: app/MarkDevKit/Core/BoundedRegularFileReader.swift
     dependencies:
       - target: MarkDevKit
       # SwiftMath ships its math fonts in an SPM resource bundle, which

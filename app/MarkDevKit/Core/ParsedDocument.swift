@@ -269,9 +269,11 @@ extension ParsedDocument {
     /// Parses `source` via the bounded Rust ABI.
     public static func parseChecked(_ source: String) -> ParsedDocumentParseOutcome {
         #if canImport(CMarkDev)
-            let byteCount = source.utf8.count
+            guard MarkdownReadLimits.acceptedDocumentByteCount(source) != nil else {
+                return .rejected
+            }
             let utf16Count = (source as NSString).length
-            guard byteCount <= Int(MDMAX_DOCUMENT_BYTES), UInt32(exactly: utf16Count) != nil else {
+            guard UInt32(exactly: utf16Count) != nil else {
                 return .rejected
             }
 

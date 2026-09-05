@@ -16,9 +16,9 @@
 
 ## Testing & Verification
 
-- [ ] Rust tests pass (`cd core && cargo test`)
-- [ ] Property tests pass if modifying incremental parser (`cd core && cargo test --test incremental`)
-- [ ] Rust performance gate verified in release mode (`cd core && cargo test --release --test performance`)
+- [ ] Rust tests pass (`cd core && cargo test --locked`)
+- [ ] Property tests pass if modifying incremental parser (`cd core && cargo test --locked --test incremental`)
+- [ ] Rust performance gate verified in release mode (`cd core && cargo test --locked --release --test performance`)
 - [ ] Swift unit & performance tests pass (`just test-app`)
 - [ ] Formatted & linted with `just check`
 

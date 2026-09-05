@@ -16,6 +16,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
     @Binding public var text: String
     public var mode: EditorMode
     public var theme: EditorTheme
+    /// Stable identity for this split's speculative render work. Omitted by
+    /// standalone consumers, whose mounted text view creates its own owner.
+    public var prefetchOwner: ContentPrefetcher.Owner?
     /// The folder the document was loaded from, for resolving relative image
     /// paths. An unsaved document has none, and its images cannot resolve —
     /// which is correct: there is nothing yet for `./shot.png` to be relative
@@ -26,10 +29,15 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public var onParse: ((ParsedDocument) -> Void)?
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
-    /// Called with the underlying text view when this editor is the one the
-    /// reader is working in — on first appearance, and whenever it takes the
-    /// keyboard. The writing tools attach to whatever arrives here.
-    public var onSurface: ((MarkdownTextView) -> Void)?
+    /// Registers the underlying AppKit view without claiming keyboard focus.
+    /// The returned token names this exact mount until ``onUnmount`` retires
+    /// it; a replacement view receives a different token.
+    public var onMount: ((MarkdownTextView) -> EditorSurfaceMountToken?)?
+    /// Called only when this exact mounted view takes the keyboard.
+    public var onFocus: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?
+    /// Retires the exact mount during SwiftUI dismantle. A stale callback may
+    /// arrive after a replacement has mounted, so consumers compare the token.
+    public var onUnmount: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?
     /// Called when the selection changes with (words, characters).
     public var onSelectionStats: ((Int, Int) -> Void)?
     /// Called when a link is hovered or unhovered.
@@ -38,6 +46,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
     /// nothing. Wired to the window's alert, because a blank page is otherwise
     /// the only thing the reader is told.
     public var onDocumentRejected: ((String) -> Void)?
+    /// Called for a privacy-safe image paste/drop failure.
+    public var onAssetIngestionError: ((String) -> Void)?
     /// Set to scroll the editor to an offset; applied once per request.
     public var reveal: RevealRequest?
 
@@ -45,30 +55,43 @@ public struct MarkdownEditorView: NSViewRepresentable {
         text: Binding<String>,
         mode: EditorMode = .livePreview,
         theme: EditorTheme = .standard,
+        prefetchOwner: ContentPrefetcher.Owner? = nil,
         documentDirectory: URL? = nil,
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
         onFollowWikiLink: ((String) -> Void)? = nil,
-        onSurface: ((MarkdownTextView) -> Void)? = nil,
+        onMount: ((MarkdownTextView) -> EditorSurfaceMountToken?)? = nil,
+        onFocus: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)? = nil,
+        onUnmount: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)? = nil,
         onSelectionStats: ((Int, Int) -> Void)? = nil,
         onHoveredLink: ((String?) -> Void)? = nil,
-        onDocumentRejected: ((String) -> Void)? = nil
+        onDocumentRejected: ((String) -> Void)? = nil,
+        onAssetIngestionError: ((String) -> Void)? = nil
     ) {
         self._text = text
         self.mode = mode
         self.theme = theme
+        self.prefetchOwner = prefetchOwner
         self.documentDirectory = documentDirectory
         self.reveal = reveal
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
-        self.onSurface = onSurface
+        self.onMount = onMount
+        self.onFocus = onFocus
+        self.onUnmount = onUnmount
         self.onSelectionStats = onSelectionStats
         self.onDocumentRejected = onDocumentRejected
+        self.onAssetIngestionError = onAssetIngestionError
         self.onHoveredLink = onHoveredLink
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
         let textView = MarkdownTextView.make(theme: theme)
+        #if !MARKDEV_QUICKLOOK
+        if let prefetchOwner {
+            textView.setContentPrefetchOwner(prefetchOwner)
+        }
+        #endif
         // Assigning `mode` also sets editability, so this must come before
         // any content is loaded.
         textView.mode = mode
@@ -92,23 +115,22 @@ public struct MarkdownEditorView: NSViewRepresentable {
         textView.onHoveredLinkChanged = { [weak coordinator = context.coordinator] link in
             coordinator?.onHoveredLink?(link)
         }
+        textView.onAssetIngestionError = { [weak coordinator = context.coordinator] message in
+            coordinator?.onAssetIngestionError?(message)
+        }
         textView.onFocus = { [weak coordinator = context.coordinator, weak textView] in
             guard let textView else { return }
-            coordinator?.onSurface?(textView)
+            coordinator?.focus(textView)
         }
         textView.setMarkdown(text)
 
         let scrollView = ScrollingTextView.scrollView(hosting: textView)
 
         context.coordinator.textView = textView
-        // Deferred for the same reason `onParse` is: this runs inside
-        // SwiftUI's update pass, and a callback that touches @State from
-        // there is dropped. Without it a fresh window has no writing surface
-        // registered until the editor is first clicked, so ⌘⇧E does nothing.
-        Task { @MainActor [weak textView] in
-            guard let textView else { return }
-            context.coordinator.onSurface?(textView)
-        }
+        // Registration mutates a plain weak registry, not SwiftUI view state,
+        // so it is deliberately synchronous. The old deferred callback could
+        // outlive dismantle and install a dead editor after its successor.
+        context.coordinator.mount(textView)
         return scrollView
     }
 
@@ -117,10 +139,19 @@ public struct MarkdownEditorView: NSViewRepresentable {
 
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
-        context.coordinator.onSurface = onSurface
+        context.coordinator.onMount = onMount
+        context.coordinator.onFocus = onFocus
+        context.coordinator.onUnmount = onUnmount
         context.coordinator.onSelectionStats = onSelectionStats
         context.coordinator.onHoveredLink = onHoveredLink
         context.coordinator.onDocumentRejected = onDocumentRejected
+        context.coordinator.onAssetIngestionError = onAssetIngestionError
+        context.coordinator.mount(textView)
+        #if !MARKDEV_QUICKLOOK
+        if let prefetchOwner {
+            textView.setContentPrefetchOwner(prefetchOwner)
+        }
+        #endif
         if textView.mode != mode { textView.mode = mode }
         if textView.baseTheme.bodyFont != theme.bodyFont || textView.theme.lineSpacing != theme.lineSpacing {
             textView.setBaseTheme(theme)
@@ -163,10 +194,28 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public func makeCoordinator() -> Coordinator {
         let coordinator = Coordinator(text: $text, onParse: onParse)
         coordinator.onFollowWikiLink = onFollowWikiLink
-        coordinator.onSurface = onSurface
+        coordinator.onMount = onMount
+        coordinator.onFocus = onFocus
+        coordinator.onUnmount = onUnmount
         coordinator.onSelectionStats = onSelectionStats
         coordinator.onHoveredLink = onHoveredLink
+        coordinator.onAssetIngestionError = onAssetIngestionError
         return coordinator
+    }
+
+    public static func dismantleNSView(
+        _ scrollView: NSScrollView,
+        coordinator: Coordinator
+    ) {
+        guard let textView = scrollView.documentView as? MarkdownTextView else { return }
+        coordinator.unmount(textView)
+        textView.onAssetIngestionError = nil
+        textView.cancelAssetIngestion()
+        #if !MARKDEV_QUICKLOOK
+        textView.cancelContentPrefetching()
+        #endif
+        textView.onFocus = nil
+        textView.delegate = nil
     }
 
     @MainActor
@@ -174,10 +223,13 @@ public struct MarkdownEditorView: NSViewRepresentable {
         private let text: Binding<String>
         var onParse: ((ParsedDocument) -> Void)?
         var onFollowWikiLink: ((String) -> Void)?
-        var onSurface: ((MarkdownTextView) -> Void)?
+        var onMount: ((MarkdownTextView) -> EditorSurfaceMountToken?)?
+        var onFocus: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?
+        var onUnmount: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?
         var onSelectionStats: ((Int, Int) -> Void)?
         var onHoveredLink: ((String?) -> Void)?
         var onDocumentRejected: ((String) -> Void)?
+        var onAssetIngestionError: ((String) -> Void)?
         /// The exact text the editor last refused.
         ///
         /// `updateNSView` pushes text in whenever it differs from the view's,
@@ -189,10 +241,28 @@ public struct MarkdownEditorView: NSViewRepresentable {
         var refusedText: String?
         var appliedReveal: UUID?
         weak var textView: MarkdownTextView?
+        private var mountToken: EditorSurfaceMountToken?
 
         init(text: Binding<String>, onParse: ((ParsedDocument) -> Void)?) {
             self.text = text
             self.onParse = onParse
+        }
+
+        func mount(_ textView: MarkdownTextView) {
+            guard mountToken == nil, self.textView === textView else { return }
+            mountToken = onMount?(textView)
+        }
+
+        func focus(_ textView: MarkdownTextView) {
+            guard self.textView === textView, let mountToken else { return }
+            onFocus?(mountToken, textView)
+        }
+
+        func unmount(_ textView: MarkdownTextView) {
+            guard self.textView === textView, let mountToken else { return }
+            self.mountToken = nil
+            onUnmount?(mountToken, textView)
+            self.textView = nil
         }
 
         /// Whether `text` should be handed to the view.

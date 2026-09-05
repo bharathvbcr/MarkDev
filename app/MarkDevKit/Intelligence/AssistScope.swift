@@ -7,6 +7,48 @@
 
 import Foundation
 
+/// Overflow-safe operations for ranges received from parsers, editors, and models.
+///
+/// Foundation's `NSIntersectionRange` and `NSMaxRange` predate Swift's checked
+/// integer arithmetic. Keeping every addition here means a malformed range is
+/// refused instead of trapping while a writing action is trying to validate it.
+enum CheckedTextRange {
+    static func end(of range: NSRange) -> Int? {
+        guard range.location >= 0, range.length >= 0 else { return nil }
+        let (end, overflow) = range.location.addingReportingOverflow(range.length)
+        return overflow ? nil : end
+    }
+
+    static func intersection(_ range: NSRange, _ bounds: NSRange) -> NSRange? {
+        guard let rangeEnd = end(of: range), let boundsEnd = end(of: bounds) else { return nil }
+        let start = max(range.location, bounds.location)
+        let end = min(rangeEnd, boundsEnd)
+        guard end >= start else {
+            // Preserve a caret as a caret at the nearest legal edge.
+            let caret = min(max(range.location, bounds.location), boundsEnd)
+            return NSRange(location: caret, length: 0)
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    static func covering(_ first: NSRange, _ second: NSRange) -> NSRange? {
+        guard let firstEnd = end(of: first), let secondEnd = end(of: second) else { return nil }
+        let start = min(first.location, second.location)
+        let end = max(firstEnd, secondEnd)
+        return NSRange(location: start, length: end - start)
+    }
+
+    static func contains(_ outer: NSRange, _ inner: NSRange) -> Bool {
+        guard let outerEnd = end(of: outer), let innerEnd = end(of: inner) else { return false }
+        return outer.location <= inner.location && outerEnd >= innerEnd
+    }
+
+    static func intersects(_ first: NSRange, _ second: NSRange) -> Bool {
+        guard let firstEnd = end(of: first), let secondEnd = end(of: second) else { return false }
+        return first.location < secondEnd && second.location < firstEnd
+    }
+}
+
 extension BlockKind {
     /// Blocks whose text is not prose, and which a rewrite must never touch.
     ///
@@ -86,7 +128,9 @@ extension AssistScope {
         limit: Int = maximumLength
     ) -> AssistScope {
         let full = NSRange(location: 0, length: text.length)
-        let selection = NSIntersectionRange(selection, full)
+        guard limit > 0, let selection = CheckedTextRange.intersection(selection, full) else {
+            return .empty
+        }
 
         let candidate: NSRange
         if selection.length > 0 {
@@ -119,11 +163,12 @@ extension AssistScope {
     ) -> BlockDescriptor? {
         var best: BlockDescriptor?
         for block in document.blocks {
-            let range = NSIntersectionRange(block.range, bounds)
+            guard let range = CheckedTextRange.intersection(block.range, bounds) else { continue }
             guard range.length > 0 else { continue }
             // A caret at the very end of a block still belongs to it —
             // otherwise the last position in a paragraph resolves to nothing.
-            guard offset >= range.location, offset <= range.location + range.length else { continue }
+            guard let end = CheckedTextRange.end(of: range), offset >= range.location, offset <= end
+            else { continue }
             if let current = best, block.depth < current.depth { continue }
             best = block
         }
@@ -142,8 +187,7 @@ extension AssistScope {
     ) -> BlockDescriptor? {
         document.blocks.first { block in
             block.kind.isVerbatim
-                && block.range.location <= range.location
-                && block.range.location + block.range.length >= range.location + range.length
+                && CheckedTextRange.contains(block.range, range)
         }
     }
 
@@ -153,9 +197,13 @@ extension AssistScope {
     /// whose range includes its terminator, would otherwise send the model a
     /// blank line to preserve and get one back in a different place.
     static func trimmingWhitespace(_ range: NSRange, in text: NSString) -> NSRange {
+        guard let range = CheckedTextRange.intersection(
+            range, NSRange(location: 0, length: text.length)),
+            let rangeEnd = CheckedTextRange.end(of: range)
+        else { return NSRange(location: 0, length: 0) }
         let whitespace = CharacterSet.whitespacesAndNewlines
         var start = range.location
-        var end = range.location + range.length
+        var end = rangeEnd
         while start < end, let scalar = Unicode.Scalar(text.character(at: start)),
             whitespace.contains(scalar)
         {
@@ -192,6 +240,7 @@ public enum ProofreadingPlan {
         text: NSString,
         limit: Int = AssistScope.maximumLength
     ) -> [NSRange] {
+        guard limit >= 2 else { return [] }
         let bounds = NSRange(location: 0, length: text.length)
         var chunks: [NSRange] = []
         var pending: NSRange?
@@ -202,7 +251,7 @@ public enum ProofreadingPlan {
         }
 
         for block in document.blocks where block.depth == 0 {
-            let range = NSIntersectionRange(block.range, bounds)
+            guard let range = CheckedTextRange.intersection(block.range, bounds) else { continue }
             guard range.length > 0 else { continue }
             if block.kind.isVerbatim {
                 // A fence interrupts the run: the passages either side of it
@@ -220,8 +269,11 @@ public enum ProofreadingPlan {
                 continue
             }
 
-            if let current = pending, current.length + trimmed.length <= limit {
-                pending = NSUnionRange(current, trimmed)
+            if let current = pending,
+                let combined = CheckedTextRange.covering(current, trimmed),
+                combined.length <= limit
+            {
+                pending = combined
             } else {
                 flush()
                 pending = trimmed
@@ -233,33 +285,77 @@ public enum ProofreadingPlan {
 
     /// Cuts an oversized range at line boundaries.
     ///
-    /// A single line longer than the limit is emitted whole rather than cut
-    /// mid-word. That can exceed the limit, and deliberately so: the limit is
-    /// a comfortable margin inside the real context window, and one long line
-    /// reported as a context-window error is far better than silently
-    /// proofreading half a sentence.
+    /// A single line longer than the limit is split on a UTF-16 boundary that
+    /// never bisects a surrogate pair. The request limit is a contract, not a
+    /// hint: emitting one giant line whole would bypass the context bound that
+    /// caused the document to be chunked in the first place.
     static func splitByLine(_ range: NSRange, in text: NSString, limit: Int) -> [NSRange] {
+        guard limit >= 2,
+            let range = CheckedTextRange.intersection(
+                range, NSRange(location: 0, length: text.length)),
+            let end = CheckedTextRange.end(of: range)
+        else { return [] }
         var chunks: [NSRange] = []
         var pending: NSRange?
         var offset = range.location
-        let end = range.location + range.length
 
         while offset < end {
-            let line = NSIntersectionRange(text.lineRange(for: NSRange(location: offset, length: 0)), range)
-            guard line.length > 0 else { break }
-            offset = line.location + line.length
+            guard let line = CheckedTextRange.intersection(
+                text.lineRange(for: NSRange(location: offset, length: 0)), range),
+                let lineEnd = CheckedTextRange.end(of: line), line.length > 0
+            else { break }
+            offset = lineEnd
 
             let trimmed = AssistScope.trimmingWhitespace(line, in: text)
             guard trimmed.length > 0 else { continue }
 
-            if let current = pending, current.length + trimmed.length <= limit {
-                pending = NSUnionRange(current, trimmed)
+            if trimmed.length > limit {
+                if let current = pending { chunks.append(current) }
+                pending = nil
+                chunks.append(contentsOf: splitLongLine(trimmed, in: text, limit: limit))
+            } else if let current = pending,
+                let combined = CheckedTextRange.covering(current, trimmed),
+                combined.length <= limit
+            {
+                pending = combined
             } else {
                 if let current = pending { chunks.append(current) }
                 pending = trimmed
             }
         }
         if let pending { chunks.append(pending) }
+        return chunks
+    }
+
+    private static func splitLongLine(
+        _ range: NSRange, in text: NSString, limit: Int
+    ) -> [NSRange] {
+        guard let end = CheckedTextRange.end(of: range) else { return [] }
+        var chunks: [NSRange] = []
+        let quotient = range.length / limit
+        let remainder = range.length % limit
+        chunks.reserveCapacity(quotient + (remainder == 0 ? 0 : 1))
+        var offset = range.location
+
+        while offset < end {
+            var length = min(limit, end - offset)
+            guard let next = CheckedTextRange.end(
+                of: NSRange(location: offset, length: length))
+            else { return [] }
+            if next < end, length > 0 {
+                let left = text.character(at: next - 1)
+                let right = text.character(at: next)
+                if (0xD800...0xDBFF).contains(left), (0xDC00...0xDFFF).contains(right) {
+                    length -= 1
+                }
+            }
+            guard length > 0 else { return [] }
+            chunks.append(NSRange(location: offset, length: length))
+            guard let advanced = CheckedTextRange.end(
+                of: NSRange(location: offset, length: length))
+            else { return [] }
+            offset = advanced
+        }
         return chunks
     }
 }

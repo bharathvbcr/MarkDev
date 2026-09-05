@@ -378,7 +378,7 @@ final class TableLayoutResolver {
         let alignment: TableAlignment
         let lineSpacing: CGFloat
     }
-    /// Solved tables, keyed by position, parse revision, and width.
+    /// Solved tables, keyed by position and width for the current parse.
     private var tables: [Key: Solved] = [:]
     private var fingerprint: Fingerprint?
 
@@ -395,10 +395,9 @@ final class TableLayoutResolver {
         /// Keying on the source would mean building a substring of the whole
         /// table for every row fragment TextKit lays out — O(table) per row,
         /// which is O(table²) for the table, and exactly the shape that has
-        /// cost this codebase seconds per keystroke three times over. The
-        /// parse's revision is what makes a position sufficient: any edit
-        /// bumps it, so an entry can never outlive the text it describes.
-        let revision: Int
+        /// cost this codebase seconds per keystroke three times over. Position
+        /// is sufficient because ``invalidate()`` removes every solved table
+        /// synchronously whenever the document is reparsed.
         let location: Int
         let length: Int
         let width: CGFloat
@@ -421,9 +420,6 @@ final class TableLayoutResolver {
         let directory: String
     }
 
-    /// Bumped whenever the document is reparsed.
-    private var revision = 0
-
     /// Drops the solved grids, keeping the styled cells.
     ///
     /// Called on every reparse. The cells survive because they are keyed on
@@ -431,7 +427,6 @@ final class TableLayoutResolver {
     /// like, and re-styling every cell of every table per keystroke is the
     /// cost this cache exists to avoid.
     func invalidate() {
-        revision &+= 1
         tables.removeAll(keepingCapacity: true)
     }
 
@@ -481,7 +476,6 @@ final class TableLayoutResolver {
         flushIfThemeChanged(theme, ink: ink, directory: directory)
 
         let key = Key(
-            revision: revision,
             location: table.range.location,
             length: table.range.length,
             width: availableWidth)

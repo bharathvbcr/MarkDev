@@ -76,6 +76,7 @@ final class DiagnosticsSettingsTests: XCTestCase {
         let permissions = try XCTUnwrap((attributes[.posixPermissions] as? NSNumber)?.intValue)
         XCTAssertEqual(summary.byteCount, data.count)
         XCTAssertEqual(summary.includedEventCount, 1)
+        XCTAssertEqual(summary.deliveryState, .settled)
         XCTAssertEqual(model.health?.recordedEventCount, 1)
         XCTAssertEqual(permissions & 0o777, 0o600)
         for forbidden in [
@@ -137,6 +138,30 @@ final class DiagnosticsSettingsTests: XCTestCase {
         XCTAssertEqual(model.exportState, .failed(.writeFailed))
         XCTAssertFalse(model.exportState.message.contains(privateSeed))
         XCTAssertFalse(model.exportState.message.contains(destination.path))
+    }
+
+    func testRemoteAuthorityFileURLCannotAliasALocalSupportExport() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let localDestination = root.appendingPathComponent("report.json")
+        var components = URLComponents()
+        components.scheme = "file"
+        components.host = "remote.example"
+        components.percentEncodedPath = localDestination.path
+        let remoteAuthority = try XCTUnwrap(components.url)
+        XCTAssertTrue(
+            remoteAuthority.isFileURL,
+            "the regression requires Foundation's permissive file-URL classification")
+
+        let center = DiagnosticsCenter(sinks: [], clock: FixedClock())
+        let model = DiagnosticsSettingsModel(center: center, metadata: reportMetadata)
+        let exported = await model.export(to: remoteAuthority)
+
+        XCTAssertFalse(exported)
+        XCTAssertEqual(model.exportState, .failed(.destinationUnavailable))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: localDestination.path),
+            "remote file authority must not be discarded into a local write")
     }
 
     func testDismissExportResultDoesNotEraseTheLastHealthSnapshot() async throws {

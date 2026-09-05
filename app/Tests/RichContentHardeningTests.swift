@@ -577,28 +577,28 @@ final class RichContentHardeningTests: XCTestCase {
         let graph = try MermaidRenderer.layout(source)
         guard graph.height > 0 else { throw RenderFailure(reason: "empty layout") }
 
-        var weighted = 0.0
-        var total = 0.0
-        func add(y: Double, height: Double, width: Double) {
-            let area = max(width, 1) * max(height, 1)
-            weighted += (y + height / 2) * area
-            total += area
-        }
-
+        let dimensions: [(y: Double, height: Double, width: Double)]
         switch graph.content {
         case .flowchart(let nodes, _, _), .stateDiagram(let nodes, _, _):
-            for node in nodes { add(y: node.y, height: node.height, width: node.width) }
+            dimensions = nodes.map { ($0.y, $0.height, $0.width) }
         case .sequenceDiagram(let actors, _, _, _, _, _):
-            for actor in actors { add(y: actor.y, height: actor.height, width: actor.width) }
+            dimensions = actors.map { ($0.y, $0.height, $0.width) }
         case .classDiagram(let classes, _):
-            for item in classes { add(y: item.y, height: item.height, width: item.width) }
+            dimensions = classes.map { ($0.y, $0.height, $0.width) }
         case .erDiagram(let entities, _):
-            for entity in entities { add(y: entity.y, height: entity.height, width: entity.width) }
+            dimensions = entities.map { ($0.y, $0.height, $0.width) }
         case .xyChart(let chart):
-            for bar in chart.bars { add(y: bar.y, height: bar.height, width: bar.width) }
+            dimensions = chart.bars.map { ($0.y, $0.height, $0.width) }
         }
 
+        let total = dimensions.reduce(0.0) { partial, item in
+            partial + max(item.width, 1) * max(item.height, 1)
+        }
         guard total > 0 else { throw RenderFailure(reason: "nothing laid out") }
+        let weighted = dimensions.reduce(0.0) { partial, item in
+            let area = max(item.width, 1) * max(item.height, 1)
+            return partial + (item.y + item.height / 2) * area
+        }
         return weighted / total / graph.height
     }
 }

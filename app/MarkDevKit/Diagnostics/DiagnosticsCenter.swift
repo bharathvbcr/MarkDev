@@ -46,19 +46,23 @@ public actor DiagnosticsCenter {
     }
 
     public static let shared: DiagnosticsCenter = {
-        var sinks: [any DiagnosticSink] = [OSLogDiagnosticsSink()]
+        let origin = DiagnosticsBootstrap.currentOrigin()
+        var registrations = [
+            DiagnosticSinkRegistration(id: .osLog, sink: OSLogDiagnosticsSink())
+        ]
         var initialSinkFailureCount: UInt64 = 0
 
         // Not a failure, and must not be counted as one: the sink was never
         // attempted. Reporting a sink failure here would make "we chose not to
         // write" indistinguishable from "the disk refused us" in the health
         // the settings panel shows.
-        if isRunningTests {
+        if isRunningTests || !origin.isTrustedProduction {
             return DiagnosticsCenter(
                 configuration: DiagnosticsConfiguration(),
-                sinks: sinks,
+                registrations: registrations,
                 clock: SystemDiagnosticClock(),
-                initialSinkFailureCount: 0)
+                initialSinkFailureCount: 0,
+                origin: origin)
         }
 
         do {
@@ -69,66 +73,147 @@ public actor DiagnosticsCenter {
                 throw DiagnosticsError.destinationDirectoryUnavailable
             }
             let directory = applicationSupport
-                .appendingPathComponent("MarkDev", isDirectory: true)
-                .appendingPathComponent("Diagnostics", isDirectory: true)
-            let fileSink = try RotatingJSONLDiagnosticsSink(
-                configuration: RotatingDiagnosticsFileConfiguration(
-                    directory: directory,
-                    baseName: "events",
-                    maximumFileBytes: 1 * 1_024 * 1_024,
-                    maximumFiles: 4))
-            sinks.append(fileSink)
+            let fileSink = try DiagnosticsScopedRunStore.makeSink(
+                applicationSupportDirectory: applicationSupport,
+                origin: origin,
+                maximumFileBytes: 1 * 1_024 * 1_024,
+                maximumFiles: 4)
+            registrations.append(
+                DiagnosticSinkRegistration(id: .rotatingJSONL, sink: fileSink))
         } catch {
             initialSinkFailureCount = 1
         }
 
         return DiagnosticsCenter(
             configuration: DiagnosticsConfiguration(),
-            sinks: sinks,
+            registrations: registrations,
             clock: SystemDiagnosticClock(),
-            initialSinkFailureCount: initialSinkFailureCount)
+            initialSinkFailureCount: initialSinkFailureCount,
+            origin: origin)
     }()
 
     private let configuration: DiagnosticsConfiguration
-    private let sinks: [any DiagnosticSink]
+    private let lanes: [DiagnosticSinkLane]
     private let clock: any DiagnosticClock
+    public nonisolated let origin: DiagnosticOrigin
+    private let rejectedSinkRegistrationCount: Int
     private var ring: BoundedDiagnosticRing
-    private var nextSequence: UInt64 = 1
+    private var nextSequence: UInt64? = 1
     private var recordedEventCount: UInt64 = 0
     private var evictedEventCount: UInt64 = 0
     private var oversizedEventCount: UInt64 = 0
     private var encodingFailureCount: UInt64 = 0
     private var ingressDroppedEventCount: UInt64 = 0
-    private var sinkFailureCount: UInt64
+    private let initialSinkFailureCount: UInt64
 
     public init(
         configuration: DiagnosticsConfiguration = DiagnosticsConfiguration(),
         sinks: [any DiagnosticSink] = [],
         clock: any DiagnosticClock = SystemDiagnosticClock(),
-        initialSinkFailureCount: UInt64 = 0
+        initialSinkFailureCount: UInt64 = 0,
+        origin: DiagnosticOrigin? = nil
     ) {
         self.configuration = configuration
-        self.sinks = sinks
         self.clock = clock
+        self.origin = origin ?? DiagnosticsBootstrap.currentOrigin()
+        let registrations = sinks.enumerated().map { index, sink in
+            DiagnosticSinkRegistration(
+                id: DiagnosticSinkID(knownRawValue: "sink-\(index)"),
+                sink: sink,
+                maximumOutstandingRecords: configuration.maximumPendingRecordsPerSink)
+        }
+        let normalized = Self.makeLanes(
+            registrations: registrations,
+            configuration: configuration)
+        lanes = normalized.lanes
+        rejectedSinkRegistrationCount = normalized.rejectedCount
         ring = BoundedDiagnosticRing(
             countLimit: configuration.memoryEventLimit,
             byteLimit: configuration.memoryByteLimit)
-        sinkFailureCount = initialSinkFailureCount
+        self.initialSinkFailureCount = initialSinkFailureCount
     }
 
-    public func record(
+    public init(
+        configuration: DiagnosticsConfiguration = DiagnosticsConfiguration(),
+        registrations: [DiagnosticSinkRegistration],
+        clock: any DiagnosticClock = SystemDiagnosticClock(),
+        initialSinkFailureCount: UInt64 = 0,
+        origin: DiagnosticOrigin? = nil
+    ) {
+        self.configuration = configuration
+        self.clock = clock
+        self.origin = origin ?? DiagnosticsBootstrap.currentOrigin()
+        let normalized = Self.makeLanes(
+            registrations: registrations,
+            configuration: configuration)
+        lanes = normalized.lanes
+        rejectedSinkRegistrationCount = normalized.rejectedCount
+        ring = BoundedDiagnosticRing(
+            countLimit: configuration.memoryEventLimit,
+            byteLimit: configuration.memoryByteLimit)
+        self.initialSinkFailureCount = initialSinkFailureCount
+    }
+
+    func record(
         severity: DiagnosticSeverity,
         subsystem: DiagnosticSubsystem,
         code: DiagnosticCode,
         operationID: DiagnosticOperationID? = nil,
         metadata: DiagnosticMetadata = DiagnosticMetadata()
     ) async {
-        let sequence = nextSequence
-        nextSequence = nextSequence.saturatingIncremented
+        let completions = offer(
+            severity: severity,
+            subsystem: subsystem,
+            code: code,
+            operationID: operationID,
+            metadata: metadata,
+            requestingSinkCompletion: true)
+        await withTaskGroup(of: Void.self) { group in
+            for completion in completions {
+                group.addTask {
+                    await completion.wait()
+                }
+            }
+        }
+    }
+
+    /// The emitter is the production ingress and already owns its own bounded
+    /// ordering queue. It offers records to every independent sink lane without
+    /// awaiting their completion, then captures an exact cut at its marker.
+    func offer(
+        severity: DiagnosticSeverity,
+        subsystem: DiagnosticSubsystem,
+        code: DiagnosticCode,
+        operationID: DiagnosticOperationID? = nil,
+        metadata: DiagnosticMetadata = DiagnosticMetadata()
+    ) {
+        _ = offer(
+            severity: severity,
+            subsystem: subsystem,
+            code: code,
+            operationID: operationID,
+            metadata: metadata,
+            requestingSinkCompletion: false)
+    }
+
+    private func offer(
+        severity: DiagnosticSeverity,
+        subsystem: DiagnosticSubsystem,
+        code: DiagnosticCode,
+        operationID: DiagnosticOperationID?,
+        metadata: DiagnosticMetadata,
+        requestingSinkCompletion: Bool
+    ) -> [DiagnosticSinkDeliveryHandle] {
+        guard let sequence = nextSequence else {
+            ingressDroppedEventCount = ingressDroppedEventCount.saturatingIncremented
+            return []
+        }
+        nextSequence = sequence == .max ? nil : sequence + 1
         recordedEventCount = recordedEventCount.saturatingIncremented
 
         let event = DiagnosticEvent(
-            sequence: sequence,
+            origin: origin,
+            localSequence: sequence,
             timestampMilliseconds: clock.millisecondsSince1970(),
             uptimeNanoseconds: clock.uptimeNanoseconds(),
             severity: severity,
@@ -142,7 +227,7 @@ public actor DiagnosticsCenter {
             record = DiagnosticRecord(event: event, jsonLine: try DiagnosticsJSON.line(for: event))
         } catch {
             encodingFailureCount = encodingFailureCount.saturatingIncremented
-            return
+            return []
         }
 
         switch ring.append(record) {
@@ -152,40 +237,113 @@ public actor DiagnosticsCenter {
             oversizedEventCount = oversizedEventCount.saturatingIncremented
         }
 
-        for sink in sinks {
-            do {
-                try await sink.write(record)
-            } catch {
-                sinkFailureCount = sinkFailureCount.saturatingIncremented
-            }
+        return lanes.compactMap {
+            $0.offer(record, requestingCompletion: requestingSinkCompletion)
         }
+    }
+
+    func setNextSequenceForTesting(_ sequence: UInt64?) {
+        precondition(recordedEventCount == 0)
+        precondition(sequence.map { $0 > 0 } ?? true)
+        nextSequence = sequence
     }
 
     public func snapshot() -> DiagnosticsSnapshot {
         DiagnosticsSnapshot(events: ring.events, health: health)
     }
 
+    func captureCut(markerID: UUID) throws -> CapturedDiagnosticsCut {
+        var barriers: [DiagnosticSinkBarrierHandle] = []
+        barriers.reserveCapacity(lanes.count)
+        do {
+            for lane in lanes {
+                barriers.append(try lane.captureBarrier())
+            }
+        } catch {
+            for barrier in barriers {
+                barrier.cancel()
+            }
+            throw error
+        }
+
+        let cut = DiagnosticsCut(
+            markerID: markerID,
+            snapshot: DiagnosticsSnapshot(events: ring.events, health: health),
+            sinks: barriers.map(\.cut))
+        return CapturedDiagnosticsCut(cut: cut, sinkBarriers: barriers)
+    }
+
+    func pendingSinkBarrierCountForTesting() -> Int {
+        lanes.reduce(0) { $0 + $1.pendingBarrierCountForTesting }
+    }
+
     /// Accounts for events refused by the synchronous producer boundary
     /// before they can enter this actor. The producer reports exact batches;
     /// saturation keeps a pathological flood from wrapping health back to a
     /// reassuringly small number.
-    public func accountForIngressDrops(_ count: UInt64) {
+    func accountForIngressDrops(_ count: UInt64) {
         ingressDroppedEventCount = ingressDroppedEventCount.saturatingAdding(count)
     }
 
-    public func supportReportData(
+    func supportReportData(
         metadata: DiagnosticReportMetadata = .current(),
         generatedAtMilliseconds: Int64? = nil
     ) throws -> Data {
-        let events = ring.events
+        try supportReportData(
+            events: ring.events,
+            health: health,
+            delivery: .snapshotOnly,
+            metadata: metadata,
+            generatedAtMilliseconds: generatedAtMilliseconds)
+    }
+
+    func supportReportData(
+        from cut: DiagnosticsCut,
+        metadata: DiagnosticReportMetadata = .current(),
+        generatedAtMilliseconds: Int64? = nil
+    ) throws -> Data {
+        try supportReportData(
+            events: cut.snapshot.events,
+            health: cut.snapshot.health,
+            delivery: .snapshotOnly,
+            metadata: metadata,
+            generatedAtMilliseconds: generatedAtMilliseconds)
+    }
+
+    func supportReportData(
+        from receipt: DiagnosticsBarrierReceipt,
+        deliveryState: DiagnosticReportDeliveryState,
+        metadata: DiagnosticReportMetadata = .current(),
+        generatedAtMilliseconds: Int64? = nil
+    ) throws -> Data {
+        precondition(deliveryState == .settled || deliveryState == .timedOut)
+        return try supportReportData(
+            events: receipt.cut.snapshot.events,
+            health: receipt.cut.snapshot.health,
+            delivery: DiagnosticReportDelivery(
+                state: deliveryState,
+                markerID: receipt.cut.markerID,
+                sinks: receipt.sinks),
+            metadata: metadata,
+            generatedAtMilliseconds: generatedAtMilliseconds)
+    }
+
+    private func supportReportData(
+        events: [DiagnosticEvent],
+        health: DiagnosticsHealth,
+        delivery: DiagnosticReportDelivery,
+        metadata: DiagnosticReportMetadata,
+        generatedAtMilliseconds: Int64?
+    ) throws -> Data {
         let timestamp = generatedAtMilliseconds ?? clock.millisecondsSince1970()
 
         func encode(omitting omittedEventCount: Int) throws -> Data {
             let report = DiagnosticSupportReport(
-                formatVersion: 1,
+                formatVersion: 2,
                 generatedAtMilliseconds: timestamp,
                 metadata: metadata,
                 health: health,
+                delivery: delivery,
                 includedEventCount: events.count - omittedEventCount,
                 omittedEventCount: omittedEventCount,
                 events: Array(events.dropFirst(omittedEventCount)))
@@ -223,7 +381,7 @@ public actor DiagnosticsCenter {
         return smallestFittingReport
     }
 
-    public func exportSupportReport(
+    func exportSupportReport(
         to destination: URL,
         metadata: DiagnosticReportMetadata = .current(),
         generatedAtMilliseconds: Int64? = nil
@@ -236,19 +394,100 @@ public actor DiagnosticsCenter {
         return DiagnosticExportSummary(
             byteCount: data.count,
             includedEventCount: report.includedEventCount,
-            omittedEventCount: report.omittedEventCount)
+            omittedEventCount: report.omittedEventCount,
+            deliveryState: report.delivery.state)
+    }
+
+    func exportSupportReport(
+        from cut: DiagnosticsCut,
+        to destination: URL,
+        metadata: DiagnosticReportMetadata = .current(),
+        generatedAtMilliseconds: Int64? = nil
+    ) throws -> DiagnosticExportSummary {
+        let data = try supportReportData(
+            from: cut,
+            metadata: metadata,
+            generatedAtMilliseconds: generatedAtMilliseconds)
+        let report = try JSONDecoder().decode(DiagnosticSupportReport.self, from: data)
+        try SecureAtomicDiagnosticsFile.write(data, to: destination)
+        return DiagnosticExportSummary(
+            byteCount: data.count,
+            includedEventCount: report.includedEventCount,
+            omittedEventCount: report.omittedEventCount,
+            deliveryState: report.delivery.state)
+    }
+
+    func exportSupportReport(
+        from receipt: DiagnosticsBarrierReceipt,
+        deliveryState: DiagnosticReportDeliveryState,
+        to destination: URL,
+        metadata: DiagnosticReportMetadata = .current(),
+        generatedAtMilliseconds: Int64? = nil
+    ) throws -> DiagnosticExportSummary {
+        let data = try supportReportData(
+            from: receipt,
+            deliveryState: deliveryState,
+            metadata: metadata,
+            generatedAtMilliseconds: generatedAtMilliseconds)
+        let report = try JSONDecoder().decode(DiagnosticSupportReport.self, from: data)
+        try SecureAtomicDiagnosticsFile.write(data, to: destination)
+        return DiagnosticExportSummary(
+            byteCount: data.count,
+            includedEventCount: report.includedEventCount,
+            omittedEventCount: report.omittedEventCount,
+            deliveryState: report.delivery.state)
     }
 
     private var health: DiagnosticsHealth {
-        DiagnosticsHealth(
+        let sinkHealth = lanes.map { $0.healthSnapshot() }
+        let sinkFailures = sinkHealth.reduce(initialSinkFailureCount) { partial, sink in
+            partial.saturatingAdding(sink.failureCount)
+        }
+        let sinkDeliveryDrops = sinkHealth.reduce(UInt64(0)) { partial, sink in
+            partial.saturatingAdding(sink.droppedEventCount)
+        }
+        return DiagnosticsHealth(
             recordedEventCount: recordedEventCount,
             retainedEventCount: ring.count,
             retainedByteCount: ring.byteCount,
             evictedEventCount: evictedEventCount,
             oversizedEventCount: oversizedEventCount,
             encodingFailureCount: encodingFailureCount,
-            sinkFailureCount: sinkFailureCount,
-            ingressDroppedEventCount: ingressDroppedEventCount)
+            sinkFailureCount: sinkFailures,
+            ingressDroppedEventCount: ingressDroppedEventCount,
+            sinkDeliveryDroppedEventCount: sinkDeliveryDrops,
+            rejectedSinkRegistrationCount: rejectedSinkRegistrationCount,
+            sinks: sinkHealth)
+    }
+
+    private static func makeLanes(
+        registrations: [DiagnosticSinkRegistration],
+        configuration: DiagnosticsConfiguration
+    ) -> (lanes: [DiagnosticSinkLane], rejectedCount: Int) {
+        var identifiers: Set<DiagnosticSinkID> = []
+        var lanes: [DiagnosticSinkLane] = []
+        lanes.reserveCapacity(min(registrations.count, configuration.maximumSinkCount))
+        var rejectedCount = 0
+
+        for registration in registrations {
+            guard lanes.count < configuration.maximumSinkCount,
+                  identifiers.insert(registration.id).inserted
+            else {
+                rejectedCount += 1
+                continue
+            }
+            let effectiveRegistration = DiagnosticSinkRegistration(
+                id: registration.id,
+                sink: registration.sink,
+                maximumOutstandingRecords: min(
+                    registration.maximumOutstandingRecords,
+                    configuration.maximumPendingRecordsPerSink))
+            lanes.append(
+                DiagnosticSinkLane(
+                    registration: effectiveRegistration,
+                    maximumBarrierWaiters: configuration.maximumBarrierWaitersPerSink))
+        }
+        return (lanes, rejectedCount)
     }
 }
 
@@ -315,21 +554,32 @@ private struct BoundedDiagnosticRing {
 }
 
 enum SecureAtomicDiagnosticsFile {
-    static func write(_ data: Data, to destination: URL) throws {
-        let fileManager = FileManager.default
-        let directory = destination.deletingLastPathComponent()
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
-        else {
+    static func write(
+        _ data: Data,
+        to destination: URL,
+        testingBeforeCommit: (() throws -> Void)? = nil
+    ) throws {
+        // `file://remote-host/path` still reports `isFileURL == true`, while
+        // Foundation and Darwin path access silently target the local `path`.
+        // Refuse that authority collapse before inspecting or creating any
+        // filesystem object.
+        guard BoundedRegularFileReader.hasLocalFileAuthority(destination) else {
             throw DiagnosticsError.destinationDirectoryUnavailable
         }
+        let destination = destination.standardizedFileURL
+        let directory = destination.deletingLastPathComponent()
+        let destinationName = destination.lastPathComponent
+        guard isValidLeafName(destinationName) else {
+            throw DiagnosticsError.destinationDirectoryUnavailable
+        }
+        let directoryDescriptor = try openStableDirectory(directory)
+        defer { Darwin.close(directoryDescriptor) }
 
-        let temporary = directory.appendingPathComponent(
-            ".\(destination.lastPathComponent).\(UUID().uuidString).tmp")
-        let descriptor = temporary.path.withCString { path in
-            Darwin.open(
-                path,
+        let temporaryName = ".markdev-diagnostics-\(UUID().uuidString).tmp"
+        let descriptor = temporaryName.withCString { name in
+            Darwin.openat(
+                directoryDescriptor,
+                name,
                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                 S_IRUSR | S_IWUSR)
         }
@@ -341,51 +591,130 @@ enum SecureAtomicDiagnosticsFile {
         defer {
             Darwin.close(descriptor)
             if !renamed {
-                temporary.path.withCString { path in
-                    _ = Darwin.unlink(path)
+                temporaryName.withCString { name in
+                    _ = Darwin.unlinkat(directoryDescriptor, name, 0)
                 }
             }
         }
 
         try writeAll(data, descriptor: descriptor)
-        guard Darwin.fsync(descriptor) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
         guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try testingBeforeCommit?()
+        guard directoryIsStillBound(directory, descriptor: directoryDescriptor),
+              regularNameIsBound(
+                temporaryName,
+                directoryDescriptor: directoryDescriptor,
+                descriptor: descriptor)
+        else {
+            throw POSIXError(.EIO)
+        }
 
-        let renameResult = temporary.path.withCString { source in
-            destination.path.withCString { target in
-                Darwin.rename(source, target)
+        let renameResult = temporaryName.withCString { source in
+            destinationName.withCString { target in
+                Darwin.renameat(
+                    directoryDescriptor,
+                    source,
+                    directoryDescriptor,
+                    target)
             }
         }
         guard renameResult == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         renamed = true
-        try syncDirectory(directory)
-    }
-
-    static func syncDirectory(_ directory: URL) throws {
-        let directoryDescriptor = directory.path.withCString { path in
-            Darwin.open(path, O_RDONLY | O_CLOEXEC)
-        }
-        guard directoryDescriptor >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        defer { Darwin.close(directoryDescriptor) }
-
-        var status = stat()
-        guard Darwin.fstat(directoryDescriptor, &status) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        guard status.st_mode & S_IFMT == S_IFDIR else {
-            throw DiagnosticsError.destinationDirectoryUnavailable
+        guard directoryIsStillBound(directory, descriptor: directoryDescriptor),
+              regularNameIsBound(
+                destinationName,
+                directoryDescriptor: directoryDescriptor,
+                descriptor: descriptor)
+        else {
+            throw POSIXError(.EIO)
         }
         guard Darwin.fsync(directoryDescriptor) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+    }
+
+    static func syncDirectory(_ directory: URL) throws {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(directory) else {
+            throw DiagnosticsError.destinationDirectoryUnavailable
+        }
+        let directory = directory.standardizedFileURL
+        let directoryDescriptor = try openStableDirectory(directory)
+        defer { Darwin.close(directoryDescriptor) }
+
+        guard Darwin.fsync(directoryDescriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    private static func openStableDirectory(_ directory: URL) throws -> Int32 {
+        let descriptor = directory.path.withCString { path in
+            Darwin.open(
+                path,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            throw DiagnosticsError.destinationDirectoryUnavailable
+        }
+        guard directoryIsStillBound(directory, descriptor: descriptor) else {
+            _ = Darwin.close(descriptor)
+            throw DiagnosticsError.destinationDirectoryUnavailable
+        }
+        return descriptor
+    }
+
+    private static func directoryIsStillBound(
+        _ directory: URL,
+        descriptor: Int32
+    ) -> Bool {
+        var held = stat()
+        var named = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              directory.path.withCString({ Darwin.lstat($0, &named) }) == 0
+        else { return false }
+        return held.st_mode & S_IFMT == S_IFDIR
+            && named.st_mode & S_IFMT == S_IFDIR
+            && held.st_dev == named.st_dev
+            && held.st_ino == named.st_ino
+    }
+
+    private static func regularNameIsBound(
+        _ name: String,
+        directoryDescriptor: Int32,
+        descriptor: Int32
+    ) -> Bool {
+        var held = stat()
+        var named = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              name.withCString({
+                  Darwin.fstatat(
+                      directoryDescriptor,
+                      $0,
+                      &named,
+                      AT_SYMLINK_NOFOLLOW)
+              }) == 0
+        else { return false }
+        return held.st_mode & S_IFMT == S_IFREG
+            && named.st_mode & S_IFMT == S_IFREG
+            && held.st_nlink == 1
+            && named.st_nlink == 1
+            && held.st_dev == named.st_dev
+            && held.st_ino == named.st_ino
+    }
+
+    private static func isValidLeafName(_ value: String) -> Bool {
+        !value.isEmpty
+            && value != "."
+            && value != ".."
+            && value.utf8.count <= Int(MAXNAMLEN)
+            && !value.utf8.contains(0)
+            && !value.contains("/")
     }
 
     static func writeAll(_ data: Data, descriptor: Int32) throws {

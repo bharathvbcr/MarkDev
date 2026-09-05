@@ -6,9 +6,29 @@ use markdev::ffi::{
     md_document_string_count, md_free, md_markers, md_parse, md_spans, md_string, md_string_count,
 };
 use markdev::md::{
-    parse, parse_checked, ParseError, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS,
-    MAX_INTERNED_STRING_BYTES, MAX_PARSE_NESTING, MAX_STRUCTURAL_RECORDS, MAX_TOTAL_STRING_BYTES,
+    parse_checked, ParseError, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS, MAX_INTERNED_STRING_BYTES,
+    MAX_PARSE_NESTING, MAX_STRUCTURAL_RECORDS, MAX_TOTAL_STRING_BYTES,
 };
+
+#[test]
+fn panic_on_rejection_parse_is_not_exported_to_untrusted_callers() {
+    let crate_root = include_str!("../src/lib.rs");
+    let markdown_module = include_str!("../src/md/mod.rs");
+    let parser = include_str!("../src/md/parse.rs");
+
+    assert!(
+        !crate_root.contains("pub use md::{parse,"),
+        "the crate root must expose only the checked parser"
+    );
+    assert!(
+        !markdown_module.contains("pub use parse::{parse,"),
+        "the Markdown module must expose only the checked parser"
+    );
+    assert!(
+        !parser.contains("pub fn parse(source:"),
+        "the panic-on-refusal parser must not remain reachable through its public module"
+    );
+}
 
 #[test]
 fn one_shot_parse_accepts_exactly_the_limit_and_rejects_plus_one() {
@@ -69,6 +89,39 @@ fn incremental_plus_one_edit_is_rejected_without_mutating_the_document() {
         unsafe { md_document_len_utf16(document) },
         before,
         "rejection must be atomic"
+    );
+    unsafe { md_document_free(document) };
+}
+
+#[test]
+fn incremental_replacement_pointer_pairs_and_utf8_are_rejected_atomically() {
+    let source = b"plain prose";
+    let document = unsafe { md_document_new(source.as_ptr(), source.len()) };
+    assert!(!document.is_null());
+    let before = unsafe { md_document_len_utf16(document) };
+
+    let empty_status = unsafe { md_document_replace(document, 2, 2, ptr::null(), 0) };
+    assert!(
+        empty_status == 1 || empty_status == 2,
+        "null plus zero is a valid empty replacement"
+    );
+    assert_eq!(unsafe { md_document_len_utf16(document) }, before);
+
+    assert_eq!(
+        unsafe { md_document_replace(document, 2, 2, ptr::null(), 1) },
+        0
+    );
+    assert_eq!(unsafe { md_document_len_utf16(document) }, before);
+
+    let invalid_utf8 = [0xff_u8];
+    assert_eq!(
+        unsafe { md_document_replace(document, 2, 2, invalid_utf8.as_ptr(), 1) },
+        0
+    );
+    assert_eq!(
+        unsafe { md_document_len_utf16(document) },
+        before,
+        "every rejected replacement must preserve the old document"
     );
     unsafe { md_document_free(document) };
 }
@@ -172,6 +225,7 @@ fn distinct_interned_string_count_is_bounded() {
 fn nul_in_text_or_string_bearing_construct_rejects_the_whole_parse() {
     for source in [
         "before\0after",
+        "[la\0bel](target)",
         "[label](before\0after)",
         "```ru\0st\ncode\n```",
     ] {
@@ -313,7 +367,7 @@ const NESTED: &[(&str, &str)] = &[
 #[test]
 fn blocks_are_emitted_in_pre_order_with_properly_nested_ranges() {
     for (name, source) in NESTED {
-        let result = parse(source);
+        let result = parse_checked(source).expect("nested fixture must satisfy parser contract");
         assert!(!result.blocks.is_empty(), "{name}: parsed to no blocks");
 
         for pair in result.blocks.windows(2) {
@@ -348,7 +402,8 @@ fn blocks_are_emitted_in_pre_order_with_properly_nested_ranges() {
 #[test]
 fn the_nested_corpus_really_contains_a_container_outliving_its_first_child() {
     let found = NESTED.iter().any(|(_, source)| {
-        parse(source)
+        parse_checked(source)
+            .expect("nested fixture must satisfy parser contract")
             .blocks
             .windows(2)
             .any(|w| w[0].start == w[1].start && w[0].end > w[1].end)
@@ -364,7 +419,7 @@ fn the_nested_corpus_really_contains_a_container_outliving_its_first_child() {
 #[test]
 fn spans_and_markers_are_sorted_by_start_then_end() {
     for (name, source) in NESTED {
-        let result = parse(source);
+        let result = parse_checked(source).expect("nested fixture must satisfy parser contract");
         for pair in result.spans.windows(2) {
             assert!(
                 (pair[0].start, pair[0].end) <= (pair[1].start, pair[1].end),

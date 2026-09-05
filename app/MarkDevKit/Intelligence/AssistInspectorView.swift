@@ -171,7 +171,9 @@ public struct AssistInspectorView: View {
     /// a pass — the whole document was read, only part of it was, and some of
     /// what the model said could not be used — and each of them changes what
     /// "no mistakes found" is entitled to mean.
-    static func summary(checked: Int, total: Int, found: Int, unplaced: Int) -> String {
+    nonisolated static func summary(
+        checked: Int, total: Int, found: Int, unplaced: Int
+    ) -> String {
         if total == 0 { return "Nothing to check." }
 
         let mistakes =
@@ -281,13 +283,13 @@ public struct AssistInspectorView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-        case .ready(let truncated):
-            briefBody(truncated: truncated)
+        case .ready(let sourceTruncated, let outputTruncated):
+            briefBody(sourceTruncated: sourceTruncated, outputTruncated: outputTruncated)
         }
     }
 
     @ViewBuilder
-    private func briefBody(truncated: Bool) -> some View {
+    private func briefBody(sourceTruncated: Bool, outputTruncated: Bool) -> some View {
         let brief = assistant.brief
 
         if !brief.title.isEmpty {
@@ -328,10 +330,10 @@ public struct AssistInspectorView: View {
                 ])
         }
 
-        if truncated {
+        if sourceTruncated || outputTruncated, let message = assistant.reading.limitMessage {
             // Never let a partial reading pass for a complete one.
             Label(
-                "Based on the first \(AssistScope.maximumLength.formatted()) characters.",
+                message,
                 systemImage: "info.circle"
             )
             .font(.caption2)
@@ -339,6 +341,7 @@ public struct AssistInspectorView: View {
             .fixedSize(horizontal: false, vertical: true)
         }
     }
+
 }
 
 // MARK: - Shared pieces

@@ -44,8 +44,18 @@ public struct TextEdit: Sendable, Equatable {
 /// engine.
 @MainActor
 public final class MarkdownTextView: ScrollingTextView {
+    #if !MARKDEV_QUICKLOOK
     /// Where a refused document is reported. Injectable for tests.
     public var diagnostics: DiagnosticsEmitter = .shared
+
+    /// Privacy-safe failures from image paste and drop. The SwiftUI bridge
+    /// routes this through the window's existing serialized transient alert.
+    public var onAssetIngestionError: ((String) -> Void)?
+
+    /// One actor owns every image created by paste and drop. Injectable so
+    /// adversarial tests can isolate reservations without sharing global state.
+    var documentAssetStore: DocumentAssetStore = .shared
+    #endif
 
     /// Visual configuration. Setting it restyles.
     public var theme: EditorTheme = .standard {
@@ -54,7 +64,9 @@ public final class MarkdownTextView: ScrollingTextView {
             // and both are in the render cache's key — so what was warmed
             // belongs to the theme just replaced. Forgotten rather than
             // re-queued here: `restyle` leads to a draw, and the draw asks.
+            #if !MARKDEV_QUICKLOOK
             warmedGeometry = nil
+            #endif
             // The palette is captured from the theme (colours, and the marker
             // fonts sized from `bodyFont`), so it is recaptured whole. TextKit
             // reuses fragments across a restyle, which is why this must go
@@ -67,6 +79,11 @@ public final class MarkdownTextView: ScrollingTextView {
         }
     }
 
+    #if MARKDEV_QUICKLOOK
+    /// Quick Look is a compile-time read-only surface. There is deliberately
+    /// no setter that can turn the extension's renderer back into an editor.
+    public private(set) var mode: EditorMode = .reading
+    #else
     /// How much syntax is shown. Setting it restyles.
     public var mode: EditorMode = .livePreview {
         didSet {
@@ -81,6 +98,7 @@ public final class MarkdownTextView: ScrollingTextView {
             restyle()
         }
     }
+    #endif
 
     /// The most recent parse. Read-only to callers; the outline, backlinks
     /// panel, and inspector all read from here rather than reparsing.
@@ -89,7 +107,9 @@ public final class MarkdownTextView: ScrollingTextView {
             listItems = parsed.blocks.filter { $0.kind == .listItem }
             listItemLevels = Self.nestingLevels(of: listItems)
             tableBlocks = parsed.tables
+            #if !MARKDEV_QUICKLOOK
             codeBlocks = parsed.blocks.filter { Self.holdsCode($0.kind) }
+            #endif
             // The solved grids describe the previous parse's offsets, so they
             // go; the styled cells are keyed on their own source and stay.
             tableLayout.invalidate()
@@ -124,6 +144,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// of as their own source. Rebuilt with each parse.
     private(set) var renderedBlocks: RenderedBlocks = .none
 
+    #if !MARKDEV_QUICKLOOK
     /// The geometry the last warm was asked for.
     ///
     /// Everything in the render cache's key that is not the block itself: a
@@ -153,6 +174,12 @@ public final class MarkdownTextView: ScrollingTextView {
     /// one budget there is. Injectable so a test can watch what a view asks
     /// for without competing with every other test for it.
     var contentPrefetcher: ContentPrefetcher = .shared
+
+    /// Stable queue ownership for this mounted editor. Sharing the renderer
+    /// does not make replacement or cancellation global: a second split must
+    /// keep warming when this view changes documents or is dismantled.
+    private(set) var contentPrefetchOwner = ContentPrefetcher.Owner()
+    #endif
 
     /// The parse's list items, in document order.
     ///
@@ -186,6 +213,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Called when hovering over a link, passing the link's target or nil when unhovered.
     public var onHoveredLinkChanged: ((String?) -> Void)?
 
+    #if !MARKDEV_QUICKLOOK
     /// The base unscaled editor theme.
     public private(set) var baseTheme: EditorTheme = .standard
 
@@ -219,6 +247,7 @@ public final class MarkdownTextView: ScrollingTextView {
     public func resetZoom() {
         zoomFactor = 1.0
     }
+    #endif
 
     /// Directory the document lives in, for resolving relative image paths.
     ///
@@ -226,11 +255,15 @@ public final class MarkdownTextView: ScrollingTextView {
     public var documentDirectory: URL? {
         didSet {
             guard documentDirectory != oldValue else { return }
+            #if !MARKDEV_QUICKLOOK
+            invalidateAssetIngestion()
+            #endif
             textLayoutManager?.invalidateLayout(for: textLayoutManager!.documentRange)
             prefetchRenderedContent()
         }
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// Called when this view takes the keyboard.
     ///
     /// The writing tools act on "the editor you are working in", and with
@@ -262,6 +295,7 @@ public final class MarkdownTextView: ScrollingTextView {
     public var onIssues: ((ProofreadingIssues) -> Void)?
 
     private var storedIssues: ProofreadingIssues = .none
+    #endif
 
     /// Currently collapsed ranges.
     ///
@@ -295,6 +329,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// changing. See ``RevealPolicy/revealFollowsCaret(_:)``.
     private var revealedBlocks: Set<Int> = []
 
+    #if !MARKDEV_QUICKLOOK
     /// The fragment line whose code block was last copied, so its chip can
     /// show a tick — and can still show it after a relayout.
     var confirmedCopyLine: NSRange?
@@ -320,6 +355,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// The chip under the pointer, and the fragment drawing it.
     var hoveredControl: BlockControl?
     weak var hoveredControlFragment: MarkdownLayoutFragment?
+    #endif
 
     /// The palette every fragment of this view draws with, and the generation
     /// its rendered content was resolved under.
@@ -328,6 +364,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// appearance or theme change. See ``BlockDecorationPaletteStore``.
     let paletteStore = BlockDecorationPaletteStore()
 
+    #if !MARKDEV_QUICKLOOK
     /// Tracks the pointer for the hover state above.
     var controlTracking: NSTrackingArea?
 
@@ -338,6 +375,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// dropped takes its entry with it, so this never holds a fragment the
     /// layout has finished with, and never needs sweeping.
     let controlFragments = NSHashTable<MarkdownLayoutFragment>.weakObjects()
+    #endif
 
     /// Guards against reentrant styling.
     private var isStyling = false
@@ -345,14 +383,39 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Holds the parse across edits so unchanged structure is not reparsed.
     private var document = IncrementalDocument(text: "")
 
+    #if !MARKDEV_QUICKLOOK
     /// Set while ``setMarkdown(_:)`` swaps the whole document, so the change
     /// notifications it provokes do not each start their own reparse of text
     /// that is about to be parsed anyway.
     private var isReplacingDocument = false
 
+    /// Every asynchronous import is tied to both the current document bytes
+    /// and destination directory. Any unrelated mutation changes this token,
+    /// cancels the task, and makes its eventual result stale.
+    private var assetGeneration = UUID()
+    private var activeAssetImportID: UUID?
+    private var assetImportTask: Task<Void, Never>?
+    private var isApplyingAssetTextMutation = false
+
+    /// Tracks the exact just-inserted reference while its file is committing.
+    /// Ordinary edits before it move the range; edits touching it invalidate
+    /// rollback rather than risking deletion of user-authored text.
+    private struct PendingAssetInsertion {
+        let id: UUID
+        var range: NSRange
+        let markdown: String
+    }
+
+    private var pendingAssetInsertion: PendingAssetInsertion?
+
     /// The edit the text view announced through `shouldChangeText`, waiting
     /// for the `didChangeText` that applies it.
     private var announcedEdit: TextEdit?
+    /// `NSTextStorage` may publish its editing notification on either side of
+    /// `didChangeText`. Keep that notification's identity separately so a
+    /// normal approved edit is never mistaken for an unannounced undo and its
+    /// tracked asset range is not transformed twice.
+    private var awaitingAnnouncedStorageChange = false
 
     /// UTF-8 size of the last accepted buffer and the post-edit value computed
     /// before AppKit mutates it. Keeping the running total makes the ordinary
@@ -377,6 +440,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Whether a catch-up is already queued, so a burst of storage edits
     /// schedules one pass rather than one per edit.
     private var isCatchUpScheduled = false
+    #endif
 
     // MARK: - Construction
 
@@ -401,9 +465,22 @@ public final class MarkdownTextView: ScrollingTextView {
 
     private func configure() {
         isRichText = false
-        isEditable = true
         isSelectable = true
+        #if MARKDEV_QUICKLOOK
+        // A preview target has no editor mode, undo stack, mutation observer,
+        // pasteboard registration, or find/replace surface in its binary.
+        isEditable = false
+        allowsUndo = false
+        isContinuousSpellCheckingEnabled = false
+        usesFindBar = false
+        isIncrementalSearchingEnabled = false
+        #else
+        isEditable = true
         allowsUndo = true
+        isContinuousSpellCheckingEnabled = true
+        usesFindBar = true
+        isIncrementalSearchingEnabled = true
+        #endif
         // Markdown is plain text; letting AppKit substitute typographic
         // quotes and dashes would silently rewrite the file on disk.
         isAutomaticQuoteSubstitutionEnabled = false
@@ -418,17 +495,12 @@ public final class MarkdownTextView: ScrollingTextView {
         // are checked along with prose — AppKit exposes no per-range opt-out
         // — which is the bargain every writing app on this platform strikes;
         // a reader who minds selects the fence and learns ⌘; toggles it.
-        isContinuousSpellCheckingEnabled = true
-
         // Find and replace over the document, using AppKit's own find bar
         // rather than a reimplementation. It searches text storage, which
         // still holds every collapsed syntax marker — so `**bold**` is
         // findable by its asterisks in live preview, exactly as it would be
         // in source mode. That is the same property that keeps ⌘C copying
         // real Markdown; see ``HiddenRanges``.
-        usesFindBar = true
-        isIncrementalSearchingEnabled = true
-
         // Resizing behaviour, sizing limits, and container growth all belong
         // to ``ScrollingTextView`` — setting any of them here would put a
         // second owner on the one contract that decides whether this view can
@@ -443,8 +515,8 @@ public final class MarkdownTextView: ScrollingTextView {
         // repaint them its own blue-underlined default.
         linkTextAttributes = [:]
 
+        #if !MARKDEV_QUICKLOOK
         registerForDraggedTypes([.fileURL, .png, .tiff])
-
         if let storage = textStorage {
             NotificationCenter.default.addObserver(
                 self,
@@ -452,9 +524,18 @@ public final class MarkdownTextView: ScrollingTextView {
                 name: NSTextStorage.didProcessEditingNotification,
                 object: storage)
         }
+        #endif
     }
 
+    #if !MARKDEV_QUICKLOOK
     // MARK: - Drag and Drop / Paste Images
+
+    private static let rawImagePasteboardTypes: [
+        (type: NSPasteboard.PasteboardType, filenameExtension: String)
+    ] = [
+        (.png, "png"),
+        (.tiff, "tiff"),
+    ]
 
     public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         if hasDraggableImages(sender) {
@@ -471,76 +552,328 @@ public final class MarkdownTextView: ScrollingTextView {
     }
 
     public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let pboard = sender.draggingPasteboard
-        if let urls = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
-            let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "heic", "tiff"])
-            let imageURLs = urls.filter { imageExtensions.contains($0.pathExtension.lowercased()) }
-            if !imageURLs.isEmpty {
-                let point = convert(sender.draggingLocation, from: nil)
-                let charIndex = characterIndexForInsertion(at: point)
-                var insertions: [String] = []
-                for url in imageURLs {
-                    let alt = url.deletingPathExtension().lastPathComponent
-                    let ref: String
-                    if let docDir = documentDirectory, url.path.hasPrefix(docDir.path) {
-                        let rel = url.path.replacingOccurrences(of: docDir.path, with: "").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                        ref = rel
-                    } else {
-                        ref = url.path
-                    }
-                    insertions.append("![\(alt)](\(ref))")
-                }
-                let markdownToInsert = insertions.joined(separator: "\n")
-                if shouldChangeText(in: NSRange(location: charIndex, length: 0), replacementString: markdownToInsert) {
-                    textStorage?.replaceCharacters(in: NSRange(location: charIndex, length: 0), with: markdownToInsert)
-                    didChangeText()
-                    setSelectedRange(NSRange(location: charIndex + (markdownToInsert as NSString).length, length: 0))
-                    return true
-                }
-            }
+        switch assetInputs(from: sender.draggingPasteboard, permitsRawImages: true) {
+        case nil:
+            return super.performDragOperation(sender)
+        case .failure(let error):
+            reportAssetIngestionError(error)
+            return true
+        case .success(let inputs):
+            let point = convert(sender.draggingLocation, from: nil)
+            let length = textStorage?.length ?? 0
+            let insertion = min(max(characterIndexForInsertion(at: point), 0), length)
+            beginAssetIngestion(
+                inputs,
+                replacing: NSRange(location: insertion, length: 0))
+            return true
         }
-        return super.performDragOperation(sender)
     }
 
     private func hasDraggableImages(_ sender: NSDraggingInfo) -> Bool {
-        let pboard = sender.draggingPasteboard
-        if let types = pboard.types, types.contains(.fileURL) {
-            if let urls = pboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-                let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "heic", "tiff"])
-                return urls.contains { imageExtensions.contains($0.pathExtension.lowercased()) }
+        let pasteboard = sender.draggingPasteboard
+        guard let items = pasteboard.pasteboardItems else { return false }
+        if items.count > DocumentAssetStore.maximumItemCount {
+            return pasteboard.availableType(
+                from: [.fileURL, .png, .tiff]) != nil
+        }
+        for item in items {
+            if let value = item.string(forType: .fileURL),
+                let url = URL(string: value),
+                BoundedRegularFileReader.hasLocalFileAuthority(url),
+                DocumentAssetStore.supports(filenameExtension: url.pathExtension)
+            {
+                return true
             }
+            if item.availableType(from: [.png, .tiff]) != nil { return true }
         }
         return false
     }
 
     public override func paste(_ sender: Any?) {
-        let pboard = NSPasteboard.general
-        if let image = NSImage(pasteboard: pboard), let tiff = image.tiffRepresentation,
-           let bitmap = NSBitmapImageRep(data: tiff), let pngData = bitmap.representation(using: .png, properties: [:]) {
-            if pboard.string(forType: .string) == nil {
-                let docDir = documentDirectory ?? FileManager.default.temporaryDirectory
-                let assetsDir = docDir.appendingPathComponent("assets", isDirectory: true)
-                try? FileManager.default.createDirectory(at: assetsDir, withIntermediateDirectories: true)
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withYear, .withMonth, .withDay, .withTime]
-                let timestamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
-                let filename = "pasted-image-\(timestamp).png"
-                let targetURL = assetsDir.appendingPathComponent(filename)
-                if (try? pngData.write(to: targetURL)) != nil {
-                    let relPath = "assets/\(filename)"
-                    let md = "![Pasted image](\(relPath))"
-                    let sel = selectedRange()
-                    if shouldChangeText(in: sel, replacementString: md) {
-                        textStorage?.replaceCharacters(in: sel, with: md)
-                        didChangeText()
-                        setSelectedRange(NSRange(location: sel.location + (md as NSString).length, length: 0))
-                        return
-                    }
-                }
+        switch assetInputs(from: .general, permitsRawImages: true) {
+        case nil:
+            super.paste(sender)
+        case .failure(let error):
+            reportAssetIngestionError(error)
+        case .success(let inputs):
+            beginAssetIngestion(inputs, replacing: selectedRange())
+        }
+    }
+
+    /// Copies only a finite representation list out of AppKit. File bytes are
+    /// opened later by the asset actor; raw pasteboard data has no descriptor
+    /// API, so it is size-checked immediately after AppKit materialises it and
+    /// before it crosses into validation.
+    private func assetInputs(
+        from pasteboard: NSPasteboard,
+        permitsRawImages: Bool
+    ) -> Result<[DocumentAssetInput], DocumentAssetError>? {
+        guard let items = pasteboard.pasteboardItems, !items.isEmpty else { return nil }
+        guard items.count <= DocumentAssetStore.maximumItemCount else {
+            return pasteboard.availableType(from: [.fileURL, .png, .tiff]) == nil
+                ? nil
+                : .failure(
+                    .tooManyItems(maximum: DocumentAssetStore.maximumItemCount))
+        }
+
+        var files: [DocumentAssetInput] = []
+        files.reserveCapacity(items.count)
+        for item in items {
+            guard let value = item.string(forType: .fileURL),
+                let url = URL(string: value),
+                BoundedRegularFileReader.hasLocalFileAuthority(url),
+                DocumentAssetStore.supports(filenameExtension: url.pathExtension)
+            else { continue }
+            files.append(.file(url))
+        }
+        if !files.isEmpty { return .success(files) }
+
+        // Rich clipboard producers often include a textual fallback. Preserve
+        // the user's established paste semantics in that case; raw image paste
+        // is selected only when it is the sole useful representation.
+        guard permitsRawImages, pasteboard.string(forType: .string) == nil else {
+            return nil
+        }
+
+        var rawImages: [DocumentAssetInput] = []
+        var batchBytes = 0
+        rawImages.reserveCapacity(items.count)
+        for item in items {
+            guard let representation = Self.rawImagePasteboardTypes.first(where: {
+                item.availableType(from: [$0.type]) != nil
+            }) else { continue }
+            guard let data = item.data(forType: representation.type) else {
+                return .failure(.unsupportedImage)
+            }
+            guard data.count <= DocumentAssetStore.maximumInputBytes else {
+                return .failure(
+                    .inputTooLarge(maximumBytes: DocumentAssetStore.maximumInputBytes))
+            }
+            let (nextBytes, overflow) = batchBytes.addingReportingOverflow(data.count)
+            guard !overflow, nextBytes <= DocumentAssetStore.maximumBatchBytes else {
+                return .failure(
+                    .batchTooLarge(maximumBytes: DocumentAssetStore.maximumBatchBytes))
+            }
+            batchBytes = nextBytes
+            rawImages.append(
+                .pasteboard(
+                    data: data,
+                    filenameExtension: representation.filenameExtension,
+                    suggestedAlt: "Pasted image"))
+        }
+        return rawImages.isEmpty ? nil : .success(rawImages)
+    }
+
+    private func beginAssetIngestion(
+        _ inputs: [DocumentAssetInput],
+        replacing range: NSRange
+    ) {
+        guard isEditable else {
+            reportAssetIngestionError(.editRefused)
+            return
+        }
+        guard documentDirectory != nil else {
+            reportAssetIngestionError(.unsavedDocument)
+            return
+        }
+        guard assetImportTask == nil else {
+            reportAssetIngestionError(.busy)
+            return
+        }
+        guard let storage = textStorage, range.location >= 0, range.length >= 0 else {
+            reportAssetIngestionError(.editRefused)
+            return
+        }
+        let (rangeEnd, overflow) = range.location.addingReportingOverflow(range.length)
+        guard !overflow, rangeEnd <= storage.length else {
+            reportAssetIngestionError(.editRefused)
+            return
+        }
+
+        let operationID = UUID()
+        let generation = assetGeneration
+        let directory = documentDirectory
+        activeAssetImportID = operationID
+        assetImportTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performAssetIngestion(
+                inputs,
+                replacing: range,
+                in: directory,
+                generation: generation)
+            self.finishAssetIngestion(operationID)
+        }
+    }
+
+    private func performAssetIngestion(
+        _ inputs: [DocumentAssetInput],
+        replacing initialRange: NSRange,
+        in directory: URL?,
+        generation: UUID
+    ) async {
+        let batch: DocumentAssetStore.PreparedBatch
+        do {
+            batch = try await documentAssetStore.prepare(
+                inputs,
+                for: directory,
+                generation: generation)
+        } catch is CancellationError {
+            return
+        } catch let error as DocumentAssetError {
+            reportAssetIngestionError(error)
+            return
+        } catch {
+            reportAssetIngestionError(.writeFailed)
+            return
+        }
+
+        guard !Task.isCancelled, assetGeneration == generation else {
+            await documentAssetStore.discard(batch)
+            reportAssetIngestionError(.staleInsertion)
+            return
+        }
+
+        var insertionRange = initialRange
+        for (index, asset) in batch.assets.enumerated() {
+            guard !Task.isCancelled, assetGeneration == generation else {
+                await documentAssetStore.discard(batch, startingAt: index)
+                reportAssetIngestionError(.staleInsertion)
+                return
+            }
+
+            let markdown = index == 0 ? asset.markdown : "\n" + asset.markdown
+            guard shouldChangeText(in: insertionRange, replacementString: markdown) else {
+                await documentAssetStore.discard(batch, startingAt: index)
+                reportAssetIngestionError(.editRefused)
+                return
+            }
+
+            let insertionID = applyAssetMarkdown(markdown, replacing: insertionRange)
+            let insertedLength = (markdown as NSString).length
+            insertionRange = NSRange(
+                location: insertionRange.location + insertedLength,
+                length: 0)
+
+            do {
+                try await documentAssetStore.commit(asset, from: batch)
+                clearPendingAssetInsertion(insertionID)
+            } catch is CancellationError {
+                await documentAssetStore.discard(batch, startingAt: index + 1)
+                reportAssetCommitFailure(.staleInsertion, insertionID: insertionID)
+                return
+            } catch let error as DocumentAssetError {
+                await documentAssetStore.discard(batch, startingAt: index + 1)
+                reportAssetCommitFailure(error, insertionID: insertionID)
+                return
+            } catch {
+                await documentAssetStore.discard(batch, startingAt: index + 1)
+                reportAssetCommitFailure(.writeFailed, insertionID: insertionID)
+                return
             }
         }
-        super.paste(sender)
     }
+
+    private func applyAssetMarkdown(_ markdown: String, replacing range: NSRange) -> UUID {
+        let identifier = UUID()
+        isApplyingAssetTextMutation = true
+        textStorage?.replaceCharacters(in: range, with: markdown)
+        didChangeText()
+        isApplyingAssetTextMutation = false
+
+        let inserted = NSRange(
+            location: range.location,
+            length: (markdown as NSString).length)
+        pendingAssetInsertion = PendingAssetInsertion(
+            id: identifier,
+            range: inserted,
+            markdown: markdown)
+        let caret = NSRange(location: NSMaxRange(inserted), length: 0)
+        setSelectedRange(caret)
+        scrollRangeToVisible(caret)
+        return identifier
+    }
+
+    private func reportAssetCommitFailure(
+        _ error: DocumentAssetError,
+        insertionID: UUID
+    ) {
+        if error.shouldRollbackInsertion {
+            let rolledBack = rollbackAssetMarkdown(insertionID)
+            reportAssetIngestionError(rolledBack ? error : .rollbackUnsafe)
+        } else {
+            clearPendingAssetInsertion(insertionID)
+            reportAssetIngestionError(error)
+        }
+    }
+
+    private func rollbackAssetMarkdown(_ insertionID: UUID) -> Bool {
+        guard let pending = pendingAssetInsertion, pending.id == insertionID,
+            let storage = textStorage,
+            pending.range.location >= 0, pending.range.length >= 0
+        else { return false }
+        let (end, overflow) = pending.range.location.addingReportingOverflow(
+            pending.range.length)
+        guard !overflow, end <= storage.length,
+            (storage.string as NSString).substring(with: pending.range) == pending.markdown
+        else {
+            pendingAssetInsertion = nil
+            return false
+        }
+
+        pendingAssetInsertion = nil
+        isApplyingAssetTextMutation = true
+        storage.replaceCharacters(in: pending.range, with: "")
+        didChangeText()
+        isApplyingAssetTextMutation = false
+        setSelectedRange(NSRange(location: pending.range.location, length: 0))
+        return true
+    }
+
+    private func clearPendingAssetInsertion(_ insertionID: UUID) {
+        guard pendingAssetInsertion?.id == insertionID else { return }
+        pendingAssetInsertion = nil
+    }
+
+    private func adjustPendingAssetInsertion(
+        for affectedRange: NSRange,
+        replacementLength: Int
+    ) {
+        guard var pending = pendingAssetInsertion else { return }
+        let oldEnd = NSMaxRange(affectedRange)
+        let trackedEnd = NSMaxRange(pending.range)
+        if oldEnd <= pending.range.location {
+            let delta = replacementLength - affectedRange.length
+            let (location, overflow) = pending.range.location.addingReportingOverflow(delta)
+            guard !overflow, location >= 0 else {
+                pendingAssetInsertion = nil
+                return
+            }
+            pending.range.location = location
+            pendingAssetInsertion = pending
+        } else if affectedRange.location < trackedEnd {
+            pendingAssetInsertion = nil
+        }
+    }
+
+    private func invalidateAssetIngestion() {
+        assetGeneration = UUID()
+        assetImportTask?.cancel()
+    }
+
+    func cancelAssetIngestion() {
+        invalidateAssetIngestion()
+    }
+
+    private func finishAssetIngestion(_ operationID: UUID) {
+        guard activeAssetImportID == operationID else { return }
+        activeAssetImportID = nil
+        assetImportTask = nil
+    }
+
+    private func reportAssetIngestionError(_ error: DocumentAssetError) {
+        onAssetIngestionError?(error.readerMessage)
+    }
+    #endif
 
     // MARK: - Content
 
@@ -551,6 +884,7 @@ public final class MarkdownTextView: ScrollingTextView {
             let storage = textStorage,
             document.rebuild(from: markdown)
         else {
+            #if !MARKDEV_QUICKLOOK
             // A refusal leaves the view holding whatever it had — for a fresh
             // editor, nothing at all. That is indistinguishable from an empty
             // note, and for a long time it was the *only* trace: no error, no
@@ -570,16 +904,27 @@ public final class MarkdownTextView: ScrollingTextView {
                 metadata: DiagnosticMetadata([
                     .byteCount: .integer(Int64(clamping: markdown.utf8.count))
                 ]))
+            #endif
             return false
         }
+        #if !MARKDEV_QUICKLOOK
+        invalidateAssetIngestion()
+        pendingAssetInsertion = nil
         isReplacingDocument = true
         defer { isReplacingDocument = false }
         // Any edit still in flight described the document being replaced.
         announcedEdit = nil
+        awaitingAnnouncedStorageChange = false
         announcedUTF8ByteCount = nil
         acceptedUTF8ByteCount = byteCount
         unparsedChange = nil
+        #else
+        // Keep the same bounded admission check in both products without
+        // compiling the editor's incremental byte-accounting state here.
+        _ = byteCount
+        #endif
         storage.setAttributedString(NSAttributedString(string: markdown))
+        #if !MARKDEV_QUICKLOOK
         // A wholesale replacement is a different document as far as the
         // proofreader is concerned; keeping the old offsets would underline
         // arbitrary words in the new text.
@@ -595,9 +940,10 @@ public final class MarkdownTextView: ScrollingTextView {
         // The queue describes the document being replaced — including the
         // notes *it* linked to, which are no longer what the reader is one
         // click away from.
-        contentPrefetcher.cancel()
+        contentPrefetcher.cancel(owner: contentPrefetchOwner)
         warmedGeometry = nil
         warmedContents = []
+        #endif
         parsed = document.parsed
         refreshRevealedBlocks()
         restyle()
@@ -620,6 +966,7 @@ public final class MarkdownTextView: ScrollingTextView {
     /// `edit`, when known, scopes the restyle to what the edit actually
     /// changed. Restyling the whole buffer per keystroke is O(document) and
     /// stalls typing in a long file.
+    #if !MARKDEV_QUICKLOOK
     public func reparse(edit: TextEdit? = nil) {
         unparsedChange = nil
         let previous = parsed
@@ -673,6 +1020,7 @@ public final class MarkdownTextView: ScrollingTextView {
         prefetchRenderedContent()
         onParse?(parsed)
     }
+    #endif
 
     /// Recomputes the cached reveal set for the current parse and selection,
     /// or empties it where reveal does not follow the caret.
@@ -683,6 +1031,7 @@ public final class MarkdownTextView: ScrollingTextView {
             : []
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// The ranges of the blocks at `indices`, in document order.
     private func revealedRanges(of indices: Set<Int>, in document: ParsedDocument) -> [NSRange] {
         indices
@@ -741,6 +1090,7 @@ public final class MarkdownTextView: ScrollingTextView {
             depth: onlyOffsetsMoved ? .offsetsOnly : .reparsed
         )
     }
+    #endif
 
     /// What the last restyle covered, or `nil` where it covered everything.
     ///
@@ -757,8 +1107,13 @@ public final class MarkdownTextView: ScrollingTextView {
         defer { isStyling = false }
         lastRestyleScope = scope
 
+        #if MARKDEV_QUICKLOOK
+        let isEditing = false
+        #else
+        let isEditing = hasKeyboardFocus
+        #endif
         hiddenRanges = HiddenRanges(
-            document: parsed, selection: selectedRange(), mode: mode, isEditing: hasKeyboardFocus,
+            document: parsed, selection: selectedRange(), mode: mode, isEditing: isEditing,
             rendered: renderedBlocks, text: storage.string as NSString)
         // The styler grows the scope to whole lines and reports what it
         // actually wrote. Every layer below is scoped to *that*, not to
@@ -776,14 +1131,19 @@ public final class MarkdownTextView: ScrollingTextView {
         // Semantic token colours must be the final foreground layer. The
         // base Markdown pass intentionally resets stale attributes first.
         applyCodeHighlighting(in: storage, scope: touched)
+        #if !MARKDEV_QUICKLOOK
         applyProofreadingUnderlines(in: storage, scope: touched)
+        #endif
         // After every attribute layer, not between two of them: this discards
         // cached layout fragments, and a fragment rebuilt before the
         // underlines land would draw the pre-proofread text.
         invalidateFragments(scope: touched)
+        #if !MARKDEV_QUICKLOOK
         repairTypingAttributes()
+        #endif
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// Underlines the mistakes the proofreader found.
     ///
     /// Last of the three attribute layers, for the same reason highlighting
@@ -807,6 +1167,7 @@ public final class MarkdownTextView: ScrollingTextView {
             storage.addAttribute(.underlineColor, value: issue.kind.tint, range: range)
         }
     }
+    #endif
 
     /// Replaces collapsed `$…$` source with one source-preserving attachment.
     ///
@@ -833,9 +1194,11 @@ public final class MarkdownTextView: ScrollingTextView {
         isStyling = true
         storage.beginEditing()
         applyInlineMathTypesetting(in: storage, scope: nil)
+        #if !MARKDEV_QUICKLOOK
         // A previous renderer diagnostic may have owned the underline before
         // this refresh. Restore proofreading's later layer after removing it.
         applyProofreadingUnderlines(in: storage, scope: nil)
+        #endif
         storage.endEditing()
         isStyling = false
         invalidateFragments(scope: nil)
@@ -850,10 +1213,12 @@ public final class MarkdownTextView: ScrollingTextView {
         refreshInlineMathTypesetting()
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// The dotted rule drawn under a mistake — the same shape macOS has used
     /// for spelling since long before this editor existed, so it needs no
     /// explaining.
     private static let issueUnderline = NSUnderlineStyle([.thick, .patternDot]).rawValue
+    #endif
 
     /// Colours fenced code through the Rust tree-sitter core.
     ///
@@ -923,6 +1288,7 @@ public final class MarkdownTextView: ScrollingTextView {
         return NSTextRange(location: start, end: end)
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// Whether this view holds keyboard focus.
     ///
     /// A view with no window counts as focused. Focus is about *another*
@@ -1066,6 +1432,7 @@ public final class MarkdownTextView: ScrollingTextView {
         guard offset >= 0, offset <= text.length else { return nil }
         return text.lineRange(for: NSRange(location: min(offset, max(text.length - 1, 0)), length: 0))
     }
+    #endif
 
     // MARK: - Overrides
 
@@ -1161,6 +1528,25 @@ public final class MarkdownTextView: ScrollingTextView {
         return false
     }
 
+    #if MARKDEV_QUICKLOOK
+    /// The extension target has one admitted mutation: ``setMarkdown(_:)``
+    /// installs the bounded file snapshot. Every AppKit editing route fails
+    /// closed, and none of MarkDev's paste/drag implementation is compiled.
+    public override func shouldChangeText(
+        in affectedCharRange: NSRange,
+        replacementString: String?
+    ) -> Bool {
+        false
+    }
+
+    public override func paste(_ sender: Any?) {}
+
+    public override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { [] }
+
+    public override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { [] }
+
+    public override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { false }
+    #else
     /// Ticks a checkbox when one is clicked, before the caret moves.
     public override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
@@ -1258,6 +1644,9 @@ public final class MarkdownTextView: ScrollingTextView {
     public override func didChangeText() {
         super.didChangeText()
         guard !isReplacingDocument else { return }
+        if !isApplyingAssetTextMutation {
+            invalidateAssetIngestion()
+        }
         let edit = announcedEdit
         announcedEdit = nil
         if let byteCount = announcedUTF8ByteCount {
@@ -1306,6 +1695,19 @@ public final class MarkdownTextView: ScrollingTextView {
 
         let edited = storage.editedRange
         let delta = storage.changeInLength
+        let wasAnnounced = awaitingAnnouncedStorageChange
+        awaitingAnnouncedStorageChange = false
+        if !wasAnnounced, !isApplyingAssetTextMutation {
+            let (replacedLength, overflow) = edited.length.subtractingReportingOverflow(delta)
+            if !overflow, replacedLength >= 0 {
+                adjustPendingAssetInsertion(
+                    for: NSRange(location: edited.location, length: replacedLength),
+                    replacementLength: edited.length)
+            } else {
+                pendingAssetInsertion = nil
+            }
+            invalidateAssetIngestion()
+        }
         if let byteCount = announcedUTF8ByteCount {
             acceptedUTF8ByteCount = byteCount
         } else if let byteCount = MarkdownReadLimits.acceptedDocumentByteCount(storage.string) {
@@ -1401,12 +1803,19 @@ public final class MarkdownTextView: ScrollingTextView {
             in: affectedCharRange, replacementString: replacementString)
         if allowed {
             announcedUTF8ByteCount = proposedByteCount
+            awaitingAnnouncedStorageChange = true
+            if !isApplyingAssetTextMutation {
+                adjustPendingAssetInsertion(
+                    for: affectedCharRange,
+                    replacementLength: (replacement as NSString).length)
+            }
         } else {
             // A refused edit never reaches `didChangeText`, so its record would
             // sit here and be consumed by whatever edit came next — describing
             // a change to the document that never happened, at offsets that
             // mean something else now.
             announcedEdit = nil
+            awaitingAnnouncedStorageChange = false
             announcedUTF8ByteCount = nil
         }
         return allowed
@@ -1487,6 +1896,7 @@ public final class MarkdownTextView: ScrollingTextView {
     public var parseStatistics: (shifted: Int, full: Int, resyncs: Int) {
         (document.shiftedEdits, document.fullReparses, document.resyncs)
     }
+    #endif
 
     /// Moves the caret over collapsed syntax as though it were not there.
     ///
@@ -1532,9 +1942,11 @@ public final class MarkdownTextView: ScrollingTextView {
         // storage's own edit cycle, which finishes before AppKit moves the
         // caret. Styling from a parse older than the text is what wrote the
         // previous document's ranges onto the new one.
+        #if !MARKDEV_QUICKLOOK
         if !stillSelecting, !isStyling {
             updateRevealIfNeeded()
         }
+        #endif
     }
 
     /// Whether `offset` is inside the collapsed source of a block drawn as
@@ -1885,6 +2297,14 @@ extension MarkdownTextView {
     /// does not have, and it needs a picture that actually rendered — a block
     /// showing its failure has nothing to enlarge.
     func resolveControls(for fragment: MarkdownLayoutFragment, at range: NSRange) {
+        #if MARKDEV_QUICKLOOK
+        // Controls are app authority, not renderer output. Keep the canonical
+        // fragment type but compile no copy/zoom offer or action into Quick Look.
+        fragment.offersCopy = false
+        fragment.offersZoom = false
+        fragment.copyConfirmed = false
+        fragment.hoveredControl = nil
+        #else
         switch fragment.decoration {
         case .code(let edge, _):
             // The head of the block only: the chip belongs to the panel, and
@@ -1910,8 +2330,10 @@ extension MarkdownTextView {
         } else {
             controlFragments.remove(fragment)
         }
+        #endif
     }
 
+    #if !MARKDEV_QUICKLOOK
     /// Whether the block at `range` has any code to put on the pasteboard.
     ///
     /// An empty fence offers no chip: a control that can only ever do nothing
@@ -2283,9 +2705,11 @@ extension MarkdownTextView {
             NSCursor.arrow.set()
         }
     }
+    #endif
 
     // MARK: - Table Key Navigation
 
+    #if !MARKDEV_QUICKLOOK
     public override func insertTab(_ sender: Any?) {
         if handleTableTab(forward: true) { return }
         super.insertTab(sender)
@@ -2393,6 +2817,7 @@ extension MarkdownTextView {
         }
         return false
     }
+    #endif
 }
 
 extension MarkdownTextView {
@@ -2662,6 +3087,11 @@ extension MarkdownTextView {
     /// narrower than this; a picture drawn for it would be a stamp.
     static let minimumRenderWidth: CGFloat = 120
 
+    #if MARKDEV_QUICKLOOK
+    /// Quick Look renders only what TextKit asks for. It does not compile the
+    /// editor's background task/queue surface into the extension process.
+    func prefetchRenderedContent() {}
+    #else
     /// Warms every picture in the document, not only the ones on screen.
     ///
     /// Cheap to call from anywhere the geometry might have settled: it does
@@ -2688,7 +3118,27 @@ extension MarkdownTextView {
         warmedGeometry = geometry
         warmedContents = renderedBlocks.entries.map(\.content)
         contentPrefetcher.warmDocument(
-            warmedContents.flatMap(\.prefetchUnits), in: documentDirectory, using: context)
+            warmedContents.flatMap(\.prefetchUnits),
+            owner: contentPrefetchOwner,
+            in: documentDirectory,
+            using: context)
+    }
+
+    /// Binds this mounted view to the stable identity its split owns.
+    func setContentPrefetchOwner(_ owner: ContentPrefetcher.Owner) {
+        guard owner != contentPrefetchOwner else { return }
+        contentPrefetcher.cancel(owner: contentPrefetchOwner)
+        contentPrefetchOwner = owner
+        warmedGeometry = nil
+        warmedContents = []
+        prefetchRenderedContent()
+    }
+
+    /// Retires only this view's speculative work during dismantle.
+    func cancelContentPrefetching() {
+        contentPrefetcher.cancel(owner: contentPrefetchOwner)
+        warmedGeometry = nil
+        warmedContents = []
     }
 
     /// Whether this parse's pictures are the ones already queued.
@@ -2704,4 +3154,5 @@ extension MarkdownTextView {
         }
         return true
     }
+    #endif
 }

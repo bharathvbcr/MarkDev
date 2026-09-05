@@ -123,6 +123,11 @@ do {
     }
     let catalog = URL(fileURLWithPath: CommandLine.arguments[1])
     let iconSet = catalog.appendingPathComponent("AppIcon.appiconset")
+    // This tool owns the entire generated catalogue. Replacing it first keeps
+    // retired slots and interrupted prior output from surviving beside the
+    // current inventory and making an otherwise successful regeneration fail
+    // closed in the post-generation validator.
+    try? FileManager.default.removeItem(at: catalog)
     try FileManager.default.createDirectory(at: iconSet, withIntermediateDirectories: true)
 
     for slot in slots {

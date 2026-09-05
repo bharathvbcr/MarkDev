@@ -8,8 +8,12 @@
 //! The randomized test at the bottom is the real guarantee; the named tests
 //! above it pin down the specific cases that are easy to get wrong.
 
-use markdev::md::{parse, Document, Reparse};
+use markdev::md::{parse_checked, Document, ParseResult, Reparse};
 use proptest::prelude::*;
+
+fn parse(source: &str) -> ParseResult {
+    parse_checked(source).expect("test fixture must satisfy the parser contract")
+}
 
 /// Applies an edit and asserts the result matches a full reparse of the
 /// resulting text. Returns what the parser chose to do.

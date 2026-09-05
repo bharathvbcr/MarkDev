@@ -87,14 +87,19 @@ enum TerminalExitStatusResolver {
 /// process delegate, keeping every app consumer on the same reliable seam.
 @MainActor
 final class MarkDevTerminalView: LocalProcessTerminalView {
+    /// The process whose callback is being forwarded to the public delegate.
+    /// The delegate otherwise receives only this reusable view, which is not
+    /// enough to distinguish a late exit from the generation Restart replaced.
+    fileprivate private(set) var forwardingTerminationPID: pid_t?
+
     override func processTerminated(_ source: LocalProcess, exitCode: Int32?) {
         let pid = source.shellPid
         guard exitCode == 0 else {
-            super.processTerminated(source, exitCode: exitCode)
+            forwardTermination(source, exitCode: exitCode)
             return
         }
         guard pid > 0 else {
-            super.processTerminated(source, exitCode: nil)
+            forwardTermination(source, exitCode: nil)
             return
         }
 
@@ -111,6 +116,8 @@ final class MarkDevTerminalView: LocalProcessTerminalView {
     }
 
     private func forwardTermination(_ source: LocalProcess, exitCode: Int32?) {
+        forwardingTerminationPID = source.shellPid
+        defer { forwardingTerminationPID = nil }
         super.processTerminated(source, exitCode: exitCode)
     }
 }
@@ -151,31 +158,41 @@ public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTermina
     public let id: UUID
 
     /// The view SwiftUI shows. Built once, re-parented as often as needed.
-    public let view: LocalProcessTerminalView
+    public private(set) var view: LocalProcessTerminalView
 
     /// What was launched most recently, so a restart can be told from a move.
-    private var generation: Int
+    public private(set) var generation: Int
+
+    /// The pid paired with ``generation`` at launch. Looking through the view
+    /// during an exit callback is too late: Restart may already have installed
+    /// its successor in the same reusable view.
+    private var launchedProcessIdentifier: pid_t = 0
 
     /// Set once ``end()`` has run, so nothing relaunches into a dead host and
     /// no callback from the dying pty is reported as this tab exiting.
     public private(set) var isEnded = false
 
     /// Reported when the shell sets a title or its directory changes.
-    var onTitleChange: (String) -> Void
+    var onTitleChange: (String, Int) -> Void
     /// Reported once, when the shell ends on its own.
-    var onExit: (TerminalExit) -> Void
+    var onExit: (TerminalExit, Int) -> Void
+    /// Reported when a typed startup action loses its executable authority
+    /// before the shell is forked. No path or shell source crosses this seam.
+    var onLaunchFailure: (TerminalLaunchFailure, Int) -> Void
 
     init(
         id: UUID,
         session: TerminalSession,
         generation: Int,
-        onTitleChange: @escaping (String) -> Void,
-        onExit: @escaping (TerminalExit) -> Void
+        onTitleChange: @escaping (String, Int) -> Void,
+        onExit: @escaping (TerminalExit, Int) -> Void,
+        onLaunchFailure: @escaping (TerminalLaunchFailure, Int) -> Void
     ) {
         self.id = id
         self.generation = generation
         self.onTitleChange = onTitleChange
         self.onExit = onExit
+        self.onLaunchFailure = onLaunchFailure
         view = MarkDevTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
         super.init()
         view.processDelegate = self
@@ -183,25 +200,41 @@ public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTermina
         launch(session)
     }
 
-    /// The shell's pid, or zero once it has ended.
+    /// The shell's pid, or zero before a process was successfully forked.
+    /// SwiftTerm may retain the numeric id after the child has ended.
     public var processIdentifier: pid_t { view.process?.shellPid ?? 0 }
 
-    /// Relaunches when `generation` has moved, and does nothing when it has
-    /// not.
+    /// Relaunches only when `generation` has moved forward.
     ///
     /// The distinction is the whole point of the generation counter: a view
     /// update that arrives because the panel moved, resized, or changed
     /// appearance must not disturb a running command, while a deliberate
     /// restart must.
     func relaunchIfNeeded(_ session: TerminalSession, generation: Int) {
-        guard !isEnded, self.generation != generation else { return }
-        self.generation = generation
-        let previous = processIdentifier
-        view.terminate()
+        // An outgoing representable may deliver one final update after its
+        // replacement has already installed the successor. Accepting any
+        // unequal value would interpret that stale lower generation as a new
+        // restart, kill the successor, and roll identity backward.
+        guard !isEnded, generation > self.generation else { return }
+        let previous = launchedProcessIdentifier
+        let replacedView = view
+        // Each process generation owns a distinct parser/view. SwiftTerm's
+        // metadata callbacks identify only that view, not the LocalProcess
+        // that produced the bytes; reusing it would let buffered title/CWD
+        // output from the old process masquerade as the new generation.
+        replacedView.processDelegate = nil
+        replacedView.terminate()
+        replacedView.removeFromSuperview()
         // The old shell's children are not the new shell's. Reaped through the
         // same path a close goes through, or a restart leaks everything the
         // previous shell started.
         LiveShells.shared.end(previous)
+        self.generation = generation
+        let replacement = MarkDevTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        replacement.processDelegate = self
+        view = replacement
+        apply(theme: .standard)
         launch(session)
     }
 
@@ -213,7 +246,7 @@ public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTermina
     public func end() {
         guard !isEnded else { return }
         isEnded = true
-        let pid = processIdentifier
+        let pid = launchedProcessIdentifier
         view.processDelegate = nil
         view.terminate()
         LiveShells.shared.end(pid)
@@ -224,24 +257,59 @@ public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTermina
         // vault can be renamed or a folder deleted in between, and launching
         // into a directory that is gone fails inside the shell where the
         // reader can neither see the cause nor act on it.
-        let live = session.revalidated()
+        let live: TerminalSession
+        var environment = Terminal.getEnvironmentVariables(termName: "xterm-256color")
+        do {
+            live = try session.revalidated()
+            if let action = live.startupAction {
+                environment = try action.launchEnvironment(base: environment)
+            }
+        } catch let failure as TerminalLaunchFailure {
+            isEnded = true
+            onLaunchFailure(failure, generation)
+            return
+        } catch {
+            isEnded = true
+            onLaunchFailure(
+                TerminalLaunchFailure(
+                    reason: "The requested terminal action could not be validated."),
+                generation)
+            return
+        }
         view.startProcess(
             executable: live.shell,
             args: [],
-            environment: Terminal.getEnvironmentVariables(termName: "xterm-256color"),
+            environment: environment,
             execName: live.argv0,
             currentDirectory: live.workingDirectory)
-        LiveShells.shared.register(processIdentifier)
-        onTitleChange((live.workingDirectory as NSString).lastPathComponent)
+        launchedProcessIdentifier = processIdentifier
+        LiveShells.shared.register(launchedProcessIdentifier)
+        onTitleChange((live.workingDirectory as NSString).lastPathComponent, generation)
 
-        // Typed into the shell rather than passed as `-c`, so the session stays
-        // an interactive login shell — which is what puts Homebrew, mise and
-        // nvm on `PATH`, and therefore what makes a coding CLI resolvable at
-        // all. It also leaves the command visible in the scrollback, so the
-        // reader can see what was run and re-run it.
-        if let command = live.initialCommand {
-            view.send(txt: command + "\n")
+        // The fixed source expands one quoted environment value. Shell syntax
+        // in a pathname is therefore never parsed, while the session remains
+        // an interactive login shell and survives after the executable exits.
+        if let action = live.startupAction {
+            do {
+                try action.validateImmediatelyBeforeSend()
+                view.send(txt: action.shellSource + "\n")
+            } catch let failure as TerminalLaunchFailure {
+                refuseLaunchedShell(failure)
+            } catch {
+                refuseLaunchedShell(
+                    TerminalLaunchFailure(
+                        reason: "The requested terminal action could not be validated."))
+            }
         }
+    }
+
+    private func refuseLaunchedShell(_ failure: TerminalLaunchFailure) {
+        let pid = launchedProcessIdentifier
+        isEnded = true
+        view.processDelegate = nil
+        view.terminate()
+        LiveShells.shared.end(pid)
+        onLaunchFailure(failure, generation)
     }
 
     /// Matches the terminal to the editor's own palette.
@@ -261,21 +329,29 @@ public final class TerminalProcessHost: NSObject, @MainActor LocalProcessTermina
     public func sizeChanged(source: LocalProcessTerminalView, newCols: Int, newRows: Int) {}
 
     public func setTerminalTitle(source: LocalProcessTerminalView, title: String) {
-        guard !isEnded, !title.isEmpty else { return }
-        onTitleChange(title)
+        guard !isEnded, source === view, !title.isEmpty else { return }
+        onTitleChange(title, generation)
     }
 
     public func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {
-        guard !isEnded, let directory, !directory.isEmpty else { return }
-        onTitleChange((directory as NSString).lastPathComponent)
+        guard !isEnded, source === view, let directory, !directory.isEmpty else { return }
+        onTitleChange((directory as NSString).lastPathComponent, generation)
     }
 
     /// - Parameter exitCode: named that way by SwiftTerm, but it is the raw
     ///   `waitpid` status. See ``TerminalExit``.
     public func processTerminated(source: TerminalView, exitCode: Int32?) {
-        guard !isEnded else { return }
-        LiveShells.shared.forget(processIdentifier)
-        onExit(TerminalExit(waitStatus: exitCode))
+        guard !isEnded, source === view else { return }
+        let reportedPID = (source as? MarkDevTerminalView)?.forwardingTerminationPID
+        guard reportedPID == launchedProcessIdentifier else {
+            // A replaced generation ended after its successor launched. Drop
+            // the stale callback, but retire that exact old pid if the reaper
+            // did not already do so.
+            if let reportedPID { LiveShells.shared.forget(reportedPID) }
+            return
+        }
+        LiveShells.shared.forget(launchedProcessIdentifier)
+        onExit(TerminalExit(waitStatus: exitCode), generation)
     }
 }
 

@@ -20,6 +20,8 @@ public struct TerminalSessionState: Identifiable, Equatable, Sendable {
     public var title: String
     /// How the shell ended, once it has.
     public var exit: TerminalExit?
+    /// Why a typed startup action was refused before any shell was forked.
+    public var launchFailure: TerminalLaunchFailure?
     /// Bumped to relaunch in place. The host view watches it; nothing else
     /// restarts a shell, so a restart is always an explicit act.
     public var generation: Int
@@ -29,17 +31,19 @@ public struct TerminalSessionState: Identifiable, Equatable, Sendable {
         config: TerminalSession,
         title: String? = nil,
         exit: TerminalExit? = nil,
+        launchFailure: TerminalLaunchFailure? = nil,
         generation: Int = 0
     ) {
         self.id = id
         self.config = config
         self.title = title ?? (config.workingDirectory as NSString).lastPathComponent
         self.exit = exit
+        self.launchFailure = launchFailure
         self.generation = generation
     }
 
     /// Whether the shell is still running.
-    public var isLive: Bool { exit == nil }
+    public var isLive: Bool { exit == nil && launchFailure == nil }
 }
 
 /// Why a terminal could not be opened.
@@ -107,6 +111,50 @@ public final class TerminalSessions {
     /// Sessions that are still running.
     public var live: [TerminalSessionState] { sessions.filter(\.isLive) }
 
+    /// Exact process generations that would be destroyed by closing this
+    /// window. A session that has never been drawn has no pty and therefore no
+    /// process risk, even though its tab still reads as live model state.
+    public var closeRisks: [TerminalCloseRisk] {
+        sessions.compactMap { closeRisk(for: $0.id) }
+    }
+
+    public func closeRisk(for id: TerminalSessionState.ID) -> TerminalCloseRisk? {
+        guard let session = sessions.first(where: { $0.id == id }), session.isLive,
+            let host = hosts[id], !host.isEnded, host.processIdentifier > 0
+        else { return nil }
+        return TerminalCloseRisk(
+            sessionID: id,
+            generation: host.generation,
+            title: session.title)
+    }
+
+    /// Whether consent still names the process generation that exists now.
+    public func isCurrent(_ risk: TerminalCloseRisk) -> Bool {
+        closeRisk(for: risk.id.sessionID) == risk
+    }
+
+    public func areCurrent(_ risks: [TerminalCloseRisk]) -> Bool {
+        closeRisks.map(\.id) == risks.map(\.id)
+    }
+
+    /// Consent for a process remains safe when that exact generation is still
+    /// present or has exited naturally. A successor generation is never
+    /// covered by its predecessor's prompt.
+    public func isUnchangedOrExited(afterReviewing risk: TerminalCloseRisk) -> Bool {
+        guard sessions.contains(where: { $0.id == risk.id.sessionID }) else { return false }
+        guard let current = closeRisk(for: risk.id.sessionID) else { return true }
+        return current == risk
+    }
+
+    /// Window/Quit counterpart: every process still at risk must be one the
+    /// sheet named. Reviewed processes may have exited while the sheet was up;
+    /// newly launched or restarted processes fail the check.
+    public func areUnchangedOrExited(afterReviewing risks: [TerminalCloseRisk]) -> Bool {
+        let reviewed = Set(risks)
+        guard reviewed.count == risks.count else { return false }
+        return closeRisks.allSatisfy { reviewed.contains($0) }
+    }
+
     // MARK: - Opening
 
     /// Opens a new shell and selects it.
@@ -142,13 +190,13 @@ public final class TerminalSessions {
     /// to open. The drawer's own "+" calls ``open(_:)`` and always forks.
     @discardableResult
     public func reveal(_ config: TerminalSession) throws -> TerminalSessionState.ID {
-        // Matched on the command as well as the directory. A shell opened to
+        // Matched on the typed action as well as the directory. A shell opened to
         // run an agent and a shell opened to type in are two different things
         // in one folder, and folding them together would answer "run MANVI
         // here" by selecting a plain prompt that is not running it.
         if let existing = sessions.first(where: {
             $0.isLive && $0.config.workingDirectory == config.workingDirectory
-                && $0.config.initialCommand == config.initialCommand
+                && $0.config.startupAction == config.startupAction
         }) {
             selection = existing.id
             return existing.id
@@ -214,8 +262,15 @@ public final class TerminalSessions {
             id: id,
             session: session.config,
             generation: session.generation,
-            onTitleChange: { [weak self] title in self?.setTitle(title, for: id) },
-            onExit: { [weak self] exit in self?.markExited(exit, for: id) })
+            onTitleChange: { [weak self] title, generation in
+                self?.setTitle(title, for: id, generation: generation)
+            },
+            onExit: { [weak self] exit, generation in
+                self?.markExited(exit, for: id, generation: generation)
+            },
+            onLaunchFailure: { [weak self] failure, generation in
+                self?.markLaunchFailed(failure, for: id, generation: generation)
+            })
         hosts[id] = host
         return host
     }
@@ -225,21 +280,73 @@ public final class TerminalSessions {
     public func hasHost(for id: TerminalSessionState.ID) -> Bool { hosts[id] != nil }
 
     /// Relaunches the shell in place, keeping its tab and directory.
-    public func restart(_ id: TerminalSessionState.ID) {
-        update(id) { session in
-            session.generation += 1
-            session.exit = nil
-        }
+    @discardableResult
+    public func restart(_ id: TerminalSessionState.ID) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return false }
+        // Never wrap to a generation an old callback could also name. Reaching
+        // this bound is not practical, but failing closed is cheaper than an
+        // identity alias in process-teardown code.
+        guard sessions[index].generation < .max else { return false }
+        sessions[index].generation += 1
+        sessions[index].exit = nil
+        sessions[index].launchFailure = nil
+        return true
     }
 
     public func setTitle(_ title: String, for id: TerminalSessionState.ID) {
+        guard let generation = sessions.first(where: { $0.id == id })?.generation else { return }
+        setTitle(title, for: id, generation: generation)
+    }
+
+    private func setTitle(
+        _ title: String,
+        for id: TerminalSessionState.ID,
+        generation: Int
+    ) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        update(id) { $0.title = trimmed }
+        update(id) { session in
+            guard session.generation == generation else { return }
+            session.title = trimmed
+        }
     }
 
     public func markExited(_ exit: TerminalExit, for id: TerminalSessionState.ID) {
-        update(id) { $0.exit = exit }
+        guard let generation = sessions.first(where: { $0.id == id })?.generation else { return }
+        markExited(exit, for: id, generation: generation)
+    }
+
+    func markExited(
+        _ exit: TerminalExit,
+        for id: TerminalSessionState.ID,
+        generation: Int
+    ) {
+        update(id) { session in
+            guard session.generation == generation else { return }
+            session.exit = exit
+            session.launchFailure = nil
+        }
+    }
+
+    private func markLaunchFailed(
+        _ failure: TerminalLaunchFailure,
+        for id: TerminalSessionState.ID,
+        generation: Int
+    ) {
+        update(id) { session in
+            guard session.generation == generation else { return }
+            session.launchFailure = failure
+            session.exit = nil
+        }
+        let trustWasRevoked = failure.code == .executableTrustRevoked
+        DiagnosticsEmitter.shared.emit(
+            severity: .error,
+            subsystem: trustWasRevoked ? .permissions : .terminal,
+            code: trustWasRevoked
+                ? .permissionsHarnessExecutableRevoked
+                : .harnessTerminalFailed,
+            operationID: DiagnosticOperationID(),
+            metadata: DiagnosticMetadata([.available: .boolean(false)]))
     }
 
     private func update(

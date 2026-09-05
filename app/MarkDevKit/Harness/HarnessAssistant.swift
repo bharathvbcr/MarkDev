@@ -201,9 +201,46 @@ public final class HarnessAssistant {
         self.surface = surface
     }
 
+    /// Releases only the editor still attached to this panel. Stale SwiftUI
+    /// dismantle callbacks are intentionally inert.
+    public func detach(from surface: MarkdownTextView) {
+        guard self.surface === surface else { return }
+        stop()
+        self.surface = nil
+    }
+
     public var isRunning: Bool {
         if case .running = state { return true }
         return false
+    }
+
+    /// Returns the exact executable action the terminal may start now.
+    ///
+    /// Workspace deliberately does not retain a second URL. Discovery,
+    /// configured-path matching, consent revocation, and launch identity all
+    /// stay with this one owner. Terminal launch is an explicit user action
+    /// and does not inherit the separate permission to let MANVI edit notes.
+    public func terminalStartupAction() throws -> TerminalStartupAction {
+        guard case .found(let location) = availability else {
+            if availability != .searching { refreshAvailability() }
+            throw TerminalLaunchFailure(
+                code: .harnessUnavailable,
+                reason:
+                    "MarkDev couldn’t find MANVI. Set its path under MANVI settings in the Assist panel."
+            )
+        }
+        guard location.matches(configured: settings.binaryPath),
+            HarnessLocator.isCurrent(location)
+        else {
+            settings.revokeExecutableConsent()
+            availability = .unknown
+            refreshAvailability()
+            throw TerminalLaunchFailure(
+                code: .executableTrustRevoked,
+                reason: "The MANVI executable changed. Check it before opening a terminal.")
+        }
+        settings.bindExecutable(location)
+        return .runExecutable(location)
     }
 
     /// The task whose answer is on screen, if any.
@@ -251,8 +288,9 @@ public final class HarnessAssistant {
             } else if !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 self.settings.revokeExecutableConsent()
                 self.availability = .missing(
-                    "There is no executable at the configured MANVI path. Correct it, or clear "
-                        + "the field to let MarkDev search.")
+                    "The configured MANVI executable could not be used. It may be missing or "
+                        + "outside a private, trusted local location. Choose a trusted local "
+                        + "executable, or clear the field to let MarkDev search.")
             } else {
                 self.settings.revokeExecutableConsent()
                 self.availability = .missing(
@@ -323,7 +361,7 @@ public final class HarnessAssistant {
         }
 
         let request = HarnessRunRequest(
-            binary: location.url,
+            trustedBinary: location,
             prompt: prompt,
             workingDirectory: directory,
             maxSteps: HarnessSettings.clampSteps(settings.maxSteps),

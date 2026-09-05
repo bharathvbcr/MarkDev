@@ -16,33 +16,52 @@ concurrency:
 
 jobs:
   rust-checks:
-    name: Rust Core and Release Contracts
-    runs-on: macos-26
+    name: Rust Core and Release Contracts (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: 1.98.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: core
       - name: Install Tools
-        run: brew install just
+        run: bash tools/ci/install-pinned-tools.sh just
       - name: Rust, performance, and release checks
         run: just ci-core
 
   macos-app:
-    name: macOS App (Swift + MarkDevKit)
-    runs-on: macos-26
+    name: macOS App (Debug Tests + Universal Release, ${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
     needs: rust-checks
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tools
-        run: brew install just xcodegen
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install pinned tools
+        run: bash tools/ci/install-pinned-tools.sh all
       - name: Verify Xcode Toolchain
         run: just verify-toolchain
       - name: Build and Test AppKit Targets
         run: just test-app
+      - name: Build Universal Release
+        run: just build-release

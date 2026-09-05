@@ -15,21 +15,56 @@ export DEVELOPER_DIR := env_var_or_default("DEVELOPER_DIR", "/Applications/Xcode
 # deployment target.
 export MACOSX_DEPLOYMENT_TARGET := "26.0"
 
+# Every Xcode entry point consumes the checked-in transitive lock and refuses
+# to rewrite it as a side effect of building, testing, or locating products.
+locked_package_flags := "-onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates"
+
 default: build
 
 # --- Rust core -------------------------------------------------------------
 
 build-core:
-    cd core && cargo build --release
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    targets=(aarch64-apple-darwin x86_64-apple-darwin)
+    for target in $targets; do
+        cargo build --locked --manifest-path core/Cargo.toml --release --target "$target"
+    done
+
+    output=core/target/release/libmarkdev.a
+    mkdir -p "${output:h}"
+    staging=$(mktemp -d "${output:h}/.universal-core.XXXXXX")
+    trap 'rm -rf "$staging"' EXIT
+    staged=$staging/libmarkdev.a
+    lipo -create \
+        core/target/aarch64-apple-darwin/release/libmarkdev.a \
+        core/target/x86_64-apple-darwin/release/libmarkdev.a \
+        -output "$staged"
+    lipo "$staged" -verify_arch arm64 x86_64
+    actual_arches=$(lipo -archs "$staged")
+    if ! print -r -- "$actual_arches" | awk '
+        {
+            if (NF != 2) exit 1
+            for (field = 1; field <= NF; field += 1) seen[$field] += 1
+            exit !(seen["arm64"] == 1 && seen["x86_64"] == 1)
+        }
+    '; then
+        echo "universal Rust archive has unexpected slices: $actual_arches" >&2
+        exit 1
+    fi
+    mv -f "$staged" "$output"
+    rmdir "$staging"
+    trap - EXIT
+    echo "universal Rust archive: $output ($actual_arches)"
 
 build-core-debug:
-    cd core && cargo build
+    cd core && cargo build --locked
 
 test-core:
-    cd core && cargo test
+    cd core && cargo test --locked
 
 lint-core:
-    cd core && cargo clippy --all-targets -- -D warnings
+    cd core && cargo clippy --locked --all-targets -- -D warnings
 
 fmt:
     cd core && cargo fmt
@@ -39,7 +74,7 @@ fmt-check:
 
 # Regenerate include/markdev.h from the FFI surface.
 header:
-    cd core && touch build.rs && cargo build
+    cd core && touch build.rs && cargo build --locked
 
 # --- Brand -----------------------------------------------------------------
 
@@ -59,21 +94,18 @@ icons:
     catalog=app/MarkDev/Assets.xcassets
     resources=app/MarkDev/Resources
     document=$resources/DocumentIcon.icns
+    validator=tools/icongen/validate.py
     sources=(tools/icongen/main.swift app/MarkDevKit/Brand/MarkDevLogo.swift)
-    if [[ -f $document ]]; then
-        stale=0
-        for source in $sources; do
-            if [[ $source -nt $document ]]; then stale=1; fi
-        done
-        if (( ! stale )); then
-            echo "icons: up to date"
-            exit 0
-        fi
+    freshness_sources=($sources $validator)
+    if python3 "$validator" "$catalog" "$document" $freshness_sources; then
+        echo "icons: up to date"
+        exit 0
     fi
     mkdir -p build/tools $resources
     xcrun swiftc -O $sources -o build/tools/icongen
     build/tools/icongen $catalog build/DocumentIcon.iconset
     xcrun iconutil -c icns build/DocumentIcon.iconset -o $document
+    python3 "$validator" "$catalog" "$document" $freshness_sources
 
 # --- Xcode project ---------------------------------------------------------
 
@@ -88,23 +120,20 @@ generate: icons
 # --- App -------------------------------------------------------------------
 
 build: build-core-debug generate
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation build
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug {{ locked_package_flags }} -skipPackagePluginValidation -derivedDataPath build/DerivedData/Debug build
 
-build-release: build-core generate
+build-release: verify-toolchain build-core generate
     python3 tools/release/project_contract.py -v
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" -skipPackagePluginValidation build
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" {{ locked_package_flags }} -skipPackagePluginValidation -derivedDataPath build/DerivedData/Release clean build
 
 # A Release signed with a real identity.
 #
-# This does *not* get the Quick Look extension registered, which was the
-# original reason for it. `pkd` will not register an extension whose app
-# Gatekeeper rejects, and it rejects anything signed with an Apple
-# Development certificate — tested here with a valid one: `pkd` still had no
-# record of the bundle. That needs a Developer ID and notarisation. See the
-# Quick Look entry in CLAUDE.md.
-#
-# It is still the build worth installing: a real identity is what allows
-# hardened runtime, which an ad-hoc build cannot have.
+# A real identity is what allows hardened runtime, which an ad-hoc build
+# cannot have. It does not by itself prove that another Mac will accept the
+# app or that Quick Look registered the embedded extension: Developer ID signing
+# and notarisation are separate distribution gates, and `install-only` checks
+# the local plug-in registry after installation rather than inferring success
+# from the signature.
 #
 # Hardened runtime is turned back on here and *only* here. It travels with the
 # identity: a hardened-runtime process cannot load an ad-hoc signed framework,
@@ -115,52 +144,29 @@ build-release: build-core generate
 # with no certificate still builds and runs.
 #
 #     just build-release-signed                      # Apple Development
-#     just build-release-signed "Developer ID Application: You (TEAMID)"
-build-release-signed IDENTITY="Apple Development": build-core generate
+# just build-release-signed "Developer ID Application: You (TEAMID)"
+build-release-signed IDENTITY="Apple Development": verify-toolchain build-core generate
     #!/usr/bin/env zsh
     set -euo pipefail
-    if ! security find-identity -v -p codesigning | grep -q "{{IDENTITY}}"; then
-        echo "no *valid* codesigning identity matching {{IDENTITY}}." >&2
-        echo >&2
-        security find-identity -p codesigning 2>/dev/null | grep -E "CSSMERR|[0-9]\)" >&2 || true
-        echo >&2
-        echo "A certificate listed above as CSSMERR_TP_NOT_TRUSTED has its key" >&2
-        echo "and is only missing its issuer. Apple Development certificates" >&2
-        echo "chain to the WWDR *G3* intermediate; the original expired in" >&2
-        echo "Feb 2023 and does not validate them:" >&2
-        echo "  https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" >&2
-        echo >&2
-        echo "No certificate at all: Xcode > Settings > Accounts > (Apple ID)" >&2
-        echo "  > Manage Certificates > + > Apple Development. A free Apple ID" >&2
-        echo "  gives that, and it is enough to sign and to enable hardened" >&2
-        echo "  runtime — but not to register the Quick Look extension." >&2
-        exit 1
-    fi
-    # The team is read from the certificate rather than written down here.
-    # Xcode refuses to sign without one — "requires selecting either a
-    # development team or a provisioning profile" — and an Apple-issued
-    # certificate already carries it as the OU of its subject. The
-    # parenthetical in the common name is the *certificate's* id, not the
-    # team, which is the easy one to copy by mistake.
-    team=$(security find-certificate -a -c "{{IDENTITY}}" -p 2>/dev/null \
-        | openssl x509 -noout -subject 2>/dev/null \
-        | sed -n 's/.*OU=\([A-Z0-9]*\).*/\1/p' | head -1)
-    if [[ -z "$team" ]]; then
-        echo "could not read a team identifier from {{IDENTITY}}." >&2
-        exit 1
-    fi
+    identity={{ quote(IDENTITY) }}
+    identity_info=$(python3 tools/release/signing_identity.py resolve "$identity")
+    IFS=$'\t' read -r fingerprint team <<< "$identity_info"
     python3 tools/release/project_contract.py -v
-    echo "signing as {{IDENTITY}} (team $team)"
+    echo "signing with exact certificate $fingerprint (team $team)"
     # Manual signing: a Mac app with no team-restricted entitlements needs no
     # provisioning profile, and automatic signing would insist on fetching one.
     xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Release \
         MARKDEV_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-        CODE_SIGN_IDENTITY="{{IDENTITY}}" \
+        CODE_SIGN_IDENTITY="$fingerprint" \
         DEVELOPMENT_TEAM="$team" \
         CODE_SIGN_STYLE=Manual \
         ENABLE_HARDENED_RUNTIME=YES \
+        {{ locked_package_flags }} \
         -skipPackagePluginValidation \
-        build
+        -derivedDataPath build/DerivedData/Release \
+        clean build
+    app=build/DerivedData/Release/Build/Products/Release/MarkDev.app
+    python3 tools/release/signing_identity.py verify "$app" "$fingerprint" "$team"
 
 # Copy a built Release into /Applications and make the system notice it.
 #
@@ -169,9 +175,10 @@ build-release-signed IDENTITY="Apple Development": build-core generate
 # by path, so a bundle that once had no icon keeps showing the placeholder
 # grid — which reads as "the icon is broken" — until the caches are dropped.
 #
-# `install` is the ad-hoc build: the app runs and claims .md, but its Quick
-# Look extension will not register. `install-signed` is the one that gets
-# Space-bar previews working.
+# `install` installs the ad-hoc build. `install-signed` installs a build with
+# the requested identity and hardened runtime. Neither signature choice is
+# treated as proof that Finder can use the extension; `install-only` requires
+# the registry to contain this exact installed bundle before it reports success.
 install: build-release install-only
 install-signed IDENTITY="Apple Development": (build-release-signed IDENTITY) install-only
 
@@ -179,55 +186,70 @@ install-only:
     #!/usr/bin/env zsh
     set -euo pipefail
     products=$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev \
-        -configuration Release -showBuildSettings 2>/dev/null \
+        -configuration Release {{ locked_package_flags }} -showBuildSettings 2>/dev/null \
+        -derivedDataPath build/DerivedData/Release \
         | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')
     app=$products/MarkDev.app
-    codesign --verify --deep --strict "$app"
-    # Replaced, not merged: ditto over an existing bundle leaves behind files
-    # the new build no longer ships.
-    rm -rf /Applications/MarkDev.app
-    ditto "$app" /Applications/MarkDev.app
-    lsregister=/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister
-    killall -9 iconservicesagent 2>/dev/null || true
-    $lsregister -f -R -trusted /Applications/MarkDev.app
-    killall Dock 2>/dev/null || true
-    echo "installed /Applications/MarkDev.app"
+    tools/release/install-app.sh "$app"
 
 test: test-core test-app
 
 test-app $TEST_FILTER="": build-core-debug generate
     python3 tools/release/project_contract.py -v
-    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -skipPackagePluginValidation test ${TEST_FILTER:+"-only-testing:$TEST_FILTER"}
+    xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug {{ locked_package_flags }} -skipPackagePluginValidation -derivedDataPath build/DerivedData/Debug test ${TEST_FILTER:+"-only-testing:$TEST_FILTER"}
 
 run: build
-    open "$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')/MarkDev.app"
+    open "$(xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug {{ locked_package_flags }} -derivedDataPath build/DerivedData/Debug -showBuildSettings 2>/dev/null | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')/MarkDev.app"
 
 # --- Quick Look ------------------------------------------------------------
 
-# Preview a file through the built extension. Requires `just run` at least
-# once so Launch Services has registered the .appex.
+# Ask the system Quick Look service to preview a file. Building MarkDev does
+# not prove which provider macOS will use, so first require at least one
+# existing extension whose bundle identifier is exactly MarkDev's. `qlmanage`
+# opens the system preview UI but cannot attribute the rendered preview to a
+# provider; `just preview-status` checks the /Applications registration.
 preview FILE: build
-    qlmanage -p {{FILE}}
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    target={{ quote(FILE) }}
+    bundle_id=dev.markdev.MarkDev.QuickLook
+    registrations=$(pluginkit -mAD -p com.apple.quicklook.preview \
+        -i "$bundle_id" -v 2>/dev/null || true)
+    found=0
+    while IFS= read -r appex; do
+        [[ -d "$appex" ]] || continue
+        actual_bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+            "$appex/Contents/Info.plist" 2>/dev/null || true)
+        if [[ "$actual_bundle_id" == "$bundle_id" ]]; then
+            echo "registered MarkDev Quick Look candidate: $appex"
+            found=1
+        fi
+    done < <(print -r -- "$registrations" | awk -F '\t' -v id="$bundle_id" '
+        {
+            candidate = $1
+            sub(/^[[:space:]]+/, "", candidate)
+            if (index(candidate, id "(") == 1) print $NF
+        }
+    ')
+    if (( ! found )); then
+        echo "no existing Quick Look extension with bundle identifier $bundle_id is registered" >&2
+        exit 1
+    fi
+    echo "qlmanage is opening the system preview; it does not report which provider rendered it."
+    qlmanage -p "$target"
 
-# What macOS thinks will handle Markdown previews right now.
+# Verify the registration for the installed MarkDev extension and show
+# the content types macOS assigns to representative filename extensions.
 #
 # `qlmanage -m plugins` lists only the *legacy* .qlgenerator plugins and never
-# mentions a modern .appex, so it reported "nothing registered" even for the
-# extension that was in fact serving previews. pluginkit is the register that
-# actually decides.
+# mentions a modern .appex. `pluginkit -mAD` is queried by exact bundle ID and
+# a record must resolve to the exact /Applications path; another
+# checkout or a competing Markdown extension is not accepted as success.
 preview-status:
     #!/usr/bin/env zsh
-    echo "Quick Look preview extensions claiming Markdown:"
-    pluginkit -mAD -p com.apple.quicklook.preview -v 2>/dev/null \
-        | grep -iE "markdev|markdown" || echo "  (none)"
-    echo
-    echo "Type resolution:"
-    for ext in md markdown mdx mkd; do
-        probe=$(mktemp -d)/probe.$ext
-        touch $probe
-        printf "  .%-9s %s\n" $ext "$(mdls -name kMDItemContentType -raw $probe)"
-        rm -rf $(dirname $probe)
-    done
+    set -euo pipefail
+    appex=/Applications/MarkDev.app/Contents/PlugIns/MarkDevQuickLook.appex
+    python3 tools/release/quicklook_registration.py check "$appex"
 
 # --- Release ---------------------------------------------------------------
 
@@ -246,8 +268,9 @@ release-stage $TAG:
 release-verify $TAG:
     python3 tools/release/release.py verify-assets "$TAG"
 
-# Retry missing uploads, but never replace an asset or mutate a public release.
-release-draft $TAG:
+# Retry missing uploads without replacing an asset. The command refuses a
+# release observed as published; publication must not race this remote workflow.
+release-draft $TAG: verify-github-cli
     python3 tools/release/release.py draft "$TAG"
 
 test-release:
@@ -257,25 +280,80 @@ test-release:
 
 clean:
     cd core && cargo clean
-    rm -rf MarkDev.xcodeproj build/ app/MarkDev/Assets.xcassets app/MarkDev/Resources ~/Library/Developer/Xcode/DerivedData/MarkDev-*
+    rm -rf build/ app/MarkDev/Assets.xcassets app/MarkDev/Resources
 
 check: test-release fmt-check lint-core test
 
 # Run full CI suite locally (matches GitHub Actions CI workflow)
-ci-core: test-release fmt-check lint-core test-core
-    cd core && cargo test --release --test performance
+ci-core: verify-core-toolchain test-release fmt-check lint-core test-core build-core
+    host_target=$(rustc -vV | awk -F': ' '/^host:/ {print $2}') && cd core && cargo test --locked --release --target "$host_target" --test performance
 
-verify-toolchain:
+verify-core-toolchain:
     #!/usr/bin/env zsh
     set -euo pipefail
-    version=$(xcodebuild -version)
-    if [[ "$version" != 'Xcode 26.'* ]]; then
-        echo "Xcode 26.x is required; selected toolchain reports: $version" >&2
+    expected_rust='rustc 1.98.0 (88d9e12ae 2026-08-18)'
+    expected_cargo='cargo 1.98.0 (797e8a9bc 2026-08-05)'
+    expected_just='just 1.58.0'
+    actual_rust=$(rustc --version)
+    actual_cargo=$(cargo --version)
+    actual_just=$(just --version)
+    [[ "$actual_rust" == "$expected_rust" ]] || {
+        echo "Rust toolchain mismatch: expected $expected_rust, got $actual_rust" >&2
+        exit 1
+    }
+    [[ "$actual_cargo" == "$expected_cargo" ]] || {
+        echo "Cargo toolchain mismatch: expected $expected_cargo, got $actual_cargo" >&2
+        exit 1
+    }
+    [[ "$actual_just" == "$expected_just" ]] || {
+        echo "just mismatch: expected $expected_just, got $actual_just" >&2
+        exit 1
+    }
+    installed_targets=$(rustup target list --installed)
+    for required_target in aarch64-apple-darwin x86_64-apple-darwin; do
+        if ! print -r -- "$installed_targets" | grep -Fxq "$required_target"; then
+            echo "missing Rust release target: $required_target" >&2
+            exit 1
+        fi
+    done
+    echo "$actual_rust"
+    echo "$actual_cargo"
+    echo "$actual_just"
+
+verify-github-cli:
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    expected='gh version 2.95.0 '
+    actual=$(gh --version | sed -n '1p')
+    if [[ "$actual" != "$expected"* ]]; then
+        echo "GitHub CLI mismatch: expected ${expected}..., got $actual" >&2
         exit 1
     fi
+    echo "$actual"
+
+verify-release-toolchain: verify-toolchain verify-github-cli
+
+verify-toolchain: verify-core-toolchain
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    expected_xcodegen='Version: 2.45.4'
+    actual_xcodegen=$(xcodegen --version)
+    if [[ "$actual_xcodegen" != "$expected_xcodegen" ]]; then
+        echo "XcodeGen mismatch: expected $expected_xcodegen, got $actual_xcodegen" >&2
+        exit 1
+    fi
+    version=$(xcodebuild -version)
+    expected_version=$'Xcode 26.6\nBuild version 17F113'
+    if [[ "$version" != "$expected_version" ]]; then
+        echo "Xcode toolchain mismatch; expected:" >&2
+        echo "$expected_version" >&2
+        echo "selected toolchain reports:" >&2
+        echo "$version" >&2
+        exit 1
+    fi
+    echo "$actual_xcodegen"
     echo "$version"
 
-ci-local: verify-toolchain ci-core test-app
+ci-local: verify-toolchain ci-core test-app build-release
 
 ci: ci-local
-

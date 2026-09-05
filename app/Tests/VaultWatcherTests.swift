@@ -19,13 +19,13 @@ import XCTest
 final class VaultWatcherTests: XCTestCase {
     private var directory: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevWatch-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -152,6 +152,23 @@ final class VaultWatcherTests: XCTestCase {
         // A second stop over an ended stream must not crash or resurrect.
         watcher.stop()
         XCTAssertNil(watcher.watchedRoot)
+    }
+
+    func testRemoteAuthorityCannotStartOrRegisterALocalWatch() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(directory.path)/"))
+        let watcher = VaultWatcher()
+        defer { watcher.stop() }
+
+        watcher.start(at: hostile)
+
+        XCTAssertNil(watcher.watchedRoot)
+        let coordinator = VaultWatchCoordinator.shared
+        let token = coordinator.subscribe(to: hostile) { _ in
+            XCTFail("a rejected watch must never deliver local events")
+        }
+        defer { coordinator.unsubscribe(token, root: hostile) }
+        XCTAssertEqual(coordinator.activeStreamCount(forTestingRoot: hostile), 0)
     }
 
     func testStartingTwiceMovesTheWatchRatherThanLeakingAStream() throws {

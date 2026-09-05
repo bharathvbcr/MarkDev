@@ -832,6 +832,18 @@ final class HarnessLocatorTests: XCTestCase {
         return file
     }
 
+    private func addEveryoneWriteACL(to url: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = ["+a", "everyone allow write", url.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationReason, .exit)
+        XCTAssertEqual(process.terminationStatus, 0)
+    }
+
     private func waitForFile(_ url: URL, timeout: Duration = .seconds(2)) async -> Bool {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
@@ -969,6 +981,111 @@ final class HarnessLocatorTests: XCTestCase {
 
         XCTAssertEqual(found.url.path, try physicalPath(of: first))
         XCTAssertTrue(HarnessLocator.isCurrent(found))
+    }
+
+    /// Executability is not authority. Another local account must not be able
+    /// to replace the bytes between discovery and launch through either the
+    /// executable itself or one of its containing directories.
+    func testDiscoveryRejectsGroupOrWorldWritableExecutableAndAncestor() throws {
+        let executable = try makeExecutable(named: "manvi")
+        let directory = executable.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o775], ofItemAtPath: executable.path)
+        XCTAssertNil(
+            HarnessLocator.locateSynchronously(configured: executable.path, environment: [:]))
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o777], ofItemAtPath: directory.path)
+        XCTAssertNil(
+            HarnessLocator.locateSynchronously(configured: executable.path, environment: [:]))
+    }
+
+    func testDiscoveryRejectsWritableExtendedACLsOnExecutableAndAncestor() throws {
+        let executable = try makeExecutable(named: "manvi")
+        let directory = executable.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try addEveryoneWriteACL(to: executable)
+        XCTAssertNil(
+            HarnessLocator.locateSynchronously(configured: executable.path, environment: [:]))
+
+        let replacement = directory.appendingPathComponent("trusted-manvi")
+        try "#!/bin/sh\nexit 0\n".write(to: replacement, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: replacement.path)
+        try addEveryoneWriteACL(to: directory)
+        XCTAssertNil(
+            HarnessLocator.locateSynchronously(configured: replacement.path, environment: [:]))
+    }
+
+    func testDiscoveryValidatesTheResolvedPhysicalAncestorChain() throws {
+        let target = try makeExecutable(named: "manvi")
+        let targetDirectory = target.deletingLastPathComponent()
+        let linkDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevHarnessSafeLink-\(UUID().uuidString)")
+        let link = linkDirectory.appendingPathComponent("manvi")
+        try FileManager.default.createDirectory(
+            at: linkDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        defer {
+            try? FileManager.default.removeItem(at: targetDirectory)
+            try? FileManager.default.removeItem(at: linkDirectory)
+        }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o777], ofItemAtPath: targetDirectory.path)
+
+        XCTAssertNil(
+            HarnessLocator.locateSynchronously(configured: link.path, environment: [:]),
+            "a safe-looking alias must not hide a writable physical ancestor")
+    }
+
+    func testMountTrustRequiresLocalNonremovablePermissionEnforcingStorage() {
+        let local = UInt32(MNT_LOCAL)
+        XCTAssertTrue(HarnessLocator.isTrustedFileSystem(flags: local))
+        XCTAssertFalse(HarnessLocator.isTrustedFileSystem(flags: 0), "network storage")
+        XCTAssertFalse(
+            HarnessLocator.isTrustedFileSystem(flags: local | UInt32(MNT_REMOVABLE)),
+            "removable storage")
+        XCTAssertFalse(
+            HarnessLocator.isTrustedFileSystem(flags: local | UInt32(MNT_IGNORE_OWNERSHIP)),
+            "ownership-blind storage")
+        XCTAssertFalse(
+            HarnessLocator.isTrustedFileSystem(flags: local | UInt32(MNT_NOEXEC)),
+            "a no-exec mount cannot be a launch authority")
+    }
+
+    func testDirectoryTrustAcceptsOnlyRootOrTheCurrentUserAsOwner() {
+        let current = Darwin.geteuid()
+        let safeMode = mode_t(S_IFDIR | 0o755)
+        let foreign = current == uid_t.max ? current - 1 : current + 1
+
+        XCTAssertTrue(
+            HarnessLocator.isTrustedDirectoryMetadata(
+                mode: safeMode, owner: 0, effectiveUser: current))
+        XCTAssertTrue(
+            HarnessLocator.isTrustedDirectoryMetadata(
+                mode: safeMode, owner: current, effectiveUser: current))
+        XCTAssertFalse(
+            HarnessLocator.isTrustedDirectoryMetadata(
+                mode: safeMode, owner: foreign, effectiveUser: current))
+        XCTAssertFalse(
+            HarnessLocator.isTrustedDirectoryMetadata(
+                mode: mode_t(S_IFDIR | 0o775), owner: current, effectiveUser: current))
+    }
+
+    func testDiscoveryAcceptsPrivateUserAndRootOwnedSystemExecutables() throws {
+        let executable = try makeExecutable(named: "manvi")
+        defer { try? FileManager.default.removeItem(at: executable.deletingLastPathComponent()) }
+
+        XCTAssertNotNil(
+            HarnessLocator.locateSynchronously(configured: executable.path, environment: [:]))
+        XCTAssertNotNil(
+            HarnessLocator.locateSynchronously(configured: "/bin/sh", environment: [:]))
     }
 
     func testLoginShellProbeDrainsFloodButRejectsOutputPastTheCap() async throws {
@@ -1309,6 +1426,29 @@ final class HarnessAssistantTests: XCTestCase {
         XCTAssertFalse(message.isEmpty)
     }
 
+    /// Discovery intentionally fails closed for an existing executable in an
+    /// unsafe tree as well as for a missing file. The UI must not turn that
+    /// combined result into the false claim that no executable exists.
+    func testConfiguredPathFailureDescribesBothMissingAndUntrustedFilesTruthfully() async {
+        let defaults = UserDefaults(
+            suiteName: "markdev.harness.untrusted-message.\(UUID().uuidString)")!
+        let settings = HarnessSettings(defaults: defaults)
+        settings.binaryPath = "/existing-but-untrusted/manvi"
+        let assistant = HarnessAssistant(settings: settings) { _ in nil }
+
+        assistant.refreshAvailability()
+        let finished = await waitUntil {
+            if case .missing = assistant.availability { return true }
+            return false
+        }
+        XCTAssertTrue(finished)
+        guard case .missing(let message) = assistant.availability else {
+            return XCTFail("the failed configured lookup must become a visible explanation")
+        }
+        XCTAssertFalse(message.contains("There is no executable"))
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("trusted local"))
+    }
+
     func testAvailabilityDiscoveryBindsEditingConsentToTheVisibleExecutable() async throws {
         let binary = try stub("cat >/dev/null; exit 0")
         defer { try? FileManager.default.removeItem(at: binary.deletingLastPathComponent()) }
@@ -1326,6 +1466,59 @@ final class HarnessAssistantTests: XCTestCase {
 
         XCTAssertTrue(assistant.settings.allowEditing)
         XCTAssertNil(assistant.settings.runBlocker)
+    }
+
+    func testTerminalStartupUsesTheVisibleExecutableWithoutGrantingEditingConsent() async throws {
+        let binary = try stub("exit 0")
+        defer { try? FileManager.default.removeItem(at: binary.deletingLastPathComponent()) }
+        let assistant = makeAssistant()
+        assistant.settings.authority = .editing
+        assistant.settings.binaryPath = binary.path
+        assistant.refreshAvailability()
+
+        let becameAvailable = await waitUntil { assistant.availability.isReady }
+        XCTAssertTrue(becameAvailable)
+        XCTAssertFalse(assistant.settings.allowEditing)
+
+        guard case .found(let visibleLocation) = assistant.availability else {
+            return XCTFail("the terminal action requires the executable currently shown as available")
+        }
+
+        let action = try assistant.terminalStartupAction()
+        XCTAssertEqual(action, .runExecutable(visibleLocation))
+        let environment = try action.launchEnvironment(base: [
+            "\(TerminalStartupAction.executableEnvironmentKey)=/tmp/poisoned"
+        ])
+
+        XCTAssertEqual(
+            environment,
+            [
+                TerminalStartupAction.executableEnvironmentKey + "="
+                    + visibleLocation.url.path
+            ])
+        XCTAssertFalse(assistant.settings.allowEditing)
+    }
+
+    func testTerminalStartupRevokesAReplacedExecutableBeforeReturningAnAction() async throws {
+        let binary = try stub("exit 0")
+        defer { try? FileManager.default.removeItem(at: binary.deletingLastPathComponent()) }
+        let assistant = makeAssistant()
+        assistant.settings.binaryPath = binary.path
+        assistant.refreshAvailability()
+        let becameAvailable = await waitUntil { assistant.availability.isReady }
+        XCTAssertTrue(becameAvailable)
+
+        try "#!/bin/sh\nexit 9\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: binary.path)
+
+        XCTAssertThrowsError(try assistant.terminalStartupAction()) { error in
+            XCTAssertEqual(
+                (error as? TerminalLaunchFailure)?.reason,
+                "The MANVI executable changed. Check it before opening a terminal.")
+        }
+        XCTAssertFalse(assistant.availability.isReady)
     }
 
     func testRapidBinaryChangesCancelAndBoundAvailabilityLookups() async {
@@ -1497,6 +1690,13 @@ final class HarnessAssistantTests: XCTestCase {
 
 // MARK: - Driving a real subprocess
 
+private actor HarnessWriterCompletionState {
+    private var finished = false
+
+    func markFinished() { finished = true }
+    func hasFinished() -> Bool { finished }
+}
+
 /// The part that talks to a process, tested against one.
 ///
 /// Not against `manvi` itself: a real turn is minutes on a local 27B and needs
@@ -1509,13 +1709,13 @@ final class HarnessAssistantTests: XCTestCase {
 final class HarnessRunProcessTests: XCTestCase {
     private var scratch: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         scratch = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevRun-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: scratch)
     }
 
@@ -1532,6 +1732,57 @@ final class HarnessRunProcessTests: XCTestCase {
         HarnessRunRequest(
             binary: binary, prompt: prompt, workingDirectory: scratch,
             maxSteps: 4, timeout: timeout, environment: ProcessInfo.processInfo.environment)
+    }
+
+    private func processID(in file: URL) throws -> pid_t {
+        let text = try String(contentsOf: file, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return try XCTUnwrap(pid_t(text))
+    }
+
+    private func waitForProcessToDisappear(
+        _ pid: pid_t,
+        timeout: Duration = .seconds(2)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            errno = 0
+            if Darwin.kill(pid, 0) == -1, errno == ESRCH { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        errno = 0
+        return Darwin.kill(pid, 0) == -1 && errno == ESRCH
+    }
+
+    func testProductionRunAuthorityIsRevalidatedAtProcessLaunch() async throws {
+        let binary = try stub("printf launched > marker; exit 0")
+        let location = try XCTUnwrap(
+            HarnessLocator.locateSynchronously(configured: binary.path, environment: [:]))
+        let request = HarnessRunRequest(
+            trustedBinary: location,
+            prompt: "safe prompt",
+            workingDirectory: scratch,
+            maxSteps: 4,
+            timeout: .seconds(2),
+            environment: ProcessInfo.processInfo.environment)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o777], ofItemAtPath: scratch.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: scratch.path)
+        }
+
+        let result = await HarnessRun.run(request) { _ in }
+
+        guard case .failed(let reason) = result.outcome else {
+            return XCTFail("an untrusted launch must fail, got \(result.outcome)")
+        }
+        XCTAssertEqual(reason, "The MANVI executable changed before the run could start.")
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: scratch.appendingPathComponent("marker").path))
+        XCTAssertFalse(reason.contains(binary.path))
     }
 
     func testAFinishedRunJoinsItsAnswerAndReportsItsEvents() async throws {
@@ -1569,6 +1820,37 @@ final class HarnessRunProcessTests: XCTestCase {
             """)
         let result = await HarnessRun.run(request(binary, prompt: "restructure this")) { _ in }
         XCTAssertEqual(result.answer, "restructure this")
+    }
+
+    func testCancellingAFullInputPipeReturnsWithoutWaitingForAReader() async throws {
+        let pipe = Pipe()
+        let completion = HarnessWriterCompletionState()
+        let writer = StdinWriter(handle: pipe.fileHandleForWriting)
+        let payload = Data(repeating: 0x61, count: HarnessRun.maximumInputBytes)
+        let task = Task.detached {
+            let accepted = writer.write(payload)
+            await completion.markFinished()
+            return accepted
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while clock.now < deadline, !(await completion.hasFinished()) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let returnedWhileReaderWasOpen = await completion.hasFinished()
+        XCTAssertTrue(
+            returnedWhileReaderWasOpen,
+            "cancellation must bound a full stdin pipe even when an inherited reader stays open")
+
+        // Failure cleanup also unblocks the old blocking implementation, so
+        // this regression cannot strand the test process after recording the
+        // assertion above.
+        try? pipe.fileHandleForReading.close()
+        let accepted = await task.value
+        XCTAssertFalse(accepted)
     }
 
     /// A JSON object is regularly delivered in two reads. A half-decoded line
@@ -1676,6 +1958,120 @@ final class HarnessRunProcessTests: XCTestCase {
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: marker.path),
             "the script ran to completion, so it was never actually stopped")
+    }
+
+    func testCancellationEscalatesAcrossATermIgnoringProcessGroup() async throws {
+        let leaderMarker = scratch.appendingPathComponent("leader-finished")
+        let childMarker = scratch.appendingPathComponent("child-finished")
+        let leaderPIDFile = scratch.appendingPathComponent("leader.pid")
+        let childPIDFile = scratch.appendingPathComponent("child.pid")
+        let binary = try stub(
+            """
+            echo $$ > '\(leaderPIDFile.path)'
+            (
+              trap '' TERM
+              sleep 5
+              touch '\(childMarker.path)'
+            ) &
+            child=$!
+            echo "$child" > '\(childPIDFile.path)'
+            echo '{"kind":"assistant.text","text":"working"}'
+            trap '' TERM
+            sleep 5
+            touch '\(leaderMarker.path)'
+            exit 0
+            """)
+
+        let started = expectation(description: "term-ignoring group started")
+        let task = Task { @MainActor in
+            await HarnessRun.run(request(binary, timeout: .seconds(30))) { event in
+                if event.kind == .text { started.fulfill() }
+            }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        let leaderPID = try processID(in: leaderPIDFile)
+        let childPID = try processID(in: childPIDFile)
+        let clock = ContinuousClock()
+        let cancelledAt = clock.now
+
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.outcome, .cancelled)
+        XCTAssertLessThan(
+            cancelledAt.duration(to: clock.now),
+            .seconds(4),
+            "SIGTERM refusal must escalate on a finite deadline")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaderMarker.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: childMarker.path))
+        let leaderDisappeared = await waitForProcessToDisappear(leaderPID)
+        let childDisappeared = await waitForProcessToDisappear(childPID)
+        XCTAssertTrue(leaderDisappeared, "the group leader must be reaped")
+        XCTAssertTrue(childDisappeared, "the owned descendant must be killed rather than orphaned")
+    }
+
+    func testBackstopRemainsTimedOutWhenTheChildHandlesTermAndExitsZero() async throws {
+        let binary = try stub(
+            """
+            trap 'exit 0' TERM
+            echo '{"kind":"assistant.text","text":"working"}'
+            sleep 5
+            exit 0
+            """)
+        let clock = ContinuousClock()
+        let began = clock.now
+
+        let result = await HarnessRun.run(
+            request(binary, timeout: .milliseconds(100)),
+            backstopGrace: .milliseconds(100)) { _ in }
+
+        XCTAssertEqual(result.outcome, .timedOut)
+        XCTAssertLessThan(
+            began.duration(to: clock.now),
+            .seconds(4),
+            "a cooperative TERM handler must not bypass the teardown deadline")
+    }
+
+    func testExitedLeaderCannotLeaveADescendantHoldingPipesForever() async throws {
+        let descendantMarker = scratch.appendingPathComponent("descendant-finished")
+        let leaderPIDFile = scratch.appendingPathComponent("leader.pid")
+        let descendantPIDFile = scratch.appendingPathComponent("descendant.pid")
+        let binary = try stub(
+            """
+            echo $$ > '\(leaderPIDFile.path)'
+            (
+              trap '' TERM
+              sleep 5
+              touch '\(descendantMarker.path)'
+            ) &
+            descendant=$!
+            echo "$descendant" > '\(descendantPIDFile.path)'
+            echo '{"kind":"assistant.text","text":"leader done"}'
+            exit 0
+            """)
+        let clock = ContinuousClock()
+        let began = clock.now
+
+        let result = await HarnessRun.run(
+            request(binary, timeout: .seconds(1)),
+            backstopGrace: .milliseconds(100)) { _ in }
+        let elapsed = began.duration(to: clock.now)
+        let leaderPID = try processID(in: leaderPIDFile)
+        let descendantPID = try processID(in: descendantPIDFile)
+
+        XCTAssertEqual(result.outcome, .finished)
+        XCTAssertEqual(result.answer, "leader done")
+        XCTAssertLessThan(
+            elapsed,
+            .seconds(3),
+            "pipe EOF inherited by an orphan must not become an unbounded await")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: descendantMarker.path))
+        let leaderDisappeared = await waitForProcessToDisappear(leaderPID)
+        let descendantDisappeared = await waitForProcessToDisappear(descendantPID)
+        XCTAssertTrue(leaderDisappeared, "the direct child must be reaped")
+        XCTAssertTrue(
+            descendantDisappeared,
+            "normal leader exit must still clean its owned process group")
     }
 
     func testAMissingBinaryIsReportedRatherThanCrashing() async {

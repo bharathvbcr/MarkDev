@@ -65,7 +65,7 @@ public final class DocumentSurface {
 
     public init() {}
 
-    deinit {
+    isolated deinit {
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
     }
 

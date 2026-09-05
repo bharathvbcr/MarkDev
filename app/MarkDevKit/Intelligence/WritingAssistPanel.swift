@@ -41,6 +41,7 @@ public struct WritingAssistPanel: View {
                 resultArea
                 finishedControls
             case .failed(let message):
+                if !assistant.output.isEmpty { resultArea }
                 notice(message, symbol: "exclamationmark.triangle")
                 retryControls
             }
@@ -168,19 +169,31 @@ public struct WritingAssistPanel: View {
     }
 
     private var finishedControls: some View {
-        HStack(spacing: GlassTheme.Spacing.tight) {
-            Button("Copy") { assistant.copyOutput() }
-            Spacer(minLength: GlassTheme.Spacing.tight)
-            Button("Insert Below") { assistant.insertBelow() }
-                .disabled(!assistant.canApply)
-            // A derived result — a summary, a list of key points — is never
-            // offered as a replacement. Swapping a section for its own summary
-            // deletes the section, and no one presses Summarize to do that.
-            if !assistant.resultIsDerived {
-                Button("Replace") { assistant.replaceSource() }
-                    .keyboardShortcut(.return)
-                    .buttonStyle(.borderedProminent)
+        VStack(alignment: .leading, spacing: GlassTheme.Spacing.tight) {
+            if assistant.partialResultNeedsConfirmation {
+                notice(
+                    "This result was stopped before it finished. Review it before using it.",
+                    symbol: "exclamationmark.triangle")
+                Button("Use Partial Result") { assistant.acceptPartialResult() }
+                    .controlSize(.small)
+            }
+            if let refusal = assistant.visibleApplicationRefusal {
+                notice(refusal, symbol: "exclamationmark.triangle")
+            }
+            HStack(spacing: GlassTheme.Spacing.tight) {
+                Button("Copy") { assistant.copyOutput() }
+                Spacer(minLength: GlassTheme.Spacing.tight)
+                Button("Insert Below") { assistant.insertBelow() }
                     .disabled(!assistant.canApply)
+                // A derived result — a summary, a list of key points — is never
+                // offered as a replacement. Swapping a section for its own summary
+                // deletes the section, and no one presses Summarize to do that.
+                if !assistant.resultIsDerived {
+                    Button("Replace") { assistant.replaceSource() }
+                        .keyboardShortcut(.return)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!assistant.canApply)
+                }
             }
         }
     }

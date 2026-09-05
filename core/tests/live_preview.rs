@@ -7,8 +7,12 @@
 
 use markdev::md::{
     model::{BlockKind, SpanKind, TableAlignment, TABLE_ALIGNMENT_BITS, TABLE_ALIGNMENT_MASK},
-    parse,
+    parse_checked, ParseResult,
 };
+
+fn parse(source: &str) -> ParseResult {
+    parse_checked(source).expect("test fixture must satisfy the parser contract")
+}
 
 /// Collapses every syntax marker, yielding what live preview shows when the
 /// caret is elsewhere.

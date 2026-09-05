@@ -7,6 +7,7 @@
 
 import AppKit
 import BeautifulMermaid
+import ImageIO
 import SwiftMath
 import UniformTypeIdentifiers
 
@@ -114,22 +115,46 @@ public struct RenderFailure: Error, Sendable, Equatable {
 public final class RichContentRenderer {
     public static let shared = RichContentRenderer()
 
+    /// An exact, hashable identity for one scalar that influences rendering.
+    ///
+    /// `CGFloat` is a `Double` on supported macOS targets. Storing its bit
+    /// pattern avoids the lossy integer buckets that used to make, for example,
+    /// 72.1pt and 72.9pt images share a cache entry even though they were drawn
+    /// at different sizes. Non-finite inputs are canonical because every render
+    /// path rejects or replaces them before drawing; negative zero is likewise
+    /// canonicalised to the zero actually used by arithmetic.
+    private enum ScalarKey: Hashable {
+        case absent
+        case invalid
+        case finite(UInt64)
+    }
+
     private struct Key: Hashable {
         let kind: String
         let source: String
-        let scale: Int
+        let scale: ScalarKey
         let dark: Bool
+        /// Descriptor-derived authority for a file-backed entry. Non-file
+        /// renders and request-only failures leave this nil.
+        var fileGeneration: BoundedRegularFileGeneration? = nil
+        /// Intrinsic and author-requested sizes can have the same request width
+        /// before the file is opened but different correct output sizes.
+        var explicitImageSize = false
+        /// Immutable decoder/admission authority from the requested filename.
+        /// The descriptor's canonical pathname can change during a rename and
+        /// must not let one format reuse another format's validated entry.
+        var imageFormat = ""
         /// How many bitmap pixels per point were asked for.
         ///
         /// Part of the key because it is not derivable from the others: the
         /// same diagram at the same width is a different bitmap at reading
         /// detail and at viewing detail, and without this the viewer would be
         /// served whichever of the two the editor had already cached.
-        var raster: Int = 0
+        var raster: ScalarKey = .absent
         /// The ink the content was drawn with, for the paths that take one.
         var tint: Int = 0
-        /// Display backing scale factor (e.g. 20 for 2.0x Retina, 10 for 1.0x standard).
-        var backingScale: Int = 20
+        /// Exact display backing scale used to choose the bitmap resolution.
+        var backingScale: ScalarKey = .absent
     }
 
     /// Packs a colour into a cache key.
@@ -150,6 +175,10 @@ public final class RichContentRenderer {
 
     private var cache: [Key: RenderedContent] = [:]
     private var failures: [Key: RenderFailure] = [:]
+    /// SwiftMath's package-global manager is mutable and nonisolated. Keep the
+    /// font cache owned by this renderer instead: the renderer is MainActor-
+    /// isolated, so every lookup and mutation has one enforced executor.
+    private let mathFontManager = MTFontManager()
     /// Where to find the bitmap already made for a vector that proved
     /// expensive to rasterise, by file.
     ///
@@ -159,8 +188,14 @@ public final class RichContentRenderer {
     /// the cache stays the only owner of a bitmap: if the entry has since been
     /// evicted the lookup simply misses, the picture is rasterised again, and
     /// it is measured again.
-    private var expensive: [String: Key] = [:]
-    private var expensiveOrder: [String] = []
+    private struct FileGenerationKey: Hashable {
+        let path: String
+        let generation: BoundedRegularFileGeneration
+        let format: String
+    }
+
+    private var expensive: [FileGenerationKey: Key] = [:]
+    private var expensiveOrder: [FileGenerationKey] = []
     private var order: [Key] = []
     private var failureOrder: [Key] = []
     /// Bounded: a long document full of diagrams should not pin every bitmap
@@ -183,15 +218,88 @@ public final class RichContentRenderer {
     /// allocate sixty megapixels to reach it.
     let pixelBudget: Int
 
-    /// What the cache is currently holding, in pixels.
+    /// Ceiling for the decoded output retained from one raster image.
+    ///
+    /// Kept at renderer level so tests can force real 8-, 16-, and 32-bit
+    /// images through the downsampling path without allocating a production-
+    /// sized fixture. Production construction always uses the 64 MB default.
+    let decodedRasterByteBudget: Int
+
+    /// Maximum UTF-8 bytes retained by success and failure cache keys.
+    ///
+    /// Entry counts alone are not a memory bound when a key owns authored
+    /// source. Math and diagram admission cap each individual key; this second
+    /// aggregate bound prevents 128 individually-valid sources from retaining
+    /// an arbitrarily large multiple of that cap.
+    let retainedSourceByteBudget: Int
+
+    private static let maxRetainedSourceBytes = 1 * 1_024 * 1_024
+    private(set) var retainedSourceBytes = 0
+
+    /// Opens the descriptor used for an image render. Kept as one injectable
+    /// boundary so race tests can deterministically model a pathname rename
+    /// between lookup and descriptor identity capture.
+    typealias ImageFileOpener = (_ url: URL, _ maximumBytes: Int) throws
+        -> BoundedRegularFileLease
+    private let imageFileOpener: ImageFileOpener
+
+    /// What the cache is currently holding, in four-byte pixel equivalents.
     private(set) var cachedPixels = 0
 
-    public init(
+    var cacheInventoryForTesting: (
+        successes: Int, failures: Int, expensive: Int, retainedSourceBytes: Int
+    ) {
+        (cache.count, failures.count, expensive.count, retainedSourceBytes)
+    }
+
+    public convenience init(
         pixelBudget: Int = 64_000_000,
-        expensiveRasterBudget: Duration = .milliseconds(250)
+        expensiveRasterBudget: Duration = .milliseconds(250),
+        retainedSourceByteBudget: Int = 1_048_576
+    ) {
+        self.init(
+            pixelBudget: pixelBudget,
+            expensiveRasterBudget: expensiveRasterBudget,
+            decodedRasterByteBudget: Self.maxDecodedRasterBytes,
+            retainedSourceByteBudget: retainedSourceByteBudget,
+            imageFileOpener: { url, maximumBytes in
+                try BoundedRegularFileReader.open(
+                    url,
+                    maximumBytes: maximumBytes,
+                    cancellationCheck: { false })
+            })
+    }
+
+    convenience init(
+        pixelBudget: Int = 64_000_000,
+        expensiveRasterBudget: Duration = .milliseconds(250),
+        decodedRasterByteBudget: Int
+    ) {
+        self.init(
+            pixelBudget: pixelBudget,
+            expensiveRasterBudget: expensiveRasterBudget,
+            decodedRasterByteBudget: decodedRasterByteBudget,
+            retainedSourceByteBudget: Self.maxRetainedSourceBytes,
+            imageFileOpener: { url, maximumBytes in
+                try BoundedRegularFileReader.open(
+                    url,
+                    maximumBytes: maximumBytes,
+                    cancellationCheck: { false })
+            })
+    }
+
+    init(
+        pixelBudget: Int = 64_000_000,
+        expensiveRasterBudget: Duration = .milliseconds(250),
+        decodedRasterByteBudget: Int = RichContentRenderer.maxDecodedRasterBytes,
+        retainedSourceByteBudget: Int = RichContentRenderer.maxRetainedSourceBytes,
+        imageFileOpener: @escaping ImageFileOpener
     ) {
         self.pixelBudget = pixelBudget
         self.expensiveRasterBudget = expensiveRasterBudget
+        self.decodedRasterByteBudget = decodedRasterByteBudget
+        self.retainedSourceByteBudget = max(0, retainedSourceByteBudget)
+        self.imageFileOpener = imageFileOpener
     }
 
     /// Discards everything, for a theme or appearance change.
@@ -203,17 +311,15 @@ public final class RichContentRenderer {
         expensive.removeAll()
         expensiveOrder.removeAll()
         cachedPixels = 0
+        retainedSourceBytes = 0
     }
 
-    /// Buckets a measurement for the cache key.
-    ///
-    /// `Int(_:)` traps on a NaN and on anything past `Int.max`, and every entry
-    /// point here derives its key from a caller-supplied `CGFloat` *before* it
-    /// validates anything. This is a public surface: a nonsense number has to
-    /// come back as a render failure the caller can show, never as a crash.
-    private static func bucket(_ value: CGFloat) -> Int {
-        guard value.isFinite else { return 0 }
-        return Int(min(max(value, -1_000_000), 1_000_000))
+    /// Canonicalises a scalar before it enters a cache key.
+    private static func scalarKey(_ value: CGFloat?) -> ScalarKey {
+        guard let value else { return .absent }
+        guard value.isFinite else { return .invalid }
+        let canonical = value == 0 ? 0.0 : Double(value)
+        return .finite(canonical.bitPattern)
     }
 
     /// Whether a caller-supplied dimension can be drawn at all.
@@ -272,32 +378,71 @@ public final class RichContentRenderer {
     /// walk past what the reader has already scrolled through, which is most
     /// of a warm on a document that has been open for a while.
     public func isCached(_ request: RenderRequest) -> Bool {
-        let key = key(for: request)
+        if case .image = request.block.kind {
+            return isImageCached(request)
+        }
+        guard let key = key(for: request) else { return false }
+        return cache[key] != nil || failures[key] != nil
+    }
+
+    private func isImageCached(_ request: RenderRequest) -> Bool {
+        let url = resolve(request.block.source, relativeTo: request.directory)
+        let asked = Self.sanitised(Self.requestedWidth(for: request))
+        let bounded = Self.boundedWidth(request.context.width, asked)
+        let requestKey = key(
+            forImage: url?.path ?? request.block.source,
+            width: bounded,
+            explicit: asked != nil,
+            format: url.map(Self.imageFormatAuthority) ?? "")
+        guard Self.isDrawable(bounded), let url else {
+            return cache[requestKey] != nil || failures[requestKey] != nil
+        }
+
+        let scalable = Self.isScalable(url)
+        let maximumBytes = scalable ? Self.maxVectorBytes : Self.maxRasterBytes
+        guard let lease = try? imageFileOpener(url, maximumBytes)
+        else { return false }
+        let key = key(
+            forImage: lease.canonicalURL.path,
+            width: bounded,
+            explicit: asked != nil,
+            format: Self.imageFormatAuthority(url),
+            generation: lease.generation)
         return cache[key] != nil || failures[key] != nil
     }
 
     /// The cache key `request` would be answered from.
-    private func key(for request: RenderRequest) -> Key {
+    private func key(for request: RenderRequest) -> Key? {
         switch request.block.kind {
         case .math:
+            guard Self.sourceFits(request.block.source, byteLimit: Self.maxMathBytes)
+            else { return nil }
             return key(
-                forMath: request.block.source, fontSize: request.context.mathFontSize,
+                forCanonicalMath: Self.canonicalMathSource(request.block.source),
+                fontSize: request.context.mathFontSize,
                 color: request.context.textColor, display: true,
                 maxWidth: request.context.width, scale: request.context.scale)
         case .diagram:
+            guard Self.sourceFits(request.block.source, byteLimit: Self.maxDiagramBytes)
+            else { return nil }
             return key(
                 forDiagram: request.block.source, maxWidth: request.context.width,
                 dark: request.context.dark, scale: request.context.scale)
         case .image:
+            let requested = Self.sanitised(Self.requestedWidth(for: request))
             return key(
                 forImage: resolve(request.block.source, relativeTo: request.directory)?.path
                     ?? request.block.source,
                 width: Self.boundedWidth(
-                    request.context.width, Self.requestedWidth(for: request)))
+                    request.context.width, requested),
+                explicit: requested != nil,
+                format: resolve(request.block.source, relativeTo: request.directory)
+                    .map(Self.imageFormatAuthority) ?? "")
         case .htmlFlow:
-            return Key(kind: "htmlFlow", source: request.block.source, scale: 0, dark: false)
+            return Key(
+                kind: "htmlFlow", source: request.block.source, scale: .absent, dark: false)
         case .htmlComment:
-            return Key(kind: "htmlComment", source: "", scale: 0, dark: false)
+            return Key(kind: "htmlComment", source: "", scale: .absent, dark: false)
         }
     }
 
@@ -306,7 +451,7 @@ public final class RichContentRenderer {
     // probe comes to disagree with the store it is probing.
 
     private func key(
-        forMath latex: String, fontSize: CGFloat, color: NSColor, display: Bool,
+        forCanonicalMath source: String, fontSize: CGFloat, color: NSColor, display: Bool,
         maxWidth: CGFloat?, scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Key {
         // The column is part of the key for the same reason it is for a
@@ -324,21 +469,21 @@ public final class RichContentRenderer {
         // beside the entry `render(_:)` had just stored.
         Key(
             kind: display ? "math.display" : "math.inline",
-            source: Self.canonicalMathSource(latex),
-            scale: Self.bucket(fontSize * 10),
+            source: source,
+            scale: Self.scalarKey(fontSize),
             dark: false,
-            raster: Self.bucket(Self.sanitised(maxWidth) ?? 0),
+            raster: Self.scalarKey(Self.sanitised(maxWidth)),
             tint: Self.tint(of: color),
-            backingScale: Self.bucket(scale * 10))
+            backingScale: Self.scalarKey(Self.canonicalRasterScale(scale)))
     }
 
     private func key(
         forDiagram source: String, maxWidth: CGFloat, dark: Bool, scale: CGFloat
     ) -> Key {
         Key(
-            kind: "mermaid", source: source, scale: Self.bucket(maxWidth), dark: dark,
-            raster: Self.bucket(scale * 10),
-            backingScale: Self.bucket(scale * 10))
+            kind: "mermaid", source: source, scale: Self.scalarKey(maxWidth), dark: dark,
+            raster: Self.scalarKey(Self.canonicalRasterScale(scale)),
+            backingScale: Self.scalarKey(Self.canonicalRasterScale(scale)))
     }
 
     /// - Parameter width: the drawn width from ``boundedWidth(_:_:)``, not the
@@ -346,8 +491,25 @@ public final class RichContentRenderer {
     ///   two different pictures of one file, and in the same column — and a
     ///   vector opened in the viewer is a third, which is what makes this the
     ///   whole of what distinguishes two requests for one file.
-    private func key(forImage file: String, width: CGFloat) -> Key {
-        Key(kind: "image", source: file, scale: Self.bucket(width), dark: false)
+    private func key(
+        forImage file: String,
+        width: CGFloat,
+        explicit: Bool,
+        format: String,
+        generation: BoundedRegularFileGeneration? = nil
+    ) -> Key {
+        Key(
+            kind: "image",
+            source: file,
+            scale: Self.scalarKey(width),
+            dark: false,
+            fileGeneration: generation,
+            explicitImageSize: explicit,
+            imageFormat: format)
+    }
+
+    private static func imageFormatAuthority(_ url: URL) -> String {
+        url.pathExtension.lowercased()
     }
 
     /// The width an image is drawn at, decided before its file is opened.
@@ -383,6 +545,17 @@ public final class RichContentRenderer {
     /// wide — wider than any column, where it was previously clipped at the
     /// view edge anyway. Refusing names the problem; clipping hid it.
     private static let maxMathBytes = 8_192
+
+    /// Tests whether a string fits without traversing past the admitted UTF-8
+    /// prefix. This ordering matters for attacker-sized inputs: counting the
+    /// whole string before refusing it would make the guard itself unbounded.
+    private static func sourceFits(_ source: String, byteLimit: Int) -> Bool {
+        let bytes = source.utf8
+        return bytes.index(
+            bytes.startIndex,
+            offsetBy: byteLimit + 1,
+            limitedBy: bytes.endIndex) == nil
+    }
 
     /// The deepest brace nesting a formula may reach.
     ///
@@ -549,10 +722,20 @@ public final class RichContentRenderer {
         maxWidth: CGFloat? = nil,
         scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Result<RenderedContent, RenderFailure> {
+        // Admission must precede canonicalisation and key construction. Both
+        // retain or allocate proportional to source size, which is precisely
+        // the work this boundary exists to refuse.
+        guard Self.sourceFits(latex, byteLimit: Self.maxMathBytes) else {
+            return .failure(
+                RenderFailure(reason: "Formula too long (limit 8.0 KB)"))
+        }
         let normalised = Self.canonicalMathSource(latex)
         let column = Self.sanitised(maxWidth)
         let key = key(
-            forMath: latex, fontSize: fontSize, color: color, display: display,
+            forCanonicalMath: normalised,
+            fontSize: fontSize,
+            color: color,
+            display: display,
             maxWidth: maxWidth, scale: scale)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
@@ -566,16 +749,9 @@ public final class RichContentRenderer {
             return .failure(failure)
         }
 
-        // Both structural bounds are checked before SwiftMath sees the source:
-        // the parse is where the runaway cost lives, so refusing after it
-        // would be paying for the thing being refused.
-        guard latex.utf8.count <= Self.maxMathBytes else {
-            let kilobytes = Double(latex.utf8.count) / 1_024
-            let failure = RenderFailure(
-                reason: String(format: "Formula too long (%.1f KB)", kilobytes))
-            store(failure, for: key)
-            return .failure(failure)
-        }
+        // The remaining structural bound is checked before SwiftMath sees the
+        // source: the parse is where the runaway cost lives, so refusing after
+        // it would be paying for the thing being refused.
         let depth = Self.nestingDepth(of: normalised)
         guard depth <= Self.maxMathDepth else {
             let failure = RenderFailure(reason: "Formula too deeply nested")
@@ -587,7 +763,9 @@ public final class RichContentRenderer {
         // SwiftMath's default. That default resolves through `Bundle.module`,
         // which finds nothing when the package is linked into a framework —
         // and a nil font silently typesets to zero size instead of failing.
-        guard let font = MTFontManager.manager.latinModernFont(withSize: fontSize) else {
+        guard let font = mathFontManager.font(
+            withName: "latinmodern-math", size: fontSize)
+        else {
             let failure = RenderFailure(reason: "Math font unavailable")
             store(failure, for: key)
             return .failure(failure)
@@ -680,9 +858,10 @@ public final class RichContentRenderer {
         guard size.width.isFinite, size.height.isFinite, size.width >= 1, size.height >= 1 else {
             return nil
         }
-        let scale = fittedScale(requestedScale, for: size)
-        let pixelWidth = max(1, Int((size.width * scale).rounded()))
-        let pixelHeight = max(1, Int((size.height * scale).rounded()))
+        guard let pixels = fittedPixelDimensions(for: size, scale: requestedScale)
+        else { return nil }
+        let pixelWidth = pixels.width
+        let pixelHeight = pixels.height
         guard
             let rep = NSBitmapImageRep(
                 bitmapDataPlanes: nil, pixelsWide: pixelWidth, pixelsHigh: pixelHeight,
@@ -703,6 +882,14 @@ public final class RichContentRenderer {
 
     // MARK: - Diagrams
 
+    /// Maximum Mermaid source admitted to synchronous parsing and layout.
+    ///
+    /// Unlike the prefetcher's smaller opportunistic bound, this protects the
+    /// on-demand path itself. BeautifulMermaid parses and lays out on the main
+    /// actor with no cancellation seam; bounding its input is the only reliable
+    /// pre-layout work bound available here.
+    private static let maxDiagramBytes = 64 * 1_024
+
     /// Renders a Mermaid diagram.
     ///
     /// Unsupported diagram types come back as a failure carrying the reason,
@@ -719,6 +906,10 @@ public final class RichContentRenderer {
         dark: Bool,
         scale: CGFloat = RichContentRenderer.rasterScale
     ) -> Result<RenderedContent, RenderFailure> {
+        guard Self.sourceFits(source, byteLimit: Self.maxDiagramBytes) else {
+            return .failure(
+                RenderFailure(reason: "Diagram too long (limit 64.0 KB)"))
+        }
         let key = key(forDiagram: source, maxWidth: maxWidth, dark: dark, scale: scale)
         if let cached = cache[key] { return .success(cached) }
         if let failed = failures[key] { return .failure(failed) }
@@ -771,6 +962,16 @@ public final class RichContentRenderer {
     /// will be drawn at costs nothing in quality and bounds the allocation.
     private static let maxRasterPixels: CGFloat = 16_000_000
 
+    /// Highest useful caller-selected density. Production callers use 1–4x;
+    /// 8x leaves headroom for export while preventing a hostile finite scale
+    /// from forcing every small render up to the full 16-megapixel ceiling.
+    private static let maximumRasterScale: CGFloat = 8
+
+    /// Decoded raster storage is bounded as well as pixel count. A high-depth
+    /// decoder result can consume more than four bytes per pixel, and row
+    /// padding means `width * height` alone is not a memory bound.
+    private static let maxDecodedRasterBytes = 64_000_000
+
     /// The pixels-per-point a picture `size` points across can be rasterised
     /// at without passing ``maxRasterPixels``.
     ///
@@ -779,13 +980,54 @@ public final class RichContentRenderer {
     /// rasterise whatever their layout happens to measure. A nonsense scale
     /// falls back to ``rasterScale`` rather than failing — it reaches this
     /// from a caller-supplied number, and a picture is owed to the reader.
+    private static func canonicalRasterScale(_ requested: CGFloat) -> CGFloat {
+        guard requested.isFinite, requested >= 1 else { return rasterScale }
+        // Canonically clamp both rendering and key identity at this ceiling.
+        return min(requested, maximumRasterScale)
+    }
+
     private static func fittedScale(_ requested: CGFloat, for size: CGSize) -> CGFloat {
-        var scale = requested.isFinite && requested >= 1 ? requested : rasterScale
-        let pixels = size.width * scale * size.height * scale
-        if pixels > maxRasterPixels {
-            scale *= (maxRasterPixels / pixels).squareRoot()
+        guard size.width.isFinite, size.height.isFinite,
+            size.width > 0, size.height > 0
+        else { return 0 }
+
+        let requested = canonicalRasterScale(requested)
+        // Divide before multiplying: hostile but finite dimensions or scales
+        // must not overflow to infinity and turn the correction into NaN.
+        let areaLimit = ((maxRasterPixels / size.width) / size.height).squareRoot()
+        let dimensionLimit = maxRasterPixels / max(size.width, size.height)
+        let fitted = min(requested, min(areaLimit, dimensionLimit))
+        return fitted.isFinite && fitted > 0 ? fitted : 0
+    }
+
+    /// Converts fitted point geometry to safe integer bitmap dimensions.
+    /// Rounding may put a mathematically capped area a few pixels over its
+    /// ceiling, so the larger side is tightened once using integer arithmetic.
+    private static func fittedPixelDimensions(
+        for size: CGSize,
+        scale requested: CGFloat
+    ) -> (width: Int, height: Int)? {
+        let scale = fittedScale(requested, for: size)
+        let rawWidth = (size.width * scale).rounded()
+        let rawHeight = (size.height * scale).rounded()
+        guard rawWidth.isFinite, rawHeight.isFinite,
+            rawWidth >= 0, rawHeight >= 0,
+            rawWidth <= maxRasterPixels + 1,
+            rawHeight <= maxRasterPixels + 1
+        else { return nil }
+
+        var width = max(1, Int(max(0, rawWidth)))
+        var height = max(1, Int(max(0, rawHeight)))
+        let limit = Int(maxRasterPixels)
+        let (area, overflow) = width.multipliedReportingOverflow(by: height)
+        if overflow || area > limit {
+            if width >= height {
+                width = max(1, limit / height)
+            } else {
+                height = max(1, limit / width)
+            }
         }
-        return scale
+        return (width, height)
     }
 
     /// Draws a laid-out diagram into a bitmap, the right way up.
@@ -826,14 +1068,17 @@ public final class RichContentRenderer {
 
         // Wide graphs are scaled down rather than clipped: a diagram cut off
         // at the column edge is worse than a smaller readable one.
-        let columnFit = min(1, maxWidth / bounds.width)
+        let columnFit = min(
+            1,
+            min(
+                maxWidth / bounds.width,
+                Self.maxDrawnLength / max(bounds.width, bounds.height)))
         let size = CGSize(width: bounds.width * columnFit, height: bounds.height * columnFit)
 
-        let scale = Self.fittedScale(requested, for: size)
-
-        let pixelWidth = Int((size.width * scale).rounded())
-        let pixelHeight = Int((size.height * scale).rounded())
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        guard let pixels = Self.fittedPixelDimensions(for: size, scale: requested)
+        else { return nil }
+        let pixelWidth = pixels.width
+        let pixelHeight = pixels.height
 
         guard let context = CGContext(
             data: nil, width: pixelWidth, height: pixelHeight,
@@ -1017,31 +1262,99 @@ public final class RichContentRenderer {
         let url = resolve(source, relativeTo: base)
         let asked = Self.sanitised(requested)
         let bounded = Self.boundedWidth(maxWidth, asked)
-        let key = key(forImage: url?.path ?? source, width: bounded)
-        if let cached = cache[key] { return .success(cached) }
-        if let failed = failures[key] { return .failure(failed) }
+        let requestKey = key(
+            forImage: url?.path ?? source,
+            width: bounded,
+            explicit: asked != nil,
+            format: url.map(Self.imageFormatAuthority) ?? "")
 
         guard Self.isDrawable(bounded) else {
             let failure = RenderFailure(reason: "No room to draw an image")
-            store(failure, for: key)
+            store(failure, for: requestKey)
             return .failure(failure)
         }
         guard let url else {
             let failure = RenderFailure(reason: "Remote images are not loaded")
+            store(failure, for: requestKey)
+            return .failure(failure)
+        }
+
+        // The requested extension is the immutable format authority for this
+        // operation. A retained descriptor can acquire a different F_GETPATH
+        // spelling during a rename; that spelling identifies the generation,
+        // but must never switch byte limits or decoder branches mid-request.
+        let scalable = Self.isScalable(url)
+        let format = Self.imageFormatAuthority(url)
+        let maximumBytes = scalable ? Self.maxVectorBytes : Self.maxRasterBytes
+        let lease: BoundedRegularFileLease
+        do {
+            lease = try imageFileOpener(url, maximumBytes)
+        } catch let error as BoundedRegularFileReadError {
+            // Path/open failures are transient and have no file generation to
+            // bind to. Caching one would hide a file created or replaced later.
+            return .failure(
+                Self.describeReadFailure(
+                    error,
+                    filename: url.lastPathComponent,
+                    vector: scalable))
+        } catch {
+            return .failure(
+                RenderFailure(reason: "Could not read image: \(url.lastPathComponent)"))
+        }
+
+        let openedKey = key(
+            forImage: lease.canonicalURL.path,
+            width: bounded,
+            explicit: asked != nil,
+            format: format,
+            generation: lease.generation)
+        if let cached = cache[openedKey] { return .success(cached) }
+        if let failed = failures[openedKey] { return .failure(failed) }
+
+        let snapshot: BoundedRegularFileSnapshot
+        do {
+            snapshot = try lease.read(cancellationCheck: { false })
+        } catch let error as BoundedRegularFileReadError {
+            // A changed descriptor is likewise transient. Its original
+            // generation must not acquire a stable failure for a torn read.
+            return .failure(
+                Self.describeReadFailure(
+                    error,
+                    filename: url.lastPathComponent,
+                    vector: scalable))
+        } catch {
+            return .failure(
+                RenderFailure(reason: "Could not read image: \(url.lastPathComponent)"))
+        }
+
+        let key = key(
+            forImage: snapshot.canonicalURL.path,
+            width: bounded,
+            explicit: asked != nil,
+            format: format,
+            generation: snapshot.generation)
+        if key != openedKey {
+            if let cached = cache[key] { return .success(cached) }
+            if let failed = failures[key] { return .failure(failed) }
+        }
+
+        guard Self.detectedType(in: snapshot.data, matches: url) else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
             store(failure, for: key)
             return .failure(failure)
         }
 
-        let scalable = Self.isScalable(url)
-        // Weighed before it is opened, because opening it is already most of
-        // the cost. See ``maxVectorBytes``.
-        if scalable, let oversized = Self.tooLargeToDraw(url) {
-            store(oversized, for: key)
-            return .failure(oversized)
+        if !scalable {
+            return raster(
+                snapshot.data,
+                from: snapshot.canonicalURL,
+                boundedWidth: bounded,
+                requestedWidth: asked,
+                key: key)
         }
 
-        guard let image = NSImage(contentsOf: url) else {
-            let failure = RenderFailure(reason: "Missing image: \(url.lastPathComponent)")
+        guard let image = NSImage(data: snapshot.data) else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
             store(failure, for: key)
             return .failure(failure)
         }
@@ -1064,12 +1377,295 @@ public final class RichContentRenderer {
         let size = Self.drawable(
             CGSize(width: drawnWidth, height: natural.height * (drawnWidth / natural.width)))
 
-        guard scalable else {
-            let rendered = RenderedContent(image: image, size: size)
-            store(rendered, for: key)
-            return .success(rendered)
+        return vector(
+            image,
+            at: size,
+            from: FileGenerationKey(
+                path: snapshot.canonicalURL.path,
+                generation: snapshot.generation,
+                format: format),
+            for: key)
+    }
+
+    /// Requests the first raster frame only after its declared output cost has
+    /// been admitted. Creating an `NSImage` first is too late: several formats
+    /// defer decoding until size or CGImage access, and either access can retain
+    /// a decompressed bitmap before a caller sees its bounds. This bounds the
+    /// requested and retained decoded output; ImageIO's internal scratch space
+    /// and the process's peak RSS remain an operating-system decoder boundary.
+    private func raster(
+        _ data: Data,
+        from url: URL,
+        boundedWidth: CGFloat,
+        requestedWidth: CGFloat?,
+        key: Key
+    ) -> Result<RenderedContent, RenderFailure> {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions),
+            CGImageSourceGetCount(source) > 0,
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, sourceOptions)
+                as? [CFString: Any],
+            let declaredWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.int64Value,
+            let declaredHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.int64Value,
+            declaredWidth > 0,
+            declaredHeight > 0
+        else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
         }
-        return vector(image, at: size, from: url.path, for: key)
+
+        guard let thumbnailMaximum = Self.rasterThumbnailMaximumDimension(
+            pixelWidth: declaredWidth,
+            pixelHeight: declaredHeight,
+            depth: (properties[kCGImagePropertyDepth] as? NSNumber)?.int64Value,
+            colorModel: properties[kCGImagePropertyColorModel] as? String,
+            hasAlpha: (properties[kCGImagePropertyHasAlpha] as? NSNumber)?.boolValue ?? true,
+            indexed: (properties[kCGImagePropertyIsIndexed] as? NSNumber)?.boolValue ?? false,
+            storageByteLimit: Int64(decodedRasterByteBudget))
+        else {
+            let failure = RenderFailure(
+                reason: "Image is too large to draw: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+
+        // Asking ImageIO for a transformed thumbnail at the source's admitted
+        // maximum dimension applies EXIF orientation while retaining all detail
+        // allowed by the decoded-output budget. `ShouldCacheImmediately` makes
+        // the returned CGImage own its realized pixels here; the independent
+        // postcheck below refuses any output whose actual stride exceeds the
+        // budget. Neither option claims to cap ImageIO's transient scratch or
+        // the process's peak RSS while the system decoder is running.
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: thumbnailMaximum,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceShouldAllowFloat: false,
+            kCGImageSourceDecodeRequest: kCGImageSourceDecodeToSDR,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            thumbnailOptions as CFDictionary)
+        else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+
+        let declaredOrientation =
+            (properties[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        let orientation = (1...8).contains(declaredOrientation) ? declaredOrientation : 1
+        guard Self.rasterBufferIsAdmitted(
+            width: image.width,
+            height: image.height,
+            bytesPerRow: image.bytesPerRow,
+            maximumDimension: thumbnailMaximum,
+            storageByteLimit: decodedRasterByteBudget)
+        else {
+            let failure = RenderFailure(
+                reason: "Image is too large to draw: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+
+        let natural = Self.rasterPointSize(
+            pixelWidth: Int(declaredWidth),
+            pixelHeight: Int(declaredHeight),
+            dpiWidth: (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue,
+            dpiHeight: (properties[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue,
+            orientation: orientation,
+            decodedWidth: image.width,
+            decodedHeight: image.height)
+        guard natural.width.isFinite,
+            natural.height.isFinite,
+            natural.width > 0,
+            natural.height > 0
+        else {
+            let failure = RenderFailure(reason: "Unreadable image: \(url.lastPathComponent)")
+            store(failure, for: key)
+            return .failure(failure)
+        }
+        let drawnWidth = requestedWidth == nil ? min(natural.width, boundedWidth) : boundedWidth
+        let size = Self.drawable(
+            CGSize(
+                width: drawnWidth,
+                height: natural.height * (drawnWidth / natural.width)))
+        let rendered = RenderedContent(cgImage: image, size: size)
+        store(rendered, for: key)
+        return .success(rendered)
+    }
+
+    /// Returns the greatest square thumbnail dimension admitted by both the
+    /// pixel and decoded-row-storage budgets. Factoring this policy keeps its
+    /// overflow, metadata, alignment, and maximality contracts independently
+    /// testable without asking ImageIO to allocate an enormous fixture.
+    static func rasterThumbnailMaximumDimension(
+        pixelWidth: Int64,
+        pixelHeight: Int64,
+        depth: Int64?,
+        colorModel: String?,
+        hasAlpha: Bool,
+        indexed: Bool,
+        storageByteLimit: Int64 = Int64(maxDecodedRasterBytes),
+        rasterPixelLimit: Int64 = Int64(maxRasterPixels),
+        rowAlignment: Int64 = 4_096
+    ) -> Int? {
+        let (declaredPixels, overflow) = pixelWidth.multipliedReportingOverflow(
+            by: pixelHeight)
+        guard pixelWidth > 0,
+            pixelHeight > 0,
+            let depth,
+            (1...32).contains(depth),
+            let colorModel,
+            storageByteLimit > 0,
+            rasterPixelLimit > 0,
+            rowAlignment > 0,
+            !overflow,
+            declaredPixels <= rasterPixelLimit
+        else { return nil }
+
+        let sourceComponents: Int64
+        if colorModel == (kCGImagePropertyColorModelGray as String) {
+            sourceComponents = 1
+        } else if colorModel == (kCGImagePropertyColorModelRGB as String)
+            || colorModel == (kCGImagePropertyColorModelLab as String)
+        {
+            sourceComponents = 3
+        } else if colorModel == (kCGImagePropertyColorModelCMYK as String) {
+            sourceComponents = 4
+        } else {
+            return nil
+        }
+
+        // Indexed and low-component sources commonly expand to an RGBA
+        // destination. CMYK with alpha can require five components. Use the
+        // larger representation to cap the output requested from ImageIO, then
+        // verify the realized CGImage's actual row stride after decoding.
+        let decodedComponents = max(
+            4,
+            indexed ? 4 : sourceComponents + (hasAlpha ? 1 : 0))
+        let componentBytes = (max(depth, 8) + 7) / 8
+        let (bytesPerPixel, bytesPerPixelOverflow) = decodedComponents
+            .multipliedReportingOverflow(by: componentBytes)
+        guard !bytesPerPixelOverflow else { return nil }
+
+        func admitted(_ dimension: Int64) -> Bool {
+            let (squarePixels, squareOverflow) = dimension.multipliedReportingOverflow(
+                by: dimension)
+            let (rowBytes, rowOverflow) = dimension.multipliedReportingOverflow(
+                by: bytesPerPixel)
+            let (paddedRow, paddingOverflow) = rowBytes.addingReportingOverflow(
+                rowAlignment - 1)
+            guard !squareOverflow,
+                squarePixels <= rasterPixelLimit,
+                !rowOverflow,
+                !paddingOverflow
+            else { return false }
+            let alignedUnits = paddedRow / rowAlignment
+            let (alignedRowBytes, alignmentOverflow) = alignedUnits
+                .multipliedReportingOverflow(by: rowAlignment)
+            let (storageBytes, storageOverflow) = alignedRowBytes
+                .multipliedReportingOverflow(by: dimension)
+            return !alignmentOverflow
+                && !storageOverflow
+                && storageBytes <= storageByteLimit
+        }
+
+        // Binary search keeps the arithmetic bounded even when hostile
+        // metadata supplies dimensions near Int64.max.
+        var lower: Int64 = 1
+        var upper = min(max(pixelWidth, pixelHeight), rasterPixelLimit)
+        var result: Int64 = 0
+        while lower <= upper {
+            let middle = lower + (upper - lower) / 2
+            if admitted(middle) {
+                result = middle
+                lower = middle + 1
+            } else {
+                upper = middle - 1
+            }
+        }
+        guard result > 0, result <= Int64(Int.max) else { return nil }
+        return Int(result)
+    }
+
+    /// Verifies the decoder's realized storage independently of its declared
+    /// metadata. ImageIO remains a trust boundary: dimensions, row stride, and
+    /// both products must all stay inside the pre-established ceilings.
+    static func rasterBufferIsAdmitted(
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        maximumDimension: Int,
+        rasterPixelLimit: Int = Int(maxRasterPixels),
+        storageByteLimit: Int = maxDecodedRasterBytes
+    ) -> Bool {
+        guard width > 0,
+            height > 0,
+            bytesPerRow > 0,
+            maximumDimension > 0,
+            width <= maximumDimension,
+            height <= maximumDimension,
+            rasterPixelLimit > 0,
+            storageByteLimit > 0
+        else { return false }
+        let (pixels, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        let (storage, storageOverflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+        return !pixelOverflow
+            && pixels <= rasterPixelLimit
+            && !storageOverflow
+            && storage <= storageByteLimit
+    }
+
+    /// Converts admitted physical pixels into AppKit points. DPI is accepted
+    /// only as a valid pair; half-corrupt metadata falls back without warping
+    /// one axis. EXIF transforms across the diagonal swap the logical axes.
+    static func rasterPointSize(
+        pixelWidth: Int,
+        pixelHeight: Int,
+        dpiWidth: Double?,
+        dpiHeight: Double?,
+        orientation: UInt32,
+        decodedWidth: Int? = nil,
+        decodedHeight: Int? = nil
+    ) -> CGSize {
+        let swapsAxes = (5...8).contains(Int(orientation))
+        let orientedPixels = swapsAxes
+            ? CGSize(width: CGFloat(pixelHeight), height: CGFloat(pixelWidth))
+            : CGSize(width: CGFloat(pixelWidth), height: CGFloat(pixelHeight))
+        let hasValidDPI = dpiWidth?.isFinite == true
+            && dpiHeight?.isFinite == true
+            && (dpiWidth ?? 0) > 0
+            && (dpiHeight ?? 0) > 0
+
+        guard hasValidDPI, let dpiWidth, let dpiHeight else {
+            guard let decodedWidth,
+                let decodedHeight,
+                decodedWidth > 0,
+                decodedHeight > 0
+            else { return orientedPixels }
+            let decoded = CGSize(width: CGFloat(decodedWidth), height: CGFloat(decodedHeight))
+            let scale = max(orientedPixels.width, orientedPixels.height)
+                / max(decoded.width, decoded.height)
+            let transformed = CGSize(
+                width: decoded.width * scale,
+                height: decoded.height * scale)
+            return transformed.width.isFinite && transformed.height.isFinite
+                ? transformed : orientedPixels
+        }
+
+        func points(_ pixels: Int, _ dpi: Double) -> CGFloat {
+            let value = CGFloat(pixels) * 72 / CGFloat(dpi)
+            return value.isFinite && value > 0 ? value : CGFloat(pixels)
+        }
+
+        let raw = CGSize(
+            width: points(pixelWidth, dpiWidth),
+            height: points(pixelHeight, dpiHeight))
+        return swapsAxes ? CGSize(width: raw.height, height: raw.width) : raw
     }
 
     /// Draws a vector at `size`, or serves one already drawn if drawing it
@@ -1096,11 +1692,31 @@ public final class RichContentRenderer {
     /// slightly soft when the column changes, instead of freezing the window
     /// every time it does.
     private func vector(
-        _ image: NSImage, at size: CGSize, from file: String, for key: Key
+        _ image: NSImage, at size: CGSize, from file: FileGenerationKey, for key: Key
     ) -> Result<RenderedContent, RenderFailure> {
         if let already = expensive[file], let kept = cache[already], let bitmap = kept.cgImage {
+            if already == key { return .success(kept) }
+
             let content = RenderedContent(cgImage: bitmap, size: size)
-            store(content, for: key)
+            // Move the one cache-owned bitmap to the new logical-size key.
+            // The CGImage allocation is unchanged, so its pixel charge is too.
+            cache.removeValue(forKey: already)
+            cache[key] = content
+            if let index = order.firstIndex(of: already) {
+                order[index] = key
+            } else {
+                order.append(key)
+            }
+            subtractRetainedSourceBytes(Self.sourceBytes(of: already))
+            addRetainedSourceBytes(Self.sourceBytes(of: key))
+            expensive[file] = key
+            enforceRetainedSourceBudget(protecting: key)
+            if cache[key] == nil {
+                expensive.removeValue(forKey: file)
+                if let index = expensiveOrder.firstIndex(of: file) {
+                    expensiveOrder.remove(at: index)
+                }
+            }
             return .success(content)
         }
 
@@ -1111,9 +1727,15 @@ public final class RichContentRenderer {
             store(failure, for: key)
             return .failure(failure)
         }
-        if clock.now - started > expensiveRasterBudget { remember(key, for: file) }
-
+        // `.zero` is the deterministic test/diagnostic sentinel: even a clock
+        // whose resolution reports a zero-length render must take the expensive
+        // reuse path. Positive production budgets retain their measured rule.
         store(rendered, for: key)
+        if (expensiveRasterBudget == .zero || clock.now - started > expensiveRasterBudget),
+            cache[key] != nil
+        {
+            remember(key, for: file)
+        }
         return .success(rendered)
     }
 
@@ -1130,7 +1752,15 @@ public final class RichContentRenderer {
     /// of 400 SVGs found on this machine the median was 1.4KB and the 99th
     /// percentile 315KB, so a megabyte is far out in the tail — and what it
     /// buys is that no note can hang the window for half a minute.
-    private static let maxVectorBytes = 1_048_576
+    private static let maxVectorBytes = BoundedVectorImageFormat.maximumBytes
+
+    /// Compressed raster input is bounded separately from its decompressed
+    /// pixel count. This is intentionally much larger than the vector ceiling:
+    /// file bytes predict vector geometry cost, while pixels and row stride
+    /// predict retained raster output. The compressed input and requested and
+    /// realized output are bounded; ImageIO scratch allocations and peak RSS
+    /// inside the operating-system decoder are not hard-bounded here.
+    private static let maxRasterBytes = 64 * 1_024 * 1_024
 
     /// A rasterisation slower than this marks its file as expensive to draw.
     ///
@@ -1139,19 +1769,49 @@ public final class RichContentRenderer {
     /// which would be a test whose meaning changed with the machine it ran on.
     let expensiveRasterBudget: Duration
 
-    /// Refuses a file too heavy to rasterise, naming what it weighs.
-    ///
-    /// A file whose size cannot be read is *not* refused: the read is an
-    /// optimisation, and failing closed on a stat error would mean a picture
-    /// on a volume with awkward permissions silently stopped drawing.
-    private static func tooLargeToDraw(_ url: URL) -> RenderFailure? {
-        guard let bytes = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-            bytes > maxVectorBytes
-        else { return nil }
-        let megabytes = Double(bytes) / 1_048_576
-        return RenderFailure(
-            reason: String(
-                format: "%@ is too large to draw (%.1f MB)", url.lastPathComponent, megabytes))
+    private static func describeReadFailure(
+        _ error: BoundedRegularFileReadError,
+        filename: String,
+        vector: Bool
+    ) -> RenderFailure {
+        switch error {
+        case .tooLarge(let maximumBytes):
+            let megabytes = Double(maximumBytes) / 1_048_576
+            let kind = vector ? "draw" : "load"
+            return RenderFailure(
+                reason: String(
+                    format: "%@ is too large to %@ (limit %.1f MB)",
+                    filename,
+                    kind,
+                    megabytes))
+        case .notFileURL, .notRegularFile:
+            return RenderFailure(reason: "Not a regular image: \(filename)")
+        case .changedDuringRead:
+            return RenderFailure(reason: "Image changed while reading: \(filename)")
+        case .invalidLimit, .systemCall:
+            return RenderFailure(reason: "Could not read image: \(filename)")
+        }
+    }
+
+    private static func detectedType(in data: Data, matches url: URL) -> Bool {
+        let vector = BoundedVectorImageFormat(filenameExtension: url.pathExtension)
+        if vector == .svg {
+            return BoundedSVGValidator.identifiesSVG(
+                data,
+                maximumBytes: maxVectorBytes)
+        }
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options),
+            let identifier = CGImageSourceGetType(source),
+            let detected = UTType(identifier as String),
+            let declared = UTType(filenameExtension: url.pathExtension)
+        else { return false }
+        if vector == .pdf {
+            return detected == .pdf && declared == .pdf
+        }
+        return detected == declared
+            || detected.conforms(to: declared)
+            || declared.conforms(to: detected)
     }
 
     /// The most either side of a drawn picture may measure, in points.
@@ -1187,9 +1847,9 @@ public final class RichContentRenderer {
     /// Whether the file `source` names can be drawn at any size without
     /// losing detail.
     ///
-    /// An SVG has no pixels of its own — the size in the file is a nominal
-    /// one — so it is rasterised at the size it will be drawn. A raster has
-    /// pixels, and enlarging them is not detail, which is why the two are
+    /// SVG and PDF have no fixed raster pixels — their declared size is a
+    /// nominal one — so they are rasterised at the size they will be drawn.
+    /// A raster has pixels, and enlarging them is not detail, which is why the two are
     /// sized by different rules and why ``ContentZoomViewer`` has to ask.
     public func isScalable(at source: String, relativeTo base: URL?) -> Bool {
         guard let url = resolve(source, relativeTo: base) else { return false }
@@ -1200,13 +1860,11 @@ public final class RichContentRenderer {
     /// before anything has been loaded — it decides how a picture is *sized*,
     /// and the size decides the bitmap that is then made.
     ///
-    /// The two cannot disagree in a way that matters: `NSImage(contentsOf:)`
-    /// resolves a file's type from its extension as well, and measured here,
-    /// it declines a file whose extension and content disagree — SVG markup in
-    /// a `.png`, and a PNG in a `.svg`, both come back nil. So a mislabelled
-    /// file is a clean failure rather than a vector sized as a raster.
+    /// The decoder's detected UTI is checked against this extension before
+    /// either raster or vector rendering begins. A mislabelled file is thus a
+    /// clean failure rather than a vector sized as a raster (or the reverse).
     private static func isScalable(_ url: URL) -> Bool {
-        UTType(filenameExtension: url.pathExtension)?.conforms(to: .svg) ?? false
+        BoundedVectorImageFormat(filenameExtension: url.pathExtension) != nil
     }
 
     /// Draws a vector image into a bitmap of its own, at the size it will be
@@ -1223,10 +1881,10 @@ public final class RichContentRenderer {
     private func rasterise(_ image: NSImage, at size: CGSize) -> RenderedContent? {
         guard Self.isDrawable(size.width), Self.isDrawable(size.height) else { return nil }
 
-        let scale = Self.fittedScale(Self.rasterScale, for: size)
-        let pixelWidth = Int((size.width * scale).rounded())
-        let pixelHeight = Int((size.height * scale).rounded())
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        guard let pixels = Self.fittedPixelDimensions(for: size, scale: Self.rasterScale)
+        else { return nil }
+        let pixelWidth = pixels.width
+        let pixelHeight = pixels.height
 
         guard let context = CGContext(
             data: nil, width: pixelWidth, height: pixelHeight,
@@ -1258,17 +1916,25 @@ public final class RichContentRenderer {
     private func resolve(_ source: String, relativeTo base: URL?) -> URL? {
         let trimmed = source.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-
-        // Protocol-relative URLs are remote in everything but name.
-        if trimmed.hasPrefix("//") { return nil }
-        if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(), !scheme.isEmpty {
-            return scheme == "file" ? url.standardizedFileURL : nil
-        }
-        if trimmed.hasPrefix("/") {
-            return URL(fileURLWithPath: trimmed).standardizedFileURL
-        }
         let decoded = trimmed.removingPercentEncoding ?? trimmed
-        guard let base else { return nil }
+
+        // Decode exactly once before classifying path syntax. Otherwise an
+        // encoded `//host/path` crosses the remote boundary as a local path.
+        // A trailing slash is directory intent and must not be standardized
+        // into the pathname of a cached regular file.
+        if decoded.hasPrefix("//") || decoded.hasSuffix("/") { return nil }
+        if let url = URL(string: trimmed), let scheme = url.scheme?.lowercased(), !scheme.isEmpty {
+            guard scheme == "file",
+                BoundedRegularFileReader.hasLocalFileAuthority(url),
+                !url.hasDirectoryPath
+            else { return nil }
+            return BoundedRegularFileReader.replacingSystemCompatibilityAlias(in: url)
+        }
+        if decoded.hasPrefix("/") {
+            return BoundedRegularFileReader.replacingSystemCompatibilityAlias(
+                in: URL(fileURLWithPath: decoded, isDirectory: false).standardizedFileURL)
+        }
+        guard let base, BoundedRegularFileReader.hasLocalFileAuthority(base) else { return nil }
         // Force a directory URL: `fileURLWithPath:relativeTo:` treats a base
         // without a trailing slash as a *file* and replaces its last
         // component, so `notes/pic.png` became `pic.png` next to `notes`.
@@ -1276,17 +1942,24 @@ public final class RichContentRenderer {
         // `../pic.png` as one path component. Joining as a relative file URL
         // against an explicit directory, then standardising, makes `../` a
         // parent and `pic.png` a child.
-        let folder = URL(fileURLWithPath: base.path, isDirectory: true)
-        return URL(fileURLWithPath: decoded, relativeTo: folder).absoluteURL.standardizedFileURL
+        let folder = BoundedRegularFileReader.replacingSystemCompatibilityAlias(
+            in: URL(fileURLWithPath: base.path, isDirectory: true))
+        let candidate = URL(fileURLWithPath: decoded, relativeTo: folder)
+            .absoluteURL.standardizedFileURL
+        return BoundedRegularFileReader.replacingSystemCompatibilityAlias(in: candidate)
     }
 
     // MARK: - Cache
 
     private func store(_ content: RenderedContent, for key: Key) {
+        let sourceBytes = Self.sourceBytes(of: key)
+        guard sourceBytes <= retainedSourceByteBudget else { return }
+
         if let replaced = cache.removeValue(forKey: key) {
             cachedPixels -= Self.pixels(of: replaced)
         } else {
             order.append(key)
+            addRetainedSourceBytes(sourceBytes)
         }
         cache[key] = content
         cachedPixels += Self.pixels(of: content)
@@ -1296,11 +1969,9 @@ public final class RichContentRenderer {
         // cache that evicts what it is in the middle of handing back would
         // re-render it on the very next request, forever.
         while order.count > 1, cache.count > limit || cachedPixels > pixelBudget {
-            let evicted = order.removeFirst()
-            if let content = cache.removeValue(forKey: evicted) {
-                cachedPixels -= Self.pixels(of: content)
-            }
+            evictSuccess(at: 0)
         }
+        enforceRetainedSourceBudget(protecting: key)
     }
 
     /// Remembers a failure, under the same bound as a success.
@@ -1309,9 +1980,78 @@ public final class RichContentRenderer {
     /// note referencing a thousand missing images recorded a thousand keys
     /// that nothing would ever drop.
     private func store(_ failure: RenderFailure, for key: Key) {
-        if failures.updateValue(failure, forKey: key) == nil { failureOrder.append(key) }
+        let sourceBytes = Self.sourceBytes(of: key)
+        guard sourceBytes <= retainedSourceByteBudget else { return }
+
+        if failures.updateValue(failure, forKey: key) == nil {
+            failureOrder.append(key)
+            addRetainedSourceBytes(sourceBytes)
+        }
         while failureOrder.count > limit {
-            failures.removeValue(forKey: failureOrder.removeFirst())
+            evictFailure(at: 0)
+        }
+        enforceRetainedSourceBudget(protecting: key)
+    }
+
+    private static func sourceBytes(of key: Key) -> Int {
+        key.source.utf8.count
+    }
+
+    private func addRetainedSourceBytes(_ bytes: Int) {
+        let (sum, overflow) = retainedSourceBytes.addingReportingOverflow(bytes)
+        retainedSourceBytes = overflow ? Int.max : sum
+    }
+
+    private func subtractRetainedSourceBytes(_ bytes: Int) {
+        retainedSourceBytes = max(0, retainedSourceBytes - min(bytes, retainedSourceBytes))
+    }
+
+    /// Applies one aggregate byte ceiling across success and failure keys.
+    /// Failures are evicted first because redoing a bounded parse is cheaper
+    /// than throwing away an already-realised bitmap. The just-produced answer
+    /// is protected when possible; a key larger than the whole budget was
+    /// refused before insertion, so removing older entries must make it fit.
+    private func enforceRetainedSourceBudget(protecting protected: Key) {
+        while retainedSourceBytes > retainedSourceByteBudget {
+            if let index = failureOrder.firstIndex(where: { $0 != protected }) {
+                evictFailure(at: index)
+            } else if let index = order.firstIndex(where: { $0 != protected }) {
+                evictSuccess(at: index)
+            } else if let index = failureOrder.firstIndex(of: protected) {
+                evictFailure(at: index)
+            } else if let index = order.firstIndex(of: protected) {
+                evictSuccess(at: index)
+            } else {
+                retainedSourceBytes = 0
+            }
+        }
+    }
+
+    private func evictFailure(at index: Int) {
+        let evicted = failureOrder.remove(at: index)
+        if failures.removeValue(forKey: evicted) != nil {
+            subtractRetainedSourceBytes(Self.sourceBytes(of: evicted))
+        }
+    }
+
+    private func evictSuccess(at index: Int) {
+        let evicted = order.remove(at: index)
+        if let content = cache.removeValue(forKey: evicted) {
+            cachedPixels -= Self.pixels(of: content)
+            subtractRetainedSourceBytes(Self.sourceBytes(of: evicted))
+        }
+        forgetExpensiveReferences(to: evicted)
+    }
+
+    private func forgetExpensiveReferences(to key: Key) {
+        let files = expensive.compactMap { file, cachedKey in
+            cachedKey == key ? file : nil
+        }
+        for file in files {
+            expensive.removeValue(forKey: file)
+            if let index = expensiveOrder.firstIndex(of: file) {
+                expensiveOrder.remove(at: index)
+            }
         }
     }
 
@@ -1320,20 +2060,30 @@ public final class RichContentRenderer {
     /// Bounded by count alone, which is all it needs: what is stored is a key,
     /// and the pixels it points at are the cache's and are bounded there.
     /// Dropped wholesale by ``invalidate()``, along with what it points at.
-    private func remember(_ key: Key, for file: String) {
+    private func remember(_ key: Key, for file: FileGenerationKey) {
         if expensive.updateValue(key, forKey: file) == nil { expensiveOrder.append(file) }
         while expensiveOrder.count > limit {
             expensive.removeValue(forKey: expensiveOrder.removeFirst())
         }
     }
 
-    /// What an entry costs to keep, in bitmap pixels.
+    /// What an entry costs to keep, in four-byte pixel equivalents.
     ///
     /// The rasterised size, not the drawn size: the same diagram at the same
     /// width is sixteen times the memory at the viewer's detail as at the
-    /// editor's, and it is the bitmap that is being held.
+    /// editor's, and it is the bitmap that is being held. Row storage is also
+    /// counted so high-depth images cannot spend more memory than the pixel
+    /// ledger reports.
     private static func pixels(of content: RenderedContent) -> Int {
-        if let image = content.cgImage { return image.width * image.height }
+        if let image = content.cgImage {
+            let (area, areaOverflow) = image.width.multipliedReportingOverflow(
+                by: image.height)
+            let (bytes, byteOverflow) = image.bytesPerRow.multipliedReportingOverflow(
+                by: image.height)
+            guard !areaOverflow, !byteOverflow else { return Int.max }
+            let byteEquivalent = bytes / 4 + (bytes.isMultiple(of: 4) ? 0 : 1)
+            return max(area, byteEquivalent)
+        }
         let area = content.size.width * content.size.height
         guard area.isFinite, area > 0 else { return 0 }
         return Int(min(area, CGFloat(Int32.max)))

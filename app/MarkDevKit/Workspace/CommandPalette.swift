@@ -59,6 +59,90 @@ public enum CommandAction: Sendable, Equatable {
     case printDocument
 }
 
+/// One pure answer to whether workspace commands can act on current state.
+///
+/// Native menus, the command palette, and pane chrome all consume this value.
+/// Keeping the decision out of those renderers prevents an action from being
+/// enabled in one surface while another correctly refuses it. The booleans
+/// distinguish a document model, a mounted native editor, and the editor that
+/// writing tools are actually attached to: those states briefly differ while
+/// SwiftUI mounts a restored or newly split pane.
+public struct CommandAvailability: Equatable, Sendable {
+    public let hasFocusedPane: Bool
+    public let paneCount: Int
+    public let maximumPaneCount: Int
+    public let hasDocument: Bool
+    public let hasEditorSurface: Bool
+    public let hasAttachedWritingSurface: Bool
+    public let hasTextSelection: Bool
+    public let hasProofreadingMarks: Bool
+    public let canRevealHarnessTerminal: Bool
+    public let isPerformingDestructiveOperation: Bool
+
+    public init(
+        hasFocusedPane: Bool,
+        paneCount: Int,
+        maximumPaneCount: Int = SplitLayout.maximumPanes,
+        hasDocument: Bool,
+        hasEditorSurface: Bool,
+        hasAttachedWritingSurface: Bool,
+        hasTextSelection: Bool,
+        hasProofreadingMarks: Bool,
+        canRevealHarnessTerminal: Bool,
+        isPerformingDestructiveOperation: Bool
+    ) {
+        self.hasFocusedPane = hasFocusedPane
+        self.paneCount = max(0, paneCount)
+        self.maximumPaneCount = max(1, maximumPaneCount)
+        self.hasDocument = hasDocument
+        self.hasEditorSurface = hasEditorSurface
+        self.hasAttachedWritingSurface = hasAttachedWritingSurface
+        self.hasTextSelection = hasTextSelection
+        self.hasProofreadingMarks = hasProofreadingMarks
+        self.canRevealHarnessTerminal = canRevealHarnessTerminal
+        self.isPerformingDestructiveOperation = isPerformingDestructiveOperation
+    }
+
+    /// Whether invoking `action` now can reach its canonical handler.
+    ///
+    /// `writingTools` intentionally remains available at a caret: its panel
+    /// explains that a selection is required. This is a real, documented
+    /// action rather than a silent no-op, while a missing or stale editor
+    /// attachment is not. A new window is process-scoped and remains possible
+    /// while another window finishes a destructive operation.
+    public func allows(_ action: CommandAction) -> Bool {
+        if action == .newWindow { return true }
+        guard !isPerformingDestructiveOperation else { return false }
+
+        switch action {
+        case .newWindow:
+            return true
+        case .newDocument:
+            return hasFocusedPane
+        case .toggleCommandPalette, .openFile, .openVault,
+            .toggleSidebar, .toggleInspector, .toggleTerminal, .toggleGraph,
+            .setMode, .moveTerminal:
+            return true
+        case .save, .saveAs, .exportHTML:
+            return hasDocument
+        case .splitRight, .splitDown:
+            return hasFocusedPane && paneCount < maximumPaneCount
+        case .closePane, .focusNextPane, .focusPreviousPane:
+            return hasFocusedPane && paneCount > 1
+        case .writingTools, .proofreadDocument, .analyzeNote, .askHarness:
+            return hasDocument && hasAttachedWritingSurface
+        case .clearProofreading:
+            return hasDocument && hasAttachedWritingSurface && hasProofreadingMarks
+        case .openHarnessTerminal:
+            return canRevealHarnessTerminal
+        case .zoomIn, .zoomOut, .resetZoom:
+            return hasEditorSurface
+        case .printDocument:
+            return hasDocument && hasEditorSurface
+        }
+    }
+}
+
 /// Something the palette can run.
 public struct Command: Identifiable, Sendable {
     public enum Kind: Sendable, Equatable {
@@ -113,6 +197,20 @@ public struct Command: Identifiable, Sendable {
     }
 }
 
+extension CommandAvailability {
+    /// Palette counterpart to ``allows(_:)``. File and content-search rows
+    /// remain available unless the workspace is inside the one state that
+    /// rejects all filesystem/UI interaction.
+    public func allows(_ kind: Command.Kind) -> Bool {
+        switch kind {
+        case .action(let action):
+            allows(action)
+        case .file, .searchResult:
+            !isPerformingDestructiveOperation
+        }
+    }
+}
+
 /// Identity of one content-search request.
 ///
 /// The index revision is part of the identity even when the visible query is
@@ -131,14 +229,14 @@ struct CommandPaletteSearchRequest: Hashable, Sendable {
 /// `results`, makes rendering idempotent. The generation rejects an old task
 /// even if requests cycle from A to B and back to A before A finishes.
 struct CommandPaletteSearchState {
-    private(set) var generation: UInt64 = 0
+    private(set) var generation = UUID()
     private(set) var request: CommandPaletteSearchRequest?
     private var storedHits: [Command] = []
     private var loading = false
 
     @discardableResult
-    mutating func begin(_ request: CommandPaletteSearchRequest) -> UInt64 {
-        generation &+= 1
+    mutating func begin(_ request: CommandPaletteSearchRequest) -> UUID {
+        generation = UUID()
         self.request = request
         storedHits = []
         loading = true
@@ -149,7 +247,7 @@ struct CommandPaletteSearchState {
     mutating func complete(
         _ hits: [Command],
         for request: CommandPaletteSearchRequest,
-        generation: UInt64,
+        generation: UUID,
         limit: Int
     ) -> Bool {
         guard self.request == request, self.generation == generation else { return false }
@@ -159,7 +257,7 @@ struct CommandPaletteSearchState {
     }
 
     mutating func reset() {
-        generation &+= 1
+        generation = UUID()
         request = nil
         storedHits = []
         loading = false
@@ -188,6 +286,7 @@ struct CommandPaletteSearchState {
 public struct CommandPalette: View {
     @Binding public var isPresented: Bool
     public let commands: [Command]
+    public let availability: CommandAvailability
     /// Full-text search over note contents, asked once per eligible
     /// query/index-revision pair after a short typing debounce.
     ///
@@ -195,7 +294,7 @@ public struct CommandPalette: View {
     /// write that", which is the other half of why a palette exists. `nil` in
     /// a context with no vault — the palette still lists actions and open
     /// tabs there.
-    public let contentSearch: ((String) -> [Command])?
+    public let contentSearch: ((String) async -> [Command])?
     /// Revision of the content index searched by ``contentSearch``.
     public let contentRevision: UInt64
     public let onRun: (Command) -> Void
@@ -226,19 +325,22 @@ public struct CommandPalette: View {
     public init(
         isPresented: Binding<Bool>,
         commands: [Command],
-        contentSearch: ((String) -> [Command])? = nil,
+        availability: CommandAvailability,
+        contentSearch: ((String) async -> [Command])? = nil,
         contentRevision: UInt64 = 0,
         onRun: @escaping (Command) -> Void
     ) {
         self._isPresented = isPresented
         self.commands = commands
+        self.availability = availability
         self.contentSearch = contentSearch
         self.contentRevision = contentRevision
         self.onRun = onRun
     }
 
     private var titleResults: [Command] {
-        Array(FuzzyMatch.rank(commands, query: query) { command in
+        let availableCommands = commands.filter { availability.allows($0.kind) }
+        return Array(FuzzyMatch.rank(availableCommands, query: query) { command in
             // Match on the subtitle too, so a file can be found by its folder.
             [command.title, command.subtitle ?? ""].joined(separator: " ")
         }.prefix(40))
@@ -272,11 +374,12 @@ public struct CommandPalette: View {
             }
         })
         return matched + contentState.hits(for: request).filter { command in
+            guard availability.allows(command.kind) else { return false }
             switch command.kind {
             case .file(let url), .searchResult(let url, _):
-                seenURLs.insert(url).inserted
+                return seenURLs.insert(url).inserted
             case .action:
-                true
+                return true
             }
         }
     }
@@ -308,10 +411,13 @@ public struct CommandPalette: View {
                     .padding(GlassTheme.Spacing.loose)
             }
         }
-        .frame(width: 560)
+        .containerRelativeFrame(.horizontal) { availableWidth, _ in
+            CommandPaletteLayout.width(availableWidth: availableWidth)
+        }
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
         .shadow(color: .black.opacity(0.28), radius: 30, y: 12)
         .onAppear { resetHighlight() }
+        .onChange(of: availability) { _, _ in resetHighlight() }
         .task {
             // Focus has to be claimed *after* the field is in the window.
             // Setting it in `onAppear` runs too early: the assignment is
@@ -410,7 +516,7 @@ public struct CommandPalette: View {
 
     /// Executes outside body evaluation and publishes only the latest result.
     /// A short debounce gives rapid typing a real cancellation window before
-    /// entering the synchronous, bounded index query.
+    /// entering the bounded index query.
     @MainActor
     private func refreshContent(for request: CommandPaletteSearchRequest) async {
         guard request.shouldSearch, let contentSearch else {
@@ -424,7 +530,7 @@ public struct CommandPalette: View {
             return
         }
         guard !Task.isCancelled else { return }
-        let hits = contentSearch(request.query)
+        let hits = await contentSearch(request.query)
         guard !Task.isCancelled,
             contentState.complete(
                 hits,
@@ -501,6 +607,18 @@ public struct CommandPalette: View {
         isPresented = false
         query = ""
         onRun(command)
+    }
+}
+
+/// Keeps the palette at its comfortable desktop width without exceeding the
+/// window that owns it. Non-finite proposals fail back to the bounded ideal;
+/// SwiftUI can transiently produce one during detached layout measurement.
+enum CommandPaletteLayout {
+    static let preferredWidth: CGFloat = 560
+
+    static func width(availableWidth: CGFloat) -> CGFloat {
+        guard availableWidth.isFinite, availableWidth > 0 else { return preferredWidth }
+        return min(availableWidth, preferredWidth)
     }
 }
 

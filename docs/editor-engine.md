@@ -85,5 +85,23 @@ For mathematical formulas (`$E=mc^2$` / `$$\int f(x)dx$$`) and Mermaid diagrams,
 
 - **LaTeX**: Rendered using Core Text via `SwiftMath` (pure Swift).
 - **Mermaid**: Rendered via `BeautifulMermaid` using layout engines ported from the Eclipse Layout Kernel (ELK).
-- **Asynchronous Cache**: Rendered bitmaps are cached by content hash.
+- **Bounded Shared Cache**: Rendered bitmaps are cached using the full render context under entry and pixel budgets. On-demand rendering occurs on the main actor. Each opportunistic prefetch step performs at most one render or one image filesystem probe; cheap dictionary-only hits and refusals for non-image content may drain in the same step. The Quick Look build compiles prefetch out.
 - **Relayout Invalidation**: When formula source code is edited, `invalidateFragments` forces TextKit to discard cached fragment heights and recalculate document bounds.
+
+---
+
+## 7. Local Inline-Image Rendering Boundary
+
+`RichContentRenderer` refuses network image references. It opens a local file once with no symlink following, retains that descriptor through the read, and binds successful cache entries to the canonical path, descriptor generation, immutable requested format, and sizing context. Transient open or changed-file failures are not cached. An expensive vector reuses one cache-owned bitmap rather than creating an unaccounted second owner.
+
+Raster files are limited to 64 MiB of compressed input and 16 million declared pixels; SVG and PDF files use a 1 MiB input ceiling. Raster metadata must identify supported dimensions, depth, and color model before ImageIO receives a thumbnail request. The requested maximum dimension is derived from conservative pixel and row-storage estimates, and the returned bitmap is post-checked for dimensions, pixel count, row stride, and at most 64,000,000 bytes of decoded row storage.
+
+Those limits bound the retained descriptor input, requested thumbnail, admitted returned bitmap, and cache. They do **not** prove a ceiling on ImageIO's internal transient allocations, simultaneous compressed/decoded buffers, or total process RSS. ImageIO remains a platform trust boundary.
+
+---
+
+## 8. Image Paste and Drop Boundary
+
+Image ingestion is app-only and is compiled out of the Quick Look renderer. `MarkdownTextView` snapshots a finite pasteboard representation, while `DocumentAssetStore` validates at most 16 inputs with 32 MiB per-item and 64 MiB batch limits. Local file inputs use bounded regular-file reads that detect replacement during the read; image type, raster dimensions, and bounded SVG structure are checked before a unique name is reserved.
+
+The actor retains the document directory handle while decoding. Only after the editor accepts the Markdown mutation does it transactionally publish the corresponding file under `assets/`. Cancellation or a stale document generation discards unpublished reservations. Proven failures remove the exact pending Markdown insertion; an indeterminate publication remains visible for explicit review so MarkDev does not manufacture an orphan by guessing that no file was written.

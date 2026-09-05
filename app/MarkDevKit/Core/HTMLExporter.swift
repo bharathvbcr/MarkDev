@@ -76,7 +76,11 @@ public enum HTMLExporter {
     /// atomic sibling-file replacement, so a render or write failure cannot
     /// leave a plausible-looking partial export behind.
     public static func write(markdown: String, title: String, to destination: URL) throws {
-        guard destination.isFileURL else {
+        // `isFileURL` alone is insufficient: Foundation exposes the local
+        // path of `file://remote-host/path`, and its write APIs silently use
+        // that path while discarding the remote authority. Keep export on the
+        // same strict local-file boundary as every document read.
+        guard BoundedRegularFileReader.hasLocalFileAuthority(destination) else {
             throw HTMLExporterError.unsupportedLocation(destination)
         }
         let output = try render(markdown: markdown, title: title)

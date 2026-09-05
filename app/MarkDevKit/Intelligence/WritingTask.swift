@@ -43,6 +43,8 @@ public struct WritingTask: Identifiable, Hashable, Sendable {
 }
 
 extension WritingTask {
+    /// Maximum UTF-8 size of a reader-authored model instruction.
+    public static let maximumCustomInstructionBytes = 1_024
     public static let proofread = WritingTask(
         id: "proofread",
         title: "Proofread",
@@ -180,8 +182,16 @@ extension WritingTask {
     /// The instruction is carried as a directive like any other, so a typed
     /// request goes through exactly the same Markdown rules as a preset
     /// rather than down a second, laxer path.
-    public static func custom(_ instruction: String) -> WritingTask {
-        WritingTask(
+    public static func custom(_ instruction: String) -> WritingTask? {
+        guard BoundedText.fitsUTF8(
+            instruction, maximum: maximumCustomInstructionBytes)
+        else { return nil }
+        // Interior whitespace is reader intent: a multiline instruction may
+        // deliberately contain an example or code. Admission makes this trim
+        // bounded; only edges are packaging, so only edges are changed.
+        let instruction = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !instruction.isEmpty else { return nil }
+        return WritingTask(
             id: "custom",
             title: "Custom Edit",
             symbol: "wand.and.sparkles",
@@ -247,6 +257,15 @@ public enum WritingPrompt {
 
 /// Tidies a model response before it is shown or applied.
 public enum WritingResponse {
+    /// Hard allocation ceiling for one streamed or final model response.
+    public static let maximumBytes = 64 * 1_024
+
+    /// Admits and cleans a generated response, or refuses it whole.
+    public static func admit(_ raw: String) -> String? {
+        guard BoundedText.fitsUTF8(raw, maximum: maximumBytes) else { return nil }
+        return cleanAdmitted(raw)
+    }
+
     /// Strips the two wrappers the model adds even when told not to.
     ///
     /// Deliberately conservative: it removes an enclosing ``` fence and
@@ -256,6 +275,10 @@ public enum WritingResponse {
     /// colon, and deleting a real line of the author's document is far worse
     /// than leaving a stray sentence they can see and remove.
     public static func clean(_ raw: String) -> String {
+        admit(raw) ?? ""
+    }
+
+    private static func cleanAdmitted(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("```") else { return trimmed }
 

@@ -40,10 +40,37 @@ final class GraphPanelStateTests: XCTestCase {
 
     func testRebuildIdentityChangesWithContentRevision() {
         let before = GraphPanel.rebuildIdentity(
-            scope: .whole, depth: 2, tag: nil, current: nil, contentRevision: 10)
+            scope: .whole,
+            depth: 2,
+            tag: nil,
+            current: nil,
+            contentVersion: VaultContentVersion(revision: 10))
         let after = GraphPanel.rebuildIdentity(
-            scope: .whole, depth: 2, tag: nil, current: nil, contentRevision: 11)
+            scope: .whole,
+            depth: 2,
+            tag: nil,
+            current: nil,
+            contentVersion: VaultContentVersion(revision: 11))
 
+        XCTAssertEqual(before.contentVersion.revision, 10)
+        XCTAssertEqual(after.contentVersion.revision, 11)
+        XCTAssertNotEqual(before, after)
+    }
+
+    func testVaultRevisionSaturatesWhileItsCacheIdentityKeepsAdvancing() {
+        let maximum = VaultContentVersion(revision: UInt64.max)
+        let advanced = maximum.advanced()
+
+        XCTAssertEqual(advanced.revision, UInt64.max)
+        XCTAssertNotEqual(
+            advanced,
+            maximum,
+            "a content change at the numeric ceiling must still invalidate graph caches")
+
+        let before = GraphPanel.rebuildIdentity(
+            scope: .whole, depth: 2, tag: nil, current: nil, contentVersion: maximum)
+        let after = GraphPanel.rebuildIdentity(
+            scope: .whole, depth: 2, tag: nil, current: nil, contentVersion: advanced)
         XCTAssertNotEqual(before, after)
     }
 
@@ -60,39 +87,114 @@ final class GraphPanelStateTests: XCTestCase {
             .empty)
     }
 
-    func testOnlyTheLatestUncancelledGraphRequestMayPublish() {
+    func testOnlyTheLatestUncancelledGraphRequestMayPublish() throws {
         let old = GraphPanel.rebuildIdentity(
-            scope: .whole, depth: 2, tag: nil, current: nil, contentRevision: 10)
+            scope: .whole,
+            depth: 2,
+            tag: nil,
+            current: nil,
+            contentVersion: VaultContentVersion(revision: 10))
         let current = GraphPanel.rebuildIdentity(
-            scope: .whole, depth: 2, tag: nil, current: nil, contentRevision: 11)
+            scope: .whole,
+            depth: 2,
+            tag: nil,
+            current: nil,
+            contentVersion: VaultContentVersion(revision: 11))
+        let staleIdentity = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000003"))
+        let currentIdentity = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000004"))
 
         XCTAssertFalse(
             GraphPanel.acceptsRebuildResult(
                 request: old,
-                generation: 4,
+                identityToken: staleIdentity,
                 current: current,
-                currentGeneration: 5,
+                currentIdentityToken: currentIdentity,
                 isCancelled: false))
         XCTAssertFalse(
             GraphPanel.acceptsRebuildResult(
                 request: current,
-                generation: 4,
+                identityToken: staleIdentity,
                 current: current,
-                currentGeneration: 5,
+                currentIdentityToken: currentIdentity,
                 isCancelled: false))
         XCTAssertFalse(
             GraphPanel.acceptsRebuildResult(
                 request: current,
-                generation: 5,
+                identityToken: currentIdentity,
                 current: current,
-                currentGeneration: 5,
+                currentIdentityToken: currentIdentity,
                 isCancelled: true))
         XCTAssertTrue(
             GraphPanel.acceptsRebuildResult(
                 request: current,
-                generation: 5,
+                identityToken: currentIdentity,
                 current: current,
-                currentGeneration: 5,
+                currentIdentityToken: currentIdentity,
                 isCancelled: false))
+    }
+}
+
+/// Guards every asynchronous/cache identity audited alongside the graph.
+///
+/// These checks deliberately read the production sources: the vulnerable
+/// state is private and only becomes observable after billions of invalidations.
+/// A finite stress loop cannot prove that a wrapping counter never aliases an
+/// old callback or cache key, while this contract names the exact forbidden
+/// mechanism and stays executable in the ordinary app test target.
+final class GenerationIdentityContractTests: XCTestCase {
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // app
+            .deletingLastPathComponent() // repository
+    }
+
+    private func source(_ relativePath: String) throws -> String {
+        try String(
+            contentsOf: repositoryRoot.appendingPathComponent(relativePath),
+            encoding: .utf8)
+    }
+
+    func testCallbackAndCacheIdentitiesCannotAliasAfterIntegerWrap() throws {
+        let wrappingOwners = [
+            "app/MarkDevKit/Vault/VaultIndex.swift",
+            "app/MarkDevKit/Vault/GraphPanel.swift",
+            "app/MarkDevKit/Intelligence/WritingAssistant.swift",
+            "app/MarkDevKit/Intelligence/DocumentAssistant.swift",
+            "app/MarkDevKit/Editor/TableRowLayout.swift",
+        ]
+
+        for path in wrappingOwners {
+            XCTAssertFalse(
+                try source(path).contains("&+="),
+                "\(path) must not authorize stale work with a wrapping integer")
+        }
+
+        let table = try source("app/MarkDevKit/Editor/TableRowLayout.swift")
+        XCTAssertFalse(
+            table.contains("private var revision"),
+            "a redundant finite cache revision can alias and is unnecessary when invalidation clears the map")
+        XCTAssertTrue(
+            table.contains("tables.removeAll(keepingCapacity: true)"),
+            "table cache invalidation must keep its synchronous clear as the canonical boundary")
+
+        let request = try source("app/MarkDevKit/Intelligence/IntelligenceService.swift")
+        XCTAssertFalse(
+            request.contains("generation += 1"),
+            "IntelligenceRequest must not trap at integer exhaustion or reuse an old identity")
+
+        for path in [
+            "app/MarkDevKit/Vault/VaultIndex.swift",
+            "app/MarkDevKit/Vault/GraphPanel.swift",
+            "app/MarkDevKit/Intelligence/WritingAssistant.swift",
+            "app/MarkDevKit/Intelligence/DocumentAssistant.swift",
+            "app/MarkDevKit/Intelligence/IntelligenceService.swift",
+        ] {
+            XCTAssertTrue(
+                try source(path).contains("UUID"),
+                "\(path) must use a non-wrapping identity at its stale-work boundary")
+        }
     }
 }

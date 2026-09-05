@@ -15,16 +15,18 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
 - [Architecture & Design Invariants](./architecture.md)
   - Swift + Rust hybrid engine design
   - The C-ABI FFI boundary and UTF-16 code unit indexing
-  - AppKit & SwiftUI shell with Liquid Glass design
+  - App framework and isolated read-only Quick Look target
   - Value-type layout engines (`SplitLayout`)
-  - Integrated terminal subsystem (`SwiftTerm` pty)
-  - Bounded diagnostics pipeline and support report export
+  - Sandboxing, privacy manifests, and terminal trust boundaries
+  - Bounded async I/O, recovery journal, and asset ingestion
+  - Current-process diagnostics and separately inspected previous-run exports
 
 - [Editor Engine & Rendering Pipeline](./editor-engine.md)
   - TextKit 2 layout fragment architecture (`NSTextLayoutFragment`)
   - Non-destructive marker collapsing with 0.01pt fonts
   - GFM tables drawn as a grid (`TableGrid` / `TableRowLayout`)
   - Native rich block rendering (LaTeX via SwiftMath, Mermaid via BeautifulMermaid)
+  - Bounded image paste/drop ingestion into document-local assets
   - Incremental shift parsing vs full reparsing
   - AI-assisted writing/proofreading panel data ownership checks
 
@@ -36,7 +38,7 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
   - Interactive force-directed graph canvas
 
 - [Performance Budgets & Benchmarking](./performance.md)
-  - Performance budgets (<16.6ms frame budget)
-  - Rust SIMD parser benchmark suite
+  - Performance targets and separately documented automated gates
+  - Architecture-aware Rust parser benchmark suite
   - Keystroke latency profiling in TextKit 2
   - Best runs vs median variance in CI/testing

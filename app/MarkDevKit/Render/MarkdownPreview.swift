@@ -41,9 +41,12 @@ public final class MarkdownPreviewController {
 
     public init(theme: EditorTheme = .standard) {
         textView = MarkdownTextView.make(theme: theme)
+        #if !MARKDEV_QUICKLOOK
         // Before any content: assigning the mode also drops editability, and
-        // a preview must never be typed into.
+        // an in-app preview must never be typed into. The extension build has
+        // a compile-time fixed `.reading` mode and no public mode setter.
         textView.mode = .reading
+        #endif
 
         // Through the same helper the editor uses, not a scroll view built by
         // hand here. TextKit 2 lays out only the visible viewport and needs
@@ -53,7 +56,8 @@ public final class MarkdownPreviewController {
         view = ScrollingTextView.scrollView(hosting: textView)
     }
 
-    /// Reads `url` and previews it.
+    #if !MARKDEV_QUICKLOOK
+    /// Reads `url` and previews it in the application framework.
     ///
     /// Decoding falls back to Latin-1 rather than failing: a note saved by an
     /// older tool is still worth previewing, and Quick Look's alternative is a
@@ -67,6 +71,7 @@ public final class MarkdownPreviewController {
             ?? ""
         show(markdown, directory: url.deletingLastPathComponent())
     }
+    #endif
 
     /// What a reader sees instead of an empty panel when a file is refused.
     ///

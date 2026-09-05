@@ -21,6 +21,20 @@ final class VaultIndexTests: XCTestCase {
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
 
+    func testRemoteAuthorityRootCannotBeCollapsedIntoALocalVaultPath() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Local", to: root.appendingPathComponent("Local.md"))
+        let hostile = try XCTUnwrap(URL(string: "file://remote.example\(root.path)/"))
+        let vault = VaultIndex()
+
+        vault.open(hostile)
+
+        XCTAssertNil(vault.root)
+        XCTAssertEqual(vault.noteCount, 0)
+        XCTAssertTrue(vault.notePaths().isEmpty)
+    }
+
     func testQueriesCrossTheSwiftRustBoundary() throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -198,12 +212,15 @@ final class VaultIndexTests: XCTestCase {
         try write("# Note", to: note)
         let sibling = root.deletingLastPathComponent()
             .appendingPathComponent("Vault-copy/Outside.md")
+        let remoteAuthority = try XCTUnwrap(
+            URL(string: "file://remote.example\(note.path)"))
 
         let vault = VaultIndex()
         vault.open(root)
 
         XCTAssertEqual(vault.relativePath(for: note), "Note.md")
         XCTAssertNil(vault.relativePath(for: sibling))
+        XCTAssertNil(vault.relativePath(for: remoteAuthority))
         XCTAssertNil(vault.url(for: "../Outside.md"))
         XCTAssertNil(vault.url(for: ""))
     }
@@ -218,5 +235,35 @@ final class VaultIndexTests: XCTestCase {
 
         XCTAssertEqual(vault.search("searchable", limit: 0), [])
         XCTAssertEqual(vault.search("searchable", limit: -1), [])
+    }
+
+    func testOffMainSearchMatchesTheSynchronousIndexQuery() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Alpha\n\nneedle one", to: root.appendingPathComponent("Alpha.md"))
+        try write("# Beta\n\nneedle needle two", to: root.appendingPathComponent("Beta.md"))
+        let vault = VaultIndex()
+        vault.open(root)
+
+        let expected = vault.search("needle", limit: 8)
+        let actual = await vault.searchOffMain("needle", limit: 8)
+
+        XCTAssertEqual(actual, expected)
+    }
+
+    func testAlreadyCancelledOffMainSearchNeverPublishesHits() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        try write("# Alpha\n\nneedle", to: root.appendingPathComponent("Alpha.md"))
+        let vault = VaultIndex()
+        vault.open(root)
+
+        let task = Task { () -> [SearchHit] in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await vault.searchOffMain("needle", limit: 8)
+        }
+
+        let result = await task.value
+        XCTAssertTrue(result.isEmpty)
     }
 }

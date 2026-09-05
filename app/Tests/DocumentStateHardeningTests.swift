@@ -188,6 +188,12 @@ final class NoteTextCacheIdentityTests: XCTestCase {
 
 @MainActor
 final class WorkspaceBoundaryHardeningTests: XCTestCase {
+    private func makeWorkspace() -> Workspace {
+        Workspace(
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
+    }
+
     private func makeDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("MarkDevWorkspaceBoundary-\(UUID().uuidString)")
@@ -201,7 +207,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
     /// reader anything: the model keeps the old string, SwiftUI pushes it back
     /// into the editor, and the paste is reverted. Nothing said so.
     func testAnOversizedEditIsReportedRatherThanFoldedInWithAnEmptyPane() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let oversized = String(
             repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes + 1)
@@ -228,7 +234,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
     }
 
     func testAnAcceptedEditSaysSoAndCarriesNoMessage() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
 
         XCTAssertEqual(workspace.apply(text: "# Note", in: pane), .applied)
@@ -239,9 +245,117 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         XCTAssertTrue(workspace.apply(text: "# Note", in: pane).didApply)
     }
 
+    func testOversizedEditReportsOnlyTheBoundedObservedLowerLimit() {
+        let workspace = makeWorkspace()
+        let oversized = String(
+            repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes + 4_096)
+
+        XCTAssertEqual(
+            workspace.apply(text: oversized, in: workspace.focusedPane),
+            .refusedTooLarge(
+                byteCount: MarkdownReadLimits.maximumDocumentBytes + 1,
+                limit: MarkdownReadLimits.maximumDocumentBytes),
+            "refusal accounting must stop at limit + 1 instead of scanning the tail")
+    }
+
+    func testTokenlessFileBackedCompatibilityStatesRemainVisiblyDirty() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Source.md")
+        let renamed = directory.appendingPathComponent("Renamed.md")
+        try Data("disk".utf8).write(to: source)
+        try Data("other".utf8).write(to: renamed)
+
+        let constructed = OpenDocument(
+            url: source, text: "disk", hasUnsavedChanges: false)
+        XCTAssertTrue(
+            constructed.hasUnsavedChanges,
+            "a path and caller-supplied text are not exact persisted authority")
+        XCTAssertFalse(constructed.matchesPersisted("disk"))
+
+        let workspace = makeWorkspace()
+        let verified = try workspace.resolvedDocument(for: source)
+        XCTAssertFalse(verified.hasUnsavedChanges)
+        XCTAssertNotNil(verified.persistedVersion)
+
+        let reloaded = verified.reloaded(from: "disk")
+        XCTAssertTrue(reloaded.hasUnsavedChanges)
+        XCTAssertNil(reloaded.persistedVersion)
+        XCTAssertFalse(reloaded.matchesPersisted("disk"))
+
+        let retargeted = verified.retargeted(to: renamed)
+        XCTAssertTrue(retargeted.hasUnsavedChanges)
+        XCTAssertNil(retargeted.persistedVersion)
+        XCTAssertFalse(retargeted.matchesPersisted("disk"))
+
+        let rebased = verified.rebased(on: "disk")
+        XCTAssertTrue(rebased.hasUnsavedChanges)
+        XCTAssertNil(rebased.persistedVersion)
+        XCTAssertFalse(rebased.matchesPersisted("disk"))
+    }
+
+    func testCompatibilityDocumentStateDoesNotLaunderRemoteFileAuthority() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example/tmp/Local.md"))
+        let constructed = OpenDocument(
+            url: hostile, text: "untrusted", hasUnsavedChanges: false)
+        let local = OpenDocument(url: URL(fileURLWithPath: "/tmp/Missing.md"))
+
+        XCTAssertNil(constructed.url)
+        XCTAssertTrue(constructed.hasUnsavedChanges)
+        XCTAssertEqual(local.url, URL(fileURLWithPath: "/tmp/Missing.md"))
+        XCTAssertNil(local.retargeted(to: hostile).url)
+    }
+
+    func testPublicMutationCannotManufactureCleanUnauthorizedState() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Source.md")
+        let other = directory.appendingPathComponent("Other.md")
+        try Data("disk".utf8).write(to: source)
+        try Data("other".utf8).write(to: other)
+        let workspace = makeWorkspace()
+        try workspace.open(source, in: workspace.focusedPane)
+
+        var forged = try XCTUnwrap(workspace.document(in: workspace.focusedPane))
+        forged.url = other
+        forged.hasUnsavedChanges = false
+        XCTAssertTrue(workspace.replace(document: forged))
+
+        let admitted = try XCTUnwrap(workspace.document(in: workspace.focusedPane))
+        XCTAssertTrue(admitted.hasUnsavedChanges)
+        XCTAssertNil(admitted.persistedVersion)
+        XCTAssertFalse(admitted.matchesPersisted("disk"))
+    }
+
+    func testPublicDirtyFlagMutationIsRecomputedFromTrustedBaseline() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Source.md")
+        try Data("disk".utf8).write(to: source)
+        let workspace = makeWorkspace()
+        try workspace.open(source, in: workspace.focusedPane)
+        XCTAssertTrue(workspace.updateText("mine", in: workspace.focusedPane))
+
+        var forged = try XCTUnwrap(workspace.document(in: workspace.focusedPane))
+        forged.hasUnsavedChanges = false
+        XCTAssertTrue(workspace.replace(document: forged))
+
+        XCTAssertTrue(workspace.document(in: workspace.focusedPane)?.hasUnsavedChanges == true)
+        XCTAssertEqual(workspace.documentsWithUnsavedChanges.map(\.id), [forged.id])
+    }
+
+    func testReplacingUnknownDocumentReturnsFalseAndDoesNotMutateWorkspace() {
+        let workspace = makeWorkspace()
+        let before = workspace.state(for: workspace.focusedPane)
+
+        XCTAssertFalse(workspace.replace(document: OpenDocument(text: "unknown")))
+        XCTAssertEqual(workspace.state(for: workspace.focusedPane), before)
+    }
+
     /// The `Bool` wrapper keeps meaning exactly what it did.
     func testTheBooleanWrapperStillFoldsTheFourOutcomesTheSameWay() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let oversized = String(
             repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes + 1)
@@ -253,7 +367,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
     }
 
     func testWorkspaceAcceptsExactDocumentLimitAndRejectsOneBytePastIt() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let exact = String(
             repeating: "é", count: MarkdownReadLimits.maximumDocumentBytes / 2)
@@ -386,7 +500,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         try "body".write(to: original, atomically: true, encoding: .utf8)
         try FileManager.default.linkItem(at: original, to: hardLink)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(original, in: pane)
         let identity = try XCTUnwrap(workspace.document(in: pane)?.id)
@@ -406,7 +520,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         let exact = String(
             repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(manual, in: pane)
         XCTAssertTrue(workspace.updateText(exact, in: pane))
@@ -428,7 +542,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("Protected.md")
         try "safe".write(to: file, atomically: true, encoding: .utf8)
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         var replacement = try XCTUnwrap(workspace.document(in: pane))
@@ -449,7 +563,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         try "protected".write(to: original, atomically: true, encoding: .utf8)
         try FileManager.default.linkItem(at: original, to: hardLink)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(original, in: pane)
         _ = workspace.newDocument(in: pane)
@@ -473,7 +587,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         try "second".write(to: second, atomically: true, encoding: .utf8)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: first)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(alias, in: pane)
         workspace.updateText("edited", in: pane)
@@ -494,7 +608,7 @@ final class WorkspaceBoundaryHardeningTests: XCTestCase {
         try FileManager.default.createSymbolicLink(
             at: dangling,
             withDestinationURL: directory.appendingPathComponent("Missing.md"))
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         workspace.updateText("draft", in: workspace.focusedPane)
 
         XCTAssertThrowsError(

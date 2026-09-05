@@ -7,8 +7,12 @@
 
 use markdev::md::{
     model::{BlockKind, CalloutKind, SpanKind, NO_INFO},
-    parse,
+    parse_checked, ParseResult,
 };
+
+fn parse(source: &str) -> ParseResult {
+    parse_checked(source).expect("test fixture must satisfy the parser contract")
+}
 
 fn revealed(source: &str) -> String {
     let result = parse(source);

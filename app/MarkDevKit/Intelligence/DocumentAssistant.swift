@@ -46,8 +46,23 @@ public final class DocumentAssistant {
     public enum Reading: Equatable {
         case idle
         case running
-        case ready(truncated: Bool)
+        case ready(sourceTruncated: Bool, outputTruncated: Bool)
         case failed(String)
+
+        var limitMessage: String? {
+            guard case .ready(let sourceTruncated, let outputTruncated) = self else { return nil }
+            switch (sourceTruncated, outputTruncated) {
+            case (true, true):
+                return "Based on the first \(AssistScope.maximumLength.formatted()) characters. "
+                    + "Some generated fields were shortened to MarkDev’s safety limits."
+            case (true, false):
+                return "Based on the first \(AssistScope.maximumLength.formatted()) characters."
+            case (false, true):
+                return "Some generated fields were shortened to MarkDev’s safety limits."
+            case (false, false):
+                return nil
+            }
+        }
     }
 
     /// The most passages one proofreading pass will check.
@@ -80,8 +95,11 @@ public final class DocumentAssistant {
     /// Snapshot that the visible brief belongs to. It is refreshed when a
     /// reading starts and invalidated when focus moves to another editor.
     @ObservationIgnored private var briefSource: AssistedEditSource?
-    @ObservationIgnored private var reviewGeneration: UInt64 = 0
-    @ObservationIgnored private var readingGeneration: UInt64 = 0
+    /// Separate authorities prevent a delayed proofreading or reading callback
+    /// from publishing into the editor that replaced its source.
+    @ObservationIgnored private var reviewIdentity = UUID()
+    @ObservationIgnored private var readingIdentity = UUID()
+    @ObservationIgnored private var reviewUnplaced = 0
 
     public init(service: IntelligenceService) {
         self.service = service
@@ -96,8 +114,8 @@ public final class DocumentAssistant {
     /// pane's edits rewriting the mirror for the foreground one.
     public func attach(to surface: MarkdownTextView) {
         guard self.surface !== surface else { return }
-        reviewGeneration &+= 1
-        readingGeneration &+= 1
+        replaceReviewIdentity()
+        replaceReadingIdentity()
         reviewRequest.cancel()
         readingRequest.cancel()
         self.surface = surface
@@ -106,10 +124,21 @@ public final class DocumentAssistant {
         brief = NoteBrief(summary: "", keyPoints: [], title: "", tags: [])
         briefSource = AssistedEditSource(surface)
         issues = surface.issues
+        reviewUnplaced = 0
         surface.onIssues = { [weak self, weak surface] updated in
             guard let self, let surface, self.surface === surface else { return }
             self.issues = updated
         }
+    }
+
+    /// Releases one dismantled editor without allowing an old pane's teardown
+    /// to disturb a newer attachment.
+    public func detach(from surface: MarkdownTextView) {
+        guard self.surface === surface else { return }
+        stopReview()
+        stopReading()
+        self.surface = nil
+        briefSource = nil
     }
 
     public var isReviewing: Bool {
@@ -130,6 +159,8 @@ public final class DocumentAssistant {
     /// requests at it at once trades a predictable minute for an unpredictable
     /// one, plus `rateLimited` errors on half of them.
     public func proofread() {
+        let reviewIdentity = replaceReviewIdentity()
+        reviewRequest.cancel()
         guard let surface else { return }
         service.refreshAvailability()
         guard service.state.isReady else {
@@ -149,11 +180,9 @@ public final class DocumentAssistant {
         let chunks = Array(planned.prefix(Self.maximumPasses))
         surface.issues = .none
         review = .running(checked: 0, total: planned.count)
-        reviewGeneration &+= 1
-        let generation = reviewGeneration
-
+        reviewUnplaced = 0
         reviewRequest.start { [weak self, weak surface] in
-            guard let self, self.reviewGeneration == generation else { return }
+            guard let self, self.reviewIdentity == reviewIdentity else { return }
             guard let surface, self.surface === surface else {
                 self.review = .failed("The document changed while it was being checked.")
                 return
@@ -162,7 +191,7 @@ public final class DocumentAssistant {
             var unplaced = 0
 
             for (index, chunk) in chunks.enumerated() {
-                guard self.reviewGeneration == generation else { return }
+                guard self.reviewIdentity == reviewIdentity else { return }
                 guard self.surface === surface else {
                     // The editor detached mid-pass (pane closed, focus moved).
                     // Ending without a terminal state left the panel showing
@@ -186,23 +215,28 @@ public final class DocumentAssistant {
                 do {
                     let report = try await self.service.proofread(text.substring(with: chunk))
                     try Task.checkCancellation()
-                    guard self.reviewGeneration == generation else { return }
+                    guard self.reviewIdentity == reviewIdentity else { return }
                     let placed = ProofreadingIssues.locate(
                         report.findings, in: text, within: chunk)
                     found = found.merging(placed.issues)
-                    unplaced += placed.unplaced
+                    let (batchUnplaced, overflow) = report.declined.addingReportingOverflow(
+                        placed.unplaced)
+                    let increment = overflow ? Int.max : batchUnplaced
+                    let (totalUnplaced, totalOverflow) = unplaced.addingReportingOverflow(increment)
+                    unplaced = totalOverflow ? Int.max : totalUnplaced
+                    self.reviewUnplaced = unplaced
                     // Published as it goes, so underlines appear from the top
                     // of the document down instead of all at the end.
                     surface.issues = found
                     self.review = .running(checked: index + 1, total: planned.count)
                 } catch is CancellationError {
-                    guard self.reviewGeneration == generation else { return }
+                    guard self.reviewIdentity == reviewIdentity else { return }
                     self.review = .done(
                         checked: index, total: planned.count, found: found.count,
                         unplaced: unplaced)
                     return
                 } catch {
-                    guard self.reviewGeneration == generation else { return }
+                    guard self.reviewIdentity == reviewIdentity else { return }
                     self.review = .failed(error.localizedDescription)
                     return
                 }
@@ -216,10 +250,11 @@ public final class DocumentAssistant {
 
     public func stopReview() {
         let stoppedReview = review
-        reviewGeneration &+= 1
+        replaceReviewIdentity()
         reviewRequest.cancel()
         if case .running(let checked, let total) = stoppedReview {
-            review = .done(checked: checked, total: total, found: issues.count, unplaced: 0)
+            review = .done(
+                checked: checked, total: total, found: issues.count, unplaced: reviewUnplaced)
         }
     }
 
@@ -240,12 +275,20 @@ public final class DocumentAssistant {
     public func fix(_ issue: ProofreadingIssue) -> Bool {
         guard let surface, surface.acceptsAssistedEdits else { return false }
         let text = surface.markdown as NSString
-        guard issue.range.location + issue.range.length <= text.length,
+        guard let end = CheckedTextRange.end(of: issue.range), end <= text.length,
+            Self.isAdmissibleCorrection(issue),
             text.substring(with: issue.range) == issue.original
         else {
             // Stale: drop the underline rather than leave a button that
             // would rewrite the wrong words.
             surface.issues = surface.issues.removing(issue.id)
+            return false
+        }
+        guard Self.projectedDocumentBytes(
+            surface.markdown, replacing: issue.range, with: issue.replacement)
+            .map({ $0 <= MarkdownReadLimits.maximumDocumentBytes }) == true
+        else {
+            review = .failed("That correction would make the document too large, so it wasn’t applied.")
             return false
         }
         return surface.applyAssistedEdit(
@@ -260,18 +303,98 @@ public final class DocumentAssistant {
     /// yet applied untouched. Front to back would need every later range
     /// shifted after every fix — the same arithmetic, done by hand, in a loop
     /// where one mistake corrupts the document.
-    public func fixAll() {
-        guard let surface, surface.acceptsAssistedEdits else { return }
-        let pending = surface.issues.issues
-        guard !pending.isEmpty else { return }
+    @discardableResult
+    public func fixAll() -> Bool {
+        guard let surface, surface.acceptsAssistedEdits else { return false }
+        let pending = surface.issues.issues.sorted { $0.range.location < $1.range.location }
+        guard !pending.isEmpty else { return false }
 
-        surface.undoManager?.beginUndoGrouping()
-        for issue in pending.reversed() { fix(issue) }
-        // Named before the group is closed: each `fix` sets its own action
-        // name as it goes, and after `endUndoGrouping` the name would attach
-        // to whatever comes next instead of to this group.
-        surface.undoManager?.setActionName("Correct All")
-        surface.undoManager?.endUndoGrouping()
+        let original = surface.markdown
+        let text = original as NSString
+        guard var projectedBytes = MarkdownReadLimits.acceptedDocumentByteCount(original) else {
+            review = .failed("The document is too large to correct safely. Nothing was changed.")
+            return false
+        }
+        var previousEnd = 0
+        for issue in pending {
+            guard let end = CheckedTextRange.end(of: issue.range),
+                issue.range.location >= previousEnd, end <= text.length,
+                Self.isAdmissibleCorrection(issue),
+                text.substring(with: issue.range) == issue.original
+            else {
+                review = .failed(
+                    "One or more corrections no longer match the document. Nothing was changed.")
+                return false
+            }
+            let removedBytes = issue.original.utf8.count
+            let (withoutRemoved, subtractOverflow) = projectedBytes.subtractingReportingOverflow(
+                removedBytes)
+            let (withReplacement, addOverflow) = withoutRemoved.addingReportingOverflow(
+                issue.replacement.utf8.count)
+            guard !subtractOverflow, withoutRemoved >= 0, !addOverflow,
+                withReplacement <= MarkdownReadLimits.maximumDocumentBytes
+            else {
+                review = .failed(
+                    "Those corrections would make the document too large. Nothing was changed.")
+                return false
+            }
+            projectedBytes = withReplacement
+            previousEnd = end
+        }
+
+        let candidate = NSMutableString(string: original)
+        for issue in pending.reversed() {
+            candidate.replaceCharacters(in: issue.range, with: issue.replacement)
+        }
+        let replacement = candidate as String
+        guard replacement.utf8.count == projectedBytes else {
+            review = .failed("The corrections could not be verified. Nothing was changed.")
+            return false
+        }
+        guard surface.applyAssistedEdit(
+                range: NSRange(location: 0, length: text.length),
+                replacement: replacement,
+                actionName: "Correct All")
+        else {
+            // `shouldChangeText` may have updated the editor's issue projection
+            // before AppKit ultimately refuses the edit. Restore the exact
+            // review snapshot so a failed atomic action also preserves its UI.
+            surface.issues = ProofreadingIssues(issues: pending)
+            review = .failed("The editor refused those corrections. Nothing was changed.")
+            return false
+        }
+        return true
+    }
+
+    private nonisolated static func isAdmissibleCorrection(_ issue: ProofreadingIssue) -> Bool {
+        !issue.original.isEmpty && !issue.replacement.isEmpty
+            && issue.original != issue.replacement
+            && BoundedText.fitsUTF8(
+                issue.original, maximum: ProofreadingIssues.maximumFindingBytes)
+            && BoundedText.fitsUTF8(
+                issue.replacement, maximum: ProofreadingIssues.maximumFindingBytes)
+            && !issue.original.contains("\n") && !issue.original.contains("\r")
+            && !issue.replacement.contains("\n") && !issue.replacement.contains("\r")
+            && !issue.original.unicodeScalars.contains(where: { $0.value == 0 })
+            && !issue.replacement.unicodeScalars.contains(where: { $0.value == 0 })
+            && (issue.original as NSString).length <= ProofreadingIssues.maximumFindingLength
+            && (issue.replacement as NSString).length <= ProofreadingIssues.maximumFindingLength
+    }
+
+    private nonisolated static func projectedDocumentBytes(
+        _ markdown: String, replacing range: NSRange, with replacement: String
+    ) -> Int? {
+        let text = markdown as NSString
+        guard let end = CheckedTextRange.end(of: range), end <= text.length else { return nil }
+        guard let documentBytes = MarkdownReadLimits.acceptedDocumentByteCount(markdown) else {
+            return nil
+        }
+        let removed = text.substring(with: range).utf8.count
+        let (withoutRemoved, subtractOverflow) = documentBytes.subtractingReportingOverflow(removed)
+        let (projected, addOverflow) = withoutRemoved.addingReportingOverflow(
+            replacement.utf8.count)
+        guard !subtractOverflow, withoutRemoved >= 0, !addOverflow else { return nil }
+        return projected
     }
 
     // MARK: - Reading the note
@@ -285,6 +408,8 @@ public final class DocumentAssistant {
     /// anything, because an opaque string affords nothing but Copy. See
     /// ``NoteBrief``.
     public func analyze() {
+        let readingIdentity = replaceReadingIdentity()
+        readingRequest.cancel()
         guard let surface else { return }
         service.refreshAvailability()
         guard service.state.isReady else {
@@ -302,14 +427,12 @@ public final class DocumentAssistant {
         briefSource = source
         brief = NoteBrief(summary: "", keyPoints: [], title: "", tags: [])
         reading = .running
-        readingGeneration &+= 1
-        let generation = readingGeneration
         readingRequest.start { [weak self] in
-            guard let self, self.readingGeneration == generation else { return }
+            guard let self, self.readingIdentity == readingIdentity else { return }
             do {
                 let found = try await self.service.brief(text)
                 try Task.checkCancellation()
-                guard self.readingGeneration == generation else { return }
+                guard self.readingIdentity == readingIdentity else { return }
                 let validation = source.validate(
                     attachedTo: self.surface, requiresEditing: false)
                 guard validation == .current else {
@@ -317,27 +440,43 @@ public final class DocumentAssistant {
                         validation.message ?? "The source document is no longer available.")
                     return
                 }
-                self.brief = found
+                self.brief = found.brief
                 self.reading =
-                    found.isEmpty
+                    found.brief.isEmpty
                     ? .failed("Apple Intelligence returned nothing for that.")
-                    : .ready(truncated: truncated)
+                    : .ready(sourceTruncated: truncated, outputTruncated: found.truncated)
             } catch is CancellationError {
-                guard self.readingGeneration == generation else { return }
+                guard self.readingIdentity == readingIdentity else { return }
                 self.reading = self.readingRequest.didTimeOut
                     ? .failed(IntelligenceFailure.timedOut.localizedDescription)
                     : .idle
             } catch {
-                guard self.readingGeneration == generation else { return }
+                guard self.readingIdentity == readingIdentity else { return }
                 self.reading = .failed(error.localizedDescription)
             }
         }
     }
 
     public func stopReading() {
-        readingGeneration &+= 1
+        replaceReadingIdentity()
         readingRequest.cancel()
         reading = .idle
+    }
+
+    /// Invalidates callbacks from every previous proofreading request.
+    @discardableResult
+    private func replaceReviewIdentity() -> UUID {
+        let identity = UUID()
+        reviewIdentity = identity
+        return identity
+    }
+
+    /// Invalidates callbacks from every previous document-reading request.
+    @discardableResult
+    private func replaceReadingIdentity() -> UUID {
+        let identity = UUID()
+        readingIdentity = identity
+        return identity
     }
 
     /// Copies one piece of the brief.
@@ -449,8 +588,40 @@ public final class DocumentAssistant {
     nonisolated static func source(from markdown: String, limit: Int = AssistScope.maximumLength)
         -> (text: String, truncated: Bool)
     {
-        let text = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count > limit else { return (text, false) }
-        return (String(text.prefix(limit)), true)
+        guard limit > 0 else { return ("", !markdown.isEmpty) }
+        let source = markdown as NSString
+        let whitespace = CharacterSet.whitespacesAndNewlines
+        var start = 0
+        var semanticEnd = source.length
+        while start < semanticEnd, let scalar = Unicode.Scalar(source.character(at: start)),
+            whitespace.contains(scalar)
+        {
+            start += 1
+        }
+        while semanticEnd > start,
+            let scalar = Unicode.Scalar(source.character(at: semanticEnd - 1)),
+            whitespace.contains(scalar)
+        {
+            semanticEnd -= 1
+        }
+        guard start < semanticEnd else { return ("", false) }
+
+        let available = semanticEnd - start
+        var length = min(limit, available)
+        if length < available {
+            guard let boundary = CheckedTextRange.end(
+                of: NSRange(location: start, length: length))
+            else { return ("", true) }
+            if length > 0,
+                (0xD800...0xDBFF).contains(source.character(at: boundary - 1)),
+                (0xDC00...0xDFFF).contains(source.character(at: boundary))
+            {
+                length -= 1
+            }
+        }
+        guard length > 0 else { return ("", true) }
+        return (
+            source.substring(with: NSRange(location: start, length: length)),
+            available > length)
     }
 }

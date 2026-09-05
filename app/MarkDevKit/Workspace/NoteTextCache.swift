@@ -6,26 +6,7 @@
 //  still what is on disk.
 //
 
-import Darwin
 import Foundation
-
-/// Memory ceilings for Markdown that crosses from the file system into a UI.
-///
-/// The editor can reasonably hold a larger working document than an instant
-/// preview, but neither path may let an untrusted file allocate without a
-/// bound. Keeping both values here makes every file-backed surface use the
-/// same policy instead of accumulating subtly different magic numbers.
-public enum MarkdownReadLimits {
-    public static let maximumDocumentBytes = 16 * 1_024 * 1_024
-    public static let maximumPreviewBytes = 4 * 1_024 * 1_024
-
-    /// Returns the UTF-8 byte count only when the whole document is safe to
-    /// hand to the editor and the Rust ABI.
-    public static func acceptedDocumentByteCount(_ text: String) -> Int? {
-        let count = text.utf8.count
-        return count <= maximumDocumentBytes ? count : nil
-    }
-}
 
 /// Recoverable failures from a bounded note read.
 public enum NoteTextReadError: Error, Equatable, LocalizedError {
@@ -92,11 +73,14 @@ public final class NoteTextCache: @unchecked Sendable {
     private struct Entry {
         let data: Data
         let stamp: LocalFileStamp
+        let version: FileVersionToken
     }
 
     struct ReadResult: Sendable {
         let data: Data
         let stamp: LocalFileStamp
+        let version: FileVersionToken
+        let canonicalURL: URL
     }
 
     /// Not an actor: the readers are a synchronous `@MainActor` open and a
@@ -162,6 +146,13 @@ public final class NoteTextCache: @unchecked Sendable {
         _ url: URL,
         maximumBytes requestedMaximum: Int? = nil
     ) throws -> ReadResult {
+        // Validate before canonicalization: `standardizedFileURL` and path
+        // resolution discard file-URL authority. Without this guard a hostile
+        // remote-authority spelling can hit bytes cached under the matching
+        // local path without reaching the secure reader's later check.
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else {
+            throw NoteTextReadError.unsupportedFile(url)
+        }
         // Canonicalised once, and everything below works from it. Keying on
         // the tidied path while stamping the one that arrived would make two
         // spellings of the same note two entries — and worse, would stat a
@@ -169,40 +160,48 @@ public final class NoteTextCache: @unchecked Sendable {
         let file = Self.canonical(url)
         let key = file.path
         let maximumBytes = max(0, requestedMaximum ?? maximumFileBytes)
-
-        // At most one retry. A racing replace may make the path metadata and
-        // opened descriptor disagree; returning either version would let a
-        // stale/torn read escape, while retrying forever lets an attacker pin
-        // a caller by continually replacing the file.
-        for attempt in 0..<2 {
-            let current = LocalFileSystem.stamp(of: file)
-            if (current?.size ?? 0) > maximumBytes {
-                throw NoteTextReadError.fileTooLarge(file, maximumBytes: maximumBytes)
-            }
-
-            if let current,
-                let cached: Data = withLock({
-                    guard let entry = entries[key], entry.stamp == current else { return nil }
-                    guard entry.data.count <= maximumBytes else { return nil }
-                    hitCount += 1
-                    return entry.data
-                })
-            {
-                return ReadResult(data: cached, stamp: current)
-            }
-            if attempt == 0 { withLock { missCount += 1 } }
-
-            let result = try Self.boundedRead(file, maximumBytes: maximumBytes)
-            guard current == result.stamp,
-                LocalFileSystem.stamp(of: file) == result.stamp
-            else {
-                if attempt == 0 { continue }
-                throw NoteTextReadError.fileChangedDuringRead(file)
-            }
-            store(result.data, stamp: result.stamp, for: key)
-            return ReadResult(data: result.data, stamp: result.stamp)
+        let current = LocalFileSystem.stamp(of: file)
+        if (current?.size ?? 0) > maximumBytes {
+            throw NoteTextReadError.fileTooLarge(file, maximumBytes: maximumBytes)
         }
-        throw NoteTextReadError.fileChangedDuringRead(file)
+
+        if let current,
+            let cached: (data: Data, version: FileVersionToken) = withLock({
+                guard let entry = entries[key], entry.stamp == current else { return nil }
+                guard entry.data.count <= maximumBytes else { return nil }
+                hitCount += 1
+                return (entry.data, entry.version)
+            })
+        {
+            return ReadResult(
+                data: cached.data,
+                stamp: current,
+                version: cached.version,
+                canonicalURL: file)
+        }
+        withLock { missCount += 1 }
+
+        let snapshot: SecureLocalFileReadSnapshot
+        do {
+            snapshot = try SecureLocalFileSystem.read(url, maximumBytes: maximumBytes)
+        } catch SecureLocalFileError.fileTooLarge {
+            throw NoteTextReadError.fileTooLarge(file, maximumBytes: maximumBytes)
+        } catch SecureLocalFileError.unsupportedEntry {
+            throw NoteTextReadError.unsupportedFile(file)
+        } catch SecureLocalFileError.expectationMismatch {
+            throw NoteTextReadError.fileChangedDuringRead(file)
+        }
+        let canonicalKey = Self.canonical(snapshot.canonicalURL).path
+        store(
+            snapshot.data,
+            stamp: snapshot.stamp,
+            version: snapshot.version,
+            for: canonicalKey)
+        return ReadResult(
+            data: snapshot.data,
+            stamp: snapshot.stamp,
+            version: snapshot.version,
+            canonicalURL: snapshot.canonicalURL)
     }
 
     /// UTF-8 text, with the same contract as `String(contentsOf:encoding:)`.
@@ -213,14 +212,19 @@ public final class NoteTextCache: @unchecked Sendable {
     func utf8TextResult(
         at url: URL,
         maximumBytes: Int? = nil
-    ) throws -> (text: String, stamp: LocalFileStamp) {
+    ) throws -> (
+        text: String,
+        stamp: LocalFileStamp,
+        version: FileVersionToken,
+        canonicalURL: URL
+    ) {
         let result = try readResult(url, maximumBytes: maximumBytes)
         guard let text = String(data: result.data, encoding: .utf8) else {
             throw CocoaError(
                 .fileReadInapplicableStringEncoding,
                 userInfo: [NSURLErrorKey: url])
         }
-        return (text, result.stamp)
+        return (text, result.stamp, result.version, result.canonicalURL)
     }
 
     /// Reads `url` into the cache, reporting whether it landed there.
@@ -230,6 +234,7 @@ public final class NoteTextCache: @unchecked Sendable {
     /// was indexed — to be nothing more than a warm that did not happen.
     @discardableResult
     public func warm(_ url: URL) -> Data? {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else { return nil }
         guard let size = LocalFileSystem.stamp(of: Self.canonical(url))?.size,
             size <= maximumFileBytes
         else { return nil }
@@ -239,6 +244,7 @@ public final class NoteTextCache: @unchecked Sendable {
     /// The cached bytes for `url`, or `nil` when there are none or they are
     /// stale. Never reads the file's contents.
     public func cached(_ url: URL) -> Data? {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else { return nil }
         let file = Self.canonical(url)
         guard let current = LocalFileSystem.stamp(of: file) else { return nil }
         guard let entry = withLock({ entries[file.path] }), entry.stamp == current else {
@@ -264,7 +270,12 @@ public final class NoteTextCache: @unchecked Sendable {
 
     // MARK: - Storage
 
-    private func store(_ data: Data, stamp: LocalFileStamp, for key: String) {
+    private func store(
+        _ data: Data,
+        stamp: LocalFileStamp,
+        version: FileVersionToken,
+        for key: String
+    ) {
         guard data.count <= maximumFileBytes, data.count <= maximumTotalBytes else { return }
         withLock {
             if let replaced = entries.removeValue(forKey: key) {
@@ -272,7 +283,7 @@ public final class NoteTextCache: @unchecked Sendable {
             } else {
                 order.append(key)
             }
-            entries[key] = Entry(data: data, stamp: stamp)
+            entries[key] = Entry(data: data, stamp: stamp, version: version)
             bytes += data.count
 
             // Never past the entry just stored: the caller is about to use it,
@@ -291,69 +302,6 @@ public final class NoteTextCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
-    }
-
-    /// Opens the file and reads at most one byte beyond the ceiling.
-    ///
-    /// The metadata check in ``read(_:maximumBytes:)`` rejects an already
-    /// oversized regular file without allocating it. This second bound is
-    /// still required: a file can grow after that check, and a special file
-    /// can report no useful size at all. Reading to EOF after a successful
-    /// `stat` would turn that race back into an unbounded allocation.
-    private static func boundedRead(
-        _ url: URL,
-        maximumBytes: Int
-    ) throws -> (data: Data, stamp: LocalFileStamp) {
-        guard maximumBytes >= 0 else {
-            throw NoteTextReadError.fileTooLarge(url, maximumBytes: 0)
-        }
-        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            // O_NOFOLLOW_ANY rejects a symlink substituted into any component
-            // after canonicalisation; O_NONBLOCK prevents a FIFO from hanging
-            // the main actor before `fstat` can reject it.
-            let noFollowAny: Int32 = 0x2000_0000
-            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | noFollowAny)
-        }
-        guard descriptor >= 0 else {
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(errno),
-                userInfo: [NSFilePathErrorKey: url.path])
-        }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close() }
-
-        var status = stat()
-        guard fstat(descriptor, &status) == 0 else {
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(errno),
-                userInfo: [NSFilePathErrorKey: url.path])
-        }
-        guard status.st_mode & S_IFMT == S_IFREG,
-            let stamp = LocalFileStamp(status)
-        else {
-            throw NoteTextReadError.unsupportedFile(url)
-        }
-        if stamp.size > maximumBytes {
-            throw NoteTextReadError.fileTooLarge(url, maximumBytes: maximumBytes)
-        }
-
-        let ceiling = maximumBytes == Int.max ? Int.max : maximumBytes + 1
-        var data = Data()
-        data.reserveCapacity(min(maximumBytes, 64 * 1_024))
-        while data.count < ceiling {
-            let requested = min(64 * 1_024, ceiling - data.count)
-            guard let chunk = try handle.read(upToCount: requested), !chunk.isEmpty else {
-                break
-            }
-            data.append(chunk)
-        }
-        guard data.count <= maximumBytes else {
-            throw NoteTextReadError.fileTooLarge(url, maximumBytes: maximumBytes)
-        }
-        return (data, stamp)
     }
 
     /// One spelling per file, so `Notes/./a.md` and `Notes/a.md` are one

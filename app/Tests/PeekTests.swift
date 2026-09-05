@@ -6,11 +6,25 @@
 //  keys move the selection it previews.
 //
 
+import Darwin
 import XCTest
 
 @testable import MarkDevKit
 
 final class PeekLoaderTests: XCTestCase {
+    func testRemoteAuthorityCannotPreviewTheMatchingLocalPath() throws {
+        let local = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevPeekAuthority-\(UUID().uuidString).md")
+        defer { try? FileManager.default.removeItem(at: local) }
+        try Data("private".utf8).write(to: local)
+        let hostile = try XCTUnwrap(URL(string: "file://remote.example\(local.path)"))
+
+        guard case .failure(let failure) = PeekLoader.read(hostile) else {
+            return XCTFail("remote authority reached the local preview path")
+        }
+        XCTAssertEqual(failure.reason, "Only a local file can be previewed")
+    }
+
     private var directory: URL!
 
     override func setUpWithError() throws {
@@ -63,6 +77,21 @@ final class PeekLoaderTests: XCTestCase {
             return XCTFail("a file past the limit should not peek")
         }
         XCTAssertTrue(failure.reason.lowercased().contains("large"))
+    }
+
+    func testASpecialFileIsNotMisreportedAsTooLarge() throws {
+        let url = directory.appendingPathComponent("Pipe.md")
+        XCTAssertEqual(url.path.withCString { Darwin.mkfifo($0, 0o600) }, 0)
+
+        guard case .failure(let failure) = PeekLoader.read(url) else {
+            return XCTFail("a FIFO cannot be peeked")
+        }
+        XCTAssertTrue(
+            failure.reason.lowercased().contains("regular file"),
+            "the preview must describe the refused object class")
+        XCTAssertFalse(
+            failure.reason.lowercased().contains("large"),
+            "an unsupported file must not be presented as a size failure")
     }
 
     func testAFileExactlyAtTheLimitStillPeeks() throws {

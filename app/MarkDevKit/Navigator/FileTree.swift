@@ -150,6 +150,7 @@ public enum FileTree {
     /// Directories sort before files, then case-insensitively by name — the
     /// ordering Finder uses, so the sidebar does not feel foreign.
     public static func children(of url: URL, includeAllFiles: Bool = false) -> [FileNode] {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else { return [] }
         let keys: [URLResourceKey] = [.isDirectoryKey, .isHiddenKey, .isSymbolicLinkKey]
         guard
             let entries = try? FileManager.default.contentsOfDirectory(
@@ -212,6 +213,17 @@ public enum FileTree {
     public static func scanMarkdownFiles(
         under root: URL, limits: ScanLimits = .standard
     ) -> ScanResult {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else {
+            return ScanResult(
+                files: [],
+                visitedEntries: 0,
+                skippedSymlinks: 0,
+                unreadableDirectories: 1,
+                unreadableEntries: 0,
+                oversizedFiles: 0,
+                hitDepthLimit: false,
+                hitEntryLimit: false)
+        }
         let fileManager = FileManager.default
         let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
         let rootPath = resolvedRoot.path
@@ -362,6 +374,8 @@ public enum FileTree {
     ) -> UTF8ReadResult {
         let maximumBytes = max(0, maximumBytes)
         guard
+            BoundedRegularFileReader.hasLocalFileAuthority(url),
+            BoundedRegularFileReader.hasLocalFileAuthority(root),
             let values = try? url.resourceValues(forKeys: [
                 .fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey,
             ]),
@@ -433,7 +447,8 @@ public enum FileTree {
     }
 
     private static func canonicalExistingPath(_ url: URL) -> String? {
-        url.withUnsafeFileSystemRepresentation { path -> String? in
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else { return nil }
+        return url.withUnsafeFileSystemRepresentation { path -> String? in
             guard let path else { return nil }
             var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
             return buffer.withUnsafeMutableBufferPointer { resolved in

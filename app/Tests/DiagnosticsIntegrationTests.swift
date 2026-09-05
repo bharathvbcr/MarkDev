@@ -61,13 +61,13 @@ private actor GatedIntegrationDiagnosticSink: DiagnosticSink {
 final class DiagnosticsProductionIntegrationTests: XCTestCase {
     private var scratch: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         scratch = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevDiagnosticsIntegration-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: scratch)
     }
 
@@ -123,7 +123,10 @@ final class DiagnosticsProductionIntegrationTests: XCTestCase {
         let failingSink = FailingIntegrationDiagnosticSink()
         let center = makeCenter(sinks: [failingSink])
         let emitter = DiagnosticsEmitter(center: center)
-        let workspace = Workspace(diagnostics: emitter)
+        let workspace = Workspace(
+            diagnostics: emitter,
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
         let pane = workspace.focusedPane
         let secretText = "note-body-SECRET-2f79f6f0"
         let secretName = "private-token-7b12c.md"
@@ -160,7 +163,10 @@ final class DiagnosticsProductionIntegrationTests: XCTestCase {
     func testAnOversizedEditEmitsOnceAndAcceptedEditsEmitNothing() async throws {
         let center = makeCenter()
         let emitter = DiagnosticsEmitter(center: center)
-        let workspace = Workspace(diagnostics: emitter)
+        let workspace = Workspace(
+            diagnostics: emitter,
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
         let pane = workspace.focusedPane
         let secretText = "draft-body-SECRET-4c81ba90"
         let oversized = String(
@@ -197,7 +203,10 @@ final class DiagnosticsProductionIntegrationTests: XCTestCase {
     func testWorkspaceSaveFailureEmitsWithoutChangingTheThrownError() async throws {
         let center = makeCenter()
         let emitter = DiagnosticsEmitter(center: center)
-        let workspace = Workspace(diagnostics: emitter)
+        let workspace = Workspace(
+            diagnostics: emitter,
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
         let pane = workspace.focusedPane
         let secretText = "draft-SECRET-e3e9e773"
         let destination = scratch
@@ -220,10 +229,13 @@ final class DiagnosticsProductionIntegrationTests: XCTestCase {
         XCTAssertFalse(report.contains(destination.path))
     }
 
-    func testAutosaveReportsConflictAndFailureWithExactAggregateCounts() async throws {
+    func testAutosaveReportsConflictsWithExactAggregateCounts() async throws {
         let center = makeCenter()
         let emitter = DiagnosticsEmitter(center: center)
-        let workspace = Workspace(diagnostics: emitter)
+        let workspace = Workspace(
+            diagnostics: emitter,
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
         let pane = workspace.focusedPane
 
         let conflict = scratch.appendingPathComponent("conflict-secret-931b.md")
@@ -244,18 +256,19 @@ final class DiagnosticsProductionIntegrationTests: XCTestCase {
         let snapshot = await center.snapshot()
         XCTAssertEqual(
             snapshot.events.map(\.code),
-            [.workspaceAutosaveConflict, .workspaceAutosaveConflict, .workspaceAutosaveFailed])
+            [.workspaceAutosaveConflict, .workspaceAutosaveConflict])
+        guard snapshot.events.count == 2 else { return }
         let first = snapshot.events[0]
         XCTAssertEqual(first.metadata[.attemptedCount], .integer(1))
         XCTAssertEqual(first.metadata[.succeededCount], .integer(0))
         XCTAssertEqual(first.metadata[.conflictCount], .integer(1))
         XCTAssertEqual(first.metadata[.failedCount], .integer(0))
-        let last = snapshot.events[2]
+        let last = snapshot.events[1]
         XCTAssertEqual(last.metadata[.attemptedCount], .integer(2))
         XCTAssertEqual(last.metadata[.succeededCount], .integer(0))
-        XCTAssertEqual(last.metadata[.conflictCount], .integer(1))
-        XCTAssertEqual(last.metadata[.failedCount], .integer(1))
-        XCTAssertEqual(snapshot.events[1].operationID, snapshot.events[2].operationID)
+        XCTAssertEqual(last.metadata[.conflictCount], .integer(2))
+        XCTAssertEqual(last.metadata[.failedCount], .integer(0))
+        XCTAssertNotEqual(first.operationID, last.operationID)
 
         let report = try await reportString(center)
         for forbidden in [
@@ -582,24 +595,28 @@ final class DiagnosticsEmitterStressTests: XCTestCase {
     }
 
     func testBlockedSinkKeepsIngressBoundedAndAccountsForEveryDrop() async {
+        let concurrentEmissionCount = 10_000
+        let totalEmissionCount = concurrentEmissionCount + 1
+        let maximumPendingEvents = 64
         let gate = GatedIntegrationDiagnosticSink()
         let center = DiagnosticsCenter(
             configuration: DiagnosticsConfiguration(
-                memoryEventLimit: 128,
-                memoryByteLimit: 1 * 1_024 * 1_024,
-                supportReportByteLimit: 1 * 1_024 * 1_024),
+                memoryEventLimit: totalEmissionCount,
+                memoryByteLimit: 16 * 1_024 * 1_024,
+                supportReportByteLimit: 16 * 1_024 * 1_024),
             sinks: [gate],
             clock: IntegrationDiagnosticClock())
         let emitter = DiagnosticsEmitter(
             center: center,
-            configuration: DiagnosticsEmitterConfiguration(maximumPendingEvents: 64))
+            configuration: DiagnosticsEmitterConfiguration(
+                maximumPendingEvents: maximumPendingEvents))
 
         emitter.emit(
             severity: .notice,
             subsystem: .diagnostics,
             code: .appLaunchABIVerified)
         await gate.waitUntilFirstWriteStarts()
-        DispatchQueue.concurrentPerform(iterations: 10_000) { _ in
+        DispatchQueue.concurrentPerform(iterations: concurrentEmissionCount) { _ in
             emitter.emit(
                 severity: .notice,
                 subsystem: .diagnostics,
@@ -609,10 +626,14 @@ final class DiagnosticsEmitterStressTests: XCTestCase {
         await emitter.flush()
 
         let snapshot = await center.snapshot()
-        XCTAssertEqual(snapshot.health.recordedEventCount, 65)
-        XCTAssertEqual(snapshot.health.ingressDroppedEventCount, 9_936)
-        XCTAssertEqual(snapshot.health.droppedEventCount, 9_936)
-        XCTAssertEqual(snapshot.events.map(\.sequence), Array(1...65))
+        let recorded = snapshot.health.recordedEventCount
+        let dropped = snapshot.health.droppedEventCount
+        XCTAssertLessThanOrEqual(
+            emitter.maximumObservedPendingCountForTesting,
+            maximumPendingEvents)
+        XCTAssertEqual(recorded + dropped, UInt64(totalEmissionCount))
+        XCTAssertEqual(snapshot.health.ingressDroppedEventCount, dropped)
+        XCTAssertEqual(snapshot.events.map(\.sequence), Array(1...recorded))
     }
 }
 

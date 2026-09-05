@@ -35,6 +35,26 @@ private func vaultSaturatedAdd(_ lhs: Int, _ rhs: Int) -> Int {
     return overflow ? Int.max : sum
 }
 
+/// One exact version of graph-relevant vault content.
+///
+/// `revision` remains the public, monotonic progress value readers already
+/// consume. It saturates instead of wrapping at `UInt64.max`; `identity`
+/// changes on every accepted mutation, so an internal cache key never aliases
+/// an ancient version even after the display revision is exhausted.
+struct VaultContentVersion: Hashable, Sendable {
+    let revision: UInt64
+    private let identity = UUID()
+
+    init(revision: UInt64 = 0) {
+        self.revision = revision
+    }
+
+    func advanced() -> VaultContentVersion {
+        VaultContentVersion(
+            revision: revision == UInt64.max ? UInt64.max : revision + 1)
+    }
+}
+
 /// A link pointing at the current note.
 public struct Backlink: Codable, Identifiable, Sendable, Hashable {
     public let path: String
@@ -108,6 +128,64 @@ public struct RenameOutcome: Equatable, Sendable {
         self.failedRewrites = failedRewrites
         self.isComplete = isComplete
     }
+}
+
+public enum VaultIndexError: Error, Equatable, LocalizedError {
+    case invalidRoot
+    case openFailed
+    case renameRefused
+    case superseded
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidRoot:
+            "That vault location is not a safe local folder."
+        case .openFailed:
+            "The vault index could not be opened."
+        case .renameRefused:
+            "The note could not be moved safely."
+        case .superseded:
+            "A newer vault operation replaced this one."
+        }
+    }
+}
+
+#if canImport(CMarkDev)
+    /// Temporary owner used to move a freshly built Rust index from a detached
+    /// scan into the MainActor object without leaking or double-freeing it.
+    private final class PreparedVaultCore: @unchecked Sendable {
+        private let lock = NSLock()
+        private var handle: OpaquePointer?
+
+        init(_ handle: OpaquePointer) {
+            self.handle = handle
+        }
+
+        deinit {
+            lock.lock()
+            let retained = handle
+            handle = nil
+            lock.unlock()
+            if let retained { md_vault_free(retained) }
+        }
+
+        func take() -> OpaquePointer? {
+            lock.lock()
+            defer { lock.unlock() }
+            let retained = handle
+            handle = nil
+            return retained
+        }
+    }
+#endif
+
+private struct PreparedVaultOpen: @unchecked Sendable {
+    let root: URL
+    let noteCount: Int
+    let scanStatus: VaultInitialScanStatus?
+    #if canImport(CMarkDev)
+        let core: PreparedVaultCore
+    #endif
 }
 
 /// Whether an editor-buffer update crossed and changed the Rust index.
@@ -246,7 +324,10 @@ public final class VaultIndex {
     public private(set) var noteCount: Int = 0
     /// Advances whenever graph-relevant indexed content may have changed,
     /// including edits and renames that leave the number of notes unchanged.
-    public private(set) var contentRevision: UInt64 = 0
+    public var contentRevision: UInt64 { contentVersion.revision }
+    /// Canonical cache authority. Unlike the public finite revision, this
+    /// remains distinguishable across every accepted content transition.
+    private(set) var contentVersion = VaultContentVersion()
     /// Retains coverage evidence for diagnostics and callers using the legacy
     /// integer-returning reconciliation entry point.
     public private(set) var lastReconciliationResult: VaultReconciliationResult?
@@ -261,11 +342,14 @@ public final class VaultIndex {
         // hopeful: a layout running on a background thread and an index
         // update on the main actor can interleave at the lock, never inside
         // the Rust structure.
-        nonisolated(unsafe) private let coreLock = NSLock()
+        private let coreLock = NSLock()
         // All mutation remains main-actor isolated. Deinitialization is
         // nonisolated in Swift 6, so this annotation permits only the final
         // ownership release there; it does not make query methods concurrent.
         nonisolated(unsafe) private var handle: OpaquePointer?
+        /// Identity of the exact Rust handle under `coreLock`. Detached
+        /// mutations capture it before work and refuse a replacement handle.
+        nonisolated(unsafe) private var coreIdentity = UUID()
     #endif
 
     public init(diagnostics: DiagnosticsEmitter = .shared) {
@@ -288,6 +372,24 @@ public final class VaultIndex {
     /// Walking and parsing happen in Rust, which is fast enough that a
     /// personal vault indexes in the time it takes the window to appear.
     public func open(_ root: URL) {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else {
+            #if canImport(CMarkDev)
+                coreLock.withLock {
+                    if let handle { md_vault_free(handle) }
+                    handle = nil
+                    coreIdentity = UUID()
+                    noteCount = 0
+                    initialScanStatus = nil
+                }
+            #else
+                noteCount = 0
+                initialScanStatus = nil
+            #endif
+            self.root = nil
+            lastReconciliationResult = nil
+            contentVersion = contentVersion.advanced()
+            return
+        }
         let root = root.standardizedFileURL.resolvingSymlinksInPath()
         lastReconciliationResult = nil
         #if canImport(CMarkDev)
@@ -300,16 +402,116 @@ public final class VaultIndex {
             } else {
                 handle = nil
             }
+            coreIdentity = UUID()
             noteCount = handle.map { Int(md_vault_note_count($0)) } ?? 0
             initialScanStatus = handle.flatMap { decode(md_vault_scan_status($0)) }
             coreLock.unlock()
             self.root = root
-            contentRevision &+= 1
+            contentVersion = contentVersion.advanced()
         #else
             self.root = root
             initialScanStatus = nil
         #endif
     }
+
+    /// Opens and scans a vault outside MainActor, then swaps the complete Rust
+    /// handle in one locked commit. Cancellation before or after the blocking
+    /// scan frees the prepared handle and leaves the live index untouched.
+    public func openAsync(_ root: URL) async throws {
+        try Task.checkCancellation()
+        let worker = Task.detached(priority: .userInitiated) {
+            try Self.prepareOpen(root)
+        }
+        let prepared = try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        try Task.checkCancellation()
+
+        #if canImport(CMarkDev)
+            guard let preparedHandle = prepared.core.take() else {
+                throw VaultIndexError.superseded
+            }
+            coreLock.withLock {
+                if let handle { md_vault_free(handle) }
+                handle = preparedHandle
+                coreIdentity = UUID()
+                noteCount = prepared.noteCount
+                initialScanStatus = prepared.scanStatus
+            }
+        #else
+            noteCount = prepared.noteCount
+            initialScanStatus = prepared.scanStatus
+        #endif
+        self.root = prepared.root
+        lastReconciliationResult = nil
+        contentVersion = contentVersion.advanced()
+    }
+
+    private nonisolated static func prepareOpen(_ requestedRoot: URL) throws
+        -> PreparedVaultOpen
+    {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(requestedRoot),
+            !Task.isCancelled
+        else {
+            if Task.isCancelled { throw CancellationError() }
+            throw VaultIndexError.invalidRoot
+        }
+        let retainedDirectory: SecureLocalDirectoryHandle
+        do {
+            retainedDirectory = try SecureLocalDirectoryHandle(
+                opening: requestedRoot,
+                cancellationCheck: { Task.isCancelled })
+        } catch SecureLocalFileError.cancelled {
+            throw CancellationError()
+        } catch {
+            throw VaultIndexError.invalidRoot
+        }
+        let canonicalRoot = retainedDirectory.url.standardizedFileURL
+        guard VaultBoundary.acceptsCString(
+            canonicalRoot.path,
+            maximumBytes: VaultBoundary.maximumPathBytes)
+        else { throw VaultIndexError.invalidRoot }
+        try retainedDirectory.verifyLocation()
+
+        #if canImport(CMarkDev)
+            guard !Task.isCancelled,
+                let handle = canonicalRoot.path.withCString({ md_vault_open($0) })
+            else {
+                if Task.isCancelled { throw CancellationError() }
+                throw VaultIndexError.openFailed
+            }
+            let core = PreparedVaultCore(handle)
+            let count = Int(md_vault_note_count(handle))
+            let status: VaultInitialScanStatus? = decodeBorrowed(
+                md_vault_scan_status(handle))
+            try retainedDirectory.verifyLocation()
+            if Task.isCancelled { throw CancellationError() }
+            return PreparedVaultOpen(
+                root: canonicalRoot,
+                noteCount: count,
+                scanStatus: status,
+                core: core)
+        #else
+            if Task.isCancelled { throw CancellationError() }
+            return PreparedVaultOpen(
+                root: canonicalRoot,
+                noteCount: 0,
+                scanStatus: nil)
+        #endif
+    }
+
+    #if canImport(CMarkDev)
+        private nonisolated static func decodeBorrowed<T: Decodable>(
+            _ pointer: UnsafePointer<CChar>?
+        ) -> T? {
+            guard let pointer,
+                let data = String(cString: pointer).data(using: .utf8)
+            else { return nil }
+            return try? JSONDecoder().decode(T.self, from: data)
+        }
+    #endif
 
     /// Re-indexes one note from text held in the editor rather than on disk,
     /// so backlinks track what is on screen and not the last save.
@@ -338,7 +540,7 @@ public final class VaultIndex {
             switch rawResult {
             case 2:
                 noteCount = Int(md_vault_note_count(handle))
-                contentRevision &+= 1
+                contentVersion = contentVersion.advanced()
                 return .changed
             case 1:
                 return .unchanged
@@ -352,7 +554,10 @@ public final class VaultIndex {
 
     /// Vault-relative path for `url`, or `nil` when it sits outside the vault.
     public func relativePath(for url: URL) -> String? {
-        guard let root else { return nil }
+        guard let root,
+            BoundedRegularFileReader.hasLocalFileAuthority(root),
+            BoundedRegularFileReader.hasLocalFileAuthority(url)
+        else { return nil }
         let rootComponents = root.standardizedFileURL.resolvingSymlinksInPath().pathComponents
         let fileComponents = url.standardizedFileURL.resolvingSymlinksInPath().pathComponents
         guard fileComponents.count > rootComponents.count,
@@ -423,6 +628,57 @@ public final class VaultIndex {
         #endif
     }
 
+    /// Full-text search without running the synchronous Rust query on
+    /// MainActor. The live handle is still protected by ``coreLock`` and the
+    /// captured identity prevents queued work from searching a replacement
+    /// vault. Cancellation is forwarded to the detached owner and sampled
+    /// both before the lock and immediately before entering the FFI.
+    public func searchOffMain(_ text: String, limit: Int = 50) async -> [SearchHit] {
+        #if canImport(CMarkDev)
+            guard limit > 0,
+                VaultBoundary.acceptsCString(
+                    text, maximumBytes: VaultBoundary.maximumQueryBytes),
+                !Task.isCancelled
+            else { return [] }
+            let boundedLimit = UInt32(min(limit, VaultBoundary.maximumSearchResults))
+            let expectedIdentity = coreLock.withLock { coreIdentity }
+            let worker = Task.detached(priority: .userInitiated) { [self] in
+                lockedSearch(
+                    text,
+                    limit: boundedLimit,
+                    expectedIdentity: expectedIdentity)
+            }
+            return await withTaskCancellationHandler {
+                if Task.isCancelled { worker.cancel() }
+                let hits = await worker.value
+                return Task.isCancelled ? [] : hits
+            } onCancel: {
+                worker.cancel()
+            }
+        #else
+            return []
+        #endif
+    }
+
+    #if canImport(CMarkDev)
+        private nonisolated func lockedSearch(
+            _ text: String,
+            limit: UInt32,
+            expectedIdentity: UUID
+        ) -> [SearchHit] {
+            guard !Task.isCancelled else { return [] }
+            return coreLock.withLock {
+                guard !Task.isCancelled,
+                    coreIdentity == expectedIdentity,
+                    let handle
+                else { return [] }
+                return text.withCString {
+                    decode(md_vault_search(handle, $0, limit)) as [SearchHit]?
+                } ?? []
+            }
+        }
+    #endif
+
     /// Resolves a `[[wikilink]]` target and optional `#anchor`.
     public func resolve(target: String, anchor: String? = nil) -> LinkResolution? {
         #if canImport(CMarkDev)
@@ -481,7 +737,7 @@ public final class VaultIndex {
             guard let handle else { return }
             path.withCString { md_vault_remove(handle, $0) }
             noteCount = Int(md_vault_note_count(handle))
-            contentRevision &+= 1
+            contentVersion = contentVersion.advanced()
         #endif
     }
 
@@ -537,7 +793,14 @@ public final class VaultIndex {
             recordIncompleteReconciliation(result, operationID: operationID)
             return result
         }
-        let excluded = Set(excluding.map(\.standardizedFileURL.path))
+        // Excluding a note grants authority to keep its in-memory text over
+        // what is on disk. Validate before standardization so a hostile
+        // remote-authority spelling cannot suppress the matching local path.
+        let excluded = Set(excluding.compactMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL.path
+                : nil
+        })
 
         // Read off the main actor. The snapshot carries bytes, not parsed
         // results, so the apply step below cannot mistake a stale read for a
@@ -546,8 +809,7 @@ public final class VaultIndex {
             let url: URL
             let text: String
         }
-        let readResult: (FileTree.ScanResult, [DiskNote], Int, Int, Int, Bool) =
-            await Task.detached(priority: .utility) {
+        let readWorker = Task.detached(priority: .utility) {
                 let scan = FileTree.scanMarkdownFiles(under: root, limits: scanLimits)
                 let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
                 let rootPrefix = resolvedRoot.hasSuffix("/") ? resolvedRoot : resolvedRoot + "/"
@@ -558,6 +820,7 @@ public final class VaultIndex {
                 var snapshot: [DiskNote] = []
                 snapshot.reserveCapacity(scan.files.count)
                 for url in scan.files {
+                    guard !Task.isCancelled else { break }
                     let standardized = url.standardizedFileURL.path
                     guard !excluded.contains(standardized) else { continue }
                     let values = try? url.resourceValues(forKeys: [
@@ -603,13 +866,31 @@ public final class VaultIndex {
                     oversizedFilesDuringRead,
                     bytesRead,
                     hitTotalByteLimitDuringRead)
-            }.value
+            }
+        let readResult: (FileTree.ScanResult, [DiskNote], Int, Int, Int, Bool) =
+            await withTaskCancellationHandler {
+                await readWorker.value
+            } onCancel: {
+                readWorker.cancel()
+            }
         let scan = readResult.0
         let snapshot = readResult.1
         var unreadableFiles = readResult.2
         let oversizedFilesDuringRead = readResult.3
         let bytesRead = readResult.4
         let hitTotalByteLimitDuringRead = readResult.5
+
+        guard !Task.isCancelled,
+            self.root?.standardizedFileURL == root.standardizedFileURL
+        else {
+            return VaultReconciliationResult(
+                changedNotes: 0,
+                scan: scan,
+                unreadableFiles: max(1, unreadableFiles),
+                oversizedFilesDuringRead: oversizedFilesDuringRead,
+                bytesRead: bytesRead,
+                hitTotalByteLimitDuringRead: hitTotalByteLimitDuringRead)
+        }
 
         var touched = 0
         let onDisk = Set(scan.files.map(\.standardizedFileURL.path))
@@ -707,7 +988,7 @@ public final class VaultIndex {
                     }
                 }
                 guard let payload else { return nil }
-                contentRevision &+= 1
+                contentVersion = contentVersion.advanced()
                 return RenameOutcome(
                     rewrittenNotes: Int(payload.rewritten_notes),
                     rewrittenLinks: Int(payload.rewritten_links),
@@ -718,6 +999,71 @@ public final class VaultIndex {
             return nil
         #endif
     }
+
+    /// Runs the Rust file move/link rewrite away from MainActor. The exact
+    /// handle identity is checked under the same lock as the mutation, so a
+    /// delayed rename can never land on a newly opened vault instance.
+    public func renameNoteOffMain(from: String, to: String) async throws -> RenameOutcome {
+        guard VaultBoundary.acceptsCString(
+            from, maximumBytes: VaultBoundary.maximumPathBytes),
+            VaultBoundary.acceptsCString(
+                to, maximumBytes: VaultBoundary.maximumPathBytes)
+        else { throw VaultIndexError.renameRefused }
+        try Task.checkCancellation()
+
+        #if canImport(CMarkDev)
+            let expectedIdentity = coreLock.withLock { coreIdentity }
+            let worker = Task.detached(priority: .userInitiated) { [self] in
+                try renameLocked(
+                    from: from,
+                    to: to,
+                    expectedIdentity: expectedIdentity)
+            }
+            let outcome = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+
+            // Cancellation after `md_vault_rename` began cannot undo its disk
+            // effect. Return and settle that exact result instead of reporting
+            // cancellation and inviting a duplicate retry.
+            let stillCurrent = coreLock.withLock { coreIdentity == expectedIdentity }
+            guard stillCurrent else { throw VaultIndexError.superseded }
+            contentVersion = contentVersion.advanced()
+            return outcome
+        #else
+            throw VaultIndexError.renameRefused
+        #endif
+    }
+
+    #if canImport(CMarkDev)
+        private nonisolated func renameLocked(
+            from: String,
+            to: String,
+            expectedIdentity: UUID
+        ) throws -> RenameOutcome {
+            try coreLock.withLock {
+                guard !Task.isCancelled else { throw CancellationError() }
+                guard coreIdentity == expectedIdentity else {
+                    throw VaultIndexError.superseded
+                }
+                guard let handle else { throw VaultIndexError.renameRefused }
+                let payload: RenameOutcomePayload? = from.withCString { fromPointer in
+                    to.withCString { toPointer in
+                        Self.decodeBorrowed(
+                            md_vault_rename(handle, fromPointer, toPointer))
+                    }
+                }
+                guard let payload else { throw VaultIndexError.renameRefused }
+                return RenameOutcome(
+                    rewrittenNotes: Int(payload.rewritten_notes),
+                    rewrittenLinks: Int(payload.rewritten_links),
+                    failedRewrites: Int(payload.failed_rewrites),
+                    isComplete: payload.complete)
+            }
+        }
+    #endif
 
     /// The link graph, laid out and ready to draw.
     ///

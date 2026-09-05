@@ -108,3 +108,67 @@ final class CommandPaletteSearchStateTests: XCTestCase {
         XCTAssertEqual(state.generation, revision, "render-time reads must not mutate the cache")
     }
 }
+
+final class CommandPaletteSearchWiringTests: XCTestCase {
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func source(_ path: String) throws -> String {
+        try String(contentsOf: repositoryRoot.appendingPathComponent(path), encoding: .utf8)
+    }
+
+    private func slice(_ source: String, from start: String, until end: String) throws -> Substring {
+        let lower = try XCTUnwrap(source.range(of: start)?.lowerBound)
+        let upper = try XCTUnwrap(
+            source.range(of: end, range: lower..<source.endIndex)?.lowerBound)
+        return source[lower..<upper]
+    }
+
+    func testPaletteContentSearchLeavesMainActorAndRejectsLatePublication() throws {
+        let paletteSource = try source("app/MarkDevKit/Workspace/CommandPalette.swift")
+        let workspaceSource = try source("app/MarkDev/WorkspaceView.swift")
+        let vaultSource = try source("app/MarkDevKit/Vault/VaultIndex.swift")
+        let refresh = try slice(
+            paletteSource,
+            from: "private func refreshContent(",
+            until: "private func resetHighlight(")
+        let commandProjection = try slice(
+            workspaceSource,
+            from: "private func contentSearchCommands(",
+            until: "private func run(_ command:")
+        let offMain = try slice(
+            vaultSource,
+            from: "public func searchOffMain(",
+            until: "public func resolve(")
+
+        let awaitedSearch = try XCTUnwrap(
+            refresh.range(of: "let hits = await contentSearch(request.query)"))
+        let publication = try XCTUnwrap(
+            refresh.range(
+                of: "contentState.complete(",
+                range: awaitedSearch.upperBound..<refresh.endIndex))
+        let postAwaitGuard = refresh[awaitedSearch.upperBound..<publication.lowerBound]
+
+        XCTAssertTrue(refresh.contains("let hits = await contentSearch(request.query)"))
+        XCTAssertTrue(
+            postAwaitGuard.contains("guard !Task.isCancelled"),
+            "cancellation must be sampled after blocking work returns and before publication")
+        XCTAssertTrue(refresh.contains("contentState.complete("))
+        XCTAssertTrue(refresh.contains("generation: generation"))
+        XCTAssertTrue(
+            workspaceSource.contains("? nil : { await contentSearchCommands(for: $0) }"),
+            "the palette must await the async content-search adapter")
+        XCTAssertTrue(commandProjection.contains("async -> [Command]"))
+        XCTAssertTrue(commandProjection.contains("await vault.searchOffMain("))
+        XCTAssertFalse(
+            commandProjection.contains("vault.search("),
+            "the synchronous Rust call must never return to the MainActor UI seam")
+        XCTAssertTrue(offMain.contains("Task.detached"))
+        XCTAssertTrue(offMain.contains("withTaskCancellationHandler"))
+        XCTAssertTrue(offMain.contains("expectedIdentity"))
+    }
+}

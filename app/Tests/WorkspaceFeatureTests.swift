@@ -8,6 +8,45 @@ import XCTest
 @testable import MarkDevKit
 
 final class WorkspaceFeatureTests: XCTestCase {
+    func testRenameBatchAdmissionIsBoundedStableAndDeduplicated() {
+        let first = URL(fileURLWithPath: "/vault/A.md")
+        let second = URL(fileURLWithPath: "/vault/B.md")
+        let tail = (0..<40).map { URL(fileURLWithPath: "/vault/\($0).md") }
+
+        let request = WorkspaceRenameBatchRequest.bounded(
+            [first, first, second] + tail,
+            limit: 3)
+
+        XCTAssertEqual(request.urls, [first, second])
+        XCTAssertEqual(request.dropped, 41, "duplicate and over-budget items remain visible")
+        XCTAssertNotNil(request.truncationMessage)
+    }
+
+    func testRenameBatchDoesNotLaunderRemoteFileAuthorityIntoALocalPath() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example/vault/Private.md"))
+
+        let request = WorkspaceRenameBatchRequest.bounded([hostile])
+
+        XCTAssertTrue(request.urls.isEmpty)
+        XCTAssertEqual(request.dropped, 1)
+    }
+
+    func testRenameBatchOutcomeKeepsMovedPartialAndFailedItemsDistinct() {
+        var outcome = WorkspaceRenameBatchOutcome()
+        let moved = URL(fileURLWithPath: "/vault/Moved.md")
+        let partial = URL(fileURLWithPath: "/vault/Partial.md")
+        let failed = URL(fileURLWithPath: "/vault/Failed.md")
+
+        outcome.record(.moved, item: moved)
+        outcome.record(.movedWithIssue("two links were not rewritten"), item: partial)
+        outcome.record(.failed("destination already exists"), item: failed)
+
+        XCTAssertEqual(outcome.movedCount, 2)
+        XCTAssertEqual(outcome.issues.map(\.displayName), ["Partial.md", "Failed.md"])
+        XCTAssertTrue(outcome.issueMessage?.contains("2 note moves need attention") == true)
+    }
+
     // MARK: - Palette content search
 
     func testLineOffsetsResolveToUTF16LocationsForReveal() {
@@ -58,14 +97,84 @@ final class WorkspaceFeatureTests: XCTestCase {
         XCTAssertEqual(range.clamping(.infinity), 260)
     }
 
-    func testMinimumWindowFitsTwoReadableEditorsAndBothPanels() {
-        let chrome =
-            GlassTheme.sidebar.preferred + GlassTheme.inspector.preferred
-            + (GlassTheme.dividerHitWidth * 3)
-        let editors = GlassTheme.minimumEditorPaneWidth * 2
+    func testWindowGeometryTracksHorizontalPanesAndVisiblePanels() {
+        let first = PaneID()
+        let second = PaneID()
+        let single = SplitLayout(pane: first)
+        let horizontal = SplitLayout(
+            root: .split(
+                SplitNodeGroup(
+                    axis: .horizontal,
+                    children: [.leaf(first), .leaf(second)],
+                    fractions: [0.5, 0.5])))
+        let vertical = SplitLayout(
+            root: .split(
+                SplitNodeGroup(
+                    axis: .vertical,
+                    children: [.leaf(first), .leaf(second)],
+                    fractions: [0.5, 0.5])))
 
-        XCTAssertEqual(GlassTheme.minimumTwoPaneWindowWidth, chrome + editors)
-        XCTAssertEqual(GlassTheme.minimumTwoPaneWindowWidth, 1_270)
+        XCTAssertEqual(
+            WorkspaceWindowGeometry(
+                layout: single, showsSidebar: false, showsInspector: false
+            ).desiredMinimumWidth,
+            360)
+        XCTAssertEqual(
+            WorkspaceWindowGeometry(
+                layout: single, showsSidebar: true, showsInspector: true
+            ).desiredMinimumWidth,
+            680)
+        XCTAssertEqual(
+            WorkspaceWindowGeometry(
+                layout: horizontal, showsSidebar: true, showsInspector: true
+            ).desiredMinimumWidth,
+            950)
+        XCTAssertEqual(
+            WorkspaceWindowGeometry(
+                layout: vertical, showsSidebar: true, showsInspector: true
+            ).desiredMinimumWidth,
+            680,
+            "vertical splits consume height rather than another editor column")
+    }
+
+    func testWindowGeometryHonoursNarrowScreenAndInvalidProposals() {
+        let geometry = WorkspaceWindowGeometry(
+            layout: SplitLayout(pane: PaneID()),
+            showsSidebar: true,
+            showsInspector: true)
+
+        XCTAssertEqual(geometry.minimumWidth(maximumAvailableWidth: 540), 540)
+        XCTAssertEqual(geometry.minimumWidth(maximumAvailableWidth: 2_000), 680)
+        XCTAssertEqual(geometry.minimumWidth(maximumAvailableWidth: nil), 680)
+        XCTAssertEqual(geometry.minimumWidth(maximumAvailableWidth: .nan), 680)
+        XCTAssertEqual(geometry.minimumWidth(maximumAvailableWidth: -1), 680)
+    }
+
+    func testCloseReviewSheetUsesCompactWidthAndStacksAccessibilityActions() {
+        XCTAssertEqual(CloseReviewSheetLayout.width(availableWidth: nil), 510)
+        XCTAssertEqual(CloseReviewSheetLayout.width(availableWidth: 360), 360)
+        XCTAssertEqual(CloseReviewSheetLayout.width(availableWidth: 900), 620)
+        XCTAssertEqual(CloseReviewSheetLayout.width(availableWidth: .nan), 510)
+
+        XCTAssertEqual(
+            CloseReviewSheetLayout.actionAxis(
+                availableContentWidth: 470,
+                buttonWidths: [70, 105, 90, 65],
+                spacing: 10),
+            .horizontal)
+        XCTAssertEqual(
+            CloseReviewSheetLayout.actionAxis(
+                availableContentWidth: 470,
+                buttonWidths: [125, 185, 155, 110],
+                spacing: 10),
+            .vertical,
+            "large accessibility labels must stack before any action clips")
+        XCTAssertEqual(
+            CloseReviewSheetLayout.actionAxis(
+                availableContentWidth: 260,
+                buttonWidths: [70, 105, 90, 65],
+                spacing: 10),
+            .vertical)
     }
 
     // MARK: - Writing modes

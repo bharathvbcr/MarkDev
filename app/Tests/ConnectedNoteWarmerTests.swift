@@ -15,14 +15,14 @@ import XCTest
 final class ConnectedNoteWarmerTests: XCTestCase {
     private var root: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevWarmer-\(UUID().uuidString)")
             .appendingPathComponent("Vault")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
     }
 

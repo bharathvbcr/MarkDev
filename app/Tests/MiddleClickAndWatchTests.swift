@@ -18,7 +18,7 @@ final class MiddleClickDispatcherTests: XCTestCase {
     private var window: NSWindow!
     private var views: [MiddleClickView] = []
 
-    override func setUp() {
+    override func setUp() async throws {
         // Borderless, off-screen, never closed — a window built in code is
         // released by close(), and a test holding it afterwards over-releases
         // (see the suite's own notes on that trap).
@@ -28,7 +28,7 @@ final class MiddleClickDispatcherTests: XCTestCase {
         window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         for view in views {
             view.removeFromSuperview()
             MiddleClickDispatcher.shared.unregister(view)
@@ -36,7 +36,7 @@ final class MiddleClickDispatcherTests: XCTestCase {
         views.removeAll()
         MiddleClickDispatcher.shared.removeAllForTesting()
         window = nil
-        super.tearDown()
+        try await super.tearDown()
     }
 
     @discardableResult
@@ -128,7 +128,7 @@ final class VaultWatchCoordinatorTests: XCTestCase {
     private var rootA: URL!
     private var rootB: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         // Refcounting and fan-out need no daemon: fseventsd throttles a
         // process that births many streams, so these run against the
         // bookkeeping-only mode and every live-delivery question is answered
@@ -142,7 +142,7 @@ final class VaultWatchCoordinatorTests: XCTestCase {
         try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         VaultWatchCoordinator.startsRealStreamsForTesting = true
         try? FileManager.default.removeItem(at: rootA)
         try? FileManager.default.removeItem(at: rootB)

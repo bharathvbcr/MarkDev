@@ -37,6 +37,12 @@ public struct TerminalDrawer: View {
     /// and the processes behind them, are the same either way.
     public var placement: TerminalPlacement = .drawer
     public var onClose: (() -> Void)?
+    /// Requests destruction of one terminal tab. The app supplies close
+    /// review; previews and isolated framework clients retain the direct model
+    /// behavior through the default.
+    public var onCloseSession: ((TerminalSessionState.ID) -> Void)?
+    /// Requests replacement of a live process generation.
+    public var onRestartSession: ((TerminalSessionState.ID) -> Void)?
     /// Moves the terminal to the other panel.
     public var onMove: (() -> Void)?
     /// Opens a shell already running the local harness. `nil` hides the option
@@ -54,6 +60,8 @@ public struct TerminalDrawer: View {
         vault: URL?,
         placement: TerminalPlacement = .drawer,
         onClose: (() -> Void)? = nil,
+        onCloseSession: ((TerminalSessionState.ID) -> Void)? = nil,
+        onRestartSession: ((TerminalSessionState.ID) -> Void)? = nil,
         onMove: (() -> Void)? = nil,
         onOpenHarness: (() -> Void)? = nil,
         onError: ((String) -> Void)? = nil
@@ -63,6 +71,8 @@ public struct TerminalDrawer: View {
         self.vault = vault
         self.placement = placement
         self.onClose = onClose
+        self.onCloseSession = onCloseSession
+        self.onRestartSession = onRestartSession
         self.onMove = onMove
         self.onOpenHarness = onOpenHarness
         self.onError = onError
@@ -98,7 +108,7 @@ public struct TerminalDrawer: View {
                             session: session,
                             isSelected: session.id == sessions.selection,
                             onSelect: { sessions.select(session.id) },
-                            onClose: { sessions.close(session.id) })
+                            onClose: { requestClose(session.id) })
                     }
                 }
             }
@@ -128,6 +138,7 @@ public struct TerminalDrawer: View {
             } else {
                 Button(action: openNewSession) {
                     Image(systemName: "plus")
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
                 .help("New terminal")
@@ -137,6 +148,7 @@ public struct TerminalDrawer: View {
             if let onMove {
                 Button(action: onMove) {
                     Image(systemName: placement.moveSymbol)
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
                 .help(placement.moveHelp)
@@ -144,17 +156,20 @@ public struct TerminalDrawer: View {
             }
 
             if let current = sessions.current {
-                Button { sessions.restart(current.id) } label: {
+                Button { requestRestart(current.id) } label: {
                     Image(systemName: "arrow.clockwise")
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
                 .help("Restart this shell")
                 .accessibilityLabel("Restart this shell")
+                .accessibilityIdentifier("terminal.restart.\(current.id.uuidString)")
             }
 
             if let onClose {
                 Button(action: onClose) {
                     Image(systemName: placement.hideSymbol)
+                        .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
                 }
                 .buttonStyle(.plain)
                 .help("Hide the terminal")
@@ -211,12 +226,27 @@ public struct TerminalDrawer: View {
     /// which reads as the terminal having broken rather than having exited.
     @ViewBuilder
     private var exitBadge: some View {
-        if let current = sessions.current, let exit = current.exit {
+        if let current = sessions.current, let failure = current.launchFailure {
+            HStack(spacing: GlassTheme.Spacing.tight) {
+                Text(failure.reason)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                Button("Close") { requestClose(current.id) }
+                    .controlSize(.mini)
+            }
+            .font(.caption2)
+            .padding(.horizontal, GlassTheme.Spacing.snug)
+            .padding(.vertical, GlassTheme.Spacing.tight)
+            .glassPanel(radius: GlassTheme.Radius.small, padding: EdgeInsets())
+            .padding(GlassTheme.Spacing.snug)
+            .accessibilityIdentifier("terminal.launch-failure")
+        } else if let current = sessions.current, let exit = current.exit {
             HStack(spacing: GlassTheme.Spacing.tight) {
                 Text(exit.summary)
                     .foregroundStyle(exit.isClean ? AnyShapeStyle(.secondary) : AnyShapeStyle(.red))
-                Button("Restart") { sessions.restart(current.id) }
+                Button("Restart") { requestRestart(current.id) }
                     .controlSize(.mini)
+                    .accessibilityIdentifier("terminal.restart.\(current.id.uuidString)")
             }
             .font(.caption2)
             .padding(.horizontal, GlassTheme.Spacing.snug)
@@ -233,6 +263,22 @@ public struct TerminalDrawer: View {
             onError?(failure.reason)
         } catch {
             onError?(error.localizedDescription)
+        }
+    }
+
+    private func requestClose(_ id: TerminalSessionState.ID) {
+        if let onCloseSession {
+            onCloseSession(id)
+        } else {
+            sessions.close(id)
+        }
+    }
+
+    private func requestRestart(_ id: TerminalSessionState.ID) {
+        if let onRestartSession {
+            onRestartSession(id)
+        } else {
+            sessions.restart(id)
         }
     }
 }
@@ -258,14 +304,18 @@ private struct TerminalTab: View {
             Text(session.title)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            if isHovering || isSelected {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8))
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close \(session.title)")
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8))
+                    .controlTarget(Circle(), padding: 4)
             }
+            .buttonStyle(.plain)
+            // Keep the close action present for Full Keyboard Access and
+            // VoiceOver even when pointer chrome is visually quiet.
+            .opacity(isHovering || isSelected ? 1 : 0)
+            .accessibilityHidden(false)
+            .accessibilityLabel("Close \(session.title)")
+            .accessibilityIdentifier("terminal.close.\(session.id.uuidString)")
         }
         .font(.caption)
         .foregroundStyle(isSelected ? Color.primary : Color.secondary)
@@ -278,7 +328,20 @@ private struct TerminalTab: View {
         .onTapGesture(perform: onSelect)
         .onHover { isHovering = $0 }
         .help(session.config.workingDirectory)
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .focusable()
+        .onKeyPress(.return) {
+            onSelect()
+            return .handled
+        }
+        .onKeyPress(.space) {
+            onSelect()
+            return .handled
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(session.title), terminal tab")
+        .accessibilityHint(isSelected ? "Selected terminal" : "Activates this terminal")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
+        .accessibilityAction(.default) { onSelect() }
     }
 }
 
@@ -318,8 +381,8 @@ struct TerminalHostView: NSViewRepresentable {
     }
 
     func updateNSView(_ container: NSView, context: Context) {
-        attach(to: container)
         sessions.host(for: id)?.relaunchIfNeeded(config, generation: generation)
+        attach(to: container)
     }
 
     private func attach(to container: NSView) {

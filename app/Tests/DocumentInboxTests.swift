@@ -103,6 +103,19 @@ final class DocumentInboxTests: XCTestCase {
         XCTAssertEqual(window.names, ["A.md", "B.md"])
     }
 
+    func testRemoteAuthorityIsRejectedBeforeQueueNormalizationCanDiscardIt() throws {
+        let (inbox, _) = makeInbox()
+        let window = FakeSurface()
+        window.register(with: inbox)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example/vault/Local.md"))
+
+        inbox.receive([hostile])
+
+        XCTAssertTrue(window.received.isEmpty)
+        XCTAssertTrue(inbox.pending.isEmpty)
+    }
+
     func testUnregisteringStopsDeliveryAndTheNextWindowGetsTheBacklog() {
         // A closing window must stop being handed documents, and whatever
         // arrives before the next one opens must not be lost.

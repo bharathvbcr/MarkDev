@@ -45,6 +45,17 @@ final class SyntaxHighlightingTests: XCTestCase {
         XCTAssertFalse(highlighter.isCached(language: oversizedLanguage, code: "x"))
     }
 
+    func testHostileCombiningClustersAreRefusedAtTheByteBoundary() {
+        let highlighter = SyntaxHighlighter()
+        let oversizedCode = "a" + String(
+            repeating: "\u{301}", count: SyntaxHighlighter.maximumCodeBytes)
+        let oversizedLanguage = "r" + String(repeating: "\u{301}", count: 1_000_000)
+
+        XCTAssertTrue(highlighter.spans(language: "rust", code: oversizedCode).isEmpty)
+        XCTAssertFalse(highlighter.isCached(language: "rust", code: oversizedCode))
+        XCTAssertFalse(highlighter.supports(oversizedLanguage))
+    }
+
     func testCacheEvictsByRetainedBytesAsWellAsEntryCount() {
         let highlighter = SyntaxHighlighter(maximumEntries: 10, maximumBytes: 1_000)
         let first = String(repeating: "a", count: 600)

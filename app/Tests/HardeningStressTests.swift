@@ -18,13 +18,13 @@ import XCTest
 final class WatcherStressTests: XCTestCase {
     private var directory: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevWatchStorm-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -150,7 +150,7 @@ final class SessionHostilityTests: XCTestCase {
             focusedPane: PaneID(),  // not in the layout at all
             vaultRoot: "/volumes/that/never/existed")
 
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: hostile)
 
         // Every pane of the LAYOUT answers with exactly one document view;
@@ -190,7 +190,7 @@ final class GraphHammerTests: XCTestCase {
     private var directory: URL!
     private var index: VaultIndex!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         directory = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevGraphHammer-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -205,7 +205,7 @@ final class GraphHammerTests: XCTestCase {
         index.open(directory)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -254,7 +254,7 @@ final class AutosaveRaceTests: XCTestCase {
         let file = root.appendingPathComponent("Contested.md")
         try "# v0".write(to: file, atomically: true, encoding: .utf8)
 
-        let workspace = Workspace()
+        let workspace = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         try workspace.open(file, in: workspace.focusedPane)
 
         for round in 1...20 {

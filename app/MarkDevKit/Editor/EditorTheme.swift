@@ -199,8 +199,19 @@ public struct EditorTheme {
         highContrastDark: NSColor? = nil
     ) -> NSColor {
         NSColor(name: NSColor.Name(name)) { appearance in
-            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast {
+            // Resolve from the view's appearance rather than the process-wide
+            // NSWorkspace singleton. Besides being correct for a window whose
+            // appearance differs from the system, this API is extension-safe.
+            let match = appearance.bestMatch(from: [
+                .accessibilityHighContrastAqua,
+                .accessibilityHighContrastDarkAqua,
+                .aqua,
+                .darkAqua,
+            ])
+            let isDark = match == .darkAqua || match == .accessibilityHighContrastDarkAqua
+            let isHighContrast = match == .accessibilityHighContrastAqua
+                || match == .accessibilityHighContrastDarkAqua
+            if isHighContrast {
                 if isDark, let hc = highContrastDark { return hc }
                 if !isDark, let hc = highContrastLight { return hc }
             }

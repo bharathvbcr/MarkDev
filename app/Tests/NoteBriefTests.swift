@@ -69,6 +69,52 @@ final class NoteBriefTests: XCTestCase {
         XCTAssertTrue(normalized.isEmpty)
     }
 
+    func testHostileGeneratedFieldsAreBoundedBeforeStorage() {
+        let hostile = brief(
+            summary: String(repeating: "summary ", count: 1_000),
+            keyPoints: Array(repeating: String(repeating: "point ", count: 100), count: 100),
+            title: String(repeating: "title ", count: 100),
+            tags: Array(repeating: String(repeating: "tag ", count: 100), count: 100))
+        let result = hostile.normalization
+        let normalized = result.brief
+
+        XCTAssertTrue(result.truncated)
+        XCTAssertLessThanOrEqual(normalized.summary.utf8.count, 512)
+        XCTAssertLessThanOrEqual(normalized.summary.split(whereSeparator: \.isWhitespace).count, 25)
+        XCTAssertLessThanOrEqual(normalized.keyPoints.count, 5)
+        XCTAssertTrue(normalized.keyPoints.allSatisfy {
+            $0.utf8.count <= 256 && $0.split(whereSeparator: \.isWhitespace).count <= 12
+        })
+        XCTAssertLessThanOrEqual(normalized.title.utf8.count, 256)
+        XCTAssertLessThanOrEqual(normalized.title.split(whereSeparator: \.isWhitespace).count, 8)
+        XCTAssertLessThanOrEqual(normalized.tags.count, 6)
+        XCTAssertTrue(normalized.tags.allSatisfy { $0.utf8.count <= 64 })
+    }
+
+    func testGeneratedFieldByteBoundaryIsExactAndPlusOneIsReported() {
+        let exact = brief(summary: String(repeating: "x", count: 512)).normalization
+        XCTAssertEqual(exact.brief.summary.utf8.count, NoteBrief.maximumSummaryBytes)
+        XCTAssertFalse(exact.truncated)
+
+        let plusOne = brief(summary: String(repeating: "x", count: 513)).normalization
+        XCTAssertEqual(plusOne.brief.summary.utf8.count, NoteBrief.maximumSummaryBytes)
+        XCTAssertTrue(plusOne.truncated)
+    }
+
+    /// Empty-output truth checks must inspect only the already-admitted
+    /// prefix. Trimming the original model field here would walk a multi-MiB
+    /// value after the normalizer had otherwise stopped at 128/256 bytes.
+    func testHugeWhitespaceAndPunctuationFieldsAreRefusedFromBoundedPrefixes() {
+        let hostile = brief(
+            keyPoints: [String(repeating: " ", count: 1_000_000)],
+            tags: [String(repeating: "!", count: 1_000_000)])
+        let result = hostile.normalization
+
+        XCTAssertTrue(result.brief.keyPoints.isEmpty)
+        XCTAssertTrue(result.brief.tags.isEmpty)
+        XCTAssertTrue(result.truncated)
+    }
+
     // MARK: - What gets inserted
 
     func testTheTagLineIsWhatWouldBeTyped() {

@@ -269,6 +269,7 @@ public enum HarnessLocator {
     static let maximumShellOutputBytes = 64 * 1_024
     static let maximumExecutableBytes: Int64 = 512 * 1_024 * 1_024
     private static let maximumSearchDirectories = 256
+    private static let maximumAncestorComponents = 256
     private static let maximumPathBytes = 4 * 1_024
     private static let shellOutputDrainGrace: TimeInterval = 0.1
 
@@ -359,10 +360,11 @@ public enum HarnessLocator {
         return Task.isCancelled ? nil : foundIdentity
     }
 
-    /// Whether a cached location still resolves to the same executable file.
-    /// Content was hashed at discovery; the cheap launch-time check compares
-    /// the kernel identity and nanosecond change time, which changes for an
-    /// in-place rewrite as well as a replacement.
+    /// Whether a cached location still resolves to the same trusted executable.
+    /// Content was hashed at discovery; the bounded launch-time check opens
+    /// every physical ancestor without following links, rechecks mount and
+    /// permission policy, and compares kernel identity plus nanosecond change
+    /// time. An in-place rewrite as well as a replacement changes that time.
     static func isCurrent(_ location: HarnessLocation) -> Bool {
         guard let status = executableStatus(at: location.url.path) else { return false }
         let identity = location.identity
@@ -397,7 +399,7 @@ public enum HarnessLocator {
                 byteLimit: maximumOutputBytes)
         else { return nil }
         let readerTask = Task.detached(priority: .utility) { reader.read() }
-        let child = await HarnessShellProcess()
+        let child = HarnessShellProcess()
 
         do {
             try await child.start(executable: executable, arguments: arguments, output: output)
@@ -473,6 +475,11 @@ public enum HarnessLocator {
         let changedNanoseconds: Int64
     }
 
+    private struct OpenedExecutable {
+        let descriptor: Int32
+        let status: ExecutableStatus
+    }
+
     private static func location(
         at path: String,
         origin: HarnessLocation.Origin,
@@ -491,20 +498,19 @@ public enum HarnessLocator {
     }
 
     private static func executableIdentity(at path: String) -> HarnessExecutableIdentity? {
-        guard let before = executableStatus(at: path),
-            before.byteCount >= 0,
-            before.byteCount <= maximumExecutableBytes,
+        guard let opened = openTrustedExecutable(at: path),
+            opened.status.byteCount >= 0,
+            opened.status.byteCount <= maximumExecutableBytes,
             !Task.isCancelled
         else { return nil }
-        let descriptor = Darwin.open(
-            before.resolvedPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY)
-        guard descriptor >= 0 else { return nil }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close() }
+        let descriptor = opened.descriptor
+        let before = opened.status
+        defer { Darwin.close(descriptor) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
 
-        var opened = stat()
-        guard Darwin.fstat(descriptor, &opened) == 0,
-            status(from: opened, resolvedPath: before.resolvedPath) == before
+        var openedRaw = stat()
+        guard Darwin.fstat(descriptor, &openedRaw) == 0,
+            status(from: openedRaw, resolvedPath: before.resolvedPath) == before
         else { return nil }
 
         var contentHasher = SHA256()
@@ -524,12 +530,15 @@ public enum HarnessLocator {
         var afterRaw = stat()
         guard Darwin.fstat(descriptor, &afterRaw) == 0,
             let after = status(from: afterRaw, resolvedPath: before.resolvedPath),
-            after == before
+            after == before,
+            isTrustedExecutable(afterRaw),
+            isTrustedFileSystem(descriptor: descriptor),
+            executableStatus(at: before.resolvedPath) == before
         else { return nil }
 
         let contentDigest = contentHasher.finalize().map { String(format: "%02x", $0) }.joined()
         let fingerprint = stableFingerprint([
-            "markdev.harness.executable.v1",
+            "markdev.harness.executable.v2",
             before.resolvedPath,
             String(before.device),
             String(before.inode),
@@ -549,13 +558,9 @@ public enum HarnessLocator {
     }
 
     private static func executableStatus(at path: String) -> ExecutableStatus? {
-        guard let resolved = physicalPath(of: path) else { return nil }
-        guard resolved.hasPrefix("/"), resolved.utf8.count <= maximumPathBytes,
-            Darwin.access(resolved, X_OK) == 0
-        else { return nil }
-        var raw = stat()
-        guard Darwin.lstat(resolved, &raw) == 0 else { return nil }
-        return status(from: raw, resolvedPath: resolved)
+        guard let opened = openTrustedExecutable(at: path) else { return nil }
+        defer { Darwin.close(opened.descriptor) }
+        return opened.status
     }
 
     private static func physicalPath(of path: String) -> String? {
@@ -576,5 +581,194 @@ public enum HarnessLocator {
             byteCount: Int64(raw.st_size),
             changedSeconds: Int64(raw.st_ctimespec.tv_sec),
             changedNanoseconds: Int64(raw.st_ctimespec.tv_nsec))
+    }
+
+    /// Opens the resolved path one component at a time from a trusted root
+    /// descriptor. `realpath` decides which physical object a configured
+    /// symlink names; `openat` with `O_NOFOLLOW` then ensures that no component
+    /// changed back into a link while its permissions and mount are checked.
+    private static func openTrustedExecutable(at path: String) -> OpenedExecutable? {
+        guard let resolved = physicalPath(of: path) else { return nil }
+        guard resolved.hasPrefix("/"), resolved.utf8.count <= maximumPathBytes else { return nil }
+        let components = resolved.split(separator: "/", omittingEmptySubsequences: true)
+        guard !components.isEmpty,
+            components.count <= maximumAncestorComponents
+        else { return nil }
+
+        var parent = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard parent >= 0 else { return nil }
+        guard isTrustedDirectory(parent) else {
+            Darwin.close(parent)
+            return nil
+        }
+
+        for (index, rawComponent) in components.enumerated() {
+            guard !Task.isCancelled else {
+                Darwin.close(parent)
+                return nil
+            }
+            let component = String(rawComponent)
+            guard component != ".", component != "..", !component.contains("\0") else {
+                Darwin.close(parent)
+                return nil
+            }
+            let isExecutable = index == components.index(before: components.endIndex)
+            let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | (isExecutable ? 0 : O_DIRECTORY)
+            let child = component.withCString { Darwin.openat(parent, $0, flags) }
+            guard child >= 0 else {
+                Darwin.close(parent)
+                return nil
+            }
+            Darwin.close(parent)
+
+            if !isExecutable {
+                guard isTrustedDirectory(child) else {
+                    Darwin.close(child)
+                    return nil
+                }
+                parent = child
+                continue
+            }
+
+            var raw = stat()
+            guard Darwin.fstat(child, &raw) == 0,
+                isTrustedExecutable(raw),
+                hasNoWritableExtendedACL(child),
+                isTrustedFileSystem(descriptor: child),
+                let status = status(from: raw, resolvedPath: resolved),
+                status.byteCount >= 0,
+                status.byteCount <= maximumExecutableBytes
+            else {
+                Darwin.close(child)
+                return nil
+            }
+            return OpenedExecutable(descriptor: child, status: status)
+        }
+
+        Darwin.close(parent)
+        return nil
+    }
+
+    /// Root is deliberately checked like every other ancestor. It has no
+    /// parent whose authority could replace it, so the relevant invariant is
+    /// simply that its mount is trusted, it is owned by root, and its mode
+    /// grants no group/world write. Every other ancestor must be owned by root
+    /// or this user as well. Sticky shared directories such as `/private/tmp`
+    /// remain refused.
+    private static func isTrustedDirectory(_ descriptor: Int32) -> Bool {
+        var raw = stat()
+        guard Darwin.fstat(descriptor, &raw) == 0,
+            isTrustedDirectoryMetadata(
+                mode: raw.st_mode,
+                owner: raw.st_uid,
+                effectiveUser: Darwin.geteuid()),
+            hasNoWritableExtendedACL(descriptor)
+        else { return false }
+        return isTrustedFileSystem(descriptor: descriptor)
+    }
+
+    /// Pure seam for ownership-policy tests that do not require privileged
+    /// `chown`. A foreign-owned directory is mutable by that foreign account
+    /// even when its group/world mode bits are read-only.
+    static func isTrustedDirectoryMetadata(
+        mode: mode_t,
+        owner: uid_t,
+        effectiveUser: uid_t
+    ) -> Bool {
+        (mode & S_IFMT) == S_IFDIR
+            && (owner == 0 || owner == effectiveUser)
+            && (mode & 0o022) == 0
+    }
+
+    private static func isTrustedExecutable(_ raw: stat) -> Bool {
+        guard (raw.st_mode & S_IFMT) == S_IFREG,
+            (raw.st_mode & 0o022) == 0,
+            (raw.st_mode & (S_ISUID | S_ISGID)) == 0
+        else { return false }
+        let effectiveUser = Darwin.geteuid()
+        guard raw.st_uid == 0 || raw.st_uid == effectiveUser else { return false }
+        return isExecutableByCurrentUser(raw, effectiveUser: effectiveUser)
+    }
+
+    private static func isExecutableByCurrentUser(_ raw: stat, effectiveUser: uid_t) -> Bool {
+        let mode = raw.st_mode
+        if effectiveUser == 0 { return (mode & 0o111) != 0 }
+        if raw.st_uid == effectiveUser { return (mode & S_IXUSR) != 0 }
+        if currentGroups().contains(raw.st_gid) { return (mode & S_IXGRP) != 0 }
+        return (mode & S_IXOTH) != 0
+    }
+
+    private static func currentGroups() -> Set<gid_t> {
+        let count = Darwin.getgroups(0, nil)
+        guard count > 0 else { return [Darwin.getegid()] }
+        var groups = [gid_t](repeating: 0, count: Int(count))
+        let read = groups.withUnsafeMutableBufferPointer { buffer in
+            Darwin.getgroups(count, buffer.baseAddress)
+        }
+        guard read >= 0 else { return [Darwin.getegid()] }
+        groups.removeSubrange(Int(read)..<groups.count)
+        groups.append(Darwin.getegid())
+        return Set(groups)
+    }
+
+    /// Mode bits are not the complete macOS authorization surface. Preserve
+    /// harmless deny ACLs (including the standard home-directory `deny delete`
+    /// entry), but reject any named allow entry that can mutate or replace a
+    /// file or directory. Failure to inspect an ACL is a refusal, not a pass.
+    private static func hasNoWritableExtendedACL(_ descriptor: Int32) -> Bool {
+        errno = 0
+        guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+            return errno == ENOENT
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        let mutationPermissions: [acl_perm_t] = [
+            ACL_WRITE_DATA,
+            ACL_DELETE,
+            ACL_APPEND_DATA,
+            ACL_DELETE_CHILD,
+            ACL_WRITE_ATTRIBUTES,
+            ACL_WRITE_EXTATTRIBUTES,
+            ACL_WRITE_SECURITY,
+            ACL_CHANGE_OWNER,
+        ]
+        var entryID = ACL_FIRST_ENTRY.rawValue
+        for _ in 0..<ACL_MAX_ENTRIES {
+            var entry: acl_entry_t?
+            errno = 0
+            let result = acl_get_entry(acl, entryID, &entry)
+            if result != 0 { return errno == EINVAL }
+            guard let entry else { return false }
+
+            var tag = ACL_UNDEFINED_TAG
+            guard acl_get_tag_type(entry, &tag) == 0 else { return false }
+            if tag == ACL_EXTENDED_ALLOW {
+                var permissions: acl_permset_t?
+                guard acl_get_permset(entry, &permissions) == 0,
+                    let permissions
+                else { return false }
+                for permission in mutationPermissions {
+                    let allowed = acl_get_perm_np(permissions, permission)
+                    guard allowed >= 0 else { return false }
+                    if allowed == 1 { return false }
+                }
+            }
+            entryID = ACL_NEXT_ENTRY.rawValue
+        }
+        return false
+    }
+
+    private static func isTrustedFileSystem(descriptor: Int32) -> Bool {
+        var fileSystem = statfs()
+        guard Darwin.fstatfs(descriptor, &fileSystem) == 0 else { return false }
+        return isTrustedFileSystem(flags: fileSystem.f_flags)
+    }
+
+    /// Internal pure seam for adversarial mount-policy coverage. Ownership
+    /// checks are meaningless on `noowners` media, and a no-exec mount cannot
+    /// truthfully authorize a process even when its mode bits look executable.
+    static func isTrustedFileSystem(flags: UInt32) -> Bool {
+        let required = UInt32(MNT_LOCAL)
+        let refused = UInt32(MNT_REMOVABLE | MNT_IGNORE_OWNERSHIP | MNT_NOEXEC)
+        return (flags & required) == required && (flags & refused) == 0
     }
 }

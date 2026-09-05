@@ -33,6 +33,7 @@ public final class WritingTools {
     /// that applied its answer to a pane the reader is not looking at would
     /// overwrite the wrong note.
     public let harness: HarnessAssistant
+    private weak var attachedSurface: MarkdownTextView?
 
     public init() {
         let service = IntelligenceService()
@@ -44,8 +45,20 @@ public final class WritingTools {
 
     /// Points every panel at the editor the reader is working in.
     public func attach(to surface: MarkdownTextView) {
+        attachedSurface = surface
         inline.surface = surface
         document.attach(to: surface)
         harness.attach(to: surface)
+    }
+
+    /// Detaches only if `surface` is still the editor all tools target. A
+    /// delayed dismantle from an old split must not detach its replacement.
+    public func detach(from surface: MarkdownTextView) {
+        guard attachedSurface === surface else { return }
+        attachedSurface = nil
+        inline.close()
+        inline.surface = nil
+        document.detach(from: surface)
+        harness.detach(from: surface)
     }
 }

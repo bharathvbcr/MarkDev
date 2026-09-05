@@ -63,7 +63,30 @@ public struct NoteBrief: Equatable, Sendable {
     public var tags: [String]
 }
 
+/// A bounded brief plus whether any generated content was declined.
+public struct NoteBriefNormalization: Equatable, Sendable {
+    public let brief: NoteBrief
+    public let truncated: Bool
+
+    init(brief: NoteBrief, truncated: Bool) {
+        self.brief = brief
+        self.truncated = truncated
+    }
+}
+
 extension NoteBrief {
+    public static let maximumSummaryBytes = 512
+    public static let maximumSummaryWords = 25
+    public static let maximumKeyPoints = 5
+    public static let maximumKeyPointBytes = 256
+    public static let maximumKeyPointWords = 12
+    public static let maximumTitleBytes = 256
+    public static let maximumTitleWords = 8
+    public static let maximumTags = 6
+    public static let maximumRawTagBytes = 128
+    public static let maximumTagBytes = 64
+    public static let maximumTotalBytes = 4 * 1_024
+
     /// The brief with each field put in the shape the editor will insert.
     ///
     /// Every rule here exists because the model breaks it. It is told not to
@@ -77,18 +100,75 @@ extension NoteBrief {
     /// What it does *not* do is invent or drop content: an empty field stays
     /// empty, so a brief that came back without tags cannot be shown as one
     /// that has them.
-    public var normalized: NoteBrief {
-        NoteBrief(
-            summary: NoteBrief.oneLine(summary),
-            keyPoints:
-                keyPoints
-                .map(NoteBrief.unbulleted)
-                .filter { !$0.isEmpty },
-            title: NoteBrief.plainTitle(title),
-            tags:
-                tags
-                .map(NoteBrief.plainTag)
-                .filter { !$0.isEmpty })
+    var normalized: NoteBrief {
+        normalization.brief
+    }
+
+    /// Normalizes only bounded prefixes and carries every declined suffix.
+    public var normalization: NoteBriefNormalization {
+        let summaryResult = Self.boundedWords(
+            summary, byteLimit: Self.maximumSummaryBytes,
+            wordLimit: Self.maximumSummaryWords)
+        let titlePrefix = BoundedText.unicodeScalarPrefix(title, maximum: Self.maximumTitleBytes)
+        let titleResult = Self.wordPrefix(
+            Self.plainTitle(titlePrefix.text), limit: Self.maximumTitleWords)
+
+        var normalizedPoints: [String] = []
+        normalizedPoints.reserveCapacity(min(keyPoints.count, Self.maximumKeyPoints))
+        var truncated = summaryResult.truncated || titlePrefix.truncated || titleResult.truncated
+            || keyPoints.count > Self.maximumKeyPoints || tags.count > Self.maximumTags
+
+        for raw in keyPoints.prefix(Self.maximumKeyPoints) {
+            let prefix = BoundedText.unicodeScalarPrefix(raw, maximum: Self.maximumKeyPointBytes)
+            let words = Self.wordPrefix(Self.unbulleted(prefix.text), limit: Self.maximumKeyPointWords)
+            truncated = truncated || prefix.truncated || words.truncated
+            if words.text.isEmpty {
+                truncated = truncated || Self.containsNonWhitespace(prefix.text)
+            } else {
+                normalizedPoints.append(words.text)
+            }
+        }
+
+        var normalizedTags: [String] = []
+        normalizedTags.reserveCapacity(min(tags.count, Self.maximumTags))
+        for raw in tags.prefix(Self.maximumTags) {
+            let rawPrefix = BoundedText.unicodeScalarPrefix(raw, maximum: Self.maximumRawTagBytes)
+            let cleaned = Self.plainTag(rawPrefix.text)
+            let output = BoundedText.unicodeScalarPrefix(cleaned, maximum: Self.maximumTagBytes)
+            truncated = truncated || rawPrefix.truncated || output.truncated
+            if output.text.isEmpty {
+                truncated = truncated || Self.containsNonWhitespace(rawPrefix.text)
+            } else {
+                normalizedTags.append(output.text)
+            }
+        }
+
+        let brief = NoteBrief(
+            summary: summaryResult.text,
+            keyPoints: normalizedPoints,
+            title: titleResult.text,
+            tags: normalizedTags)
+        // Individual limits currently total less than 4 KiB. Keep the
+        // aggregate check executable and overflow-free so a future field
+        // cannot silently invalidate that assumption.
+        var aggregateBytes = 0
+        func admitToAggregate(_ value: String) -> Bool {
+            let remaining = Self.maximumTotalBytes - aggregateBytes
+            guard let count = BoundedText.acceptedUTF8ByteCount(value, maximum: remaining) else {
+                return false
+            }
+            aggregateBytes += count
+            return true
+        }
+        guard admitToAggregate(brief.summary), admitToAggregate(brief.title),
+            brief.keyPoints.allSatisfy(admitToAggregate),
+            brief.tags.allSatisfy(admitToAggregate)
+        else {
+            return NoteBriefNormalization(
+                brief: NoteBrief(summary: "", keyPoints: [], title: "", tags: []),
+                truncated: true)
+        }
+        return NoteBriefNormalization(brief: brief, truncated: truncated)
     }
 
     /// The tags as the line that would be inserted into a note.
@@ -108,16 +188,13 @@ extension NoteBrief {
     /// Collapses newlines, because a field asked for as one sentence is
     /// occasionally answered with two lines — and a "summary" carrying a line
     /// break inserted at the top of a note silently becomes two paragraphs.
-    static func oneLine(_ raw: String) -> String {
-        raw.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
+    static func oneLine(_ raw: String, limit: Int) -> String {
+        BoundedText.collapsingWhitespace(raw, maximum: limit) ?? ""
     }
 
     /// Takes a list marker off a point that came back already bulleted.
     static func unbulleted(_ raw: String) -> String {
-        var text = oneLine(raw)
+        var text = oneLine(raw, limit: Self.maximumKeyPointBytes)
         for marker in ["- ", "* ", "• "] where text.hasPrefix(marker) {
             text = String(text.dropFirst(marker.count))
             break
@@ -135,7 +212,7 @@ extension NoteBrief {
 
     /// A title with the heading syntax and quotation marks taken off.
     static func plainTitle(_ raw: String) -> String {
-        var text = oneLine(raw)
+        var text = oneLine(raw, limit: Self.maximumTitleBytes)
         while text.hasPrefix("#") { text = String(text.dropFirst()) }
         text = text.trimmingCharacters(in: .whitespaces)
         for quote in ["\"", "“", "”", "'"] {
@@ -155,7 +232,7 @@ extension NoteBrief {
     /// a Markdown tag may contain, and a stray comma turns the rest of the line
     /// into part of the tag.
     static func plainTag(_ raw: String) -> String {
-        var text = oneLine(raw).lowercased()
+        var text = oneLine(raw, limit: Self.maximumRawTagBytes).lowercased()
         while text.hasPrefix("#") { text = String(text.dropFirst()) }
         var out = ""
         for character in text {
@@ -169,6 +246,24 @@ extension NoteBrief {
         }
         while out.hasSuffix("-") { out = String(out.dropLast()) }
         return out
+    }
+
+    private static func boundedWords(
+        _ raw: String, byteLimit: Int, wordLimit: Int
+    ) -> (text: String, truncated: Bool) {
+        let prefix = BoundedText.unicodeScalarPrefix(raw, maximum: byteLimit)
+        let words = wordPrefix(oneLine(prefix.text, limit: byteLimit), limit: wordLimit)
+        return (words.text, prefix.truncated || words.truncated)
+    }
+
+    private static func containsNonWhitespace(_ text: String) -> Bool {
+        text.unicodeScalars.contains { !$0.properties.isWhitespace }
+    }
+
+    private static func wordPrefix(_ text: String, limit: Int) -> (text: String, truncated: Bool) {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard words.count > limit else { return (words.joined(separator: " "), false) }
+        return (words.prefix(limit).joined(separator: " "), true)
     }
 }
 

@@ -12,6 +12,11 @@ import XCTest
 
 final class DiagnosticsFileSinkTests: XCTestCase {
     private var root: URL!
+    private let origin = DiagnosticOrigin(
+        validatedRunID: UUID(uuidString: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")!,
+        processID: 42,
+        role: .testHost,
+        locality: .ephemeralTest)
 
     override func setUpWithError() throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -25,7 +30,8 @@ final class DiagnosticsFileSinkTests: XCTestCase {
 
     private func event(sequence: UInt64) -> DiagnosticEvent {
         DiagnosticEvent(
-            sequence: sequence,
+            origin: origin,
+            localSequence: sequence,
             timestampMilliseconds: 1_700_000_000_123,
             uptimeNanoseconds: sequence,
             severity: .info,
@@ -40,6 +46,43 @@ final class DiagnosticsFileSinkTests: XCTestCase {
         return DiagnosticRecord(event: event, jsonLine: try DiagnosticsJSON.line(for: event))
     }
 
+    func testRemoteAuthorityCannotAliasALocalDiagnosticsDirectory() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/"))
+        let configuration = RotatingDiagnosticsFileConfiguration(directory: hostile)
+
+        XCTAssertThrowsError(
+            try RotatingJSONLDiagnosticsSink(
+                configuration: configuration,
+                requiredOrigin: origin)
+        ) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .pathIsNotDirectory)
+        }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+    }
+
+    func testDirectoryInventoryFailsClosedAtItsBoundWithoutMaterializingTheTail() throws {
+        for index in 0...RotatingJSONLDiagnosticsSink.maximumInspectedDirectoryEntries {
+            let created = FileManager.default.createFile(
+                atPath: root.appendingPathComponent("unowned-\(index)").path,
+                contents: Data())
+            XCTAssertTrue(created)
+        }
+        let configuration = RotatingDiagnosticsFileConfiguration(directory: root)
+
+        XCTAssertThrowsError(
+            try RotatingJSONLDiagnosticsSink(
+                configuration: configuration,
+                requiredOrigin: origin)
+        ) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .incompatibleExistingSegment)
+        }
+    }
+
     func testRotationBoundsEveryFileAndRetainsOnlyTheNewestGenerations() async throws {
         let oneLine = try record(sequence: 1).jsonLine.count
         let configuration = RotatingDiagnosticsFileConfiguration(
@@ -47,7 +90,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             baseName: "events",
             maximumFileBytes: oneLine * 2,
             maximumFiles: 3)
-        let sink = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
         let directoryAttributes = try FileManager.default.attributesOfItem(atPath: root.path)
         let directoryPermissions = try XCTUnwrap(
             (directoryAttributes[.posixPermissions] as? NSNumber)?.intValue)
@@ -70,7 +115,8 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             let data = try Data(contentsOf: file)
             for line in data.split(separator: 0x0A) {
                 let object = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
-                allSequences.append(try XCTUnwrap((object?["sequence"] as? NSNumber)?.uint64Value))
+                allSequences.append(try XCTUnwrap(
+                    (object?["localSequence"] as? NSNumber)?.uint64Value))
             }
         }
         XCTAssertTrue(allSequences.contains(7), "the newest event must survive rotation")
@@ -88,7 +134,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
         damaged.append(Data("{\"sequence\":2,\"unterminated\"".utf8))
         try damaged.write(to: configuration.fileURL(at: 0))
 
-        let sink = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
         XCTAssertEqual(try Data(contentsOf: configuration.fileURL(at: 0)), valid)
 
         try await sink.write(record(sequence: 2))
@@ -109,7 +157,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             maximumFileBytes: 4_096,
             maximumFiles: 2)
 
-        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(configuration: configuration))
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin))
     }
 
     func testSymlinkGenerationIsRejectedWithoutReadingOrChangingItsTarget() throws {
@@ -127,8 +177,134 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             at: configuration.fileURL(at: 0),
             withDestinationURL: victim)
 
-        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(configuration: configuration))
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin))
         XCTAssertEqual(try Data(contentsOf: victim), secret)
+    }
+
+    func testHardLinkedGenerationIsRejectedWithoutChangingItsOtherName() throws {
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: root,
+            baseName: "events",
+            maximumFileBytes: 4_096,
+            maximumFiles: 2)
+        let victim = root.deletingLastPathComponent()
+            .appendingPathComponent("MarkDevDiagnosticsVictim-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: victim) }
+        let original = try record(sequence: 1).jsonLine
+        try original.write(to: victim)
+        try FileManager.default.linkItem(at: victim, to: configuration.fileURL(at: 0))
+
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .incompatibleExistingSegment)
+        }
+        XCTAssertEqual(try Data(contentsOf: victim), original)
+    }
+
+    func testHardLinkedGenerationInsertedAfterInitializationIsNeverAppended() async throws {
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: root,
+            baseName: "events",
+            maximumFileBytes: 4_096,
+            maximumFiles: 2)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
+        let victim = root.deletingLastPathComponent()
+            .appendingPathComponent("MarkDevDiagnosticsVictim-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: victim) }
+        let original = try record(sequence: 1).jsonLine
+        try original.write(to: victim)
+        try FileManager.default.linkItem(at: victim, to: configuration.fileURL(at: 0))
+
+        do {
+            try await sink.write(try record(sequence: 2))
+            XCTFail("a hard-linked generation must not be appended")
+        } catch {
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .incompatibleExistingSegment)
+        }
+        XCTAssertEqual(try Data(contentsOf: victim), original)
+    }
+
+    func testRotationRefusesAReplacedDirectoryWithoutTouchingTheReplacement() async throws {
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        let movedSelection = root.appendingPathComponent("moved-selected", isDirectory: true)
+        let replacement = root.appendingPathComponent("replacement", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: false)
+        let first = try record(sequence: 1)
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: selected,
+            baseName: "events",
+            maximumFileBytes: first.jsonLine.count,
+            maximumFiles: 2)
+        let hooks = RotatingDiagnosticsSinkTestingHooks(beforeRotationMutation: {
+            try FileManager.default.moveItem(at: selected, to: movedSelection)
+            try FileManager.default.moveItem(at: replacement, to: selected)
+        })
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin,
+            testingHooks: hooks)
+        try await sink.write(first)
+
+        do {
+            try await sink.write(try record(sequence: 2))
+            XCTFail("rotation must refuse a replaced diagnostics directory")
+        } catch {
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .fileChangedDuringWrite)
+        }
+
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: selected.path).isEmpty)
+        XCTAssertEqual(
+            try Data(contentsOf: movedSelection.appendingPathComponent("events.jsonl")),
+            first.jsonLine)
+    }
+
+    func testRotationRefusesAReplacedGenerationWithoutMovingOrDeletingIt() async throws {
+        let first = try record(sequence: 1)
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: root,
+            baseName: "events",
+            maximumFileBytes: first.jsonLine.count,
+            maximumFiles: 2)
+        let active = configuration.fileURL(at: 0)
+        let savedActive = root.appendingPathComponent("saved-active.jsonl")
+        let replacement = root.appendingPathComponent("replacement.jsonl")
+        let replacementBytes = Data("replacement-must-survive".utf8)
+        let hooks = RotatingDiagnosticsSinkTestingHooks(beforeRotationMutation: {
+            try FileManager.default.moveItem(at: active, to: savedActive)
+            try FileManager.default.moveItem(at: replacement, to: active)
+        })
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin,
+            testingHooks: hooks)
+        try replacementBytes.write(to: replacement)
+        try await sink.write(first)
+
+        do {
+            try await sink.write(try record(sequence: 2))
+            XCTFail("rotation must refuse a generation replaced after inventory")
+        } catch {
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .fileChangedDuringWrite)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: active), replacementBytes)
+        XCTAssertEqual(try Data(contentsOf: savedActive), first.jsonLine)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: configuration.fileURL(at: 1).path))
     }
 
     func testOversizedRecordIsRejectedWithoutCreatingAnActiveFile() async throws {
@@ -138,7 +314,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             baseName: "events",
             maximumFileBytes: oversized.jsonLine.count - 1,
             maximumFiles: 2)
-        let sink = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
 
         do {
             try await sink.write(oversized)
@@ -153,7 +331,7 @@ final class DiagnosticsFileSinkTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: configuration.fileURL(at: 0).path))
     }
 
-    func testRecoveryStopsAtTheFirstInvalidCompleteLine() throws {
+    func testInvalidCompleteLineQuarantinesTheWholeSegmentWithoutChangingBytes() throws {
         let configuration = RotatingDiagnosticsFileConfiguration(
             directory: root,
             baseName: "events",
@@ -166,9 +344,15 @@ final class DiagnosticsFileSinkTests: XCTestCase {
         damaged.append(later)
         try damaged.write(to: configuration.fileURL(at: 0))
 
-        _ = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .incompatibleExistingSegment)
+        }
 
-        XCTAssertEqual(try Data(contentsOf: configuration.fileURL(at: 0)), first)
+        XCTAssertEqual(try Data(contentsOf: configuration.fileURL(at: 0)), damaged)
     }
 
     func testSinkReencodesTheEventInsteadOfTrustingInjectedRecordBytes() async throws {
@@ -177,7 +361,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             baseName: "events",
             maximumFileBytes: 64 * 1_024,
             maximumFiles: 2)
-        let sink = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
         let secret = "PRIVATE-INJECTED-RECORD-BYTES-9C2D"
         let untrusted = DiagnosticRecord(
             event: event(sequence: 1),
@@ -200,7 +386,9 @@ final class DiagnosticsFileSinkTests: XCTestCase {
             baseName: "events",
             maximumFileBytes: 1 * 1_024 * 1_024,
             maximumFiles: 2)
-        let sink = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        let sink = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
         let eventCount = 200
         let records = try (UInt64(1)...UInt64(eventCount)).map {
             try record(sequence: $0)
@@ -238,10 +426,81 @@ final class DiagnosticsFileSinkTests: XCTestCase {
         try Data("old".utf8).write(to: overflowGeneration)
         try Data("unrelated".utf8).write(to: unrelated)
 
-        _ = try RotatingJSONLDiagnosticsSink(configuration: configuration)
+        _ = try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: staleTemporary.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: overflowGeneration.path))
         XCTAssertEqual(try Data(contentsOf: unrelated), Data("unrelated".utf8))
+    }
+
+    func testPruningRefusesAReplacedDirectoryWithoutTouchingTheReplacement() throws {
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        let movedSelection = root.appendingPathComponent("moved-selected", isDirectory: true)
+        let replacement = root.appendingPathComponent("replacement", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: false)
+        let overflowName = "events.9.jsonl"
+        let overflow = selected.appendingPathComponent(overflowName)
+        let overflowBytes = Data("owned-overflow".utf8)
+        try overflowBytes.write(to: overflow)
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: selected,
+            baseName: "events",
+            maximumFileBytes: 4_096,
+            maximumFiles: 2)
+        let hooks = RotatingDiagnosticsSinkTestingHooks(beforePruneMutation: { name in
+            XCTAssertEqual(name, overflowName)
+            try FileManager.default.moveItem(at: selected, to: movedSelection)
+            try FileManager.default.moveItem(at: replacement, to: selected)
+        })
+
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin,
+            testingHooks: hooks)) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .fileChangedDuringWrite)
+        }
+
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: selected.path).isEmpty)
+        XCTAssertEqual(
+            try Data(contentsOf: movedSelection.appendingPathComponent(overflowName)),
+            overflowBytes)
+    }
+
+    func testPruningRefusesAReplacedCandidateWithoutDeletingTheNewEntry() throws {
+        let overflowName = "events.9.jsonl"
+        let overflow = root.appendingPathComponent(overflowName)
+        let savedOverflow = root.appendingPathComponent("saved-overflow.jsonl")
+        let replacement = root.appendingPathComponent("replacement.jsonl")
+        let overflowBytes = Data("owned-overflow".utf8)
+        let replacementBytes = Data("replacement-must-survive".utf8)
+        try overflowBytes.write(to: overflow)
+        try replacementBytes.write(to: replacement)
+        let configuration = RotatingDiagnosticsFileConfiguration(
+            directory: root,
+            baseName: "events",
+            maximumFileBytes: 4_096,
+            maximumFiles: 2)
+        let hooks = RotatingDiagnosticsSinkTestingHooks(beforePruneMutation: { name in
+            XCTAssertEqual(name, overflowName)
+            try FileManager.default.moveItem(at: overflow, to: savedOverflow)
+            try FileManager.default.moveItem(at: replacement, to: overflow)
+        })
+
+        XCTAssertThrowsError(try RotatingJSONLDiagnosticsSink(
+            configuration: configuration,
+            requiredOrigin: origin,
+            testingHooks: hooks)) { error in
+            XCTAssertEqual(
+                error as? RotatingDiagnosticsFileError,
+                .fileChangedDuringWrite)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: overflow), replacementBytes)
+        XCTAssertEqual(try Data(contentsOf: savedOverflow), overflowBytes)
     }
 }

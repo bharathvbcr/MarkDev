@@ -79,7 +79,11 @@ public struct SplitTreeView<PaneContent: View>: View {
                         ResizeHandle(
                             axis: group.axis,
                             label: group.axis == .horizontal
-                                ? "Vertical split divider" : "Horizontal split divider"
+                                ? "Vertical split divider" : "Horizontal split divider",
+                            valueDescription: SplitDividerAccessibility.value(
+                                fractions: group.fractions,
+                                dividerAfter: index,
+                                axis: group.axis)
                         ) { translation in
                             guard available > 0 else { return }
                             layout.resize(
@@ -131,5 +135,20 @@ public struct SplitTreeView<PaneContent: View>: View {
             : .asymmetric(
                 insertion: .scale(scale: 0.92).combined(with: .opacity),
                 removal: .opacity)
+    }
+}
+
+/// A bounded, defensive description of a split divider's current position.
+enum SplitDividerAccessibility {
+    static func value(
+        fractions: [Double], dividerAfter index: Int, axis: SplitAxis
+    ) -> String? {
+        guard fractions.indices.contains(index), index < fractions.count - 1,
+            fractions.allSatisfy({ $0.isFinite && $0 >= 0 })
+        else { return nil }
+        let position = fractions.prefix(index + 1).reduce(0, +)
+        guard position.isFinite else { return nil }
+        let percentage = Int((min(max(position, 0), 1) * 100).rounded())
+        return "\(percentage)% from the \(axis == .horizontal ? "left" : "top")"
     }
 }

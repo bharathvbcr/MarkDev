@@ -13,7 +13,7 @@ import XCTest
 final class VaultIndexRegistryTests: XCTestCase {
     private var root: URL!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         VaultIndexRegistry.shared.reset()
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevRegistry-\(UUID().uuidString)")
@@ -29,7 +29,7 @@ final class VaultIndexRegistryTests: XCTestCase {
         }
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         VaultIndexRegistry.shared.reset()
         try? FileManager.default.removeItem(at: root)
     }

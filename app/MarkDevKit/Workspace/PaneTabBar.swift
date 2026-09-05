@@ -49,9 +49,8 @@ extension SplitEdge {
 public struct PaneTabBar: View {
     public let state: PaneState
     public let isFocused: Bool
-    /// Whether the window holds more than one pane. Gates the control that
-    /// only means something in a split.
-    public let isSplit: Bool
+    /// The same command state used by native menus and the palette.
+    public let availability: CommandAvailability
     public let onSelect: (OpenDocument.ID) -> Void
     public let onClose: (OpenDocument.ID) -> Void
     public let onSplit: (SplitEdge) -> Void
@@ -63,7 +62,7 @@ public struct PaneTabBar: View {
     public init(
         state: PaneState,
         isFocused: Bool,
-        isSplit: Bool,
+        availability: CommandAvailability,
         onSelect: @escaping (OpenDocument.ID) -> Void,
         onClose: @escaping (OpenDocument.ID) -> Void,
         onSplit: @escaping (SplitEdge) -> Void,
@@ -71,7 +70,7 @@ public struct PaneTabBar: View {
     ) {
         self.state = state
         self.isFocused = isFocused
-        self.isSplit = isSplit
+        self.availability = availability
         self.onSelect = onSelect
         self.onClose = onClose
         self.onSplit = onSplit
@@ -139,17 +138,20 @@ public struct PaneTabBar: View {
                     symbol: edge.symbol,
                     label: edge.commandTitle,
                     help: edge.controlHelp,
+                    isEnabled: availability.allows(
+                        edge == .trailing ? .splitRight : .splitDown),
                     reduceMotion: reduceMotion,
                     action: { onSplit(edge) })
             }
 
-            if isSplit {
+            if availability.paneCount > 1 {
                 Divider().frame(height: 12).opacity(0.4)
 
                 PaneControl(
                     symbol: "xmark",
                     label: "Close Pane",
                     help: "Close this pane (⌃⌘W) — its tabs close with it",
+                    isEnabled: availability.allows(.closePane),
                     reduceMotion: reduceMotion,
                     action: onClosePane)
             }
@@ -159,7 +161,7 @@ public struct PaneTabBar: View {
         .glassEffect(.regular.interactive(), in: .capsule)
         .animation(
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
-            value: isSplit)
+            value: availability.paneCount > 1)
     }
 }
 
@@ -175,6 +177,7 @@ private struct PaneControl: View {
     let label: String
     /// The tooltip, and the spoken hint behind the name.
     let help: String
+    let isEnabled: Bool
     let reduceMotion: Bool
     let action: () -> Void
 
@@ -193,6 +196,8 @@ private struct PaneControl: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.42)
         .help(help)
         .accessibilityLabel(label)
         .accessibilityHint(help)
@@ -247,7 +252,7 @@ private struct TabChip: View {
                         // frame and shape are inside the label, which is what
                         // makes them count towards the hit region at all.
                         .frame(width: 12, height: 12)
-                        .contentShape(Circle())
+                        .controlTarget(Circle(), padding: 4)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
@@ -371,19 +376,15 @@ final class MiddleClickView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        let attached = window != nil
-        let registerSelf = { [weak self] in
-            guard let self else { return }
-            if attached {
+        // AppKit view lifecycle callbacks run on the main thread. State both
+        // the runtime precondition and actor boundary here so registration
+        // cannot be deferred past a later detach or window replacement.
+        MainActor.assumeIsolated {
+            if window != nil {
                 MiddleClickDispatcher.shared.register(self, action: self.action)
             } else {
                 MiddleClickDispatcher.shared.unregister(self)
             }
-        }
-        if Thread.isMainThread {
-            MainActor.assumeIsolated { registerSelf() }
-        } else {
-            DispatchQueue.main.async(execute: registerSelf)
         }
     }
 }
@@ -473,14 +474,17 @@ final class MiddleClickDispatcher {
         // monitor *and this observer*, which would otherwise outlive both.
         let observer = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: window, queue: .main
-        ) { [weak self] note in
-            guard let closing = note.object as? NSWindow else { return }
-            let key = ObjectIdentifier(closing)
-            if let monitor = self?.monitors.removeValue(forKey: key) {
-                NSEvent.removeMonitor(monitor)
-            }
-            if let ownObserver = self?.observers.removeValue(forKey: key) {
-                NotificationCenter.default.removeObserver(ownObserver)
+        ) { [weak self] _ in
+            // Object filtering above already identifies the window. Carrying
+            // only its Sendable identity into this closure avoids transferring
+            // an AppKit object across isolation domains.
+            MainActor.assumeIsolated {
+                if let monitor = self?.monitors.removeValue(forKey: key) {
+                    NSEvent.removeMonitor(monitor)
+                }
+                if let ownObserver = self?.observers.removeValue(forKey: key) {
+                    NotificationCenter.default.removeObserver(ownObserver)
+                }
             }
         }
         observers[key] = observer

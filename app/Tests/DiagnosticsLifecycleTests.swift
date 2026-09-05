@@ -18,7 +18,9 @@ final class DiagnosticsLifecycleTests: XCTestCase {
     func testVerifiedABILaunchEventIsTypedAndMetadataFree() async throws {
         let center = DiagnosticsCenter(sinks: [], clock: FixedClock())
 
-        await center.recordVerifiedABILaunch()
+        let emitter = DiagnosticsEmitter(center: center)
+        emitter.recordVerifiedABILaunch()
+        await emitter.flush()
 
         let snapshot = await center.snapshot()
         let event = try XCTUnwrap(snapshot.events.first)
@@ -28,6 +30,56 @@ final class DiagnosticsLifecycleTests: XCTestCase {
         XCTAssertEqual(event.code, .appLaunchABIVerified)
         XCTAssertNil(event.operationID)
         XCTAssertEqual(event.metadata, DiagnosticMetadata())
+    }
+
+    func testTerminationDrainSettlesAnAdmittedCut() async {
+        let center = DiagnosticsCenter(sinks: [], clock: FixedClock())
+        let emitter = DiagnosticsEmitter(center: center)
+        emitter.emit(
+            severity: .notice,
+            subsystem: .app,
+            code: .appLaunchABIVerified)
+        let policy = DiagnosticsTerminationDrainPolicy(
+            emitter: emitter,
+            timeoutNanoseconds: 1_000_000_000)
+
+        let outcome = await policy.drainForTermination()
+
+        XCTAssertEqual(outcome, .settled)
+    }
+
+    func testTerminationDrainKeepsDeadlineCancellationAndFailureDistinct() async {
+        let center = DiagnosticsCenter(sinks: [], clock: FixedClock())
+        let emitter = DiagnosticsEmitter(center: center)
+        let receipt: DiagnosticsBarrierReceipt
+        do {
+            receipt = try await emitter.flush(deadline: .after(nanoseconds: 1_000_000_000))
+        } catch {
+            XCTFail("fixture could not create a settled receipt: \(error)")
+            return
+        }
+
+        let timedOut = DiagnosticsTerminationDrainPolicy(timeoutNanoseconds: 0) { _ in
+            throw DiagnosticsBarrierError.deadlineExceeded(partial: nil)
+        }
+        let cancelled = DiagnosticsTerminationDrainPolicy(timeoutNanoseconds: .max) { _ in
+            throw CancellationError()
+        }
+        let failed = DiagnosticsTerminationDrainPolicy(timeoutNanoseconds: 1) { _ in
+            throw DiagnosticsBarrierError.waiterLimitExceeded(limit: 1)
+        }
+        let settled = DiagnosticsTerminationDrainPolicy(timeoutNanoseconds: 1) { _ in
+            receipt
+        }
+
+        let timedOutOutcome = await timedOut.drainForTermination()
+        let cancelledOutcome = await cancelled.drainForTermination()
+        let failedOutcome = await failed.drainForTermination()
+        let settledOutcome = await settled.drainForTermination()
+        XCTAssertEqual(timedOutOutcome, .timedOut)
+        XCTAssertEqual(cancelledOutcome, .cancelled)
+        XCTAssertEqual(failedOutcome, .failed)
+        XCTAssertEqual(settledOutcome, .settled)
     }
 
     // MARK: - The shared centre must not write during a test run

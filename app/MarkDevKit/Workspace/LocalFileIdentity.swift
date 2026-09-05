@@ -35,6 +35,11 @@ struct LocalFileIdentity: Hashable, Sendable {
 struct LocalFileStamp: Equatable, Sendable {
     let identity: LocalFileIdentity
     let size: Int
+    let linkCount: UInt64
+    let mode: mode_t
+    let ownerID: uid_t
+    let groupID: gid_t
+    let flags: UInt32
     let modifiedSeconds: Int64
     let modifiedNanoseconds: Int64
     let changedSeconds: Int64
@@ -47,10 +52,117 @@ struct LocalFileStamp: Equatable, Sendable {
         else { return nil }
         identity = LocalFileIdentity(status)
         self.size = size
+        linkCount = UInt64(status.st_nlink)
+        mode = status.st_mode
+        ownerID = status.st_uid
+        groupID = status.st_gid
+        flags = status.st_flags
         modifiedSeconds = Int64(status.st_mtimespec.tv_sec)
         modifiedNanoseconds = Int64(status.st_mtimespec.tv_nsec)
         changedSeconds = Int64(status.st_ctimespec.tv_sec)
         changedNanoseconds = Int64(status.st_ctimespec.tv_nsec)
+    }
+}
+
+/// Full no-follow identity approved for one move-to-Trash operation.
+///
+/// This is intentionally stronger than device/inode/type. Inodes can be
+/// recycled, and metadata changes after confirmation must invalidate consent.
+/// Every field is copied from one `fstat` on the opened final entry, so the
+/// snapshot cannot combine attributes from two pathname resolutions.
+public struct SecureTrashTarget: Equatable, Sendable {
+    private struct Identity: Equatable, Sendable {
+        let device: UInt64
+        let inode: UInt64
+        let generation: UInt32
+        let birthSeconds: Int64
+        let birthNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+        let mode: mode_t
+        let ownerID: uid_t
+        let groupID: gid_t
+        let linkCount: UInt64
+        let size: Int64
+        let flags: UInt32
+
+        init(_ status: stat) {
+            device = UInt64(truncatingIfNeeded: status.st_dev)
+            inode = UInt64(truncatingIfNeeded: status.st_ino)
+            generation = status.st_gen
+            birthSeconds = Int64(status.st_birthtimespec.tv_sec)
+            birthNanoseconds = Int64(status.st_birthtimespec.tv_nsec)
+            changedSeconds = Int64(status.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(status.st_ctimespec.tv_nsec)
+            mode = status.st_mode
+            ownerID = status.st_uid
+            groupID = status.st_gid
+            linkCount = UInt64(status.st_nlink)
+            size = Int64(status.st_size)
+            flags = status.st_flags
+        }
+    }
+
+    public enum MutationResult: Equatable, Sendable {
+        case moved
+        case stale
+    }
+
+    public let url: URL
+    private let identity: Identity
+
+    public init(at url: URL) throws {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else {
+            throw LocalFileResolutionError.notAFileURL(url)
+        }
+        self.url = url.standardizedFileURL
+        identity = try Self.captureIdentity(at: self.url)
+    }
+
+    /// Re-opens the final directory entry without following a symlink and
+    /// compares the complete descriptor snapshot.
+    public func matchesCurrentEntry() throws -> Bool {
+        try Self.captureIdentity(at: url) == identity
+    }
+
+    /// Revalidates immediately before asking Foundation to move the path.
+    ///
+    /// `FileManager.trashItem` exposes no descriptor-relative or conditional
+    /// mutation API. An equal-UID process can therefore still replace the
+    /// pathname in the final interval between this check and Foundation's
+    /// internal rename. Keeping both operations in this one synchronous seam
+    /// removes application-level awaits but cannot claim OS-level atomicity.
+    public func moveToTrashIfCurrent() throws -> MutationResult {
+        guard try matchesCurrentEntry() else { return .stale }
+        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        return .moved
+    }
+
+    private static func captureIdentity(at url: URL) throws -> Identity {
+        var savedErrno: Int32 = EINVAL
+        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            errno = 0
+            let descriptor = Darwin.open(
+                path,
+                O_EVTONLY | O_CLOEXEC | O_NOFOLLOW)
+            if descriptor < 0 { savedErrno = errno }
+            return descriptor
+        }
+        guard descriptor >= 0 else {
+            throw LocalFileResolutionError.posix(url, savedErrno)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var status = stat()
+        guard Darwin.fstat(descriptor, &status) == 0 else {
+            throw LocalFileResolutionError.posix(url, errno)
+        }
+        let kind = status.st_mode & S_IFMT
+        guard kind == S_IFREG || kind == S_IFDIR else {
+            throw LocalFileResolutionError.unsupportedFile(url)
+        }
+        return Identity(status)
     }
 }
 
@@ -74,7 +186,7 @@ enum LocalFileSystem {
     /// regular file. Hard-linked spellings intentionally retain their paths;
     /// callers compare the returned inode identity as well.
     static func resolveExisting(_ requestedURL: URL) throws -> ResolvedLocalFile {
-        guard requestedURL.isFileURL else {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(requestedURL) else {
             throw LocalFileResolutionError.notAFileURL(requestedURL)
         }
         let requested = requestedURL.standardizedFileURL
@@ -107,7 +219,7 @@ enum LocalFileSystem {
     /// second spelling of the same destination. A dangling/looping final
     /// symlink is rejected rather than silently replaced.
     static func resolveDestination(_ requestedURL: URL) throws -> (url: URL, identity: LocalFileIdentity?) {
-        guard requestedURL.isFileURL else {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(requestedURL) else {
             throw LocalFileResolutionError.notAFileURL(requestedURL)
         }
         let requested = requestedURL.standardizedFileURL
@@ -143,6 +255,7 @@ enum LocalFileSystem {
 
     /// Fresh metadata without URL resource-value caching.
     static func stamp(of url: URL) -> LocalFileStamp? {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else { return nil }
         var status = stat()
         let result = url.withUnsafeFileSystemRepresentation { path in
             path.map { Darwin.fstatat(AT_FDCWD, $0, &status, 0) } ?? -1

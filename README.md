@@ -1,6 +1,6 @@
 # MarkDev
 
-A blazingly fast, native macOS Markdown editor and knowledge vault tool built with **Swift + Rust**. 
+A fast, native macOS Markdown editor and knowledge vault tool built with **Swift + Rust**.
 
 **No Electron. No WebViews. Pure AppKit & TextKit 2.**
 
@@ -8,7 +8,7 @@ A blazingly fast, native macOS Markdown editor and knowledge vault tool built wi
 
 ## Overview
 
-MarkDev combines the safety and parsing throughput of a compiled Rust core with the fluid elegance of macOS Liquid Glass design. It is built from the ground up for developers and technical writers who want instant startup, sub-frame typing latency, and first-class developer tooling inside their note-taking workflow.
+MarkDev combines the safety and parsing throughput of a compiled Rust core with the fluid elegance of macOS Liquid Glass design. It is built for developers and technical writers who want a low-latency native editor and first-class developer tooling inside their note-taking workflow.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -34,14 +34,14 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 ## Key Features
 
 ### ⚡️ Swift + Rust Hybrid Architecture
-- **Rust Core**: SIMD-accelerated CommonMark parsing (`pulldown-cmark`), Tree-sitter syntax highlighting (Rust, Swift, JS/TS, Python, JSON, Bash), and inverted index vault search.
+- **Rust Core**: CommonMark parsing via `pulldown-cmark` (a runtime-detected SSSE3 scanner on supported `x86_64` CPUs and the scalar scanner on `arm64`), Tree-sitter syntax highlighting (Rust, Swift, JS/TS, Python, JSON, Bash), and inverted index vault search.
 - **AppKit & SwiftUI Shell**: Native Liquid Glass chrome, macOS menu bar integration, and deep system capabilities.
 - **Zero-Copy FFI Boundary**: Flat C-ABI data buffers communicating across the language seam using strict UTF-16 code unit indexing.
 
 ### 📝 Live In-Place Markdown Editing
 - **Collapsed Marker Engine**: Syntax markers (e.g. `**`, `*`, `~~`, ```` ``` ````) collapse in-place to 0.01pt fonts rather than being stripped from the buffer.
 - **Full Fidelity Clipboard & Undo**: Because raw Markdown remains in `NSTextStorage`, native selection, `⌘C` copy, `⌘Z` undo, and regex search operate directly on the real document.
-- **Scoped Restyling**: Keystrokes only restyle affected paragraph blocks, preserving 60fps rendering even in 10,000+ line documents.
+- **Scoped Restyling**: Keystrokes restyle affected paragraph blocks instead of repainting the entire document; the performance targets and enforced gates are reported separately below.
 
 ### 🧮 Native Rich Block Rendering
 - **LaTeX Math**: Rendered in pure Swift using Core Text via `SwiftMath` (no MathJax web overhead).
@@ -51,7 +51,9 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 
 ### 🛠️ Safety, Support, and Automation
 - **Bounded HTML Export**: Notes export as browser-ready HTML through a safe Rust path that enforces payload size limits and destination-safe rendering.
-- **Diagnostics Pipeline**: Privacy-preserving, bounded diagnostics with rotating local file/event sinks and one-click support report export from Settings.
+- **Bounded Local Images**: Remote image fetches are refused. Local images are read from a retained no-follow descriptor, type-checked, downsampled under pixel and retained-output budgets, and rechecked after ImageIO returns.
+- **Crash-Safe Saves**: Descriptor-relative transactions and a bounded two-copy recovery journal retain ambiguous save state for review rather than reporting uncertain publication as success.
+- **Diagnostics Pipeline**: Privacy-preserving, bounded local diagnostics keep the current-process support report separate from inspected previous-run history.
 - **AI-Assisted Editing Controls**: Writing and proofreading tools verify source-document ownership before applying model output.
 
 ### 🧠 Knowledge Vault & Link Graph
@@ -67,7 +69,7 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 - **Arbitrary Split Layouts**: Recursive horizontal and vertical split panes governed by a pure value-type layout engine (`SplitLayout`).
 - **Command Palette (`⌘K`)**: Unified fuzzy search over vault files, headings, and workspace actions.
 - **Spacebar Quick Look & Peek**: Hover over internal links or file trees and hold Space to peek at content without opening a new tab.
-- **macOS Quick Look Extension**: Seamless Spacebar previews of Markdown files directly within macOS Finder.
+- **macOS Quick Look Extension**: A sandboxed, user-selected read-only preview target, isolated from the app framework and terminal dependency. Registration can be checked exactly, but registration alone does not identify which provider Finder served.
 
 ---
 
@@ -97,25 +99,40 @@ frame budget; the enforced gate is what a test actually fails on, and for the
 Swift paths it is deliberately looser — see
 [docs/performance.md](docs/performance.md) for why.
 
-| Measurement | Target Budget | Enforced Gate | Measured |
+| Measurement | Target Budget | Enforced Gate | Historical Local Sample |
 |---|---|---|---|
 | **Release Parse (10k lines)** | `< 16.6ms` (1 frame) | `< 16.6ms` (Release) | **~2.55ms** |
 | **Prose Keystroke (10k lines)** | `< 16.6ms` (1 frame) | `< 50ms` (Debug) | **~14.0ms** |
 | **Caret Navigation** | `< 2.0ms` | `< 16.6ms` (one frame) | **~0.6ms** |
 
+Samples are observations from earlier local runs, not portable guarantees. The
+Rust parser gate uses a median; Swift editor latency gates use the fastest of
+several samples and print the worst sample for contention visibility.
+
 ---
 
 ## Requirements
 
-- **macOS**: macOS 26.0 or later (release downloads are for Apple silicon)
-- **Xcode**: Xcode 26.x
-- **Rust**: Rust toolchain 1.80+ (with `cargo`, `rustfmt`, `clippy`)
-- **Tools**: `just` (command runner) and `xcodegen`
+- **macOS**: macOS 26.0 or later; Release builds from this tree are universal
+  (`arm64` + `x86_64`). The already-published v0.0.4 artifact remains the
+  Apple-silicon build described by its historical release notes.
+- **Xcode**: Xcode 26.6 (build 17F113) for CI and release validation
+- **Rust**: Rust 1.98.0 with the matching Cargo, `rustfmt`, and `clippy`, plus
+  the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets
+- **Tools**: `just` 1.58.0 and XcodeGen 2.45.4 for CI and release validation
 
-To install prerequisites via [Homebrew](https://brew.sh):
+Install Just via [Homebrew](https://brew.sh):
 ```bash
-brew install just xcodegen
+brew install just
 ```
+
+Install XcodeGen from its official
+[2.45.4 release archive](https://github.com/yonaskolb/XcodeGen/releases/download/2.45.4/xcodegen.zip),
+whose expected SHA-256 is
+`090ec29491aad50aec10631bf6e62253fed733c50f3aab0f5ffc86bc170bdbef`.
+MarkDev verifies the exact tool versions and fails closed if an input has
+moved. Update the pins and their evidence deliberately; do not relax the check
+to “latest.”
 
 ---
 
@@ -137,7 +154,7 @@ just run
 # Run all test suites (Rust + Swift)
 just test
 
-# Run code formatters and linters
+# Run release contracts, format/lint checks, and both test suites
 just check
 ```
 
@@ -146,17 +163,25 @@ just check
 | Command | Action |
 |---|---|
 | `just build` | Builds Rust core (debug) → generates Xcode project → builds app |
-| `just build-release` | Builds optimized Rust core → builds Release `.app` bundle |
+| `just build-release` | Verifies the pinned toolchain → builds optimized Rust core → builds Release `.app` bundle |
 | `just run` | Builds and launches MarkDev |
 | `just test` | Runs Rust unit/integration tests and Swift test suites |
 | `just ci-local` | Runs the local CI gates, including release contracts and the release performance benchmark |
-| `just check` | Runs `cargo fmt --check`, `cargo clippy`, and all test suites |
+| `just check` | Runs `cargo fmt --check`, `cargo clippy --locked`, and all test suites |
 | `just generate` | Re-generates `MarkDev.xcodeproj` from `project.yml` |
 | `just icons` | Compiles app icon and document `.icns` from vector geometry |
-| `just preview <file>` | Previews a markdown file through the Quick Look extension |
+| `just preview <file>` | Requires a registered MarkDev candidate, then opens the system Quick Look UI; provider attribution remains unavailable |
+| `just preview-status` | Requires the exact `/Applications` Quick Look bundle registration and reports content-type resolution |
 
 > [!NOTE]
 > `MarkDev.xcodeproj` is generated by `xcodegen` and is gitignored. Always edit `project.yml` and run `just generate` rather than editing Xcode project files directly.
+> The generated workspace's shared `Package.resolved` is the dependency lock. Owned build and test recipes require that resolved graph and disable package updates; keep the lock in version control when package resolution changes.
+
+### Permissions and privacy boundary
+
+The main app is intentionally unsandboxed because opening arbitrary user-selected vaults and hosting an interactive terminal are core features. File access is still validated at MarkDev's own boundaries, but the terminal is an explicit code-execution surface, not a sandbox.
+
+The Quick Look extension is a separate sandboxed, application-extension-only target with only user-selected read access. It does not link `MarkDevKit` or `SwiftTerm`; it compiles a curated read-only renderer surface. The app, framework, and extension embed the same privacy manifest, which declares no tracking and no collected-data categories. See [Architecture & Security Boundaries](./docs/architecture.md) for the operational limits, diagnostics exports, and remaining same-user pathname race.
 
 ---
 
@@ -175,7 +200,9 @@ The tag workflow repeats CI and uploads a draft with the zip, checksum, and sour
 manifest. It never publishes automatically. Inspect the successful workflow and
 verify the downloaded artifacts before publishing the draft. `just release-draft
 vX.Y.Z` resumes missing uploads; an existing asset with different bytes requires
-investigation and is never silently replaced.
+investigation and is never silently replaced. The command refuses a release it
+observes as published, but GitHub has no transaction spanning the draft-state
+check and a later upload/edit. Do not publish the draft concurrently with a retry.
 
 ---
 
@@ -206,8 +233,8 @@ investigation and is never silently replaced.
 MarkDev/
 ├── app/
 │   ├── MarkDev/            # Main macOS Application entrypoint & views
-│   ├── MarkDevKit/         # Shared framework (Editor, Vault, Terminal, Brand)
-│   ├── MarkDevQuickLook/   # macOS Quick Look extension (.appex)
+│   ├── MarkDevKit/         # App framework (Editor, Vault, Terminal, Diagnostics)
+│   ├── MarkDevQuickLook/   # Isolated, sandboxed read-only extension (.appex)
 │   └── Tests/              # MarkDevKit unit & performance tests
 ├── core/
 │   ├── src/

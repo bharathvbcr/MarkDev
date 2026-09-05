@@ -53,15 +53,10 @@ public enum GlassTheme {
     /// column wraps into an unreadable ribbon.
     public static let inspector = PanelSizeRange(preferred: 300, minimum: 220, maximum: 460)
 
-    /// The narrowest editor column that still reads like prose rather than a
-    /// vertical ribbon. The window minimum is sized for the common two-pane
-    /// workspace with both side panels visible; otherwise Split Right can
-    /// succeed while leaving each editor too narrow to use.
-    public static let minimumEditorPaneWidth: CGFloat = 340
-    public static let minimumTwoPaneWindowWidth: CGFloat =
-        sidebar.preferred + inspector.preferred
-        + (dividerHitWidth * 3)
-        + (minimumEditorPaneWidth * 2)
+    /// Compact prose width used by the live window-geometry model. The former
+    /// fixed minimum reserved two editors plus both panels in every window,
+    /// making a one-pane window wider than many laptop work areas.
+    public static let minimumEditorPaneWidth: CGFloat = 260
 
     /// Height rules for the terminal drawer, along the bottom edge.
     ///
@@ -87,6 +82,76 @@ public enum GlassTheme {
     /// vestibular sensitivity this is not a preference but a usability floor.
     public static func motion(_ animation: Animation, reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : animation
+    }
+}
+
+/// Minimum window geometry derived from the workspace that is actually live.
+///
+/// Horizontal splits consume additional width; vertical splits do not. Side
+/// panels contribute only while visible and use their compact minima rather
+/// than forcing preferred widths. The host may cap the result to its screen's
+/// visible frame, where the compact toolbar keeps every command reachable.
+public struct WorkspaceWindowGeometry: Equatable, Sendable {
+    public static let absoluteMinimumWidth: CGFloat = 360
+    public static let minimumHeight: CGFloat = 480
+
+    public let paneCount: Int
+    public let horizontalPaneCount: Int
+    public let showsSidebar: Bool
+    public let showsInspector: Bool
+
+    public init(
+        layout: SplitLayout,
+        showsSidebar: Bool,
+        showsInspector: Bool
+    ) {
+        paneCount = max(1, layout.paneCount)
+        horizontalPaneCount = min(
+            paneCount,
+            max(1, Self.horizontalPaneCount(in: layout.root)))
+        self.showsSidebar = showsSidebar
+        self.showsInspector = showsInspector
+    }
+
+    /// Desired minimum before the host screen's usable width is known.
+    public var desiredMinimumWidth: CGFloat {
+        let panels = (showsSidebar ? GlassTheme.sidebar.minimum : 0)
+            + (showsInspector ? GlassTheme.inspector.minimum : 0)
+        let dividerCount = max(0, horizontalPaneCount - 1)
+            + (showsSidebar ? 1 : 0)
+            + (showsInspector ? 1 : 0)
+        let editors = CGFloat(horizontalPaneCount) * GlassTheme.minimumEditorPaneWidth
+        return max(
+            Self.absoluteMinimumWidth,
+            panels + editors + CGFloat(dividerCount) * GlassTheme.dividerHitWidth)
+    }
+
+    /// The content minimum installed on a real window.
+    ///
+    /// An unavailable or non-finite work area leaves the desired result
+    /// untouched. A real narrow screen wins over it so the title bar and
+    /// compact toolbar cannot be pushed beyond the visible desktop.
+    public func minimumWidth(maximumAvailableWidth: CGFloat?) -> CGFloat {
+        guard let maximumAvailableWidth,
+            maximumAvailableWidth.isFinite,
+            maximumAvailableWidth > 0
+        else { return desiredMinimumWidth }
+        return min(desiredMinimumWidth, maximumAvailableWidth)
+    }
+
+    private static func horizontalPaneCount(in node: SplitNode) -> Int {
+        switch node {
+        case .leaf:
+            return 1
+        case .split(let group):
+            let childWidths = group.children.map { horizontalPaneCount(in: $0) }
+            switch group.axis {
+            case .horizontal:
+                return childWidths.reduce(0, +)
+            case .vertical:
+                return childWidths.max() ?? 1
+            }
+        }
     }
 }
 

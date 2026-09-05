@@ -145,6 +145,47 @@ final class NavigatorTreeReloadTests: XCTestCase {
 
         XCTAssertTrue(snapshot.expanded.isEmpty)
     }
+
+    func testRemoteAuthorityCannotBeNormalizedIntoALocalTreeInventory() throws {
+        let localNote = root.appendingPathComponent("Private.md")
+        try "local-only".write(to: localNote, atomically: true, encoding: .utf8)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/"))
+
+        let snapshot = NavigatorTreeReloader.rebuild(
+            root: hostile,
+            previousRoot: hostile,
+            expanded: [])
+
+        XCTAssertTrue(snapshot.nodes.isEmpty)
+        XCTAssertTrue(snapshot.expanded.isEmpty)
+        XCTAssertTrue(snapshot.hadReadError)
+    }
+
+    func testNavigatorRequestsPreserveAuthorityUntilItCanBeRefused() throws {
+        let hostileRoot = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/"))
+        let hostileExpanded = hostileRoot.appendingPathComponent(
+            "Expanded", isDirectory: true)
+
+        let request = NavigatorTreeRequest(
+            root: hostileRoot,
+            revision: 1,
+            expanded: [hostileExpanded])
+
+        XCTAssertNil(request.root)
+        XCTAssertTrue(request.expanded.isEmpty)
+    }
+
+    @MainActor
+    func testPublicNavigatorRefusesARemoteAuthorityRoot() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/"))
+
+        let navigator = NavigatorView(root: hostile, onOpen: { _ in })
+
+        XCTAssertNil(navigator.root)
+    }
 }
 
 final class NavigatorFilterStateTests: XCTestCase {
@@ -201,6 +242,29 @@ final class NavigatorFilterStateTests: XCTestCase {
                 isCancelled: { false }))
 
         XCTAssertEqual(ranked.matches.map(\.url), [hidden])
+    }
+
+    func testFilterRequestCannotLaunderRemoteAuthorityIntoALocalScan() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevNavigatorRemote-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "private".write(
+            to: root.appendingPathComponent("Private.md"),
+            atomically: true,
+            encoding: .utf8)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/"))
+
+        let request = NavigatorFilterRequest(
+            root: hostile,
+            revision: 1,
+            query: "private")
+        let scan = FileTree.scanMarkdownFiles(under: request.root)
+
+        XCTAssertEqual(request.root.host, "remote.example")
+        XCTAssertTrue(scan.files.isEmpty)
+        XCTAssertFalse(scan.isComplete)
     }
 
     func testCappedAndUnreadableScansAreNeverPresentedAsComplete() {

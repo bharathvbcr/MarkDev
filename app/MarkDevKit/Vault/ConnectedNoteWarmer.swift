@@ -50,6 +50,9 @@ public final class ConnectedNoteWarmer {
     /// The targets of the last warm, so an edit that leaves a note's links
     /// alone — which is nearly every edit — does no work at all.
     private var warmedTargets: [URL] = []
+    /// Queue owner paired with ``warmedTargets``. The same links in a second
+    /// pane still need entries at that pane's width and appearance.
+    private var warmedOwner: ContentPrefetcher.Owner?
 
     /// How many notes have actually been read ahead, for tests.
     public private(set) var notesWarmed = 0
@@ -66,7 +69,11 @@ public final class ConnectedNoteWarmer {
     ///
     /// A document outside the vault has no links this can resolve, and cancels
     /// rather than leaving the previous document's targets warming.
-    public func warm(from url: URL, in vault: VaultIndex) {
+    public func warm(
+        from url: URL,
+        in vault: VaultIndex,
+        owner: ContentPrefetcher.Owner? = nil
+    ) {
         guard let path = vault.relativePath(for: url) else {
             cancel()
             return
@@ -83,9 +90,10 @@ public final class ConnectedNoteWarmer {
             // Asked after the pause, not before it: this crosses the FFI, and
             // the caller is on the typing path.
             let targets = self.targets(from: path, in: vault)
-            guard targets != self.warmedTargets else { return }
+            guard targets != self.warmedTargets || owner != self.warmedOwner else { return }
             self.warmedTargets = targets
-            await self.warm(targets)
+            self.warmedOwner = owner
+            await self.warm(targets, owner: owner)
         }
     }
 
@@ -94,6 +102,7 @@ public final class ConnectedNoteWarmer {
         task?.cancel()
         task = nil
         warmedTargets = []
+        warmedOwner = nil
     }
 
     /// The notes `path` links to, deduplicated and capped.
@@ -123,7 +132,10 @@ public final class ConnectedNoteWarmer {
     /// One note at a time rather than all at once: this is background work
     /// competing with an editor, and eight concurrent parses would win that
     /// competition.
-    func warm(_ targets: [URL]) async {
+    func warm(
+        _ targets: [URL],
+        owner: ContentPrefetcher.Owner? = nil
+    ) async {
         for target in targets {
             guard !Task.isCancelled else { return }
             let cache = self.cache
@@ -132,7 +144,14 @@ public final class ConnectedNoteWarmer {
             }.value
             guard !Task.isCancelled else { return }
             notesWarmed += 1
-            prefetcher.warmConnected(blocks, in: target.deletingLastPathComponent())
+            if let owner {
+                prefetcher.warmConnected(
+                    blocks,
+                    owner: owner,
+                    in: target.deletingLastPathComponent())
+            } else {
+                prefetcher.warmConnected(blocks, in: target.deletingLastPathComponent())
+            }
         }
     }
 

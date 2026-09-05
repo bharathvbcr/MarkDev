@@ -7,6 +7,87 @@
 
 import Foundation
 
+/// A closed startup action for an interactive terminal session.
+///
+/// The executable path is transported as environment data and expanded once
+/// as a quoted shell word. It is never interpolated into shell source, so
+/// metacharacters, command substitutions, quotes, and newlines in a valid
+/// filename remain filename bytes rather than syntax.
+public enum TerminalStartupAction: Sendable, Equatable {
+    case runExecutable(HarnessLocation)
+
+    static let executableEnvironmentKey = "MARKDEV_TERMINAL_EXECUTABLE"
+    static let runExecutableShellSource = "\"$MARKDEV_TERMINAL_EXECUTABLE\""
+
+    /// Revalidates the exact executable identity immediately before the shell
+    /// is forked and replaces any inherited value for the reserved variable.
+    func launchEnvironment(
+        base: [String]
+    ) throws -> [String] {
+        switch self {
+        case .runExecutable(let location):
+            guard HarnessLocator.isCurrent(location) else {
+                throw TerminalLaunchFailure(
+                    code: .executableTrustRevoked,
+                    reason: "The MANVI executable changed before the terminal could start.")
+            }
+            let prefix = Self.executableEnvironmentKey + "="
+            var environment = base.filter { !$0.hasPrefix(prefix) }
+            environment.append(prefix + location.url.path)
+            return environment
+        }
+    }
+
+    var shellSource: String {
+        switch self {
+        case .runExecutable:
+            Self.runExecutableShellSource
+        }
+    }
+
+    /// Rechecks the same closed authority at the last point MarkDev controls,
+    /// immediately before the command is written to the interactive shell.
+    ///
+    /// SwiftTerm subsequently asks the shell to reopen the path stored in the
+    /// environment. macOS provides neither `fexecve` nor `execveat`, and an
+    /// `O_RDONLY` descriptor is not a portable executable shell word, so a
+    /// pathname swap after this check remains possible. Removing that residual
+    /// requires a process-launch seam that consumes MarkDev's open descriptor;
+    /// staging or copying the executable would change its runtime semantics.
+    func validateImmediatelyBeforeSend() throws {
+        switch self {
+        case .runExecutable(let location):
+            guard HarnessLocator.isCurrent(location) else {
+                throw TerminalLaunchFailure(
+                    code: .executableTrustRevoked,
+                    reason: "The MANVI executable changed before the terminal could start.")
+            }
+        }
+    }
+}
+
+/// A terminal startup failure that can be rendered without exposing a private
+/// path, environment value, or raw command.
+public struct TerminalLaunchFailure: Error, Equatable, Sendable, LocalizedError {
+    /// A closed, path-free category for diagnostics and support exports.
+    public enum Code: String, Equatable, Sendable {
+        case harnessUnavailable = "harness-unavailable"
+        case executableTrustRevoked = "executable-trust-revoked"
+        case workingDirectoryUnavailable = "working-directory-unavailable"
+        case actionValidationFailed = "action-validation-failed"
+    }
+
+    public let code: Code
+    public let reason: String
+
+    public init(code: Code = .actionValidationFailed, reason: String) {
+        self.code = code
+        self.reason = reason
+    }
+
+    public var errorDescription: String? { reason }
+}
+
 /// How a shell ended.
 ///
 /// SwiftTerm's delegate calls the value it hands over `exitCode`, but it is
@@ -68,27 +149,20 @@ public struct TerminalSession: Sendable, Equatable {
     /// user's own tools on `PATH` — without it, a coding CLI installed by
     /// Homebrew or a version manager is simply not found.
     public let argv0: String
-    /// A line typed into the shell once it has started, or `nil`.
-    ///
-    /// Typed rather than passed as `-c`, and that is the whole reason it is a
-    /// separate field instead of arguments on the launch: `zsh -c "manvi"` is
-    /// not a login shell and not an interactive one, so it neither reads the
-    /// profile that puts the tool on `PATH` nor leaves anything behind when
-    /// the command exits. Sent into an interactive login shell instead, the
-    /// command appears in the scrollback where the reader can see and re-run
-    /// it, and the shell survives it.
-    public let initialCommand: String?
+    /// A closed action sent after the interactive login shell starts.
+    /// Arbitrary shell source is intentionally not representable.
+    public let startupAction: TerminalStartupAction?
 
     public init(
         shell: String,
         workingDirectory: String,
         argv0: String,
-        initialCommand: String? = nil
+        startupAction: TerminalStartupAction? = nil
     ) {
         self.shell = shell
         self.workingDirectory = workingDirectory
         self.argv0 = argv0
-        self.initialCommand = initialCommand
+        self.startupAction = startupAction
     }
 
     /// The shell to launch.
@@ -130,6 +204,7 @@ public struct TerminalSession: Sendable, Equatable {
             URL(fileURLWithPath: NSHomeDirectory()),
         ]
         for candidate in candidates.compactMap({ $0 }) {
+            guard BoundedRegularFileReader.hasLocalFileAuthority(candidate) else { continue }
             let path = candidate.standardizedFileURL.path
             if isUsableDirectory(path, fileManager: fileManager) { return path }
         }
@@ -160,38 +235,64 @@ public struct TerminalSession: Sendable, Equatable {
     /// outlive the folder: a vault gets renamed, a worktree is removed, an
     /// external volume is ejected. Launching into a directory that has since
     /// gone fails inside the shell, where the reader can neither see the cause
-    /// nor act on it. Re-resolving at launch turns that into starting at home.
-    public func revalidated(fileManager: FileManager = .default) -> TerminalSession {
+    /// nor act on it. A plain interactive shell may safely fall back to home.
+    /// A typed startup action may not: silently retaining the action while
+    /// broadening its working directory would run it against a context the
+    /// reader never selected.
+    public func revalidated(fileManager: FileManager = .default) throws -> TerminalSession {
         let shell =
             fileManager.isExecutableFile(atPath: shell)
             ? shell : Self.resolveShell(fileManager: fileManager)
-        let directory =
-            Self.isUsableDirectory(workingDirectory, fileManager: fileManager)
-            ? workingDirectory : NSHomeDirectory()
+        let directory: String
+        if Self.isUsableDirectory(workingDirectory, fileManager: fileManager) {
+            directory = workingDirectory
+        } else if startupAction != nil {
+            throw TerminalLaunchFailure(
+                code: .workingDirectoryUnavailable,
+                reason: "The selected folder is no longer available. MANVI was not started.")
+        } else {
+            directory = NSHomeDirectory()
+        }
 
         guard shell != self.shell || directory != workingDirectory else { return self }
         return TerminalSession(
             shell: shell,
             workingDirectory: directory,
             argv0: "-" + (shell as NSString).lastPathComponent,
-            initialCommand: initialCommand)
+            startupAction: startupAction)
     }
 
     /// The session for a given document and vault.
     public static func resolve(
         document: URL?,
         vault: URL?,
-        initialCommand: String? = nil,
+        startupAction: TerminalStartupAction? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> TerminalSession {
         let shell = resolveShell(environment: environment, fileManager: fileManager)
+        let requestedDirectory = document?.deletingLastPathComponent() ?? vault
+        // A typed action carries the reader's exact contextual intent. Keep a
+        // supplied directory even when it has already disappeared so launch
+        // revalidation can refuse it; resolving to HOME here would erase the
+        // fact that any narrower directory was requested. With no supplied
+        // context, HOME remains the ordinary interactive-shell default.
+        let workingDirectory: String
+        if startupAction != nil, let requestedDirectory {
+            workingDirectory = BoundedRegularFileReader.hasLocalFileAuthority(requestedDirectory)
+                ? requestedDirectory.standardizedFileURL.path
+                : ""
+        } else {
+            workingDirectory = resolveWorkingDirectory(
+                document: document,
+                vault: vault,
+                fileManager: fileManager)
+        }
         return TerminalSession(
             shell: shell,
-            workingDirectory: resolveWorkingDirectory(
-                document: document, vault: vault, fileManager: fileManager),
+            workingDirectory: workingDirectory,
             argv0: "-" + (shell as NSString).lastPathComponent,
-            initialCommand: initialCommand
+            startupAction: startupAction
         )
     }
 }

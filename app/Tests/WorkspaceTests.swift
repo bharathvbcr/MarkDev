@@ -9,6 +9,12 @@ import XCTest
 
 @MainActor
 final class WorkspaceTests: XCTestCase {
+    private func makeWorkspace() -> Workspace {
+        Workspace(
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
+    }
+
     private func makeVault() throws -> URL {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevTests-\(UUID().uuidString)")
@@ -21,12 +27,91 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testStartsWithOneUntitledDocument() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         XCTAssertEqual(workspace.layout.paneCount, 1)
         let state = workspace.state(for: workspace.focusedPane)
         XCTAssertEqual(state.documents.count, 1)
         XCTAssertNotNil(state.current, "a new pane must show something")
         XCTAssertEqual(state.current?.title, "Untitled")
+    }
+
+    func testInitializerDoesNotLaunderRemoteVaultAuthority() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example/tmp/LocalVault/"))
+
+        XCTAssertNil(Workspace(vaultRoot: hostile).vaultRoot)
+        XCTAssertEqual(
+            Workspace(vaultRoot: URL(fileURLWithPath: "/tmp/LocalVault", isDirectory: true))
+                .vaultRoot,
+            URL(fileURLWithPath: "/tmp/LocalVault", isDirectory: true).standardizedFileURL)
+    }
+
+    func testRestoreDoesNotLaunderRemoteVaultAuthority() async throws {
+        let localRoot = try makeVault()
+        defer { try? FileManager.default.removeItem(at: localRoot) }
+        let hostileRoot = try XCTUnwrap(
+            URL(string: "file://remote.example\(localRoot.path)/"))
+        let pane = PaneID()
+        let snapshot = WorkspaceSnapshot(
+            layout: SplitLayout(pane: pane),
+            panes: [],
+            focusedPane: pane,
+            vaultRoot: hostileRoot.absoluteString)
+
+        let synchronous = makeWorkspace()
+        synchronous.restore(from: snapshot)
+        XCTAssertNil(synchronous.vaultRoot)
+
+        let asynchronous = makeWorkspace()
+        _ = try await asynchronous.restoreAsync(from: snapshot)
+        XCTAssertNil(asynchronous.vaultRoot)
+    }
+
+    func testExternalChangeObservationDoesNotLaunderRemoteVaultAuthority() async throws {
+        let localRoot = try makeVault()
+        defer { try? FileManager.default.removeItem(at: localRoot) }
+        let hostileRoot = try XCTUnwrap(
+            URL(string: "file://remote.example\(localRoot.path)/"))
+        let workspace = makeWorkspace()
+        workspace.vaultRoot = hostileRoot
+
+        do {
+            _ = try await workspace.observeExternalChangesAsync([])
+            XCTFail("a remote-authority vault must be rejected before normalization")
+        } catch {
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(hostileRoot))
+        }
+    }
+
+    func testDiskRebaseDoesNotLaunderRemoteFileAuthorities() async throws {
+        let localRoot = try makeVault()
+        defer { try? FileManager.default.removeItem(at: localRoot) }
+        let localSource = localRoot.appendingPathComponent("Source.md")
+        let localDestination = localRoot.appendingPathComponent("Destination.md")
+        let hostileSource = try XCTUnwrap(
+            URL(string: "file://remote.example\(localSource.path)"))
+        let workspace = Workspace(vaultRoot: localRoot)
+
+        do {
+            _ = try await workspace.rebaseFromDiskAsync(
+                from: hostileSource,
+                to: localDestination,
+                within: localRoot)
+            XCTFail("a remote-authority source must be rejected before normalization")
+        } catch {
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(hostileSource))
+        }
+    }
+
+    func testRemoteAuthorityPathIsNeverClassifiedInsideALocalVault() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = Workspace(vaultRoot: root)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/Note.md"))
+
+        XCTAssertFalse(workspace.isInsideVault(hostile))
+        XCTAssertTrue(workspace.isOutsideVault(hostile))
     }
 
     func testOpeningAFileLoadsItsText() throws {
@@ -35,7 +120,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("# Hello", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         try workspace.open(file, in: workspace.focusedPane)
 
         let current = workspace.document(in: workspace.focusedPane)
@@ -49,7 +134,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("# Hello", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
 
@@ -58,7 +143,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testOpeningAMissingFileDoesNotCreateAnEmptyDocument() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let before = workspace.state(for: pane)
         let missing = URL(fileURLWithPath: "/definitely/missing-MarkDev-\(UUID().uuidString).md")
@@ -73,7 +158,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("body", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let missingPane = PaneID()
 
         XCTAssertThrowsError(try workspace.open(file, in: missingPane)) { error in
@@ -86,7 +171,7 @@ final class WorkspaceTests: XCTestCase {
         // synchronously, on the main actor. Every open funnels through this
         // boundary — Finder, a drop, a wikilink, `onOpenURL` — so opening a
         // note must be refused here rather than turned into a network request.
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let before = workspace.state(for: pane)
         let remote = URL(string: "https://example.com/note.md")!
@@ -97,8 +182,27 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertEqual(workspace.state(for: pane), before)
     }
 
+    func testRemoteAuthorityFileURLIsNotCollapsedIntoItsLocalPath() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let localFile = root.appendingPathComponent("Authority.md")
+        try write("must stay local", to: localFile)
+        let remoteAuthority = try XCTUnwrap(
+            URL(string: "file://remote.example\(localFile.path)"))
+        let workspace = makeWorkspace()
+        let pane = workspace.focusedPane
+        let before = workspace.state(for: pane)
+
+        XCTAssertThrowsError(try workspace.open(remoteAuthority, in: pane)) { error in
+            XCTAssertEqual(
+                error as? WorkspaceError,
+                .unsupportedLocation(remoteAuthority))
+        }
+        XCTAssertEqual(workspace.state(for: pane), before)
+    }
+
     func testOpeningARemoteLocationBesideAPaneLeavesNoSplit() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let layout = workspace.layout
 
@@ -119,7 +223,7 @@ final class WorkspaceTests: XCTestCase {
         try handle.truncate(atOffset: 17 * 1_024 * 1_024)
         try handle.close()
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let before = workspace.state(for: pane)
 
@@ -133,7 +237,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("body", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         let countAfterFirst = workspace.state(for: pane).documents.count
@@ -152,7 +256,7 @@ final class WorkspaceTests: XCTestCase {
         try write("body", to: target)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(alias, in: pane)
         let firstID = try XCTUnwrap(workspace.document(in: pane)?.id)
@@ -173,7 +277,7 @@ final class WorkspaceTests: XCTestCase {
         try write("before", to: target)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(alias, in: pane)
         workspace.updateText("after", in: pane)
@@ -193,7 +297,7 @@ final class WorkspaceTests: XCTestCase {
         try write("target", to: target)
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: target)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(target, in: pane)
         _ = workspace.newDocument(in: pane)
@@ -209,7 +313,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testEditingMarksTheDocumentDirty() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         workspace.updateText("new text", in: pane)
 
@@ -221,7 +325,7 @@ final class WorkspaceTests: XCTestCase {
     func testWritingIdenticalTextDoesNotMarkDirty() {
         // Otherwise round-tripping through the editor binding would mark a
         // pristine document as modified.
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let existing = workspace.document(in: pane)?.text ?? ""
         workspace.updateText(existing, in: pane)
@@ -229,7 +333,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testNewDocumentReusesThePristineUntitledTab() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         let original = workspace.document(in: pane)?.id
 
@@ -241,7 +345,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testNewDocumentAddsAndSelectsATabWithoutDiscardingWork() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         workspace.updateText("keep me", in: pane)
         let existing = workspace.document(in: pane)?.id
@@ -264,7 +368,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         workspace.updateText("changed", in: pane)
@@ -279,7 +383,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         workspace.updateText("changed", in: pane)
@@ -296,7 +400,7 @@ final class WorkspaceTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appendingPathComponent("Created.md")
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         workspace.updateText("new note", in: pane)
 
@@ -313,7 +417,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         workspace.updateText("local edit", in: pane)
@@ -329,7 +433,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testSaveRefusesANonFileDestination() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         workspace.updateText("private draft", in: pane)
         let remote = URL(string: "https://example.com/note.md")!
@@ -337,6 +441,60 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertThrowsError(try workspace.save(in: pane, to: remote)) { error in
             XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(remote))
         }
+        XCTAssertTrue(workspace.document(in: pane)?.hasUnsavedChanges ?? false)
+    }
+
+    func testRemoteAuthoritySaveAsCannotAliasTheCurrentLocalDocument() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Private.md")
+        try write("on disk", to: file)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(file.path)"))
+        let workspace = makeWorkspace()
+        let pane = workspace.focusedPane
+        try workspace.open(file, in: pane)
+        workspace.updateText("private edit", in: pane)
+
+        XCTAssertThrowsError(
+            try workspace.save(in: pane, to: hostile, overwrite: true)
+        ) { error in
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(hostile))
+        }
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "on disk")
+        XCTAssertTrue(workspace.document(in: pane)?.hasUnsavedChanges ?? false)
+    }
+
+    func testAsyncRemoteAuthoritySaveAsCannotAliasTheCurrentLocalDocument() async throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Private.md")
+        try write("on disk", to: file)
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(file.path)"))
+        let workspace = makeWorkspace()
+        let pane = workspace.focusedPane
+        try workspace.open(file, in: pane)
+        workspace.updateText("private edit", in: pane)
+
+        do {
+            _ = try await workspace.authorizeSaveDestination(hostile, overwrite: true)
+            XCTFail("remote authority must be retained in the authorization error")
+        } catch {
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(hostile))
+        }
+
+        let documentID = try XCTUnwrap(workspace.document(in: pane)?.id)
+        do {
+            _ = try await workspace.saveAsync(
+                document: documentID,
+                to: hostile,
+                overwrite: true)
+            XCTFail("remote authority must not route to the current local file")
+        } catch {
+            XCTAssertEqual(error as? WorkspaceError, .unsupportedLocation(hostile))
+        }
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "on disk")
         XCTAssertTrue(workspace.document(in: pane)?.hasUnsavedChanges ?? false)
     }
 
@@ -348,7 +506,7 @@ final class WorkspaceTests: XCTestCase {
         try write("first on disk", to: first)
         try write("second on disk", to: second)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(first, in: pane)
         let firstID = try XCTUnwrap(workspace.document(in: pane)?.id)
@@ -372,7 +530,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         try workspace.open(file, in: pane)
         workspace.updateText("mine", in: pane)
@@ -391,7 +549,7 @@ final class WorkspaceTests: XCTestCase {
 
     func testClosingTheLastTabLeavesAnEmptyOne() {
         // A pane with no tabs would render blank with no way to recover.
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let pane = workspace.focusedPane
         guard let only = workspace.state(for: pane).current else {
             return XCTFail("expected a document")
@@ -410,7 +568,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Carried.md")
         try write("carried text", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(file, in: first)
 
@@ -430,7 +588,7 @@ final class WorkspaceTests: XCTestCase {
         try write("# Original", to: original)
         try write("# Dropped", to: dropped)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(original, in: first)
 
@@ -451,7 +609,7 @@ final class WorkspaceTests: XCTestCase {
         let missing = root.appendingPathComponent("Missing.md")
         try write("# Original", to: original)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(original, in: first)
         let layoutBefore = workspace.layout
@@ -477,6 +635,8 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertFalse(MarkdownDropPolicy.accepts(root.appendingPathComponent("Image.png")))
         XCTAssertFalse(MarkdownDropPolicy.accepts(root.appendingPathComponent("README")))
         XCTAssertFalse(MarkdownDropPolicy.accepts(markdownDirectory))
+        XCTAssertFalse(MarkdownDropPolicy.accepts(try XCTUnwrap(
+            URL(string: "file://remote.example\(root.path)/Note.md"))))
     }
 
     func testDroppingAnAlreadyOpenFileSharesItsDocumentIdentity() throws {
@@ -485,7 +645,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Shared.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(file, in: first)
         let second = try workspace.open(file, beside: first)
@@ -501,7 +661,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Shared.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(file, in: first)
         let second = workspace.split(first, edge: .trailing)
@@ -518,7 +678,7 @@ final class WorkspaceTests: XCTestCase {
         let file = root.appendingPathComponent("Shared.md")
         try write("original", to: file)
 
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         try workspace.open(file, in: first)
         let second = workspace.split(first, edge: .trailing)
@@ -530,8 +690,52 @@ final class WorkspaceTests: XCTestCase {
         XCTAssertTrue(workspace.requiresConfirmationBeforeClosing(document.id, in: second))
     }
 
+    func testCloseOutcomeReportsIdentityOnlyAfterTheFinalSplitOccurrenceCloses() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("Shared.md")
+        try write("shared", to: file)
+
+        let workspace = makeWorkspace()
+        let first = workspace.focusedPane
+        try workspace.open(file, in: first)
+        let second = workspace.split(first, edge: .trailing)
+        let documentID = try XCTUnwrap(workspace.document(in: first)?.id)
+
+        let firstClose = workspace.close(documentID, in: first)
+        XCTAssertTrue(
+            firstClose.documentIDsNoLongerOpen.isEmpty,
+            "the identity remains live in the other split")
+
+        let finalClose = workspace.close(documentID, in: second)
+        XCTAssertEqual(finalClose.documentIDsNoLongerOpen, [documentID])
+    }
+
+    func testClosePaneOutcomeSeparatesSharedAndLastOccurrenceDocuments() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sharedFile = root.appendingPathComponent("Shared.md")
+        let uniqueFile = root.appendingPathComponent("Unique.md")
+        try write("shared", to: sharedFile)
+        try write("unique", to: uniqueFile)
+
+        let workspace = makeWorkspace()
+        let first = workspace.focusedPane
+        try workspace.open(sharedFile, in: first)
+        let sharedID = try XCTUnwrap(workspace.document(in: first)?.id)
+        let second = workspace.split(first, edge: .trailing)
+        try workspace.open(uniqueFile, in: second)
+        let uniqueID = try XCTUnwrap(workspace.document(in: second)?.id)
+
+        let outcome = workspace.closePane(second)
+
+        XCTAssertEqual(outcome.documentIDsNoLongerOpen, [uniqueID])
+        XCTAssertEqual(workspace.document(in: first)?.id, sharedID)
+        XCTAssertNotNil(workspace.pane(containing: sharedID))
+    }
+
     func testDocumentsWithUnsavedChangesDeduplicatesSplitViews() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         let second = workspace.split(first, edge: .trailing)
         workspace.updateText("one shared edit", in: second)
@@ -544,7 +748,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testClosingAPaneReturnsFocusToASurvivor() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         let second = workspace.split(first, edge: .trailing)
 
@@ -558,7 +762,7 @@ final class WorkspaceTests: XCTestCase {
     func testPruningDropsStateForRemovedPanes() {
         // Without pruning, every closed pane keeps the full text of its
         // documents alive for the window's lifetime.
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         let second = workspace.split(first, edge: .bottom)
         workspace.updateText("some long document body", in: second)
@@ -570,7 +774,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testClosingTheOnlyPaneIsRefused() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let only = workspace.focusedPane
         workspace.closePane(only)
         XCTAssertEqual(workspace.layout.paneCount, 1)
@@ -579,7 +783,7 @@ final class WorkspaceTests: XCTestCase {
     // MARK: - Moving between panes
 
     func testFocusMovesThroughPanesInVisualOrderAndWraps() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         let second = workspace.split(first, edge: .trailing)
         let third = workspace.split(second, edge: .trailing)
@@ -600,7 +804,7 @@ final class WorkspaceTests: XCTestCase {
     }
 
     func testFocusingAnotherPaneDoesNothingWithOnlyOne() {
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let only = workspace.focusedPane
         workspace.focusPane(offset: 1)
         XCTAssertEqual(workspace.focusedPane, only)
@@ -610,7 +814,7 @@ final class WorkspaceTests: XCTestCase {
         // Closing a pane can leave focus pointing at it until the layout
         // change is observed. The shortcut must still move rather than
         // silently doing nothing.
-        let workspace = Workspace()
+        let workspace = makeWorkspace()
         let first = workspace.focusedPane
         let second = workspace.split(first, edge: .bottom)
         let third = workspace.split(second, edge: .bottom)
@@ -630,6 +834,22 @@ final class FileTreeTests: XCTestCase {
             .appendingPathComponent("MarkDevTree-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    func testRemoteAuthorityCannotInventoryTheMatchingLocalDirectory() throws {
+        let root = try makeVault()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "local".write(
+            to: root.appendingPathComponent("Local.md"),
+            atomically: true,
+            encoding: .utf8)
+        let hostile = try XCTUnwrap(URL(string: "file://remote.example\(root.path)/"))
+
+        XCTAssertTrue(FileTree.children(of: hostile).isEmpty)
+        let scan = FileTree.scanMarkdownFiles(under: hostile)
+        XCTAssertTrue(scan.files.isEmpty)
+        XCTAssertFalse(scan.isComplete)
+        XCTAssertEqual(scan.unreadableDirectories, 1)
     }
 
     func testListsMarkdownAndDirectoriesOnly() throws {

@@ -21,6 +21,8 @@ public enum IntelligenceFailure: Error, Equatable, LocalizedError {
     case unsupportedLanguage
     case busy
     case timedOut
+    case invalidInstruction
+    case invalidResponse
     case failed(String)
 
     public var errorDescription: String? {
@@ -37,6 +39,10 @@ public enum IntelligenceFailure: Error, Equatable, LocalizedError {
             "Apple Intelligence is handling too many requests right now. Try again in a moment."
         case .timedOut:
             "Apple Intelligence didn’t answer in time."
+        case .invalidInstruction:
+            "That custom instruction is too long. Keep it under 1,024 bytes."
+        case .invalidResponse:
+            "Apple Intelligence returned a result outside MarkDev’s safety limits. Try again."
         case .failed(let detail):
             detail
         }
@@ -75,7 +81,10 @@ public final class IntelligenceService {
     /// backstop against a wedged request leaving a spinner on screen with no
     /// way back. Generous enough that a slow first run, which has to page the
     /// model in, is not cut off.
-    public static let requestTimeout: Duration = .seconds(90)
+    public nonisolated static let requestTimeout: Duration = .seconds(90)
+    public nonisolated static let maximumInputBytes = AssistScope.maximumLength * 4
+    public nonisolated static let proofreadingResponseTokenBudget = 2_048
+    public nonisolated static let briefResponseTokenBudget = 512
 
     @ObservationIgnored private let transforming: SystemLanguageModel
     @ObservationIgnored private let authoring: SystemLanguageModel
@@ -120,6 +129,11 @@ public final class IntelligenceService {
         onPartial: (String) -> Void = { _ in }
     ) async throws -> String {
         try requireReady()
+        try Self.validateInput(text)
+        guard !task.directive.isEmpty,
+            BoundedText.fitsUTF8(
+                task.directive, maximum: WritingTask.maximumCustomInstructionBytes)
+        else { throw IntelligenceFailure.invalidInstruction }
         let session = LanguageModelSession(
             model: task.output == .derived ? authoring : transforming,
             instructions: WritingPrompt.instructions)
@@ -131,13 +145,16 @@ public final class IntelligenceService {
                 options: Self.options(for: task, inputLength: text.count))
             for try await snapshot in stream {
                 try Task.checkCancellation()
-                latest = snapshot.content
-                onPartial(WritingResponse.clean(latest))
+                guard let admitted = WritingResponse.admit(snapshot.content) else {
+                    throw IntelligenceFailure.invalidResponse
+                }
+                latest = admitted
+                onPartial(admitted)
             }
         } catch {
             throw Self.describe(error)
         }
-        return WritingResponse.clean(latest)
+        return latest
     }
 
     /// Proofreads one passage.
@@ -145,16 +162,19 @@ public final class IntelligenceService {
     /// Structured output rather than prose: a list of findings the editor can
     /// locate and act on is a different thing from a paragraph describing
     /// them, and only the first can put an underline in the right place.
-    public func proofread(_ text: String) async throws -> ProofreadingReport {
+    public func proofread(_ text: String) async throws -> ProofreadingBatch {
         try requireReady()
+        try Self.validateInput(text)
         let session = LanguageModelSession(
             model: transforming, instructions: ProofreadingPrompt.instructions)
         do {
             let response = try await session.respond(
                 to: ProofreadingPrompt.prompt(for: text),
                 generating: ProofreadingReport.self,
-                options: GenerationOptions(temperature: 0.1))
-            return response.content
+                options: GenerationOptions(
+                    temperature: 0.1,
+                    maximumResponseTokens: Self.proofreadingResponseTokenBudget))
+            return response.content.normalization
         } catch {
             throw Self.describe(error)
         }
@@ -171,16 +191,19 @@ public final class IntelligenceService {
     /// Cold rather than creative. A title suggested twice for the same note
     /// coming back differently reads as the feature being unreliable, which is
     /// worse than it reading as unimaginative.
-    public func brief(_ text: String) async throws -> NoteBrief {
+    public func brief(_ text: String) async throws -> NoteBriefNormalization {
         try requireReady()
+        try Self.validateInput(text)
         let session = LanguageModelSession(
             model: authoring, instructions: NoteBriefPrompt.instructions)
         do {
             let response = try await session.respond(
                 to: NoteBriefPrompt.prompt(for: text),
                 generating: NoteBrief.self,
-                options: GenerationOptions(temperature: 0.2))
-            return response.content.normalized
+                options: GenerationOptions(
+                    temperature: 0.2,
+                    maximumResponseTokens: Self.briefResponseTokenBudget))
+            return response.content.normalization
         } catch {
             throw Self.describe(error)
         }
@@ -193,6 +216,12 @@ public final class IntelligenceService {
         // worse failure than the extra check costs.
         refreshAvailability()
         guard state.isReady else { throw IntelligenceFailure.unavailable(state) }
+    }
+
+    nonisolated private static func validateInput(_ text: String) throws {
+        guard BoundedText.fitsUTF8(text, maximum: maximumInputBytes),
+            (text as NSString).length <= AssistScope.maximumLength
+        else { throw IntelligenceFailure.tooMuchText }
     }
 
     // MARK: - Options
@@ -247,8 +276,7 @@ public final class IntelligenceService {
             // The model produced something that did not fit the schema. Not
             // actionable, but saying so beats an empty result that looks like
             // "your document is perfect".
-            return IntelligenceFailure.failed(
-                "Apple Intelligence returned a result MarkDev couldn’t read. Try again.")
+            return IntelligenceFailure.invalidResponse
         @unknown default:
             return IntelligenceFailure.failed(
                 generation.errorDescription ?? "Apple Intelligence couldn’t complete that.")
@@ -270,9 +298,10 @@ public final class IntelligenceRequest {
     // them; every other access in this file is on the main actor.
     private nonisolated(unsafe) var task: Task<Void, Never>?
     private nonisolated(unsafe) var watchdog: Task<Void, Never>?
-    /// Identifies the current run, so a watchdog that wakes after its own run
-    /// has been replaced does not cancel the new one.
-    private var generation = 0
+    /// Exact authority for the current run, so a watchdog that wakes after its
+    /// own run has been replaced cannot cancel the new one. `nil` means that
+    /// no callback retains publication authority.
+    private var currentRunIdentity: UUID?
 
     /// Whether the last run was stopped by the watchdog rather than by the
     /// reader or by finishing on its own.
@@ -292,13 +321,12 @@ public final class IntelligenceRequest {
     ) {
         cancel()
         didTimeOut = false
-        generation += 1
-        let id = generation
+        let identity = UUID()
+        currentRunIdentity = identity
 
         task = Task { @MainActor [weak self] in
             await operation()
-            guard let self, self.generation == id else { return }
-            self.finish()
+            self?.finish(ifCurrent: identity)
         }
 
         watchdog = Task { @MainActor [weak self] in
@@ -307,22 +335,29 @@ public final class IntelligenceRequest {
             } catch {
                 return  // Replaced or finished; nothing to police.
             }
-            guard let self, self.generation == id, let running = self.task else { return }
+            guard let self, self.currentRunIdentity == identity,
+                let running = self.task
+            else { return }
             self.didTimeOut = true
+            self.currentRunIdentity = nil
             running.cancel()
             self.task = nil
             self.watchdog = nil
         }
     }
 
-    /// Marks the current run finished, so the watchdog stops watching it.
-    public func finish() {
+    /// Only the task holding the current identity may retire the watchdog and
+    /// task references. A cancellation-resistant predecessor fails closed.
+    private func finish(ifCurrent identity: UUID) {
+        guard currentRunIdentity == identity else { return }
+        currentRunIdentity = nil
         watchdog?.cancel()
         watchdog = nil
         task = nil
     }
 
     public func cancel() {
+        currentRunIdentity = nil
         watchdog?.cancel()
         watchdog = nil
         task?.cancel()

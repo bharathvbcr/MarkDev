@@ -6,6 +6,7 @@
 //
 
 import Darwin
+import Dispatch
 import Foundation
 
 /// One turn to ask the harness for.
@@ -19,6 +20,11 @@ public struct HarnessRunRequest: Sendable {
     public var maxSteps: Int
     public var timeout: Duration
     public var environment: [String: String]
+    /// The app's production path carries the executable authority discovered
+    /// by `HarnessLocator`. The public URL initializer remains available for
+    /// low-level embedders and process-contract tests that explicitly own
+    /// their launch policy.
+    var executableAuthority: HarnessLocation?
 
     public init(
         binary: URL,
@@ -34,6 +40,24 @@ public struct HarnessRunRequest: Sendable {
         self.maxSteps = maxSteps
         self.timeout = timeout
         self.environment = environment
+        executableAuthority = nil
+    }
+
+    init(
+        trustedBinary location: HarnessLocation,
+        prompt: String,
+        workingDirectory: URL,
+        maxSteps: Int,
+        timeout: Duration,
+        environment: [String: String]
+    ) {
+        binary = location.url
+        self.prompt = prompt
+        self.workingDirectory = workingDirectory
+        self.maxSteps = maxSteps
+        self.timeout = timeout
+        self.environment = environment
+        executableAuthority = location
     }
 }
 
@@ -72,24 +96,61 @@ public struct HarnessRunResult: Sendable {
 /// handle has exactly one writer, which writes once and closes, and never
 /// touches anything else. The wrapper exists to say so in types rather than
 /// in a comment nobody can enforce.
-private struct StdinWriter: @unchecked Sendable {
+struct StdinWriter: @unchecked Sendable {
     let handle: FileHandle
 
     func write(_ data: Data) -> Bool {
         // A child is free to close stdin immediately. Without the descriptor-
         // local suppression, Darwin delivers SIGPIPE and kills the entire app
         // before FileHandle can surface EPIPE as an ordinary write failure.
-        guard Darwin.fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+        let descriptor = handle.fileDescriptor
+        guard Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1) != -1 else {
             try? handle.close()
             return false
         }
-        do {
-            try handle.write(contentsOf: data)
-            try handle.close()
-            return true
-        } catch {
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags != -1,
+            Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != -1
+        else {
             try? handle.close()
             return false
+        }
+        defer { try? handle.close() }
+
+        return data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return true }
+            var offset = 0
+            while offset < bytes.count {
+                guard !Task.isCancelled else { return false }
+                let written = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    bytes.count - offset)
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                guard written == -1 else { return false }
+                if errno == EINTR { continue }
+                guard errno == EAGAIN || errno == EWOULDBLOCK else { return false }
+
+                // A finite poll interval is the cancellation boundary. A
+                // descendant can escape our process group and retain stdin;
+                // no inherited descriptor is allowed to turn task
+                // cancellation into a permanently blocked write.
+                var readiness = pollfd(
+                    fd: descriptor,
+                    events: Int16(POLLOUT),
+                    revents: 0)
+                let pollResult = Darwin.poll(&readiness, 1, 100)
+                if pollResult > 0 {
+                    let terminalEvents = Int16(POLLERR | POLLHUP | POLLNVAL)
+                    guard readiness.revents & terminalEvents == 0 else { return false }
+                } else if pollResult == -1, errno != EINTR {
+                    return false
+                }
+            }
+            return true
         }
     }
 }
@@ -121,9 +182,110 @@ final class HarnessPipeLossState: @unchecked Sendable {
     }
 }
 
+private final class HarnessPipeStreamController: @unchecked Sendable {
+    private let lock = NSLock()
+    private let handle: FileHandle
+    private let chunkLimit: Int
+    private let loss: HarnessPipeLossState
+    private var continuation: AsyncStream<Data>.Continuation?
+    private var finished = false
+
+    init(handle: FileHandle, chunkLimit: Int, loss: HarnessPipeLossState) {
+        self.handle = handle
+        self.chunkLimit = chunkLimit
+        self.loss = loss
+    }
+
+    func install(_ continuation: AsyncStream<Data>.Continuation) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            continuation.finish()
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+
+        handle.readabilityHandler = { [weak self] handle in
+            self?.receive(from: handle)
+        }
+        continuation.onTermination = { [weak self] _ in self?.finish() }
+    }
+
+    func finish() {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let retained = continuation
+        continuation = nil
+        lock.unlock()
+
+        handle.readabilityHandler = nil
+        try? handle.close()
+        retained?.finish()
+    }
+
+    private func receive(from readable: FileHandle) {
+        lock.lock()
+        let shouldRead = !finished
+        lock.unlock()
+        guard shouldRead else { return }
+
+        let data: Data
+        do {
+            data = try readable.read(upToCount: chunkLimit) ?? Data()
+        } catch {
+            finish()
+            return
+        }
+        guard !data.isEmpty else {
+            finish()
+            return
+        }
+
+        lock.lock()
+        let retained = finished ? nil : continuation
+        lock.unlock()
+        guard let retained else { return }
+        var start = data.startIndex
+        while start < data.endIndex {
+            let remaining = data.distance(from: start, to: data.endIndex)
+            let end = data.index(start, offsetBy: min(chunkLimit, remaining))
+            switch retained.yield(Data(data[start..<end])) {
+            case .enqueued:
+                break
+            case .dropped:
+                loss.markDropped()
+            case .terminated:
+                finish()
+                return
+            @unknown default:
+                loss.markDropped()
+            }
+            start = end
+        }
+    }
+}
+
 struct HarnessPipeByteStream: Sendable {
     let chunks: AsyncStream<Data>
     let loss: HarnessPipeLossState
+    private let controller: HarnessPipeStreamController
+
+    fileprivate init(
+        chunks: AsyncStream<Data>,
+        loss: HarnessPipeLossState,
+        controller: HarnessPipeStreamController
+    ) {
+        self.chunks = chunks
+        self.loss = loss
+        self.controller = controller
+    }
+
+    func finish() { controller.finish() }
 }
 
 private struct HarnessTranscriptCollection: Sendable {
@@ -137,49 +299,140 @@ private struct HarnessNoteCollection: Sendable {
     let truncated: Bool
 }
 
-/// A child process, owned on the main actor.
+private enum HarnessProcessStartFailure: Error {
+    case executableTrustRevoked
+}
+
+/// A child process and every descendant it starts, owned on the main actor.
 ///
-/// `Process` is not `Sendable`, and the two things that have to be able to end
-/// a run — task cancellation and the backstop timer — both arrive from
-/// somewhere else. Wrapping it in a main-actor class is what makes it safe to
-/// hand to them: a `@MainActor` class *is* `Sendable`, so they can hold this
-/// and hop to the actor to act on it, rather than capturing a pid and
-/// signalling a number that may by then belong to something else.
-///
-/// It also keeps the main actor unblocked. `waitUntilExit()` is a blocking
-/// call, and waiting on a local 27B for ten minutes with it would freeze the
-/// window; ``waitForExit()`` suspends on `terminationHandler` instead.
+/// Foundation's `Process` inherits MarkDev's process group, so signalling its
+/// pid cannot stop grandchildren and signalling its group would stop MarkDev.
+/// This owner uses `posix_spawn` with `POSIX_SPAWN_SETPGROUP`: the returned pid
+/// is a fresh group id and remains reserved as an unreaped zombie until group
+/// cleanup finishes. That reservation is what makes TERM/KILL escalation safe
+/// from pid reuse.
 @MainActor
 final class HarnessProcess {
-    private let process = Process()
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    private var hasExited = false
+    private var processIdentifier: pid_t = 0
+    private var exitSource: (any DispatchSourceProcess)?
+    private var cleanupTask: Task<Void, Never>?
+    private var abandonmentTask: Task<Void, Never>?
+    private var leaderExitObserved = false
+    private var groupKillIssued = false
+    private var waitCompleted = false
+    private var terminationStatusValue: Int32 = 0
+    private var endedBySignalValue = false
     /// Set when MarkDev ended the process rather than the process ending.
     private(set) var wasEndedByUs = false
 
+    /// A cooperative exit window before escalation to an unblockable signal.
+    static let terminationGrace: Duration = .seconds(2)
+    /// A normally exiting leader may still have orphan descendants holding our
+    /// pipes. Give them a small graceful window, then close the whole group.
+    static let orphanGrace: Duration = .milliseconds(250)
+    /// Even an uninterruptible child cannot make the UI await process exit
+    /// forever. The dispatch source retains this owner and reaps it later.
+    static let forcedExitWait: Duration = .seconds(1)
+
     func start(_ request: HarnessRunRequest, input: Pipe, output: Pipe, errors: Pipe) throws {
-        process.executableURL = request.binary
-        process.arguments = [
+        if let authority = request.executableAuthority,
+            !HarnessLocator.isCurrent(authority)
+        {
+            throw HarnessProcessStartFailure.executableTrustRevoked
+        }
+        let arguments = [
+            request.binary.path,
             "run",
             "--json",
             "--max-steps", String(request.maxSteps),
             "--timeout", HarnessRun.durationArgument(request.timeout),
         ]
-        process.currentDirectoryURL = request.workingDirectory
-        process.environment = request.environment
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errors
-        process.terminationHandler = { _ in
-            Task { @MainActor [weak self] in self?.markExited() }
+        let environment = request.environment.keys.sorted().compactMap { key -> String? in
+            guard !key.isEmpty, !key.contains("="), !key.contains("\0"),
+                let value = request.environment[key], !value.contains("\0")
+            else { return nil }
+            return key + "=" + value
         }
-        try process.run()
+        guard environment.count == request.environment.count,
+            !arguments.contains(where: { $0.contains("\0") })
+        else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
+        }
+
+        var actions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        try Self.require(posix_spawn_file_actions_init(&actions))
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        try Self.require(posix_spawnattr_init(&attributes))
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        try Self.require(
+            posix_spawn_file_actions_adddup2(
+                &actions, input.fileHandleForReading.fileDescriptor, STDIN_FILENO))
+        try Self.require(
+            posix_spawn_file_actions_adddup2(
+                &actions, output.fileHandleForWriting.fileDescriptor, STDOUT_FILENO))
+        try Self.require(
+            posix_spawn_file_actions_adddup2(
+                &actions, errors.fileHandleForWriting.fileDescriptor, STDERR_FILENO))
+        let chdirResult = request.workingDirectory.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return EINVAL }
+            return posix_spawn_file_actions_addchdir(&actions, path)
+        }
+        try Self.require(chdirResult)
+        try Self.require(posix_spawnattr_setpgroup(&attributes, 0))
+        let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        try Self.require(posix_spawnattr_setflags(&attributes, flags))
+
+        // These are the child's pipe ends. The spawn actions duplicate them to
+        // 0/1/2; keeping the parent's copies open would make EOF impossible.
+        defer {
+            try? input.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            try? errors.fileHandleForWriting.close()
+        }
+
+        var spawnedPID: pid_t = 0
+        let result = try Self.withMutableCStringArray(arguments) { argv in
+            try Self.withMutableCStringArray(environment) { envp in
+                request.binary.withUnsafeFileSystemRepresentation { executable in
+                    guard let executable else { return EINVAL }
+                    return posix_spawn(
+                        &spawnedPID,
+                        executable,
+                        &actions,
+                        &attributes,
+                        argv,
+                        envp)
+                }
+            }
+        }
+        try Self.require(result)
+        guard spawnedPID > 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ECHILD))
+        }
+        processIdentifier = spawnedPID
+
+        // Keep the leader unreaped until every descendant has received bounded
+        // TERM/KILL cleanup. The strong handler cycle is deliberate: if the UI
+        // gives up after the forced-exit deadline, this source still owns the
+        // eventual reap and breaks the cycle in `reapLeader`.
+        let source = DispatchSource.makeProcessSource(
+            identifier: spawnedPID,
+            eventMask: .exit,
+            queue: .main)
+        source.setEventHandler { [self] in
+            Task { @MainActor in leaderDidExit() }
+        }
+        exitSource = source
+        source.resume()
     }
 
     func waitForExit() async {
-        if hasExited { return }
+        if waitCompleted { return }
         await withCheckedContinuation { continuation in
-            if hasExited {
+            if waitCompleted {
                 continuation.resume()
             } else {
                 waiters.append(continuation)
@@ -187,23 +440,159 @@ final class HarnessProcess {
         }
     }
 
-    /// Ends the run. Safe once the process has exited: nothing is signalled.
-    func terminateIfRunning() {
-        guard !hasExited, process.isRunning else { return }
+    /// Ends the run. Safe once the leader's exit was observed: no late signal
+    /// can be misattributed to an already-finished run.
+    func endIfRunning(grace: Duration = terminationGrace) {
+        guard !waitCompleted, !leaderExitObserved, processIdentifier > 0 else { return }
+        if leaderExitedWithoutReaping() {
+            leaderDidExit()
+            return
+        }
         wasEndedByUs = true
-        process.terminate()
+        signalOwnedGroup(SIGTERM)
+        scheduleGroupKill(after: grace)
     }
 
-    var isRunning: Bool { !hasExited && process.isRunning }
-    var status: Int32 { hasExited ? process.terminationStatus : 0 }
-    var endedBySignal: Bool { hasExited && process.terminationReason == .uncaughtSignal }
+    var isRunning: Bool { !waitCompleted && !leaderExitObserved && processIdentifier > 0 }
+    var status: Int32 { terminationStatusValue }
+    var endedBySignal: Bool { endedBySignalValue }
 
-    private func markExited() {
-        guard !hasExited else { return }
-        hasExited = true
+    private func leaderDidExit() {
+        guard !leaderExitObserved else { return }
+        leaderExitObserved = true
+        if groupKillIssued {
+            reapLeader()
+        } else if cleanupTask == nil {
+            // A successful leader does not prove its descendants ended. TERM
+            // the now-orphaned group while the zombie leader still reserves
+            // its numeric identity, then escalate on a finite deadline.
+            signalOwnedGroup(SIGTERM)
+            scheduleGroupKill(after: Self.orphanGrace)
+        }
+    }
+
+    private func scheduleGroupKill(after requestedGrace: Duration) {
+        cleanupTask?.cancel()
+        let grace = min(max(requestedGrace, .zero), .seconds(5))
+        cleanupTask = Task { @MainActor [self] in
+            if grace > .zero { try? await Task.sleep(for: grace) }
+            guard !Task.isCancelled, processIdentifier > 0 else { return }
+            groupKillIssued = true
+            signalOwnedGroup(SIGKILL)
+            if leaderExitObserved {
+                reapLeader()
+            } else {
+                scheduleAbandonmentDeadline()
+            }
+        }
+    }
+
+    private func scheduleAbandonmentDeadline() {
+        abandonmentTask?.cancel()
+        abandonmentTask = Task { @MainActor [self] in
+            try? await Task.sleep(for: Self.forcedExitWait)
+            guard !Task.isCancelled, !waitCompleted else { return }
+            // SIGKILL normally makes the dispatch source fire immediately. If
+            // the kernel cannot finish the process, release the caller while
+            // retaining the source so the eventual exit is still reaped.
+            endedBySignalValue = true
+            terminationStatusValue = SIGKILL
+            finishWaiting()
+        }
+    }
+
+    private func signalOwnedGroup(_ signal: Int32) {
+        let pid = processIdentifier
+        guard pid > 0 else { return }
+        _ = Darwin.killpg(pid, signal)
+    }
+
+    /// Samples direct-child exit without consuming it. Keeping the zombie
+    /// reserved preserves safe process-group signalling while preventing a
+    /// deadline callback queued just behind an exit notification from
+    /// relabelling an on-time completion as a timeout.
+    private func leaderExitedWithoutReaping() -> Bool {
+        let pid = processIdentifier
+        guard pid > 0 else { return false }
+        var information = siginfo_t()
+        var result: Int32 = -1
+        repeat {
+            result = Darwin.waitid(
+                P_PID,
+                id_t(pid),
+                &information,
+                WEXITED | WNOHANG | WNOWAIT)
+        } while result == -1 && errno == EINTR
+        return result == 0 && information.si_pid != 0
+    }
+
+    private func reapLeader() {
+        let pid = processIdentifier
+        guard pid > 0 else { return }
+        var rawStatus: Int32 = 0
+        var result: pid_t = -1
+        repeat {
+            result = Darwin.waitpid(pid, &rawStatus, WNOHANG)
+        } while result == -1 && errno == EINTR
+        guard result == pid || (result == -1 && errno == ECHILD) else {
+            scheduleAbandonmentDeadline()
+            return
+        }
+
+        if result == pid {
+            let signal = rawStatus & 0x7F
+            endedBySignalValue = signal != 0 && signal != 0x7F
+            terminationStatusValue = endedBySignalValue
+                ? signal
+                : (rawStatus >> 8) & 0xFF
+        }
+        processIdentifier = 0
+        cleanupTask?.cancel()
+        cleanupTask = nil
+        abandonmentTask?.cancel()
+        abandonmentTask = nil
+        exitSource?.cancel()
+        exitSource = nil
+        finishWaiting()
+    }
+
+    private func finishWaiting() {
+        guard !waitCompleted else { return }
+        waitCompleted = true
         let pending = waiters
         waiters.removeAll()
         for continuation in pending { continuation.resume() }
+    }
+
+    private static func require(_ result: Int32) throws {
+        guard result == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(result))
+        }
+    }
+
+    private static func withMutableCStringArray<Result>(
+        _ strings: [String],
+        _ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) throws -> Result
+    ) throws -> Result {
+        var pointers: [UnsafeMutablePointer<CChar>?] = []
+        pointers.reserveCapacity(strings.count + 1)
+        for string in strings {
+            guard let pointer = strdup(string) else {
+                for retained in pointers { free(retained) }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOMEM))
+            }
+            pointers.append(pointer)
+        }
+        pointers.append(nil)
+        defer {
+            for pointer in pointers.dropLast() { free(pointer) }
+        }
+        return try pointers.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL))
+            }
+            return try body(base)
+        }
     }
 }
 
@@ -249,6 +638,10 @@ public enum HarnessRun {
     /// this is a stuck loop printing.
     public static let maximumNoteBytes = 128 * 1024
     public static let maximumBufferedStderrBytes = 128 * 1024
+    /// Time retained pipe bytes may continue draining after the owned process
+    /// group is finished. A descendant that escaped the group and inherited a
+    /// descriptor cannot hold a run open beyond this deadline.
+    public static let pipeDrainGrace: Duration = .milliseconds(500)
     /// How far past the harness's own `--timeout` MarkDev waits before ending
     /// the process itself.
     public static let backstopGrace: Duration = .seconds(30)
@@ -299,6 +692,16 @@ public enum HarnessRun {
         let child = HarnessProcess()
         do {
             try child.start(request, input: input, output: output, errors: errors)
+        } catch HarnessProcessStartFailure.executableTrustRevoked {
+            diagnostics.emit(
+                severity: .error,
+                subsystem: .permissions,
+                code: .permissionsHarnessExecutableRevoked,
+                operationID: operationID,
+                metadata: DiagnosticMetadata([.available: .boolean(false)]))
+            return HarnessRunResult(
+                outcome: .failed("The MANVI executable changed before the run could start."),
+                answer: "", events: [], notes: "", truncated: false)
         } catch {
             diagnostics.emit(
                 severity: .error,
@@ -337,7 +740,7 @@ public enum HarnessRun {
         let backstop = Task { @MainActor in
             try? await Task.sleep(for: request.timeout + backstopGrace)
             guard !Task.isCancelled else { return }
-            child.terminateIfRunning()
+            child.endIfRunning()
         }
 
         let transcriptCollector = Task<HarnessTranscriptCollection, Never> { @MainActor in
@@ -393,37 +796,46 @@ public enum HarnessRun {
             writer.write(payload)
         }
         let inputAndTranscript = await withTaskCancellationHandler {
+            await child.waitForExit()
+            writerTask.cancel()
             let inputWasAccepted = await writerTask.value
+
+            let drainDeadline = Task { @MainActor in
+                try? await Task.sleep(for: pipeDrainGrace)
+                guard !Task.isCancelled else { return }
+                outputStream.finish()
+                noteStream.finish()
+            }
             let transcript = await transcriptCollector.value
-            return (inputWasAccepted, transcript)
+            let notes = await noteCollector.value
+            drainDeadline.cancel()
+            outputStream.finish()
+            noteStream.finish()
+            return (inputWasAccepted, transcript, notes)
         } onCancel: {
-            Task { @MainActor in child.terminateIfRunning() }
+            writerTask.cancel()
+            Task { @MainActor in child.endIfRunning() }
         }
 
-        await child.waitForExit()
         backstop.cancel()
-        let noteCollection = await noteCollector.value
         let inputWasAccepted = inputAndTranscript.0
         let events = inputAndTranscript.1.events
         let answer = inputAndTranscript.1.answer
-        let notes = noteCollection.text
-        let truncated = inputAndTranscript.1.truncated || noteCollection.truncated
+        let notes = inputAndTranscript.2.text
+        let truncated = inputAndTranscript.1.truncated || inputAndTranscript.2.truncated
 
         let outcome: HarnessOutcome
         if Task.isCancelled {
             outcome = .cancelled
-        } else if child.wasEndedByUs && child.endedBySignal {
+        } else if child.wasEndedByUs {
             // The only signal MarkDev sends is the backstop's, and the
             // backstop only fires past the harness's own timeout. Reported as
             // the timeout it is rather than as a generic failure: one says
             // "the model is slow, give it longer", the other says nothing.
-            //
-            // Both halves matter. Intent alone (`wasEndedByUs`) could be
-            // stale — `markExited` reaches the main actor one hop behind the
-            // child's real exit, and a backstop firing in that gap would
-            // brand an on-time, complete run as timed out. Requiring the
-            // signal to have actually landed ties the verdict to what
-            // happened, not to what we asked for.
+            // A child that cooperatively handles TERM and exits zero is still
+            // a timeout, not a successful completed run. `endIfRunning`
+            // separately samples an already-exited leader with WNOWAIT before
+            // setting this intent, closing the stale-notification race.
             outcome = .timedOut
         } else if !inputWasAccepted {
             outcome = .failed(inputRejectedMessage)
@@ -566,39 +978,18 @@ public enum HarnessRun {
         let chunkLimit = min(64 * 1024, byteLimit)
         let elementLimit = max(1, byteLimit / chunkLimit)
         let loss = HarnessPipeLossState()
+        let controller = HarnessPipeStreamController(
+            handle: handle,
+            chunkLimit: chunkLimit,
+            loss: loss)
         let chunks = AsyncStream<Data>(bufferingPolicy: .bufferingNewest(elementLimit)) {
             continuation in
-            handle.readabilityHandler = { handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    continuation.finish()
-                } else {
-                    var start = data.startIndex
-                    while start < data.endIndex {
-                        let remaining = data.distance(from: start, to: data.endIndex)
-                        let end = data.index(start, offsetBy: min(chunkLimit, remaining))
-                        let chunk = Data(data[start..<end])
-                        switch continuation.yield(chunk) {
-                        case .enqueued:
-                            break
-                        case .dropped:
-                            loss.markDropped()
-                        case .terminated:
-                            handle.readabilityHandler = nil
-                            return
-                        @unknown default:
-                            loss.markDropped()
-                        }
-                        start = end
-                    }
-                }
-            }
-            continuation.onTermination = { _ in
-                handle.readabilityHandler = nil
-            }
+            controller.install(continuation)
         }
-        return HarnessPipeByteStream(chunks: chunks, loss: loss)
+        return HarnessPipeByteStream(
+            chunks: chunks,
+            loss: loss,
+            controller: controller)
     }
 
     /// A `Duration` in the spelling Go's `time.ParseDuration` accepts.

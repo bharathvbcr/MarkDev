@@ -4,7 +4,16 @@ core/target/
 core/include/markdev.h
 
 # Xcode — the project is generated from project.yml by `just generate`.
-MarkDev.xcodeproj/
+# Keep only SwiftPM's transitive source lock: exact direct versions are not
+# enough when a dependency's own manifest permits a newer transitive package.
+MarkDev.xcodeproj/*
+!MarkDev.xcodeproj/project.xcworkspace/
+MarkDev.xcodeproj/project.xcworkspace/*
+!MarkDev.xcodeproj/project.xcworkspace/xcshareddata/
+MarkDev.xcodeproj/project.xcworkspace/xcshareddata/*
+!MarkDev.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+MarkDev.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/*
+!MarkDev.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 build/
 
 # Staged release zips (`just release-stage`); uploaded by the release workflow.

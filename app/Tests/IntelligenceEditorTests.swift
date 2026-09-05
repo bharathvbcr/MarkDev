@@ -363,6 +363,18 @@ final class IntelligenceEditorTests: XCTestCase {
         XCTAssertTrue(view.issues.isEmpty, "and the misleading underline must go")
     }
 
+    func testFixRefusesANulBearingCorrectionEvenIfAStoredIssueBypassesNormalization() {
+        let original = "We was ready."
+        let view = makeView(original)
+        let assistant = DocumentAssistant(service: IntelligenceService())
+        assistant.attach(to: view)
+        let hostile = issue(view, of: "We was", replacement: "We\0were")
+        view.issues = ProofreadingIssues(issues: [hostile])
+
+        XCTAssertFalse(assistant.fix(hostile))
+        XCTAssertEqual(view.markdown, original)
+    }
+
     /// Back to front, so each replacement leaves the offsets of the ones not
     /// yet applied untouched.
     func testFixAllCorrectsEveryIssue() {
@@ -377,6 +389,119 @@ final class IntelligenceEditorTests: XCTestCase {
         assistant.fixAll()
         XCTAssertEqual(view.markdown, "We were ready and they were too.")
         XCTAssertTrue(view.issues.isEmpty)
+    }
+
+    func testFixAllIsAtomicWhenOneIssueIsStale() {
+        let original = "alpha bad and beta bad"
+        let view = makeView(original)
+        let assistant = DocumentAssistant(service: IntelligenceService())
+        assistant.attach(to: view)
+        let stale = ProofreadingIssue(
+            range: NSRange(location: 0, length: 5), original: "wrong",
+            replacement: "fixed", kind: .grammar, explanation: "stale")
+        view.issues = ProofreadingIssues(issues: [
+            stale,
+            issue(view, of: "beta bad", replacement: "beta good"),
+        ])
+
+        assistant.fixAll()
+
+        XCTAssertEqual(view.markdown, original)
+        XCTAssertEqual(view.issues.count, 2, "refusal must preserve the review for inspection")
+    }
+
+    func testFixAllIsAtomicWhenCombinedCorrectionsExceedTheEditorLimit() {
+        let prefix = "a b "
+        let original = prefix + String(
+            repeating: "x",
+            count: MarkdownReadLimits.maximumDocumentBytes - prefix.utf8.count - 1)
+        XCTAssertEqual(original.utf8.count, MarkdownReadLimits.maximumDocumentBytes - 1)
+        let view = makeView(original)
+        let assistant = DocumentAssistant(service: IntelligenceService())
+        assistant.attach(to: view)
+        view.issues = ProofreadingIssues(issues: [
+            issue(view, of: "a", replacement: "aa"),
+            issue(view, of: "b", replacement: "bb"),
+        ])
+
+        assistant.fixAll()
+
+        XCTAssertTrue(view.markdown == original)
+        XCTAssertEqual(view.issues.count, 2)
+    }
+
+    func testInlineAssistantKeepsResultOnCapacityRefusal() {
+        let original = String(repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes)
+        let view = makeView(original)
+        let assistant = WritingAssistant(service: IntelligenceService())
+        XCTAssertTrue(assistant.captureSource(NSRange(location: 0, length: 1), in: view))
+        XCTAssertTrue(
+            assistant.publishFinishedResult("xx", for: .rewrite, provenance: .complete))
+
+        assistant.replaceSource()
+
+        XCTAssertTrue(view.markdown == original)
+        XCTAssertEqual(assistant.output, "xx")
+        XCTAssertEqual(assistant.phase, .finished)
+        XCTAssertEqual(assistant.applicationRefusal, .editorRefused)
+        XCTAssertNotNil(assistant.visibleApplicationRefusal)
+    }
+
+    func testInlineInsertSurfacesCapacityRefusalWithoutDiscardingResult() {
+        let original = String(repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes)
+        let view = makeView(original)
+        let assistant = WritingAssistant(service: IntelligenceService())
+        XCTAssertTrue(assistant.captureSource(NSRange(location: 0, length: 1), in: view))
+        XCTAssertTrue(
+            assistant.publishFinishedResult("result", for: .summarize, provenance: .complete))
+
+        assistant.insertBelow()
+
+        XCTAssertTrue(view.markdown == original)
+        XCTAssertEqual(assistant.output, "result")
+        XCTAssertEqual(assistant.applicationRefusal, .editorRefused)
+    }
+
+    func testStoppedInlineResultRequiresExplicitAcceptanceBeforeApply() {
+        let view = makeView("source")
+        let assistant = WritingAssistant(service: IntelligenceService())
+        XCTAssertTrue(assistant.captureSource(NSRange(location: 0, length: 6), in: view))
+        XCTAssertTrue(
+            assistant.publishFinishedResult(
+                "partial", for: .rewrite, provenance: .stoppedPartial))
+
+        XCTAssertTrue(assistant.partialResultNeedsConfirmation)
+        XCTAssertFalse(assistant.canApply)
+        assistant.acceptPartialResult()
+        XCTAssertTrue(assistant.canApply)
+    }
+
+    func testOversizedInlineResultIsRefusedBeforeStorage() {
+        let view = makeView("source")
+        let assistant = WritingAssistant(service: IntelligenceService())
+        XCTAssertTrue(assistant.captureSource(NSRange(location: 0, length: 6), in: view))
+
+        XCTAssertFalse(
+            assistant.publishFinishedResult(
+                String(repeating: "x", count: WritingResponse.maximumBytes + 1),
+                for: .rewrite,
+                provenance: .complete))
+        XCTAssertTrue(assistant.output.isEmpty)
+        XCTAssertEqual(
+            assistant.phase,
+            .failed(IntelligenceFailure.invalidResponse.localizedDescription))
+    }
+
+    func testOversizedCustomInstructionHasVisibleTypedRefusal() {
+        let assistant = WritingAssistant(service: IntelligenceService())
+        assistant.customInstruction = String(
+            repeating: "x", count: WritingTask.maximumCustomInstructionBytes + 1)
+
+        assistant.runCustomInstruction()
+
+        XCTAssertEqual(
+            assistant.phase,
+            .failed(IntelligenceFailure.invalidInstruction.localizedDescription))
     }
 
     func testTheAssistantMirrorsWhateverTheEditorHolds() {

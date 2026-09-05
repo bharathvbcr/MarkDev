@@ -11,4 +11,4 @@ pub mod html;
 pub mod md;
 pub mod vault;
 
-pub use md::{parse, parse_checked, BlockKind, ParseError, ParseResult, SpanKind};
+pub use md::{parse_checked, BlockKind, ParseError, ParseResult, SpanKind};

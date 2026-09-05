@@ -10,6 +10,7 @@ import MarkDevKit
 import SwiftUI
 
 struct WorkspaceCommandHandler {
+    let availability: CommandAvailability
     let perform: (CommandAction) -> Void
 }
 
@@ -70,8 +71,13 @@ struct WorkspaceCommands: Commands {
         CommandGroup(replacing: .newItem) {
             actionButton("New Document", action: .newDocument, key: "n")
             Button("New Window") {
-                openWindow(id: MarkDevApp.workspaceWindowID)
+                if let handler {
+                    handler.perform(.newWindow)
+                } else {
+                    openWindow(id: MarkDevApp.workspaceWindowID)
+                }
             }
+            .disabled(handler.map { !$0.availability.allows(.newWindow) } ?? false)
             // No key equivalent: ⌘N belongs to New Document, and a second
             // window is an occasional act rather than a typing-loop one.
         }
@@ -224,7 +230,7 @@ struct WorkspaceCommands: Commands {
         modifiers: EventModifiers = .command
     ) -> some View {
         Button(title) { handler?.perform(action) }
-            .disabled(handler == nil)
+            .disabled(handler?.availability.allows(action) != true)
             .optionalKeyboardShortcut(key, modifiers: modifiers)
     }
 }

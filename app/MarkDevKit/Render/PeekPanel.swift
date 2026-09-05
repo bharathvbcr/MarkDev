@@ -161,6 +161,9 @@ public enum PeekLoader {
     public static let maximumBytes = MarkdownReadLimits.maximumPreviewBytes
 
     public static func read(_ url: URL) -> Result<String, PeekLoadFailure> {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(url) else {
+            return .failure(PeekLoadFailure(reason: "Only a local file can be previewed"))
+        }
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard size <= maximumBytes else {
             let readable = ByteCountFormatter.string(
@@ -174,10 +177,16 @@ public enum PeekLoader {
         let data: Data
         do {
             data = try NoteTextCache.shared.read(url, maximumBytes: maximumBytes)
-        } catch is NoteTextReadError {
-            let readable = ByteCountFormatter.string(
-                fromByteCount: Int64(maximumBytes), countStyle: .file)
-            return .failure(PeekLoadFailure(reason: "Too large to preview (limit \(readable))"))
+        } catch let error as NoteTextReadError {
+            switch error {
+            case .fileTooLarge(_, let maximumBytes):
+                let readable = ByteCountFormatter.string(
+                    fromByteCount: Int64(maximumBytes), countStyle: .file)
+                return .failure(
+                    PeekLoadFailure(reason: "Too large to preview (limit \(readable))"))
+            case .unsupportedFile, .fileChangedDuringRead:
+                return .failure(PeekLoadFailure(reason: error.localizedDescription))
+            }
         } catch {
             return .failure(PeekLoadFailure(reason: "Could not read \(url.lastPathComponent)"))
         }

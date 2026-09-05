@@ -260,15 +260,6 @@ struct Frame {
     extra_markers: Vec<Range<usize>>,
 }
 
-/// Parses a known-bounded source for compatibility with existing core callers.
-///
-/// Production and other untrusted-input paths must call [`parse_checked`].
-/// This convenience deliberately panics on refusal rather than silently
-/// returning an empty or partial document that could be mistaken for success.
-pub fn parse(source: &str) -> ParseResult {
-    parse_checked(source).expect("Markdown source exceeds the parser contract")
-}
-
 /// Parses `source` into the flat model the editor renders from.
 ///
 /// The result is atomic: every source, event, nesting, record, and string cap

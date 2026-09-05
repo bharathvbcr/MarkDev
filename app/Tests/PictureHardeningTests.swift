@@ -158,9 +158,9 @@ final class PictureHardeningTests: XCTestCase {
         // with every step of a window resize — so without this, dragging a
         // window edge over a heavy note is a stall per step, forever.
         //
-        // The budget is set to nothing rather than the fixture made slow: a
-        // test that needs a genuinely expensive file is a test whose meaning
-        // changes with the machine it runs on.
+        // Zero is the renderer's deterministic always-expensive sentinel. Use
+        // it rather than making the fixture slow: a test that needs a genuinely
+        // expensive file is a test whose meaning changes with the machine.
         let directory = try directory()
         try write(plainSVG(width: 100, height: 100), "mark.svg", to: directory)
         let renderer = RichContentRenderer(expensiveRasterBudget: .zero)
@@ -169,6 +169,10 @@ final class PictureHardeningTests: XCTestCase {
             at: "mark.svg", relativeTo: directory, maxWidth: 600, width: 600)
         else { return XCTFail("an SVG should load") }
         XCTAssertEqual(try XCTUnwrap(first.cgImage).width, 1200)
+        XCTAssertEqual(
+            renderer.cacheInventoryForTesting.expensive,
+            1,
+            "the zero sentinel must not depend on clock resolution")
 
         guard case .success(let second) = renderer.image(
             at: "mark.svg", relativeTo: directory, maxWidth: 300, width: 300)
@@ -177,6 +181,40 @@ final class PictureHardeningTests: XCTestCase {
         XCTAssertEqual(
             try XCTUnwrap(second.cgImage).width, 1200,
             "the bitmap that was already paid for, scaled — not a second rasterisation")
+    }
+
+    func testAnExpensiveVectorBitmapIsChargedOnceAcrossLogicalSizes() throws {
+        // Reusing one CGImage at several drawn sizes creates several logical
+        // cache keys, but not several bitmap allocations. Charging every key
+        // for the shared storage makes resize traffic evict unrelated content
+        // even though the renderer retained no additional pixels.
+        let directory = try directory()
+        try write(plainSVG(width: 100, height: 100), "mark.svg", to: directory)
+        let renderer = RichContentRenderer(
+            pixelBudget: 64_000_000,
+            expensiveRasterBudget: .zero)
+
+        guard case .success(let first) = renderer.image(
+            at: "mark.svg", relativeTo: directory, maxWidth: 600, width: 600)
+        else { return XCTFail("an SVG should load") }
+        let firstBitmap = try XCTUnwrap(first.cgImage)
+        let retainedPixels = renderer.cachedPixels
+        XCTAssertGreaterThan(retainedPixels, 0)
+
+        for width: CGFloat in [500, 400, 300] {
+            guard case .success(let resized) = renderer.image(
+                at: "mark.svg", relativeTo: directory, maxWidth: width, width: width)
+            else { return XCTFail("an expensive SVG should be reusable at \(width) points") }
+            let resizedBitmap = try XCTUnwrap(resized.cgImage)
+
+            XCTAssertTrue(
+                firstBitmap === resizedBitmap,
+                "every logical size should refer to the already-retained bitmap")
+            XCTAssertEqual(
+                renderer.cachedPixels, retainedPixels,
+                "shared bitmap storage must be charged once, not once per cache key")
+        }
+        XCTAssertEqual(renderer.cacheInventoryForTesting.expensive, 1)
     }
 
     func testAnOrdinaryVectorIsNotQuietlyScaledInstead() throws {

@@ -34,12 +34,16 @@ Before proposing or implementing changes, you must understand MarkDev's core des
 ### Prerequisites
 
 1. **macOS 26.0+**
-2. **Xcode 26.x**
-3. **Rust 1.80+** (`rustup default stable`)
-4. **Command Tools**:
-   ```bash
-   brew install just xcodegen
-   ```
+2. **Xcode 26.6 (build 17F113)**: the repository verifies this exact release
+   for CI and release builds rather than accepting any Xcode 26 installation.
+3. **Rust 1.98.0**: the root `rust-toolchain.toml` selects the exact toolchain,
+   components, and universal macOS targets without changing your global Rust
+   default.
+4. **Command Tools**: Just 1.58.0 and XcodeGen 2.45.4 are required. Release
+   publication additionally requires `gh 2.95.0`. CI obtains the audited
+   binaries with `tools/ci/install-pinned-tools.sh release`; local contributors
+   must put those exact versions on `PATH` and run `just verify-toolchain` (or
+   `just verify-release-toolchain` before publishing).
 
 ### Building the Project
 
@@ -77,27 +81,27 @@ just check
 
 - **Rust Unit & Integration Tests**:
   ```bash
-  cd core && cargo test
+  cd core && cargo test --locked
   ```
 - **Rust Property Tests (Incremental Parser)**:
   ```bash
-  cd core && cargo test --test incremental
+  cd core && cargo test --locked --test incremental
   ```
 - **Rust Performance Benchmarks**:
   ```bash
-  cd core && cargo test --release --test performance
+  cd core && cargo test --locked --release --test performance
   ```
-- **Swift Unit & UI Tests**:
+- **Swift Application and Framework Unit Tests**:
   ```bash
-  xcodebuild -project MarkDev.xcodeproj -scheme MarkDev -configuration Debug test
+  just test-app
   ```
 
 ### Performance Regression Policy
 
-MarkDev enforces strict frame budgets. All changes affecting parsing, text layout, or typing must be measured against the benchmarks:
+MarkDev distinguishes interaction targets from the thresholds enforced in CI. All changes affecting parsing, text layout, or typing must be measured against the benchmarks:
 
-- **Parser Release Gate**: 10,000 lines must parse in under 16.6ms (`cargo test --release --test performance`). Current benchmark: **~2.55ms**.
-- **Editor Keystroke Gate**: Editor restyling per keystroke must stay under 16.6ms (`EditorPerformanceTests`).
+- **Parser Release Gate**: 10,000 lines must parse in under 16.6ms (`cargo test --locked --release --test performance`). Current benchmark: **~2.55ms**.
+- **Editor Keystroke Target**: One 60fps frame is 16.6ms; the current Debug test gate is `< 50ms` (`EditorPerformanceTests`).
 
 ---
 
@@ -116,7 +120,7 @@ MarkDev enforces strict frame budgets. All changes affecting parsing, text layou
 
 ### Rust (`core/`)
 - Format code with `cargo fmt`.
-- Ensure all lints pass with `cargo clippy --all-targets -- -D warnings`.
+- Ensure all lints pass with `cargo clippy --locked --all-targets -- -D warnings`.
 - If modifying FFI declarations in `core/src/ffi.rs`, update `cbindgen` bindings via `just header`.
 
 ### Swift (`app/`)

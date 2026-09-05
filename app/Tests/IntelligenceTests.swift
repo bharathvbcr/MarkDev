@@ -102,11 +102,23 @@ final class WritingPromptTests: XCTestCase {
     }
 
     func testCustomInstructionBecomesTheDirective() {
-        let task = WritingTask.custom("Translate this into French.")
+        let task = try! XCTUnwrap(WritingTask.custom("Translate this into French."))
         XCTAssertEqual(task.directive, "Translate this into French.")
         XCTAssertEqual(task.output, .rewrite)
         XCTAssertTrue(
             WritingPrompt.prompt(for: task, text: "x").contains("Translate this into French."))
+    }
+
+    func testCustomInstructionRefusesBytesBeyondItsContract() {
+        XCTAssertNotNil(WritingTask.custom(String(repeating: "x", count: 1_024)))
+        XCTAssertNil(WritingTask.custom(String(repeating: "x", count: 1_025)))
+        XCTAssertNil(WritingTask.custom(String(repeating: "é", count: 513)))
+    }
+
+    func testCustomInstructionPreservesBoundedInteriorWhitespace() throws {
+        let instruction = "  Keep this example:\n    let x = 1\n  "
+        XCTAssertEqual(try XCTUnwrap(WritingTask.custom(instruction)).directive,
+            "Keep this example:\n    let x = 1")
     }
 
     func testEveryPresetIsDistinctAndDescribed() {
@@ -148,6 +160,13 @@ final class WritingResponseTests: XCTestCase {
     func testDoesNotGuessAtPreambles() {
         let answer = "Ingredients:\n\n- flour"
         XCTAssertEqual(WritingResponse.clean(answer), answer)
+    }
+
+    func testOversizedModelOutputIsRefusedBeforeCleaningCopiesIt() {
+        let exact = String(repeating: "x", count: WritingResponse.maximumBytes)
+        XCTAssertEqual(WritingResponse.admit(exact), exact)
+        XCTAssertNil(WritingResponse.admit(exact + "x"))
+        XCTAssertTrue(WritingResponse.clean(exact + "x").isEmpty)
     }
 }
 
@@ -246,6 +265,18 @@ final class AssistScopeTests: XCTestCase {
         }
         XCTAssertTrue(AssistScope.resolved(NSRange(location: 0, length: 1)).explanation.isEmpty)
     }
+
+    func testMalformedRangesAreRefusedWithoutOverflow() {
+        let overflowing = NSRange(location: Int.max, length: 1)
+        XCTAssertNil(CheckedTextRange.end(of: overflowing))
+        XCTAssertNil(CheckedTextRange.covering(overflowing, NSRange(location: 0, length: 1)))
+        XCTAssertFalse(
+            CheckedTextRange.contains(
+                overflowing, NSRange(location: Int.max, length: 0)))
+        XCTAssertFalse(
+            CheckedTextRange.intersects(
+                overflowing, NSRange(location: Int.max - 1, length: 1)))
+    }
 }
 
 final class ProofreadingPlanTests: XCTestCase {
@@ -289,6 +320,31 @@ final class ProofreadingPlanTests: XCTestCase {
         for pass in chunks(text, limit: 200) {
             XCTAssertLessThanOrEqual((pass as NSString).length, 200)
         }
+    }
+
+    func testOneLongLineIsSegmentedAtTheExactBoundaryAndPlusOne() {
+        for length in [32, 33] {
+            let text = String(repeating: "x", count: length)
+            let passes = chunks(text, limit: 32)
+            XCTAssertTrue(passes.allSatisfy { ($0 as NSString).length <= 32 })
+            XCTAssertEqual(passes.joined(), text, "segmentation must not drop authored text")
+        }
+    }
+
+    func testLongLineSegmentationNeverSplitsASurrogatePair() {
+        let text = String(repeating: "😀", count: 9)
+        let passes = chunks(text, limit: 5)
+        XCTAssertTrue(passes.allSatisfy { ($0 as NSString).length <= 5 })
+        XCTAssertEqual(passes.joined(), text)
+    }
+
+    func testMaximumSizeSingleLineStillHonorsTheRequestBudget() {
+        let text = String(repeating: "x", count: MarkdownReadLimits.maximumDocumentBytes)
+        let passes = chunks(text)
+        XCTAssertTrue(passes.allSatisfy {
+            ($0 as NSString).length <= AssistScope.maximumLength
+        })
+        XCTAssertEqual(passes.reduce(0) { $0 + ($1 as NSString).length }, text.count)
     }
 
     func testProseOnlyDocumentsAreCoveredCompletely() {
@@ -358,6 +414,107 @@ final class ProofreadingIssuesTests: XCTestCase {
         let placed = placement([finding(sentence, sentence + "!")], in: sentence)
         XCTAssertTrue(placed.issues.isEmpty)
         XCTAssertEqual(placed.unplaced, 1)
+    }
+
+    func testReplacementFieldsAreBoundedBeforeTheyReachTheEditor() {
+        let text = "alpha beta gamma"
+        let placed = placement([
+            finding("alpha", ""),
+            finding("beta", "bad\nreplacement"),
+            finding("gamma", String(repeating: "x", count: 201)),
+        ], in: text)
+        XCTAssertTrue(placed.issues.isEmpty)
+        XCTAssertEqual(placed.unplaced, 3)
+    }
+
+    func testFindingLengthBoundaryIsExactAndPlusOneIsRefused() {
+        let exactOriginal = String(repeating: "a", count: 200)
+        let exactReplacement = String(repeating: "b", count: 200)
+        let exact = placement([finding(exactOriginal, exactReplacement)], in: exactOriginal)
+        XCTAssertEqual(exact.issues.count, 1)
+        XCTAssertEqual(exact.unplaced, 0)
+
+        let oversized = String(repeating: "a", count: 201)
+        let refused = placement([finding(oversized, "b")], in: oversized)
+        XCTAssertTrue(refused.issues.isEmpty)
+        XCTAssertEqual(refused.unplaced, 1)
+    }
+
+    func testNulBearingGeneratedFieldsAreRefused() {
+        let placed = placement([
+            finding("alpha", "be\0ta"),
+            ProofreadingFinding(
+                original: "beta", replacement: "gamma", kind: .grammar,
+                explanation: "bad\0reason"),
+        ], in: "alpha beta")
+        XCTAssertTrue(placed.issues.isEmpty)
+        XCTAssertEqual(placed.unplaced, 2)
+    }
+
+    func testOneModelResponseCannotStoreMoreThanTwentyFindings() {
+        let words = (0..<21).map { "word\($0)" }
+        let findings = words.map { finding($0, $0 + "x") }
+        let placed = placement(findings, in: words.joined(separator: " "))
+        XCTAssertEqual(placed.issues.count, 20)
+        XCTAssertEqual(placed.unplaced, 1)
+    }
+
+    func testExplanationIsSingleLineAndBoundedBeforeStorage() throws {
+        let explanation = "Subject and verb\ndo not agree."
+        let placed = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: explanation)
+        ], in: "alpha")
+        let stored = try XCTUnwrap(placed.issues.issues.first?.explanation)
+        XCTAssertFalse(stored.contains("\n"))
+        XCTAssertLessThanOrEqual(stored.utf8.count, 256)
+    }
+
+    func testOversizedExplanationRefusesTheFindingTruthfully() {
+        let placed = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: String(repeating: "reason ", count: 100))
+        ], in: "alpha")
+        XCTAssertTrue(placed.issues.isEmpty)
+        XCTAssertEqual(placed.unplaced, 1)
+    }
+
+    func testExplanationOutputBoundaryIsExactAndPlusOneIsRefused() throws {
+        let exact = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: String(repeating: "x", count: 256))
+        ], in: "alpha")
+        XCTAssertEqual(try XCTUnwrap(exact.issues.issues.first).explanation.utf8.count, 256)
+
+        let plusOne = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: String(repeating: "x", count: 257))
+        ], in: "alpha")
+        XCTAssertTrue(plusOne.issues.isEmpty)
+        XCTAssertEqual(plusOne.unplaced, 1)
+    }
+
+    func testRawExplanationBoundaryIsExactAndPlusOneIsRefused() {
+        let exact = String(repeating: " ", count: 1_023) + "x"
+        let admitted = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: exact)
+        ], in: "alpha")
+        XCTAssertEqual(admitted.issues.issues.first?.explanation, "x")
+
+        let plusOne = String(repeating: " ", count: 1_024) + "x"
+        let refused = placement([
+            ProofreadingFinding(
+                original: "alpha", replacement: "beta", kind: .grammar,
+                explanation: plusOne)
+        ], in: "alpha")
+        XCTAssertTrue(refused.issues.isEmpty)
+        XCTAssertEqual(refused.unplaced, 1)
     }
 
     /// A finding that changes nothing is noise, not discarded work — the model
@@ -519,6 +676,16 @@ final class ProofreadingIssuesTests: XCTestCase {
         XCTAssertEqual(sample.merging(duplicate).count, 2)
     }
 
+    func testAccumulatedIssuesAreCappedAcrossPasses() {
+        let issues = (0..<241).map { offset in
+            ProofreadingIssue(
+                range: NSRange(location: offset * 2, length: 1), original: "a",
+                replacement: "b", kind: .grammar, explanation: "reason")
+        }
+        let merged = ProofreadingIssues.none.merging(ProofreadingIssues(issues: issues))
+        XCTAssertEqual(merged.count, 240)
+    }
+
     func testClampingDropsIssuesPastTheEndOfTheDocument() {
         let clamped = sample.clamped(toLength: 30)
         XCTAssertEqual(clamped.count, 1)
@@ -586,7 +753,7 @@ final class IntelligenceFailureTests: XCTestCase {
     func testEveryFailureHasSomethingToShow() {
         let failures: [IntelligenceFailure] = [
             .unavailable(.notEnabled), .tooMuchText, .refused, .unsupportedLanguage,
-            .busy, .timedOut, .failed("detail"),
+            .busy, .timedOut, .invalidInstruction, .invalidResponse, .failed("detail"),
         ]
         for failure in failures {
             XCTAssertFalse(failure.localizedDescription.isEmpty, "\(failure) needs a message")
@@ -636,6 +803,35 @@ final class DocumentAssistantSourceTests: XCTestCase {
         XCTAssertEqual(text.count, 100)
         XCTAssertTrue(truncated)
     }
+
+    func testSourcePrefixNeverBisectsASurrogatePair() {
+        let (text, truncated) = DocumentAssistant.source(from: "😀tail", limit: 2)
+        XCTAssertEqual(text, "😀")
+        XCTAssertTrue(truncated)
+    }
+
+    func testLeadingWhitespaceDoesNotRequireAnUnboundedTemporaryCopy() {
+        let source = String(repeating: " ", count: 1_000_000) + "Useful text"
+        let result = DocumentAssistant.source(from: source, limit: 20)
+        XCTAssertEqual(result.text, "Useful text")
+        XCTAssertFalse(result.truncated)
+    }
+
+    func testReadingLimitMessageDistinguishesInputAndGeneratedOutput() {
+        XCTAssertEqual(
+            DocumentAssistant.Reading.ready(sourceTruncated: true, outputTruncated: false)
+                .limitMessage,
+            "Based on the first 4,000 characters.")
+        XCTAssertTrue(
+            DocumentAssistant.Reading.ready(sourceTruncated: false, outputTruncated: true)
+                .limitMessage?.contains("generated fields") == true)
+        XCTAssertTrue(
+            DocumentAssistant.Reading.ready(sourceTruncated: true, outputTruncated: true)
+                .limitMessage?.contains("first 4,000") == true)
+        XCTAssertNil(
+            DocumentAssistant.Reading.ready(sourceTruncated: false, outputTruncated: false)
+                .limitMessage)
+    }
 }
 
 final class ReviewSummaryTests: XCTestCase {
@@ -681,5 +877,94 @@ final class ReviewSummaryTests: XCTestCase {
         XCTAssertEqual(
             AssistInspectorView.summary(checked: 0, total: 0, found: 0, unplaced: 0),
             "Nothing to check.")
+    }
+}
+
+private actor IntelligenceRequestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let ready = waiters
+        waiters.removeAll()
+        for continuation in ready { continuation.resume() }
+    }
+}
+
+@MainActor
+final class IntelligenceRequestIdentityTests: XCTestCase {
+    /// A cancelled operation is allowed to ignore cancellation while it is in
+    /// foreign code. Returning later must not clear the task/watchdog that now
+    /// belong to its replacement.
+    func testCancellationResistantPredecessorCannotFinishReplacement() async {
+        let request = IntelligenceRequest()
+        let firstGate = IntelligenceRequestGate()
+        let secondGate = IntelligenceRequestGate()
+        let firstStarted = expectation(description: "first request started")
+        let firstReturned = expectation(description: "cancelled first request returned")
+        let secondStarted = expectation(description: "replacement request started")
+        let secondReturned = expectation(description: "replacement request returned")
+
+        request.start(timeout: .seconds(5)) {
+            firstStarted.fulfill()
+            await firstGate.wait()
+            firstReturned.fulfill()
+        }
+        await fulfillment(of: [firstStarted], timeout: 2)
+
+        request.start(timeout: .seconds(5)) {
+            secondStarted.fulfill()
+            await secondGate.wait()
+            secondReturned.fulfill()
+        }
+        await fulfillment(of: [secondStarted], timeout: 2)
+
+        await firstGate.open()
+        await fulfillment(of: [firstReturned], timeout: 2)
+        await Task.yield()
+        XCTAssertTrue(
+            request.isRunning,
+            "the cancelled predecessor must not retire its replacement")
+
+        await secondGate.open()
+        await fulfillment(of: [secondReturned], timeout: 2)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while request.isRunning, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertFalse(request.isRunning)
+    }
+
+    func testCancelFailsClosedBeforeACancellationResistantOperationReturns() async {
+        let request = IntelligenceRequest()
+        let gate = IntelligenceRequestGate()
+        let started = expectation(description: "request started")
+        let returned = expectation(description: "cancelled request returned")
+
+        request.start(timeout: .seconds(5)) {
+            started.fulfill()
+            await gate.wait()
+            returned.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 2)
+
+        request.cancel()
+        XCTAssertFalse(request.isRunning)
+        XCTAssertFalse(request.didTimeOut)
+
+        await gate.open()
+        await fulfillment(of: [returned], timeout: 2)
+        await Task.yield()
+        XCTAssertFalse(request.isRunning)
+        XCTAssertFalse(request.didTimeOut)
     }
 }

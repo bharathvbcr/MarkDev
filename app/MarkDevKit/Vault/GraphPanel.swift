@@ -5,6 +5,7 @@
 //  The graph, and the controls that decide what it shows.
 //
 
+import Foundation
 import SwiftUI
 
 /// A floating panel showing the vault's link graph.
@@ -34,7 +35,7 @@ public struct GraphPanel: View {
     @State private var isComputing = false
     /// Invalidates older asynchronous solves even when a newer request is
     /// fulfilled from cache before the older one returns.
-    @State private var rebuildGeneration: UInt64 = 0
+    @State private var rebuildIdentityToken = UUID()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// How much of the vault to draw.
@@ -55,7 +56,7 @@ public struct GraphPanel: View {
         let depth: Int
         let tag: String?
         let current: String?
-        let contentRevision: UInt64
+        let contentVersion: VaultContentVersion
     }
 
     public init(
@@ -104,7 +105,7 @@ public struct GraphPanel: View {
             depth: depth,
             tag: tag,
             current: current,
-            contentRevision: vault.contentRevision)
+            contentVersion: vault.contentVersion)
     }
 
     static func resolvedScope(_ requested: Scope, current: String?) -> Scope {
@@ -116,7 +117,7 @@ public struct GraphPanel: View {
         depth: Int,
         tag: String?,
         current: String?,
-        contentRevision: UInt64
+        contentVersion: VaultContentVersion
     ) -> RebuildIdentity {
         let resolved = resolvedScope(scope, current: current)
         return RebuildIdentity(
@@ -124,25 +125,25 @@ public struct GraphPanel: View {
             depth: depth,
             tag: tag,
             current: resolved == .local ? current : nil,
-            contentRevision: contentRevision)
+            contentVersion: contentVersion)
     }
 
     static func graphAfterRebuild(previous _: VaultGraph, computed: VaultGraph) -> VaultGraph {
         computed
     }
 
-    /// The single publish rule for asynchronous solves. Both the generation
-    /// and full identity are required: a cached newer request can advance the
-    /// generation without changing inputs, while a content edit can change
-    /// the identity before a view-state update advances the generation.
+    /// The single publish rule for asynchronous solves. Both identities are
+    /// required: a cached newer request can replace the operation token
+    /// without changing inputs, while a content edit can change the rebuild
+    /// key before a view-state update installs another token.
     static func acceptsRebuildResult(
         request: RebuildIdentity,
-        generation: UInt64,
+        identityToken: UUID,
         current: RebuildIdentity,
-        currentGeneration: UInt64,
+        currentIdentityToken: UUID,
         isCancelled: Bool
     ) -> Bool {
-        !isCancelled && generation == currentGeneration && request == current
+        !isCancelled && identityToken == currentIdentityToken && request == current
     }
 
     private var controls: some View {
@@ -184,6 +185,7 @@ public struct GraphPanel: View {
 
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
+                    .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close graph")
@@ -244,15 +246,20 @@ public struct GraphPanel: View {
     /// exactly what tells the reader whether to change a filter, link a note,
     /// or open a vault.
     private var emptyReason: String {
-        if vault.noteCount == 0 { return "No vault open." }
-        if tag != nil { return "No notes tagged \(tag ?? "")." }
+        Self.emptyReason(hasOpenVault: vault.root != nil, noteCount: vault.noteCount, tag: tag)
+    }
+
+    static func emptyReason(hasOpenVault: Bool, noteCount: Int, tag: String?) -> String {
+        guard hasOpenVault else { return "No vault open." }
+        if noteCount == 0 { return "This vault has no notes yet." }
+        if let tag { return "No notes tagged \(tag)." }
         return "Nothing linked yet — use [[wikilinks]] to connect notes."
     }
 
     private func rebuild() async {
         let key = rebuildKey
-        rebuildGeneration &+= 1
-        let generation = rebuildGeneration
+        let identityToken = UUID()
+        rebuildIdentityToken = identityToken
 
         if let solved = solved[key] {
             graph = solved
@@ -274,9 +281,9 @@ public struct GraphPanel: View {
         }
         guard Self.acceptsRebuildResult(
             request: key,
-            generation: generation,
+            identityToken: identityToken,
             current: rebuildKey,
-            currentGeneration: rebuildGeneration,
+            currentIdentityToken: rebuildIdentityToken,
             isCancelled: Task.isCancelled)
         else { return }
 
@@ -290,9 +297,9 @@ public struct GraphPanel: View {
         // lands. Stale results are discarded rather than cached as current.
         guard Self.acceptsRebuildResult(
             request: key,
-            generation: generation,
+            identityToken: identityToken,
             current: rebuildKey,
-            currentGeneration: rebuildGeneration,
+            currentIdentityToken: rebuildIdentityToken,
             isCancelled: Task.isCancelled)
         else { return }
         isComputing = false

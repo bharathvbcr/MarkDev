@@ -292,6 +292,7 @@ final class EditorStressTests: XCTestCase {
     /// Supplies the undo manager a text view normally gets from its window.
     /// A view built for a test has no window, so without this `allowsUndo`
     /// registers nothing and an undo test silently tests nothing.
+    @MainActor
     private final class UndoHost: NSObject, NSTextViewDelegate {
         let manager = UndoManager()
         func undoManager(for view: NSTextView) -> UndoManager? { manager }

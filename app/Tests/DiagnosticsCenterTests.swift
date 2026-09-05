@@ -37,6 +37,11 @@ final class DiagnosticsCenterTests: XCTestCase {
     }
 
     private let clock = FixedClock(milliseconds: 1_700_000_000_123, uptime: 42)
+    private let origin = DiagnosticOrigin(
+        validatedRunID: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+        processID: 42,
+        role: .testHost,
+        locality: .ephemeralTest)
 
     func testCountBoundaryEvictsOldestAndAccountsForEveryDrop() async {
         let center = DiagnosticsCenter(
@@ -66,7 +71,8 @@ final class DiagnosticsCenterTests: XCTestCase {
 
     func testByteBoundaryAcceptsExactFitAndRejectsOneByteLess() async throws {
         let event = DiagnosticEvent(
-            sequence: 1,
+            origin: origin,
+            localSequence: 1,
             timestampMilliseconds: clock.milliseconds,
             uptimeNanoseconds: clock.uptime,
             severity: .warning,
@@ -81,7 +87,8 @@ final class DiagnosticsCenterTests: XCTestCase {
                 memoryEventLimit: 1,
                 memoryByteLimit: exactBytes,
                 supportReportByteLimit: 128 * 1_024),
-            clock: clock)
+            clock: clock,
+            origin: origin)
         await exact.record(
             severity: .warning,
             subsystem: .filesystem,
@@ -96,7 +103,8 @@ final class DiagnosticsCenterTests: XCTestCase {
                 memoryEventLimit: 1,
                 memoryByteLimit: exactBytes - 1,
                 supportReportByteLimit: 128 * 1_024),
-            clock: clock)
+            clock: clock,
+            origin: origin)
         await oneShort.record(
             severity: .warning,
             subsystem: .filesystem,

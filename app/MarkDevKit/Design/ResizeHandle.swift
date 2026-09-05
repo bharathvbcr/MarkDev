@@ -31,6 +31,9 @@ public struct ResizeHandle: View {
     public let onReset: () -> Void
     /// Spoken description of what this handle separates.
     public let label: String
+    /// A current value supplied by the geometry owner, such as a percentage
+    /// for split dividers. `nil` omits the value instead of inventing one.
+    public let valueDescription: String?
 
     @State private var isHovering = false
     @State private var isDragging = false
@@ -57,11 +60,13 @@ public struct ResizeHandle: View {
     public init(
         axis: SplitAxis,
         label: String,
+        valueDescription: String? = nil,
         onDrag: @escaping (CGFloat) -> Void,
         onReset: @escaping () -> Void
     ) {
         self.axis = axis
         self.label = label
+        self.valueDescription = valueDescription
         self.onDrag = onDrag
         self.onReset = onReset
     }
@@ -137,7 +142,9 @@ public struct ResizeHandle: View {
             .help("\(label) — drag to resize, double-click to reset")
             .accessibilityElement()
             .accessibilityLabel(label)
-            .accessibilityHint("Drag to resize. Double-tap to reset.")
+            .accessibilityValue(valueDescription ?? "", isEnabled: valueDescription != nil)
+            .accessibilityHint("Adjust to resize, or choose Reset Size.")
+            .accessibilityAction(named: "Reset Size") { onReset() }
             // Adjustable, not just labelled: a divider a screen reader can
             // describe but not move is a wall with a sign on it. The step is
             // coarse because VoiceOver adjustments repeat while held.

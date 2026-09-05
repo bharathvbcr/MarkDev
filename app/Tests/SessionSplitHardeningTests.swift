@@ -371,6 +371,71 @@ final class SessionSnapshotHardeningTests: XCTestCase {
         }
     }
 
+    func testRejectedStoredSessionLeavesPrivacySafeDiagnosticEvidence() async {
+        await DiagnosticsEmitter.shared.flush()
+        let before = await DiagnosticsEmitter.shared.snapshot().events.filter {
+            $0.code.rawValue == "workspace.session-restore.rejected"
+        }.count
+        let corrupt = Data("{not json}".utf8)
+        UserDefaults.standard.set(corrupt, forKey: SessionStore.key)
+
+        XCTAssertNil(SessionStore.load())
+        await DiagnosticsEmitter.shared.flush()
+
+        let events = await DiagnosticsEmitter.shared.snapshot().events.filter {
+            $0.code.rawValue == "workspace.session-restore.rejected"
+        }
+        XCTAssertEqual(events.count, before + 1)
+        XCTAssertEqual(events.last?.severity, .warning)
+        XCTAssertEqual(events.last?.subsystem, .workspace)
+        XCTAssertEqual(
+            events.last?.metadata,
+            DiagnosticMetadata([.byteCount: .integer(Int64(corrupt.count))]))
+        XCTAssertNil(UserDefaults.standard.object(forKey: SessionStore.key))
+    }
+
+    func testRejectedSessionSaveLeavesPrivacySafeDiagnosticEvidence() async throws {
+        let layout = maximumLayout()
+        let padding = String(repeating: "a", count: 5_000)
+        var documentOrdinal = 0
+        let panes = layout.panes.map { pane -> PaneSnapshot in
+            defer { documentOrdinal += SessionStateLimits.maximumDocumentsPerPane }
+            let documents = (0..<SessionStateLimits.maximumDocumentsPerPane).map { offset in
+                DocumentSnapshot(
+                    url: "file:///tmp/\(padding)-\(documentOrdinal + offset).md")
+            }
+            return PaneSnapshot(pane: pane, documents: documents, selection: nil)
+        }
+        let oversized = WorkspaceSnapshot(
+            layout: layout,
+            panes: panes,
+            focusedPane: layout.panes[0],
+            vaultRoot: nil)
+        let encodedByteCount = try JSONEncoder().encode(oversized).count
+        XCTAssertGreaterThan(encodedByteCount, SessionStateLimits.maximumEncodedBytes)
+
+        SessionStore.save(snapshot())
+        XCTAssertNotNil(UserDefaults.standard.object(forKey: SessionStore.key))
+        await DiagnosticsEmitter.shared.flush()
+        let before = await DiagnosticsEmitter.shared.snapshot().events.filter {
+            $0.code.rawValue == "workspace.session-save.rejected"
+        }.count
+
+        SessionStore.save(oversized)
+        await DiagnosticsEmitter.shared.flush()
+
+        let events = await DiagnosticsEmitter.shared.snapshot().events.filter {
+            $0.code.rawValue == "workspace.session-save.rejected"
+        }
+        XCTAssertEqual(events.count, before + 1)
+        XCTAssertEqual(events.last?.severity, .warning)
+        XCTAssertEqual(events.last?.subsystem, .workspace)
+        XCTAssertEqual(
+            events.last?.metadata,
+            DiagnosticMetadata([.byteCount: .integer(Int64(encodedByteCount))]))
+        XCTAssertNil(UserDefaults.standard.object(forKey: SessionStore.key))
+    }
+
     func testDecodeAcceptsExactPaneEntryLimitAndRejectsTheNextEntry() throws {
         let layout = maximumLayout()
         let value = WorkspaceSnapshot(
@@ -534,7 +599,7 @@ final class SessionSnapshotHardeningTests: XCTestCase {
         try "first".write(to: first, atomically: true, encoding: .utf8)
         try "second".write(to: second, atomically: true, encoding: .utf8)
 
-        let original = Workspace()
+        let original = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         let pane = original.focusedPane
         try original.open(first, in: pane)
         try original.open(second, in: pane)
@@ -544,7 +609,7 @@ final class SessionSnapshotHardeningTests: XCTestCase {
 
         let data = try JSONEncoder().encode(original.snapshot())
         let decoded = try JSONDecoder().decode(WorkspaceSnapshot.self, from: data)
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: decoded)
 
         XCTAssertEqual(restored.document(in: pane)?.url, first)

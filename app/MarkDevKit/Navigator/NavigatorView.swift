@@ -48,8 +48,23 @@ enum NavigatorTreeReloader {
                 hitDepthLimit: false,
                 hadReadError: false)
         }
+        // Validate before standardization: Foundation removes the host from
+        // `file://remote.example/local/path`, after which an ordinary
+        // enumerator would inventory the matching local directory.
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else {
+            return NavigatorTreeSnapshot(
+                nodes: [],
+                expanded: [],
+                hitEntryLimit: false,
+                hitDepthLimit: false,
+                hadReadError: true)
+        }
         let normalizedRoot = root.standardizedFileURL
-        let sameRoot = previousRoot?.standardizedFileURL == normalizedRoot
+        let sameRoot = previousRoot.flatMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL
+                : nil
+        } == normalizedRoot
         var budget = TreeBudget(remainingEntries: max(0, maxEntries))
         var cache: [URL: [FileNode]] = [:]
         var nodes = cachedChildren(of: normalizedRoot, cache: &cache, budget: &budget)
@@ -65,7 +80,11 @@ enum NavigatorTreeReloader {
         // Expansion is only created from displayed rows, whose total is
         // capped above. Sorting makes pruning deterministic if an older view
         // somehow hands us more state than the current bound permits.
-        let candidates = expanded.map(\.standardizedFileURL).sorted { $0.path < $1.path }
+        let candidates = expanded.compactMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL
+                : nil
+        }.sorted { $0.path < $1.path }
         if candidates.count > maxEntries { budget.hitEntryLimit = true }
         let retained = Set(candidates.prefix(max(0, maxEntries)).compactMap {
             candidate -> URL? in
@@ -153,6 +172,10 @@ enum NavigatorTreeReloader {
     private static func boundedChildren(
         of directory: URL, budget: inout TreeBudget
     ) -> [FileNode] {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(directory) else {
+            budget.hadReadError = true
+            return []
+        }
         let keys: [URLResourceKey] = [.isDirectoryKey, .isHiddenKey, .isSymbolicLinkKey]
         guard
             let directoryValues = try? directory.resourceValues(forKeys: Set(keys)),
@@ -224,9 +247,17 @@ struct NavigatorTreeRequest: Hashable, Sendable {
     let expanded: [URL]
 
     init(root: URL?, revision: Int, expanded: Set<URL>) {
-        self.root = root?.standardizedFileURL
+        self.root = root.flatMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL
+                : nil
+        }
         self.revision = revision
-        self.expanded = expanded.map(\.standardizedFileURL).sorted { $0.path < $1.path }
+        self.expanded = expanded.compactMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL
+                : nil
+        }.sorted { $0.path < $1.path }
     }
 }
 
@@ -261,7 +292,12 @@ struct NavigatorFilterRequest: Hashable, Sendable {
     let query: String
 
     init(root: URL, revision: Int, query: String) {
-        self.root = root.standardizedFileURL
+        // Keep a refused authority intact so FileTree's boundary can reject
+        // it. Standardizing it here would turn the later secure check into a
+        // check of a newly manufactured local URL.
+        self.root = BoundedRegularFileReader.hasLocalFileAuthority(root)
+            ? root.standardizedFileURL
+            : root
         self.revision = revision
         self.query = query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -512,7 +548,11 @@ public struct NavigatorView: View {
         onDelete: ((URL) -> Void)? = nil,
         onDropNotes: (([URL], URL) -> Void)? = nil
     ) {
-        self.root = root
+        self.root = root.flatMap {
+            BoundedRegularFileReader.hasLocalFileAuthority($0)
+                ? $0.standardizedFileURL
+                : nil
+        }
         self.revision = revision
         self.onOpen = onOpen
         self.onChooseVault = onChooseVault
@@ -713,7 +753,11 @@ public struct NavigatorView: View {
                     Text(filterQuery.isEmpty ? "This vault has no notes yet" : emptyFilterTitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    if !filterQuery.isEmpty {
+                    if filterQuery.isEmpty, let root, let onCreateNote {
+                        Button("New Note…") { onCreateNote(root) }
+                            .controlSize(.small)
+                            .accessibilityIdentifier("navigator.empty.new-note")
+                    } else if !filterQuery.isEmpty {
                         Text("for “\(filter)”")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
@@ -729,6 +773,7 @@ public struct NavigatorView: View {
                             ForEach(rows, id: \.node.id) { row in
                                 NavigatorRow(
                                     node: row.node,
+                                    root: root,
                                     depth: row.depth,
                                     subtitle: row.subtitle,
                                     isExpanded: expanded.contains(row.node.url),
@@ -1058,9 +1103,74 @@ enum NavigatorKeyboard {
     }
 }
 
+/// Bounded hierarchy context for one flattened navigator row.
+///
+/// SwiftUI exposes the custom tree as buttons rather than a native outline,
+/// so indentation alone never reaches VoiceOver. The spoken location retains
+/// only the nearest ancestors and clips hostile or accidental long names: an
+/// accessibility improvement must not turn a deeply nested vault into an
+/// unbounded announcement.
+enum NavigatorRowAccessibility {
+    static let maximumContextComponents = 3
+    static let maximumComponentCharacters = 48
+    static let maximumLevel = NavigatorTreeReloader.maximumDepth + 1
+
+    static func level(for depth: Int) -> Int {
+        guard depth > 0 else { return 1 }
+        return depth >= maximumLevel - 1 ? maximumLevel : depth + 1
+    }
+
+    static func location(root: URL?, node: URL, filteredFolder: String?) -> String {
+        let components: [String]
+        if let filteredFolder, !filteredFolder.isEmpty {
+            components = filteredFolder.split(separator: "/").map(String.init)
+        } else if let root {
+            let rootComponents = root.standardizedFileURL.pathComponents
+            let parentComponents = node.deletingLastPathComponent().standardizedFileURL.pathComponents
+            if parentComponents.count >= rootComponents.count,
+                parentComponents.prefix(rootComponents.count).elementsEqual(rootComponents)
+            {
+                components = Array(parentComponents.dropFirst(rootComponents.count))
+            } else {
+                components = [node.deletingLastPathComponent().lastPathComponent]
+            }
+        } else {
+            components = [node.deletingLastPathComponent().lastPathComponent]
+        }
+
+        let nonEmpty = components.filter { !$0.isEmpty }
+        guard !nonEmpty.isEmpty else { return "Vault root" }
+        let retained = nonEmpty.suffix(maximumContextComponents).map(clippedComponent)
+        let prefix = nonEmpty.count > retained.count ? "… / " : ""
+        return prefix + retained.joined(separator: " / ")
+    }
+
+    static func value(
+        root: URL?,
+        node: URL,
+        depth: Int,
+        filteredFolder: String?,
+        isDirectory: Bool,
+        isExpanded: Bool
+    ) -> String {
+        var parts = [
+            "Level \(level(for: depth))",
+            location(root: root, node: node, filteredFolder: filteredFolder),
+        ]
+        if isDirectory { parts.append(isExpanded ? "expanded" : "collapsed") }
+        return parts.joined(separator: ", ")
+    }
+
+    private static func clippedComponent(_ component: String) -> String {
+        guard component.count > maximumComponentCharacters else { return component }
+        return String(component.prefix(maximumComponentCharacters - 1)) + "…"
+    }
+}
+
 /// One row of the navigator.
 private struct NavigatorRow: View {
     let node: FileNode
+    let root: URL?
     let depth: Int
     let subtitle: String?
     let isExpanded: Bool
@@ -1075,6 +1185,8 @@ private struct NavigatorRow: View {
     @State private var isHovering = false
 
     var body: some View {
+        let accessibilityLocation = NavigatorRowAccessibility.location(
+            root: root, node: node.url, filteredFolder: subtitle)
         Button(action: action) {
             HStack(spacing: GlassTheme.Spacing.tight) {
                 if node.isDirectory {
@@ -1139,11 +1251,20 @@ private struct NavigatorRow: View {
             GlassTheme.motion(GlassTheme.quickSpring, reduceMotion: reduceMotion),
             value: isSelected)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(node.name)
+        .accessibilityLabel(node.displayName)
         // A folder's open state exists only as a chevron rotation otherwise;
         // spoken here so a screen-reader reader can tell an expanded folder
         // from a collapsed one or from a file.
-        .accessibilityValue(node.isDirectory ? (isExpanded ? "expanded" : "collapsed") : "")
+        .accessibilityValue(
+            NavigatorRowAccessibility.value(
+                root: root,
+                node: node.url,
+                depth: depth,
+                filteredFolder: subtitle,
+                isDirectory: node.isDirectory,
+                isExpanded: isExpanded))
+        .accessibilityCustomContent("Outline level", "\(NavigatorRowAccessibility.level(for: depth))")
+        .accessibilityCustomContent("Location", accessibilityLocation)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : [.isButton])
     }
 

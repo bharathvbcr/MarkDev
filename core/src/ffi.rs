@@ -53,12 +53,15 @@ pub struct ParseHandle {
 
 /// Parses UTF-8 Markdown into a handle.
 ///
-/// Returns null if `bytes` is null or is not valid UTF-8. The caller keeps
-/// ownership of `bytes`; it is not retained past this call.
+/// Returns null for invalid UTF-8, an oversized/refused parse, or a null
+/// pointer paired with a nonzero length. Null plus zero is the canonical empty
+/// document. The caller keeps ownership of `bytes`; it is not retained past
+/// this call.
 ///
 /// # Safety
 ///
-/// `bytes` must point to at least `len` readable bytes.
+/// A non-null `bytes` must point to at least `len` readable bytes. Null is
+/// accepted only when `len` is zero.
 #[no_mangle]
 pub unsafe extern "C" fn md_parse(bytes: *const u8, len: usize) -> *mut ParseHandle {
     let Some(source) = read_bounded_bytes(bytes, len, MAX_DOCUMENT_BYTES) else {
@@ -291,11 +294,14 @@ pub struct DocumentHandle {
     document: Document,
 }
 
-/// Creates a document from UTF-8 bytes. Returns null on invalid UTF-8.
+/// Creates a document from UTF-8 bytes. Returns null for invalid UTF-8, a
+/// refused/oversized parse, or a null pointer paired with a nonzero length.
+/// Null plus zero creates an empty document.
 ///
 /// # Safety
 ///
-/// `bytes` must point to at least `len` readable bytes.
+/// A non-null `bytes` must point to at least `len` readable bytes. Null is
+/// accepted only when `len` is zero.
 #[no_mangle]
 pub unsafe extern "C" fn md_document_new(bytes: *const u8, len: usize) -> *mut DocumentHandle {
     let Some(text) = read_bounded_bytes(bytes, len, MAX_DOCUMENT_BYTES) else {

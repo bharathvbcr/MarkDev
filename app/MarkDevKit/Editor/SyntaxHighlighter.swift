@@ -101,7 +101,9 @@ public final class SyntaxHighlighter {
     /// Whether a grammar exists for `language`.
     public func supports(_ language: String) -> Bool {
         #if canImport(CMarkDev)
-            guard language.utf8.count <= Self.maximumLanguageBytes else { return false }
+            guard BoundedText.fitsUTF8(language, maximum: Self.maximumLanguageBytes) else {
+                return false
+            }
             var bytes = Array(language.utf8)
             return bytes.withUnsafeMutableBufferPointer { buffer in
                 md_highlight_supports(buffer.baseAddress, UInt(buffer.count)) == 1
@@ -116,14 +118,17 @@ public final class SyntaxHighlighter {
     /// Only measurements need this; it deliberately does not count as a use,
     /// so a test can probe without changing who eviction would take.
     func isCached(language: String, code: String) -> Bool {
-        cache[Key(language: language, code: code)] != nil
+        guard BoundedText.fitsUTF8(language, maximum: Self.maximumLanguageBytes),
+            BoundedText.fitsUTF8(code, maximum: Self.maximumCodeBytes)
+        else { return false }
+        return cache[Key(language: language, code: code)] != nil
     }
 
     /// Highlights `code`, or returns empty when the language is unknown.
     public func spans(language: String?, code: String) -> [HighlightSpan] {
         guard let language, !language.isEmpty, !code.isEmpty,
-            language.utf8.count <= Self.maximumLanguageBytes,
-            code.utf8.count <= Self.maximumCodeBytes
+            BoundedText.fitsUTF8(language, maximum: Self.maximumLanguageBytes),
+            BoundedText.fitsUTF8(code, maximum: Self.maximumCodeBytes)
         else { return [] }
 
         let key = Key(language: language, code: code)
@@ -176,8 +181,8 @@ public final class SyntaxHighlighter {
     /// unknown language is the distinct successful value `[]` and may cache.
     private func compute(language: String, code: String) -> [HighlightSpan]? {
         #if canImport(CMarkDev)
-            guard language.utf8.count <= Self.maximumLanguageBytes,
-                code.utf8.count <= Self.maximumCodeBytes
+            guard BoundedText.fitsUTF8(language, maximum: Self.maximumLanguageBytes),
+                BoundedText.fitsUTF8(code, maximum: Self.maximumCodeBytes)
             else { return nil }
             var languageBytes = Array(language.utf8)
             var bytes = Array(code.utf8)
@@ -221,6 +226,7 @@ public final class SyntaxHighlighter {
             return nil
         #endif
     }
+
 }
 
 extension EditorTheme {

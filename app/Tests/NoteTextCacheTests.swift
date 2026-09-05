@@ -55,6 +55,24 @@ final class NoteTextCacheTests: XCTestCase {
         XCTAssertEqual(cache.hits, 1, "the second read must not touch the file's contents")
     }
 
+    func testRemoteAuthorityCannotAliasAPopulatedLocalCacheEntry() throws {
+        let cache = NoteTextCache()
+        let local = try write("private local bytes", to: "authority.md")
+        XCTAssertEqual(try cache.read(local), Data("private local bytes".utf8))
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(local.path)"))
+
+        XCTAssertThrowsError(try cache.read(hostile)) { error in
+            guard case NoteTextReadError.unsupportedFile(let refused) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(refused, hostile)
+        }
+        XCTAssertNil(cache.cached(hostile))
+        XCTAssertNil(cache.warm(hostile))
+        XCTAssertEqual(cache.hits, 0, "a refused authority must never count as a cache hit")
+    }
+
     func testAFileChangedOnDiskIsReadAgain() throws {
         // The one that matters. Serving a stale note to the *editor* means the
         // reader edits text that is not what is on disk, and saves it back
@@ -202,6 +220,34 @@ final class NoteTextCacheTests: XCTestCase {
                 case .unsupportedFile(let refused) = typed
             else { return XCTFail("unexpected error: \(error)") }
             XCTAssertEqual(refused.lastPathComponent, url.lastPathComponent)
+        }
+    }
+
+    func testASymbolicLinkSharesTheCanonicalCacheEntryWithItsTarget() throws {
+        let cache = NoteTextCache(maximumFileBytes: 64)
+        let target = try write("body", to: "Target.md")
+        let link = directory.appendingPathComponent("Alias.md")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        XCTAssertEqual(try cache.read(target), Data("body".utf8))
+        XCTAssertEqual(try cache.read(link), Data("body".utf8))
+        XCTAssertEqual(cache.misses, 1)
+        XCTAssertEqual(cache.hits, 1)
+    }
+
+    func testAHardLinkRemainsReadableEvenThoughAtomicReplacementIsRefused() throws {
+        let cache = NoteTextCache(maximumFileBytes: 64)
+        let target = try write("body", to: "Target.md")
+        let link = directory.appendingPathComponent("Alias.md")
+        try FileManager.default.linkItem(at: target, to: link)
+
+        XCTAssertEqual(try cache.read(link), Data("body".utf8))
+        XCTAssertThrowsError(
+            try LocalDocumentIO.authorizeSaveAsSynchronously(link, overwrite: true)
+        ) { error in
+            XCTAssertTrue(
+                error as? SecureLocalFileError == .hardLinkedEntry
+                    || error is LocalDocumentIOError)
         }
     }
 

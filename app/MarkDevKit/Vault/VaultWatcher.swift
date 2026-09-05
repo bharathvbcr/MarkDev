@@ -47,7 +47,9 @@ public final class VaultWatcher: @unchecked Sendable {
     /// is what makes the gap harmless rather than pretending it away.
     public func start(at root: URL) {
         stop()
-        watchedRoot = root.standardizedFileURL
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else { return }
+        let root = root.standardizedFileURL
+        watchedRoot = root
 
         var context = FSEventStreamContext(
             version: 0,
@@ -173,8 +175,8 @@ public final class VaultWatchCoordinator {
     public func subscribe(
         to root: URL, handler: @escaping ([String]) -> Void
     ) -> UUID {
-        let key = normalized(root)
         let token = UUID()
+        guard let key = normalized(root) else { return token }
 
         if entries[key] == nil {
             let watcher = VaultWatcher()
@@ -196,7 +198,7 @@ public final class VaultWatchCoordinator {
 
     /// Ends this subscription; stops the underlying stream at zero.
     public func unsubscribe(_ token: UUID, root: URL) {
-        let key = normalized(root)
+        guard let key = normalized(root) else { return }
         entries[key]?.subscribers.removeValue(forKey: token)
         if entries[key]?.subscribers.isEmpty == true {
             entries[key]?.watcher.stop()
@@ -215,8 +217,9 @@ public final class VaultWatchCoordinator {
         }
     }
 
-    private func normalized(_ root: URL) -> URL {
-        (root.path as NSString).standardizingPath
+    private func normalized(_ root: URL) -> URL? {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else { return nil }
+        return (root.path as NSString).standardizingPath
             .pipe { URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath() }
     }
 
@@ -226,11 +229,13 @@ public final class VaultWatchCoordinator {
         /// Whether `root` currently has a live stream. Root-scoped so a
         /// multi-root test cannot pass on shared-state luck.
         func activeStreamCount(forTestingRoot root: URL) -> Int {
-            entries[normalized(root)] != nil ? 1 : 0
+            guard let key = normalized(root) else { return 0 }
+            return entries[key] != nil ? 1 : 0
         }
 
         func emit(root: URL, paths: [String]) {
-            fanOut(key: normalized(root), paths: paths)
+            guard let key = normalized(root) else { return }
+            fanOut(key: key, paths: paths)
         }
     #endif
 }

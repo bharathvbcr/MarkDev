@@ -23,7 +23,13 @@ public struct RotatingDiagnosticsFileConfiguration: Equatable, Sendable {
         maximumFileBytes: Int = 1 * 1_024 * 1_024,
         maximumFiles: Int = 4
     ) {
-        self.directory = directory.standardizedFileURL
+        // `standardizedFileURL` discards a file URL's host, credentials,
+        // query, and fragment. Preserve a non-local spelling so the sink's
+        // throwing boundary can reject it instead of laundering it into a
+        // local filesystem path.
+        self.directory = BoundedRegularFileReader.hasLocalFileAuthority(directory)
+            ? directory.standardizedFileURL
+            : directory
         self.baseName = Self.sanitizeBaseName(baseName)
         self.maximumFileBytes = min(max(1, maximumFileBytes), Self.largestSupportedFile)
         self.maximumFiles = min(max(1, maximumFiles), Self.largestSupportedFileCount)
@@ -55,6 +61,9 @@ public struct RotatingDiagnosticsFileConfiguration: Equatable, Sendable {
 public enum RotatingDiagnosticsFileError: Error, Equatable, LocalizedError {
     case pathIsNotDirectory
     case pathIsNotRegularFile
+    case unpersistableOrigin
+    case recordOriginMismatch
+    case incompatibleExistingSegment
     case recordExceedsFileLimit(limit: Int, actual: Int)
     case fileChangedDuringWrite
 
@@ -64,6 +73,12 @@ public enum RotatingDiagnosticsFileError: Error, Equatable, LocalizedError {
             return "The diagnostics directory path is not a private directory."
         case .pathIsNotRegularFile:
             return "A diagnostics generation is not a regular file."
+        case .unpersistableOrigin:
+            return "The diagnostics origin is not authorized for a scoped disk segment."
+        case .recordOriginMismatch:
+            return "The diagnostics record does not belong to this process segment."
+        case .incompatibleExistingSegment:
+            return "An existing diagnostics segment is incompatible and was left unchanged."
         case let .recordExceedsFileLimit(limit, actual):
             return "A \(actual)-byte diagnostics record exceeds the \(limit)-byte file limit."
         case .fileChangedDuringWrite:
@@ -72,21 +87,147 @@ public enum RotatingDiagnosticsFileError: Error, Equatable, LocalizedError {
     }
 }
 
-public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
-    public let configuration: RotatingDiagnosticsFileConfiguration
+struct RotatingDiagnosticsSinkTestingHooks: @unchecked Sendable {
+    var beforeRotationMutation: (() throws -> Void)?
+    var beforePruneMutation: ((String) throws -> Void)?
 
-    public init(configuration: RotatingDiagnosticsFileConfiguration) throws {
-        self.configuration = configuration
-        try Self.prepareDirectory(configuration.directory)
-        try Self.pruneUnknownGenerations(configuration: configuration)
-        for generation in 0..<configuration.maximumFiles {
-            try Self.recoverFileIfPresent(
-                at: configuration.fileURL(at: generation),
-                byteLimit: configuration.maximumFileBytes)
+    init(
+        beforeRotationMutation: (() throws -> Void)? = nil,
+        beforePruneMutation: ((String) throws -> Void)? = nil
+    ) {
+        self.beforeRotationMutation = beforeRotationMutation
+        self.beforePruneMutation = beforePruneMutation
+    }
+
+    static let none = Self()
+}
+
+public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
+    private struct DirectoryFingerprint: Equatable {
+        let identity: LocalFileIdentity
+        let ownerID: uid_t
+        let mode: mode_t
+        let flags: UInt32
+
+        init(_ status: stat) {
+            identity = LocalFileIdentity(status)
+            ownerID = status.st_uid
+            mode = status.st_mode & mode_t(0o7777)
+            flags = status.st_flags
         }
     }
 
+    private struct ExistingFileFingerprint: Equatable {
+        let identity: LocalFileIdentity
+        let ownerID: uid_t
+        let mode: mode_t
+        let linkCount: UInt64
+        let size: Int64
+        let flags: UInt32
+        let modifiedSeconds: Int64
+        let modifiedNanoseconds: Int64
+        let changedSeconds: Int64
+        let changedNanoseconds: Int64
+
+        init(_ status: stat) {
+            identity = LocalFileIdentity(status)
+            ownerID = status.st_uid
+            mode = status.st_mode & mode_t(0o7777)
+            linkCount = UInt64(status.st_nlink)
+            size = Int64(status.st_size)
+            flags = status.st_flags
+            modifiedSeconds = Int64(status.st_mtimespec.tv_sec)
+            modifiedNanoseconds = Int64(status.st_mtimespec.tv_nsec)
+            changedSeconds = Int64(status.st_ctimespec.tv_sec)
+            changedNanoseconds = Int64(status.st_ctimespec.tv_nsec)
+        }
+    }
+
+    private struct RecoveryPlan {
+        let url: URL
+        let validPrefixLength: Int?
+        let fingerprint: ExistingFileFingerprint
+    }
+
+    /// A healthy run owns at most `largestSupportedFileCount` generations and
+    /// a small number of crash temporaries. Refuse a directory flooded by a
+    /// peer process without first materializing its entire listing.
+    static let maximumInspectedDirectoryEntries = 256
+
+    public let configuration: RotatingDiagnosticsFileConfiguration
+    public nonisolated let requiredOrigin: DiagnosticOrigin
+    private let directoryFingerprint: DirectoryFingerprint
+    private let testingHooks: RotatingDiagnosticsSinkTestingHooks
+
+    public init(
+        configuration: RotatingDiagnosticsFileConfiguration,
+        requiredOrigin: DiagnosticOrigin
+    ) throws {
+        let fingerprint = try Self.initializeStorage(
+            configuration: configuration,
+            requiredOrigin: requiredOrigin,
+            testingHooks: .none)
+        self.configuration = configuration
+        self.requiredOrigin = requiredOrigin
+        directoryFingerprint = fingerprint
+        testingHooks = .none
+    }
+
+    init(
+        configuration: RotatingDiagnosticsFileConfiguration,
+        requiredOrigin: DiagnosticOrigin,
+        testingHooks: RotatingDiagnosticsSinkTestingHooks
+    ) throws {
+        let fingerprint = try Self.initializeStorage(
+            configuration: configuration,
+            requiredOrigin: requiredOrigin,
+            testingHooks: testingHooks)
+        self.configuration = configuration
+        self.requiredOrigin = requiredOrigin
+        directoryFingerprint = fingerprint
+        self.testingHooks = testingHooks
+    }
+
+    private static func initializeStorage(
+        configuration: RotatingDiagnosticsFileConfiguration,
+        requiredOrigin: DiagnosticOrigin,
+        testingHooks: RotatingDiagnosticsSinkTestingHooks
+    ) throws -> DirectoryFingerprint {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(configuration.directory) else {
+            throw RotatingDiagnosticsFileError.pathIsNotDirectory
+        }
+        guard requiredOrigin.canPersistToScopedStore else {
+            throw RotatingDiagnosticsFileError.unpersistableOrigin
+        }
+        let directoryFingerprint = try prepareDirectory(configuration.directory)
+        var recoveryPlans: [RecoveryPlan] = []
+        recoveryPlans.reserveCapacity(configuration.maximumFiles)
+        for generation in 0..<configuration.maximumFiles {
+            if let plan = try inspectFileIfPresent(
+                at: configuration.fileURL(at: generation),
+                byteLimit: configuration.maximumFileBytes,
+                requiredOrigin: requiredOrigin)
+            {
+                recoveryPlans.append(plan)
+            }
+        }
+        for plan in recoveryPlans {
+            try applyRecoveryPlan(
+                plan,
+                byteLimit: configuration.maximumFileBytes,
+                requiredOrigin: requiredOrigin)
+        }
+        try pruneUnknownGenerations(
+            configuration: configuration,
+            expectedDirectory: directoryFingerprint,
+            testingHooks: testingHooks)
+        return directoryFingerprint
+    }
+
     public func write(_ record: DiagnosticRecord) async throws {
+        guard record.event.origin == requiredOrigin else {
+            throw RotatingDiagnosticsFileError.recordOriginMismatch
+        }
         let line = try DiagnosticsJSON.line(for: record.event)
         guard line.count <= configuration.maximumFileBytes else {
             throw RotatingDiagnosticsFileError.recordExceedsFileLimit(
@@ -105,9 +246,6 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
                 to: active,
                 byteLimit: configuration.maximumFileBytes)
         } catch {
-            try? Self.recoverFileIfPresent(
-                at: active,
-                byteLimit: configuration.maximumFileBytes)
             throw error
         }
     }
@@ -120,23 +258,66 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
     }
 
     private func rotate() throws {
+        let directoryDescriptor = try Self.openBoundDirectory(
+            configuration.directory,
+            expected: directoryFingerprint)
+        defer { Darwin.close(directoryDescriptor) }
+
+        var generations: [ExistingFileFingerprint?] = []
+        generations.reserveCapacity(configuration.maximumFiles)
+        for generation in 0..<configuration.maximumFiles {
+            generations.append(try Self.trustedFingerprintIfPresent(
+                name: configuration.fileURL(at: generation).lastPathComponent,
+                directoryDescriptor: directoryDescriptor))
+        }
+
+        try testingHooks.beforeRotationMutation?()
+        try Self.requireDirectoryMutationAuthority(
+            configuration.directory,
+            descriptor: directoryDescriptor,
+            expected: directoryFingerprint)
+
         if configuration.maximumFiles == 1 {
-            try Self.unlinkIfPresent(configuration.fileURL(at: 0))
-            try SecureAtomicDiagnosticsFile.syncDirectory(configuration.directory)
+            try Self.unlinkExpectedEntry(
+                name: configuration.fileURL(at: 0).lastPathComponent,
+                expected: generations[0],
+                directoryDescriptor: directoryDescriptor)
+            try Self.syncDirectoryDescriptor(directoryDescriptor)
+            try Self.requireDirectoryMutationAuthority(
+                configuration.directory,
+                descriptor: directoryDescriptor,
+                expected: directoryFingerprint)
             return
         }
 
-        try Self.unlinkIfPresent(configuration.fileURL(at: configuration.maximumFiles - 1))
+        let lastGeneration = configuration.maximumFiles - 1
+        try Self.unlinkExpectedEntry(
+            name: configuration.fileURL(at: lastGeneration).lastPathComponent,
+            expected: generations[lastGeneration],
+            directoryDescriptor: directoryDescriptor)
+        try Self.requireDirectoryMutationAuthority(
+            configuration.directory,
+            descriptor: directoryDescriptor,
+            expected: directoryFingerprint)
         for generation in stride(from: configuration.maximumFiles - 2, through: 0, by: -1) {
-            let source = configuration.fileURL(at: generation)
-            guard FileManager.default.fileExists(atPath: source.path) else { continue }
-            let destination = configuration.fileURL(at: generation + 1)
-            try Self.rename(source, to: destination)
+            try Self.renameExpectedEntry(
+                sourceName: configuration.fileURL(at: generation).lastPathComponent,
+                destinationName: configuration.fileURL(at: generation + 1).lastPathComponent,
+                expected: generations[generation],
+                directoryDescriptor: directoryDescriptor)
+            try Self.requireDirectoryMutationAuthority(
+                configuration.directory,
+                descriptor: directoryDescriptor,
+                expected: directoryFingerprint)
         }
-        try SecureAtomicDiagnosticsFile.syncDirectory(configuration.directory)
+        try Self.syncDirectoryDescriptor(directoryDescriptor)
+        try Self.requireDirectoryMutationAuthority(
+            configuration.directory,
+            descriptor: directoryDescriptor,
+            expected: directoryFingerprint)
     }
 
-    private static func prepareDirectory(_ directory: URL) throws {
+    private static func prepareDirectory(_ directory: URL) throws -> DirectoryFingerprint {
         var status = stat()
         let result = directory.path.withCString { path in
             Darwin.lstat(path, &status)
@@ -155,32 +336,81 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
 
-        let chmodResult = directory.path.withCString { path in
-            Darwin.chmod(path, S_IRWXU)
+        let descriptor = directory.path.withCString { path in
+            Darwin.open(
+                path,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
-        guard chmodResult == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        guard descriptor >= 0 else {
+            throw RotatingDiagnosticsFileError.pathIsNotDirectory
         }
+        defer { Darwin.close(descriptor) }
+
+        guard directoryIsBoundAndOwned(directory, descriptor: descriptor),
+              Darwin.fchmod(descriptor, S_IRWXU) == 0,
+              Darwin.fsync(descriptor) == 0,
+              let fingerprint = boundDirectoryFingerprint(
+                  directory,
+                  descriptor: descriptor,
+                  requiringPrivateMode: true)
+        else {
+            throw RotatingDiagnosticsFileError.pathIsNotDirectory
+        }
+        return fingerprint
     }
 
     private static func pruneUnknownGenerations(
-        configuration: RotatingDiagnosticsFileConfiguration
+        configuration: RotatingDiagnosticsFileConfiguration,
+        expectedDirectory: DirectoryFingerprint,
+        testingHooks: RotatingDiagnosticsSinkTestingHooks
     ) throws {
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: configuration.directory,
-            includingPropertiesForKeys: nil,
-            options: [])
-        for url in contents {
-            let fileName = url.lastPathComponent
+        let directoryDescriptor = try openBoundDirectory(
+            configuration.directory,
+            expected: expectedDirectory)
+        defer { Darwin.close(directoryDescriptor) }
+
+        var candidates: [(name: String, fingerprint: ExistingFileFingerprint)] = []
+        for fileName in try directoryEntryNames(descriptor: directoryDescriptor) {
             if isOwnedTemporaryFile(fileName, baseName: configuration.baseName) {
-                try unlinkIfPresent(url)
+                guard let fingerprint = try trustedFingerprintIfPresent(
+                    name: fileName,
+                    directoryDescriptor: directoryDescriptor)
+                else { throw RotatingDiagnosticsFileError.fileChangedDuringWrite }
+                candidates.append((fileName, fingerprint))
                 continue
             }
             if let generation = generation(for: fileName, baseName: configuration.baseName),
                generation >= configuration.maximumFiles
             {
-                try unlinkIfPresent(url)
+                guard let fingerprint = try trustedFingerprintIfPresent(
+                    name: fileName,
+                    directoryDescriptor: directoryDescriptor)
+                else { throw RotatingDiagnosticsFileError.fileChangedDuringWrite }
+                candidates.append((fileName, fingerprint))
             }
+        }
+
+        for candidate in candidates {
+            try testingHooks.beforePruneMutation?(candidate.name)
+            try requireDirectoryMutationAuthority(
+                configuration.directory,
+                descriptor: directoryDescriptor,
+                expected: expectedDirectory)
+            try unlinkExpectedEntry(
+                name: candidate.name,
+                expected: candidate.fingerprint,
+                directoryDescriptor: directoryDescriptor)
+            try requireDirectoryMutationAuthority(
+                configuration.directory,
+                descriptor: directoryDescriptor,
+                expected: expectedDirectory)
+        }
+        if !candidates.isEmpty {
+            try syncDirectoryDescriptor(directoryDescriptor)
+            try requireDirectoryMutationAuthority(
+                configuration.directory,
+                descriptor: directoryDescriptor,
+                expected: expectedDirectory)
         }
     }
 
@@ -210,31 +440,79 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         return generation(for: destinationName, baseName: baseName) != nil
     }
 
-    private static func recoverFileIfPresent(at url: URL, byteLimit: Int) throws {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let tail = try readBoundedTail(of: url, byteLimit: byteLimit)
-        let recovered = recoverCompleteJSONLines(
+    private static func inspectFileIfPresent(
+        at url: URL,
+        byteLimit: Int,
+        requiredOrigin: DiagnosticOrigin
+    ) throws -> RecoveryPlan? {
+        var namedStatus = stat()
+        let statusResult = url.path.withCString { Darwin.lstat($0, &namedStatus) }
+        if statusResult != 0 {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard isTrustedExistingFile(namedStatus) else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
+        let fingerprint = ExistingFileFingerprint(namedStatus)
+        let tail = try readBoundedTail(
+            of: url,
+            byteLimit: byteLimit,
+            expectedFingerprint: fingerprint)
+        guard !tail.droppedPrefix else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
+        let validPrefixLength = try validatedPrefixLength(
             tail.data,
-            droppedPrefix: tail.droppedPrefix,
-            byteLimit: byteLimit)
-        if tail.originalSize != UInt64(recovered.count) || recovered != tail.data {
-            try SecureAtomicDiagnosticsFile.write(recovered, to: url)
+            requiredOrigin: requiredOrigin)
+        if validPrefixLength == tail.data.count {
+            return RecoveryPlan(
+                url: url,
+                validPrefixLength: nil,
+                fingerprint: fingerprint)
+        }
+        return RecoveryPlan(
+            url: url,
+            validPrefixLength: validPrefixLength,
+            fingerprint: fingerprint)
+    }
+
+    private static func applyRecoveryPlan(
+        _ plan: RecoveryPlan,
+        byteLimit: Int,
+        requiredOrigin: DiagnosticOrigin
+    ) throws {
+        if let validPrefixLength = plan.validPrefixLength {
+            let current = try readBoundedTail(
+                of: plan.url,
+                byteLimit: byteLimit,
+                expectedFingerprint: plan.fingerprint)
+            guard !current.droppedPrefix,
+                  try validatedPrefixLength(
+                      current.data,
+                      requiredOrigin: requiredOrigin) == validPrefixLength
+            else {
+                throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+            }
+            try SecureAtomicDiagnosticsFile.write(
+                Data(current.data.prefix(validPrefixLength)),
+                to: plan.url)
         } else {
-            let result = url.path.withCString { path in
-                Darwin.chmod(path, S_IRUSR | S_IWUSR)
-            }
-            guard result == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
+            try normalizePermissions(
+                at: plan.url,
+                expectedFingerprint: plan.fingerprint)
         }
     }
 
     private static func readBoundedTail(
         of url: URL,
-        byteLimit: Int
+        byteLimit: Int,
+        expectedFingerprint: ExistingFileFingerprint
     ) throws -> (data: Data, originalSize: UInt64, droppedPrefix: Bool) {
         let descriptor = url.path.withCString { path in
-            Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            Darwin.open(
+                path,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_UNIQUE)
         }
         guard descriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -245,8 +523,14 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         guard Darwin.fstat(descriptor, &status) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        guard status.st_mode & S_IFMT == S_IFREG else {
-            throw RotatingDiagnosticsFileError.pathIsNotRegularFile
+        guard isTrustedExistingFile(status),
+              ExistingFileFingerprint(status) == expectedFingerprint,
+              isNameBound(
+                url,
+                descriptor: descriptor,
+                expectedFingerprint: expectedFingerprint)
+        else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
         }
 
         let originalSize = UInt64(max(0, status.st_size))
@@ -273,40 +557,105 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
                 offset += readCount
             }
         }
-        if offset < data.count {
-            data.removeSubrange(offset..<data.count)
+        guard offset == data.count,
+              isNameBound(
+                url,
+                descriptor: descriptor,
+                expectedFingerprint: expectedFingerprint)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
         }
         return (data, originalSize, start > 0)
     }
 
-    private static func recoverCompleteJSONLines(
-        _ data: Data,
-        droppedPrefix: Bool,
-        byteLimit: Int
-    ) -> Data {
-        var startIndex = data.startIndex
-        if droppedPrefix {
-            guard let firstNewline = data[startIndex...].firstIndex(of: 0x0A) else {
-                return Data()
-            }
-            startIndex = data.index(after: firstNewline)
+    private static func normalizePermissions(
+        at url: URL,
+        expectedFingerprint: ExistingFileFingerprint
+    ) throws {
+        let descriptor = url.path.withCString { path in
+            Darwin.open(
+                path,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_UNIQUE)
         }
+        guard descriptor >= 0 else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        defer { Darwin.close(descriptor) }
+        guard isNameBound(
+            url,
+            descriptor: descriptor,
+            expectedFingerprint: expectedFingerprint)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0,
+              Darwin.fsync(descriptor) == 0,
+              isNameBound(url, descriptor: descriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+    }
 
-        var recovered = Data()
+    private static func isNameBound(
+        _ url: URL,
+        descriptor: Int32,
+        expectedFingerprint: ExistingFileFingerprint? = nil
+    ) -> Bool {
+        var held = stat()
+        var named = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              url.path.withCString({ Darwin.lstat($0, &named) }) == 0,
+              isTrustedExistingFile(held),
+              isTrustedExistingFile(named)
+        else { return false }
+        let heldFingerprint = ExistingFileFingerprint(held)
+        return heldFingerprint == ExistingFileFingerprint(named)
+            && (expectedFingerprint.map { heldFingerprint == $0 } ?? true)
+    }
+
+    private static func isTrustedExistingFile(_ status: stat) -> Bool {
+        status.st_mode & S_IFMT == S_IFREG
+            && status.st_uid == geteuid()
+            && status.st_nlink == 1
+            && status.st_mode & mode_t(0o022) == 0
+    }
+
+    private static func validatedPrefixLength(
+        _ data: Data,
+        requiredOrigin: DiagnosticOrigin
+    ) throws -> Int {
+        guard !data.isEmpty else { return 0 }
+        var startIndex = data.startIndex
+        var validPrefixLength = 0
         while startIndex < data.endIndex {
-            guard let newline = data[startIndex...].firstIndex(of: 0x0A) else { break }
+            guard let newline = data[startIndex...].firstIndex(of: 0x0A) else {
+                let trailing = Data(data[startIndex...])
+                guard validPrefixLength > 0,
+                      isPlausiblyInterruptedJSONObject(trailing)
+                else {
+                    throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+                }
+                return validPrefixLength
+            }
             let line = data[startIndex..<newline]
             guard !line.isEmpty,
                   let event = try? JSONDecoder().decode(DiagnosticEvent.self, from: Data(line)),
-                  let canonicalLine = try? DiagnosticsJSON.line(for: event),
-                  recovered.count + canonicalLine.count <= byteLimit
+                  event.origin == requiredOrigin
             else {
-                break
+                throw RotatingDiagnosticsFileError.incompatibleExistingSegment
             }
-            recovered.append(canonicalLine)
             startIndex = data.index(after: newline)
+            validPrefixLength = data.distance(from: data.startIndex, to: startIndex)
         }
-        return recovered
+        return validPrefixLength
+    }
+
+    private static func isPlausiblyInterruptedJSONObject(_ data: Data) -> Bool {
+        let nonWhitespace = data.drop { byte in
+            byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+        }
+        guard nonWhitespace.first == 0x7B else { return false }
+        return (try? JSONSerialization.jsonObject(with: data)) == nil
     }
 
     private static func regularFileSizeIfPresent(at url: URL) throws -> UInt64 {
@@ -321,6 +670,9 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         guard status.st_mode & S_IFMT == S_IFREG else {
             throw RotatingDiagnosticsFileError.pathIsNotRegularFile
         }
+        guard isTrustedExistingFile(status) else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
         return UInt64(max(0, status.st_size))
     }
 
@@ -328,7 +680,8 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         let descriptor = url.path.withCString { path in
             Darwin.open(
                 path,
-                O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+                    | O_UNIQUE,
                 S_IRUSR | S_IWUSR)
         }
         guard descriptor >= 0 else {
@@ -343,6 +696,11 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         guard status.st_mode & S_IFMT == S_IFREG else {
             throw RotatingDiagnosticsFileError.pathIsNotRegularFile
         }
+        guard isTrustedExistingFile(status),
+              isNameBound(url, descriptor: descriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
         let currentSize = UInt64(max(0, status.st_size))
         guard currentSize + UInt64(data.count) <= UInt64(byteLimit) else {
             throw RotatingDiagnosticsFileError.fileChangedDuringWrite
@@ -354,25 +712,342 @@ public actor RotatingJSONLDiagnosticsSink: DiagnosticSink {
         guard Darwin.fsync(descriptor) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        var finalStatus = stat()
+        guard Darwin.fstat(descriptor, &finalStatus) == 0,
+              UInt64(max(0, finalStatus.st_size)) == currentSize + UInt64(data.count),
+              isNameBound(url, descriptor: descriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
         try SecureAtomicDiagnosticsFile.syncDirectory(url.deletingLastPathComponent())
     }
 
-    private static func unlinkIfPresent(_ url: URL) throws {
-        let result = url.path.withCString { path in
-            Darwin.unlink(path)
+    private static func directoryIsBoundAndOwned(
+        _ directory: URL,
+        descriptor: Int32
+    ) -> Bool {
+        boundDirectoryFingerprint(
+            directory,
+            descriptor: descriptor,
+            requiringPrivateMode: false) != nil
+    }
+
+    private static func boundDirectoryFingerprint(
+        _ directory: URL,
+        descriptor: Int32,
+        requiringPrivateMode: Bool
+    ) -> DirectoryFingerprint? {
+        var held = stat()
+        var named = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              directory.path.withCString({ Darwin.lstat($0, &named) }) == 0,
+              held.st_mode & S_IFMT == S_IFDIR,
+              named.st_mode & S_IFMT == S_IFDIR,
+              held.st_uid == geteuid(),
+              named.st_uid == geteuid()
+        else { return nil }
+        let heldFingerprint = DirectoryFingerprint(held)
+        let namedFingerprint = DirectoryFingerprint(named)
+        guard heldFingerprint == namedFingerprint else { return nil }
+        if requiringPrivateMode,
+           (heldFingerprint.mode != mode_t(0o700)
+               || namedFingerprint.mode != mode_t(0o700))
+        {
+            return nil
         }
-        if result != 0, errno != ENOENT {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        return heldFingerprint
+    }
+
+    private static func openBoundDirectory(
+        _ directory: URL,
+        expected: DirectoryFingerprint
+    ) throws -> Int32 {
+        let descriptor = directory.path.withCString { path in
+            Darwin.open(
+                path,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        guard boundDirectoryFingerprint(
+            directory,
+            descriptor: descriptor,
+            requiringPrivateMode: true) == expected
+        else {
+            _ = Darwin.close(descriptor)
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        return descriptor
+    }
+
+    private static func requireDirectoryMutationAuthority(
+        _ directory: URL,
+        descriptor: Int32,
+        expected: DirectoryFingerprint
+    ) throws {
+        guard boundDirectoryFingerprint(
+            directory,
+            descriptor: descriptor,
+            requiringPrivateMode: true) == expected
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
         }
     }
 
-    private static func rename(_ source: URL, to destination: URL) throws {
-        let result = source.path.withCString { sourcePath in
-            destination.path.withCString { destinationPath in
-                Darwin.rename(sourcePath, destinationPath)
+    private static func directoryEntryNames(descriptor: Int32) throws -> [String] {
+        var sourceStatus = stat()
+        guard Darwin.fstat(descriptor, &sourceStatus) == 0,
+              sourceStatus.st_mode & S_IFMT == S_IFDIR,
+              sourceStatus.st_uid == geteuid(),
+              sourceStatus.st_mode & mode_t(0o7777) == mode_t(0o700)
+        else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
+        let sourceFingerprint = DirectoryFingerprint(sourceStatus)
+
+        let enumerationDescriptor = ".".withCString { name in
+            Darwin.openat(
+                descriptor,
+                name,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+                    | O_RESOLVE_BENEATH)
+        }
+        guard enumerationDescriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var enumerationStatus = stat()
+        guard Darwin.fstat(enumerationDescriptor, &enumerationStatus) == 0,
+              DirectoryFingerprint(enumerationStatus) == sourceFingerprint
+        else {
+            _ = Darwin.close(enumerationDescriptor)
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
+        guard let directory = Darwin.fdopendir(enumerationDescriptor) else {
+            let code = errno
+            _ = Darwin.close(enumerationDescriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        defer { Darwin.closedir(directory) }
+
+        var names: [String] = []
+        names.reserveCapacity(min(16, maximumInspectedDirectoryEntries))
+        while true {
+            errno = 0
+            guard let entry = Darwin.readdir(directory) else {
+                if errno != 0 {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                var finalSourceStatus = stat()
+                var finalEnumerationStatus = stat()
+                guard Darwin.fstat(descriptor, &finalSourceStatus) == 0,
+                      Darwin.fstat(enumerationDescriptor, &finalEnumerationStatus) == 0,
+                      DirectoryFingerprint(finalSourceStatus) == sourceFingerprint,
+                      DirectoryFingerprint(finalEnumerationStatus) == sourceFingerprint
+                else {
+                    throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+                }
+                return names.sorted()
+            }
+            var entryValue = entry.pointee
+            let name = withUnsafePointer(to: &entryValue.d_name) { pointer -> String? in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(validatingCString: $0)
+                }
+            }
+            guard let name else {
+                throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+            }
+            if name == "." || name == ".." { continue }
+            guard names.count < maximumInspectedDirectoryEntries else {
+                throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+            }
+            names.append(name)
+        }
+    }
+
+    private static func trustedFingerprintIfPresent(
+        name: String,
+        directoryDescriptor: Int32
+    ) throws -> ExistingFileFingerprint? {
+        var status = stat()
+        let result = name.withCString { pointer in
+            Darwin.fstatat(
+                directoryDescriptor,
+                pointer,
+                &status,
+                AT_SYMLINK_NOFOLLOW)
+        }
+        if result != 0 {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard isTrustedExistingFile(status) else {
+            throw RotatingDiagnosticsFileError.incompatibleExistingSegment
+        }
+        return ExistingFileFingerprint(status)
+    }
+
+    private static func openTrustedEntry(
+        name: String,
+        expected: ExistingFileFingerprint,
+        directoryDescriptor: Int32
+    ) throws -> Int32 {
+        let descriptor = name.withCString { pointer in
+            Darwin.openat(
+                directoryDescriptor,
+                pointer,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_UNIQUE)
+        }
+        guard descriptor >= 0 else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        guard isEntryNameBound(
+            name: name,
+            directoryDescriptor: directoryDescriptor,
+            descriptor: descriptor,
+            expected: expected)
+        else {
+            _ = Darwin.close(descriptor)
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        return descriptor
+    }
+
+    private static func isEntryNameBound(
+        name: String,
+        directoryDescriptor: Int32,
+        descriptor: Int32,
+        expected: ExistingFileFingerprint? = nil
+    ) -> Bool {
+        var held = stat()
+        var named = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              name.withCString({ pointer in
+                  Darwin.fstatat(
+                      directoryDescriptor,
+                      pointer,
+                      &named,
+                      AT_SYMLINK_NOFOLLOW)
+              }) == 0,
+              isTrustedExistingFile(held),
+              isTrustedExistingFile(named)
+        else { return false }
+        let heldFingerprint = ExistingFileFingerprint(held)
+        return heldFingerprint == ExistingFileFingerprint(named)
+            && (expected.map { heldFingerprint == $0 } ?? true)
+    }
+
+    private static func entryIsAbsent(
+        name: String,
+        directoryDescriptor: Int32
+    ) throws -> Bool {
+        var status = stat()
+        let result = name.withCString { pointer in
+            Darwin.fstatat(
+                directoryDescriptor,
+                pointer,
+                &status,
+                AT_SYMLINK_NOFOLLOW)
+        }
+        if result == 0 { return false }
+        if errno == ENOENT { return true }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+
+    private static func unlinkExpectedEntry(
+        name: String,
+        expected: ExistingFileFingerprint?,
+        directoryDescriptor: Int32
+    ) throws {
+        guard let expected else {
+            guard try entryIsAbsent(name: name, directoryDescriptor: directoryDescriptor) else {
+                throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+            }
+            return
+        }
+        let descriptor = try openTrustedEntry(
+            name: name,
+            expected: expected,
+            directoryDescriptor: directoryDescriptor)
+        defer { Darwin.close(descriptor) }
+
+        let result = name.withCString { pointer in
+            Darwin.unlinkat(directoryDescriptor, pointer, 0)
+        }
+        guard result == 0 else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        var held = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              held.st_mode & S_IFMT == S_IFREG,
+              held.st_uid == geteuid(),
+              held.st_nlink == 0,
+              LocalFileIdentity(held) == expected.identity,
+              try entryIsAbsent(name: name, directoryDescriptor: directoryDescriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+    }
+
+    private static func renameExpectedEntry(
+        sourceName: String,
+        destinationName: String,
+        expected: ExistingFileFingerprint?,
+        directoryDescriptor: Int32
+    ) throws {
+        guard let expected else {
+            guard try entryIsAbsent(
+                name: sourceName,
+                directoryDescriptor: directoryDescriptor)
+            else {
+                throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+            }
+            return
+        }
+        let descriptor = try openTrustedEntry(
+            name: sourceName,
+            expected: expected,
+            directoryDescriptor: directoryDescriptor)
+        defer { Darwin.close(descriptor) }
+        guard try entryIsAbsent(
+            name: destinationName,
+            directoryDescriptor: directoryDescriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+
+        let result = sourceName.withCString { source in
+            destinationName.withCString { destination in
+                Darwin.renameatx_np(
+                    directoryDescriptor,
+                    source,
+                    directoryDescriptor,
+                    destination,
+                    UInt32(RENAME_EXCL))
             }
         }
         guard result == 0 else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+        var held = stat()
+        guard Darwin.fstat(descriptor, &held) == 0,
+              isTrustedExistingFile(held),
+              LocalFileIdentity(held) == expected.identity,
+              try entryIsAbsent(
+                  name: sourceName,
+                  directoryDescriptor: directoryDescriptor),
+              isEntryNameBound(
+                  name: destinationName,
+                  directoryDescriptor: directoryDescriptor,
+                  descriptor: descriptor)
+        else {
+            throw RotatingDiagnosticsFileError.fileChangedDuringWrite
+        }
+    }
+
+    private static func syncDirectoryDescriptor(_ descriptor: Int32) throws {
+        guard Darwin.fsync(descriptor) == 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
     }

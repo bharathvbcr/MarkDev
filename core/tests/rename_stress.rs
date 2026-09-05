@@ -258,7 +258,8 @@ fn code_regions(source: &str) -> Vec<String> {
     }
     checkpoints.push((source.len(), utf16));
 
-    let parsed = markdev::md::parse(source);
+    let parsed = markdev::md::parse_checked(source)
+        .expect("stress fixture must satisfy the parser contract");
     let mut regions = Vec::new();
     for block in &parsed.blocks {
         let protected = block.kind == 2 /* code */
@@ -381,7 +382,8 @@ fn occurrences_outside_code(source: &str, needle: &str) -> usize {
     }
     checkpoints.push((source.len(), utf16));
 
-    let parsed = markdev::md::parse(source);
+    let parsed = markdev::md::parse_checked(source)
+        .expect("stress fixture must satisfy the parser contract");
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for block in &parsed.blocks {
         if block.kind == 2 || block.kind == 3 || block.kind == 4 || block.kind == 14 {

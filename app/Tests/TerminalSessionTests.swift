@@ -94,6 +94,16 @@ final class TerminalSessionTests: XCTestCase {
             TerminalSession.resolveWorkingDirectory(document: nil, vault: nil), NSHomeDirectory())
     }
 
+    func testRemoteFileAuthorityCannotSelectALocalWorkingDirectory() throws {
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(directory.path)/"))
+
+        let cwd = TerminalSession.resolveWorkingDirectory(document: nil, vault: hostile)
+
+        XCTAssertEqual(cwd, NSHomeDirectory())
+        XCTAssertNotEqual(cwd, directory.standardizedFileURL.path)
+    }
+
     // MARK: - Login shell
 
     func testTheShellIsLaunchedAsALoginShell() throws {

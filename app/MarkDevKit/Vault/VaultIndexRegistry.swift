@@ -7,6 +7,10 @@
 
 import Foundation
 
+enum VaultIndexRegistryError: Error, Equatable {
+    case busy
+}
+
 /// Shares one ``VaultIndex`` across every window that has the same vault open.
 ///
 /// Each window used to own its own index, which meant a second window re-walked
@@ -27,6 +31,8 @@ import Foundation
 public final class VaultIndexRegistry {
     public static let shared = VaultIndexRegistry()
 
+    typealias VaultOpenImplementation = @MainActor @Sendable (URL) async throws -> VaultIndex
+
     private final class WeakIndex {
         weak var value: VaultIndex?
 
@@ -36,8 +42,64 @@ public final class VaultIndexRegistry {
     }
 
     private var indexes: [URL: WeakIndex] = [:]
+    private let maximumConcurrentOpens: Int
+    private let openImplementation: VaultOpenImplementation
+    private var activeOpenCount = 0
 
-    private init() {}
+    init(
+        maximumConcurrentOpens: Int = 4,
+        open: @escaping VaultOpenImplementation = { root in
+            let index = VaultIndex()
+            try await index.openAsync(root)
+            return index
+        }
+    ) {
+        precondition((1...8).contains(maximumConcurrentOpens))
+        self.maximumConcurrentOpens = maximumConcurrentOpens
+        openImplementation = open
+    }
+
+    /// The shared index for `root`, with canonicalization and the complete
+    /// Rust scan outside MainActor. Concurrent misses are finite; if two calls
+    /// race for one root, only the first completed live index is retained.
+    public func indexAsync(for root: URL) async throws -> VaultIndex {
+        try Task.checkCancellation()
+        let normalizer = Task.detached(priority: .userInitiated) {
+            let directory = try SecureLocalDirectoryHandle(
+                opening: root,
+                cancellationCheck: { Task.isCancelled })
+            return directory.url.standardizedFileURL
+        }
+        let key: URL
+        do {
+            key = try await withTaskCancellationHandler {
+                try await normalizer.value
+            } onCancel: {
+                normalizer.cancel()
+            }
+        } catch SecureLocalFileError.cancelled {
+            throw CancellationError()
+        }
+        try Task.checkCancellation()
+
+        indexes = indexes.filter { $0.value.value != nil }
+        if let existing = indexes[key]?.value { return existing }
+        guard activeOpenCount < maximumConcurrentOpens else {
+            throw VaultIndexRegistryError.busy
+        }
+        activeOpenCount += 1
+        defer { activeOpenCount -= 1 }
+
+        let fresh = try await openImplementation(key)
+        try Task.checkCancellation()
+        guard fresh.root?.standardizedFileURL == key else {
+            throw VaultIndexError.superseded
+        }
+        indexes = indexes.filter { $0.value.value != nil }
+        if let existing = indexes[key]?.value { return existing }
+        indexes[key] = WeakIndex(fresh)
+        return fresh
+    }
 
     /// The shared index for `root`, opening it if nobody has yet.
     ///
@@ -47,6 +109,9 @@ public final class VaultIndexRegistry {
     /// duplicate index), then symlink resolution so `/var` vs `/private/var`
     /// spellings of one folder meet.
     public func index(for root: URL) -> VaultIndex {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(root) else {
+            return VaultIndex()
+        }
         let collapsed = (root.path as NSString).standardizingPath
         let key = URL(fileURLWithPath: collapsed)
             .standardizedFileURL

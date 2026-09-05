@@ -138,11 +138,6 @@ final class AppearanceTests: XCTestCase {
         return (s.rgb.max() ?? 1) < 0.5
     }
 
-    override func tearDown() {
-        NSAppearance.current = nil
-        super.tearDown()
-    }
-
     // MARK: - Ink follows the view, not the ambient appearance
 
     /// A dark view laid out while the ambient appearance is pinned Aqua must
@@ -154,13 +149,17 @@ final class AppearanceTests: XCTestCase {
     /// default. The bitmap was baked with ink from the wrong side, and the
     /// cache key recorded the same wrong value, so nothing ever corrected it.
     func testFormulaInkFollowsTheViewNotTheAmbientAppearance() throws {
-        NSAppearance.current = NSAppearance(named: .aqua)
-        let view = makeView("$$2 + 2$$\n", appearance: .darkAqua)
-        view.mode = .reading
-        layout(view)
+        let ambient = try XCTUnwrap(NSAppearance(named: .aqua))
+        var measuredInk: Double?
+        ambient.performAsCurrentDrawingAppearance {
+            let view = makeView("$$2 + 2$$\n", appearance: .darkAqua)
+            view.mode = .reading
+            layout(view)
+            measuredInk = formulaInk(view)
+        }
 
         let ink = try XCTUnwrap(
-            formulaInk(view), "the formula resolved to a bitmap")
+            measuredInk, "the formula resolved to a bitmap")
         XCTAssertGreaterThan(
             ink, 0.6,
             "a formula in a dark view must be typeset in light ink; got \(ink)")
@@ -168,12 +167,16 @@ final class AppearanceTests: XCTestCase {
 
     /// The mirror case: a light view with the ambient pinned dark.
     func testFormulaInkStaysDarkWhenTheViewIsLight() throws {
-        NSAppearance.current = NSAppearance(named: .darkAqua)
-        let view = makeView("$$2 + 2$$\n", appearance: .aqua)
-        view.mode = .reading
-        layout(view)
+        let ambient = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        var measuredInk: Double?
+        ambient.performAsCurrentDrawingAppearance {
+            let view = makeView("$$2 + 2$$\n", appearance: .aqua)
+            view.mode = .reading
+            layout(view)
+            measuredInk = formulaInk(view)
+        }
 
-        let ink = try XCTUnwrap(formulaInk(view))
+        let ink = try XCTUnwrap(measuredInk)
         XCTAssertLessThan(
             ink, 0.4,
             "a formula in a light view must be typeset in dark ink; got \(ink)")
@@ -445,7 +448,9 @@ final class AppearanceTests: XCTestCase {
                 // Only where it can commit — reading mode is read-only by
                 // design, and a silent no-op here would make this round's
                 // "edit" vacuous rather than adversarial.
-                if view.isEditable { view.insertText("x") }
+                if view.isEditable {
+                    view.insertText("x", replacementRange: view.selectedRange())
+                }
             }
             // Scroll sometimes: TextKit lays out new regions, whose fragments
             // were created under whatever generation was current.
@@ -485,7 +490,7 @@ final class AppearanceTests: XCTestCase {
         layout(view)
 
         let length = try XCTUnwrap(view.textStorage?.length)
-        view.insertText("typed ")
+        view.insertText("typed ", replacementRange: view.selectedRange())
         XCTAssertEqual(
             view.textStorage?.length, length + "typed ".count,
             "harness: the keystroke must have committed before the flip")

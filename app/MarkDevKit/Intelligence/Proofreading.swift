@@ -84,6 +84,24 @@ public struct ProofreadingReport: Equatable, Sendable {
     public var findings: [ProofreadingFinding]
 }
 
+/// Findings admitted from one model response plus the number refused.
+public struct ProofreadingBatch: Equatable, Sendable {
+    public let findings: [ProofreadingFinding]
+    public let declined: Int
+
+    init(findings: [ProofreadingFinding], declined: Int) {
+        self.findings = findings
+        self.declined = max(0, declined)
+    }
+}
+
+extension ProofreadingReport {
+    /// Enforces the generated-output contract before anything reaches UI state.
+    public var normalization: ProofreadingBatch {
+        ProofreadingIssues.normalize(findings)
+    }
+}
+
 /// A finding that has been found in the document.
 public struct ProofreadingIssue: Identifiable, Equatable, Sendable {
     public let id: UUID
@@ -95,7 +113,7 @@ public struct ProofreadingIssue: Identifiable, Equatable, Sendable {
     public let kind: ProofreadingKind
     public let explanation: String
 
-    public init(
+    init(
         id: UUID = UUID(),
         range: NSRange,
         original: String,
@@ -132,8 +150,8 @@ public struct ProofreadingIssues: Equatable, Sendable {
 
     public static let none = ProofreadingIssues(issues: [])
 
-    public init(issues: [ProofreadingIssue] = []) {
-        self.issues = issues
+    init(issues: [ProofreadingIssue] = []) {
+        self.issues = Array(issues.prefix(Self.maximumAccumulatedIssues))
     }
 
     public var isEmpty: Bool { issues.isEmpty }
@@ -146,6 +164,69 @@ public struct ProofreadingIssues: Equatable, Sendable {
     /// proofreader's hat, and applying it would silently replace prose the
     /// reader never asked to have touched.
     public static let maximumFindingLength = 200
+    public static let maximumFindingBytes = 1_024
+    public static let maximumRawExplanationBytes = 1_024
+    public static let maximumExplanationBytes = 256
+    public static let maximumFindingsPerResponse = 20
+    public static let maximumAccumulatedIssues = 240
+
+    static func normalize(_ findings: [ProofreadingFinding]) -> ProofreadingBatch {
+        var accepted: [ProofreadingFinding] = []
+        accepted.reserveCapacity(min(findings.count, maximumFindingsPerResponse))
+        var declined = max(0, findings.count - maximumFindingsPerResponse)
+
+        for finding in findings.prefix(maximumFindingsPerResponse) {
+            let original = finding.original
+            let replacement = finding.replacement
+            // Admit before equality, newline scans, NSString bridging, or any
+            // other operation that could traverse the complete model value.
+            guard BoundedText.fitsUTF8(original, maximum: maximumFindingBytes),
+                BoundedText.fitsUTF8(replacement, maximum: maximumFindingBytes)
+            else {
+                declined += 1
+                continue
+            }
+            // A no-op is model noise rather than a suggestion MarkDev declined.
+            if original == replacement { continue }
+            guard !original.isEmpty, !replacement.isEmpty,
+                !original.contains("\n"), !original.contains("\r"),
+                !replacement.contains("\n"), !replacement.contains("\r"),
+                !Self.containsNul(original), !Self.containsNul(replacement),
+                (original as NSString).length <= maximumFindingLength,
+                (replacement as NSString).length <= maximumFindingLength
+            else {
+                declined += 1
+                continue
+            }
+
+            // Collapse ordinary model line wrapping, but refuse a genuinely
+            // oversized explanation rather than silently presenting a partial
+            // reason as though it were complete.
+            guard BoundedText.fitsUTF8(
+                finding.explanation, maximum: maximumRawExplanationBytes),
+                !Self.containsNul(finding.explanation)
+            else {
+                declined += 1
+                continue
+            }
+            guard let explanation = BoundedText.collapsingWhitespace(
+                finding.explanation, maximum: maximumRawExplanationBytes),
+                BoundedText.fitsUTF8(explanation, maximum: maximumExplanationBytes)
+            else {
+                declined += 1
+                continue
+            }
+            accepted.append(
+                ProofreadingFinding(
+                    original: original, replacement: replacement, kind: finding.kind,
+                    explanation: explanation))
+        }
+        return ProofreadingBatch(findings: accepted, declined: declined)
+    }
+
+    private static func containsNul(_ text: String) -> Bool {
+        text.unicodeScalars.contains { $0.value == 0 }
+    }
 
     /// Finds each reported mistake in the source text.
     ///
@@ -179,24 +260,22 @@ public struct ProofreadingIssues: Equatable, Sendable {
         in text: NSString,
         within scope: NSRange
     ) -> (issues: ProofreadingIssues, unplaced: Int) {
-        let bounds = NSIntersectionRange(scope, NSRange(location: 0, length: text.length))
+        let normalized = normalize(findings)
+        guard let bounds = CheckedTextRange.intersection(
+            scope, NSRange(location: 0, length: text.length)), bounds.length > 0,
+            let boundsEnd = CheckedTextRange.end(of: bounds)
+        else {
+            return (.none, normalized.declined + normalized.findings.count)
+        }
         var located: [ProofreadingIssue] = []
+        located.reserveCapacity(normalized.findings.count)
         // Spans already matched by an earlier finding; later ones must claim
         // fresh text rather than stacking onto the same words.
         var claimed: [NSRange] = []
-        var unplaced = 0
+        var unplaced = normalized.declined
 
-        for finding in findings {
+        for finding in normalized.findings {
             let original = finding.original
-            // Proposes nothing: not a discarded suggestion, so not counted.
-            guard !original.isEmpty, finding.replacement != original else { continue }
-
-            guard !original.contains("\n"), !original.contains("\r"),
-                (original as NSString).length <= maximumFindingLength
-            else {
-                unplaced += 1
-                continue
-            }
 
             // Searched across the whole scope rather than behind a cursor:
             // the schema asks for findings in document order but nothing can
@@ -209,16 +288,13 @@ public struct ProofreadingIssues: Equatable, Sendable {
             while search.length > 0 {
                 let candidate = text.range(of: original, options: [.literal], range: search)
                 guard candidate.location != NSNotFound else { break }
-                let collides = claimed.contains {
-                    NSIntersectionRange($0, candidate).length > 0
-                }
+                let collides = claimed.contains { CheckedTextRange.intersects($0, candidate) }
                 if !collides {
                     found = candidate
                     break
                 }
-                let next = candidate.location + candidate.length
-                guard next < NSMaxRange(bounds) else { break }
-                search = NSRange(location: next, length: NSMaxRange(bounds) - next)
+                guard let next = CheckedTextRange.end(of: candidate), next < boundsEnd else { break }
+                search = NSRange(location: next, length: boundsEnd - next)
             }
             guard found.location != NSNotFound else {
                 unplaced += 1
@@ -244,19 +320,24 @@ public struct ProofreadingIssues: Equatable, Sendable {
     /// difference, and an issue the edit ran through is discarded — its text
     /// is no longer the text that was objected to.
     public func applying(edit: NSRange, replacementLength: Int) -> ProofreadingIssues {
-        let delta = replacementLength - edit.length
-        let editEnd = edit.location + edit.length
+        guard replacementLength >= 0,
+            let editEnd = CheckedTextRange.end(of: edit)
+        else { return .none }
+        let (delta, deltaOverflow) = replacementLength.subtractingReportingOverflow(edit.length)
+        guard !deltaOverflow else { return .none }
 
         var survivors: [ProofreadingIssue] = []
         survivors.reserveCapacity(issues.count)
         for issue in issues {
-            let end = issue.range.location + issue.range.length
+            guard let end = CheckedTextRange.end(of: issue.range) else { continue }
             if end <= edit.location {
                 survivors.append(issue)
             } else if issue.range.location >= editEnd {
+                let (location, overflow) = issue.range.location.addingReportingOverflow(delta)
+                guard !overflow, location >= 0 else { continue }
                 var shifted = issue
                 shifted.range = NSRange(
-                    location: issue.range.location + delta, length: issue.range.length)
+                    location: location, length: issue.range.length)
                 survivors.append(shifted)
             }
             // Anything left over straddles the edit and is dropped.
@@ -272,9 +353,8 @@ public struct ProofreadingIssues: Equatable, Sendable {
     public func merging(_ other: ProofreadingIssues) -> ProofreadingIssues {
         var combined = issues
         for issue in other.issues {
-            let overlaps = combined.contains {
-                NSIntersectionRange($0.range, issue.range).length > 0
-            }
+            guard combined.count < Self.maximumAccumulatedIssues else { break }
+            let overlaps = combined.contains { CheckedTextRange.intersects($0.range, issue.range) }
             if !overlaps { combined.append(issue) }
         }
         combined.sort { $0.range.location < $1.range.location }
@@ -283,7 +363,10 @@ public struct ProofreadingIssues: Equatable, Sendable {
 
     /// The issue under `offset`, if any.
     public func issue(at offset: Int) -> ProofreadingIssue? {
-        issues.first { offset >= $0.range.location && offset < $0.range.location + $0.range.length }
+        issues.first {
+            guard let end = CheckedTextRange.end(of: $0.range) else { return false }
+            return offset >= $0.range.location && offset < end
+        }
     }
 
     /// The set with `id` removed, for a fix applied outside the edit path.
@@ -304,7 +387,7 @@ public struct ProofreadingIssues: Equatable, Sendable {
             issues: issues.filter { issue in
                 issue.range.location >= 0
                     && issue.range.length > 0
-                    && issue.range.location + issue.range.length <= length
+                    && (CheckedTextRange.end(of: issue.range) ?? Int.max) <= length
             })
     }
 }

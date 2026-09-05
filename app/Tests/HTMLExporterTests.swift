@@ -26,6 +26,32 @@ final class HTMLExporterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
+    func testRemoteAuthorityFileURLCannotAliasALocalExportDestination() throws {
+        let localDestination = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevHostAuthority-\(UUID().uuidString).html")
+        defer { try? FileManager.default.removeItem(at: localDestination) }
+
+        var components = URLComponents()
+        components.scheme = "file"
+        components.host = "remote.example"
+        components.percentEncodedPath = localDestination.path
+        let remoteAuthority = try XCTUnwrap(components.url)
+        XCTAssertTrue(
+            remoteAuthority.isFileURL,
+            "the regression requires Foundation's permissive file-URL classification")
+
+        XCTAssertThrowsError(
+            try HTMLExporter.write(markdown: "body", title: "Note", to: remoteAuthority)
+        ) { error in
+            XCTAssertEqual(
+                error as? HTMLExporterError,
+                .unsupportedLocation(remoteAuthority))
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: localDestination.path),
+            "a remote-authority URL must not be collapsed into its local path")
+    }
+
     func testUnicodeAndNulRoundTripWithoutTruncation() throws {
         let html = try HTMLExporter.render(markdown: "before\0after 🧪", title: "β\0title")
 

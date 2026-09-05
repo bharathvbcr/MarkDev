@@ -107,8 +107,15 @@ final class BlockDecorationPaletteStore: @unchecked Sendable {
         var generation: Int = 1
     }
 
-    private let lock = OSAllocatedUnfairLock<Snapshot>(
-        initialState: Snapshot(palette: BlockDecorationPalette(theme: .standard)))
+    private let lock: OSAllocatedUnfairLock<Snapshot>
+
+    /// The standard palette touches AppKit colors and fonts, so construction
+    /// belongs on the same actor as the text view that owns this store.
+    @MainActor
+    init() {
+        lock = OSAllocatedUnfairLock(
+            initialState: Snapshot(palette: BlockDecorationPalette(theme: .standard)))
+    }
 
     /// The palette every fragment of one view should draw with right now.
     var current: BlockDecorationPalette {
@@ -129,6 +136,14 @@ final class BlockDecorationPaletteStore: @unchecked Sendable {
             snapshot.generation += 1
         }
     }
+}
+
+/// A narrow bridge for TextKit callbacks whose Objective-C declarations do
+/// not carry AppKit's main-thread contract into Swift concurrency checking.
+/// The fragment is unpacked only inside `MainActor.assumeIsolated`, whose
+/// runtime precondition traps if TextKit ever violates that contract.
+private struct MainActorFragmentReference: @unchecked Sendable {
+    let fragment: MarkdownLayoutFragment
 }
 
 /// A layout fragment that paints block decoration behind its text.
@@ -544,20 +559,21 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// converges on the next cycle rather than drawing inside the display
     /// call that is already in flight.
     func refreshRenderedContentIfStale(using view: MarkdownTextView) {
-        guard let store = paletteStore else { return }
-        let generation = store.generation
-        guard stampedGeneration != generation else { return }
-
-        // Drawing runs on the main thread — AppKit's display and event paths
-        // both — but the override is formally nonisolated, so the hop into
-        // the view's actor is stated rather than implied. Same pattern as
-        // DocumentSurface and VaultWatcher.
-        let heightBefore = contentHeight
+        let reference = MainActorFragmentReference(fragment: self)
         MainActor.assumeIsolated {
-            view.resolveRenderedContent(for: self)
-            if contentHeight != heightBefore { view.needsLayout = true }
+            let fragment = reference.fragment
+            guard let store = fragment.paletteStore else { return }
+            let generation = store.generation
+            guard fragment.stampedGeneration != generation else { return }
+
+            // Drawing runs on the main thread — AppKit's display and event
+            // paths both — but the override is formally nonisolated. Keep all
+            // mutable fragment access within the checked actor boundary.
+            let heightBefore = fragment.contentHeight
+            view.resolveRenderedContent(for: fragment)
+            if fragment.contentHeight != heightBefore { view.needsLayout = true }
+            fragment.stampedGeneration = generation
         }
-        stampedGeneration = generation
     }
 
     override func draw(at point: CGPoint, in context: CGContext) {

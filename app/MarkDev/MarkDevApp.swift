@@ -26,9 +26,7 @@ struct MarkDevApp: App {
         // A stale libmarkdev.a would misread struct layouts and produce
         // subtly wrong text ranges. Fail at launch instead.
         MarkDevCore.verifyABI()
-        Task {
-            await DiagnosticsCenter.shared.recordVerifiedABILaunch()
-        }
+        DiagnosticsEmitter.shared.recordVerifiedABILaunch()
         // Apply the persisted value before the first window is drawn. The
         // settings view handles subsequent changes through the same typed value.
         EditorPreferences.storedAppearance().apply()
@@ -38,8 +36,8 @@ struct MarkDevApp: App {
         WindowGroup(id: Self.workspaceWindowID) {
             WorkspaceView()
                 .frame(
-                    minWidth: GlassTheme.minimumTwoPaneWindowWidth,
-                    minHeight: 640)
+                    minWidth: WorkspaceWindowGeometry.absoluteMinimumWidth,
+                    minHeight: WorkspaceWindowGeometry.minimumHeight)
                 // Installed from a view because the action is only usable once
                 // the scene exists. Every workspace sets the same closure, so
                 // which one ran last does not matter.

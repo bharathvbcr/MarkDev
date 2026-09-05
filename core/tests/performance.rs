@@ -5,7 +5,7 @@
 //! editor will actually feel like:
 //!
 //! ```sh
-//! cargo test --release --test performance -- --nocapture
+//! cargo test --locked --release --test performance -- --nocapture
 //! ```
 //!
 //! The budget is one 60fps frame (16.6ms) for a full parse of a large
@@ -13,6 +13,8 @@
 //! the full parse still runs on open and must not stall the window.
 
 use std::time::Instant;
+
+use markdev::parse_checked;
 
 /// A document shaped like real writing rather than one repeated line, since
 /// headings, code fences, and inline spans all cost differently.
@@ -60,7 +62,7 @@ fn median_millis(iterations: usize, mut body: impl FnMut()) -> f64 {
 fn full_parse_of_ten_thousand_lines_fits_in_a_frame() {
     let source = large_document(10_000);
     let median = median_millis(7, || {
-        let result = markdev::parse(&source);
+        let result = parse_checked(&source).expect("benchmark source must satisfy parser contract");
         // Consume the result so the optimiser cannot elide the parse.
         assert!(!result.blocks.is_empty());
     });
@@ -90,10 +92,10 @@ fn parse_scales_linearly_not_quadratically() {
     let large = large_document(8_000);
 
     let t_small = median_millis(5, || {
-        markdev::parse(&small);
+        parse_checked(&small).expect("small benchmark source must satisfy parser contract");
     });
     let t_large = median_millis(5, || {
-        markdev::parse(&large);
+        parse_checked(&large).expect("large benchmark source must satisfy parser contract");
     });
 
     let ratio = t_large / t_small.max(0.0001);

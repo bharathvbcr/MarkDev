@@ -211,12 +211,9 @@ private enum SessionCanonical {
     static func fileURLString(_ raw: String) -> String? {
         guard raw.utf8.count <= SessionStateLimits.maximumURLBytes,
             !raw.unicodeScalars.contains(where: { $0.value == 0 }),
-            let url = URL(string: raw), url.isFileURL,
-            url.path.hasPrefix("/"),
-            !url.path.unicodeScalars.contains(where: { $0.value == 0 }),
-            url.user == nil, url.password == nil, url.port == nil,
-            url.query == nil, url.fragment == nil,
-            url.host == nil || url.host?.isEmpty == true || url.host == "localhost"
+            let url = URL(string: raw),
+            BoundedRegularFileReader.hasLocalFileAuthority(url),
+            !url.path.unicodeScalars.contains(where: { $0.value == 0 })
         else { return nil }
         return url.standardizedFileURL.absoluteString
     }
@@ -235,6 +232,19 @@ final class SessionRestoreClaim: @unchecked Sendable {
         guard !claimed else { return false }
         claimed = true
         return true
+    }
+}
+
+/// Serial off-main lane for bounded session encoding and UserDefaults I/O.
+/// Multiple windows still use last-arrival-wins semantics, but their writes
+/// cannot overlap or complete out of actor order.
+public actor SessionPersistenceLane {
+    public static let shared = SessionPersistenceLane()
+
+    public init() {}
+
+    public func save(_ snapshot: WorkspaceSnapshot) {
+        SessionStore.save(snapshot)
     }
 }
 
@@ -259,10 +269,18 @@ public enum SessionStore {
     private static let restoreClaim = SessionRestoreClaim()
 
     public static func save(_ snapshot: WorkspaceSnapshot) {
-        guard let data = try? JSONEncoder().encode(snapshot),
-            data.count <= SessionStateLimits.maximumEncodedBytes,
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(snapshot)
+        } catch {
+            reject(.workspaceSessionSaveRejected)
+            clear()
+            return
+        }
+        guard data.count <= SessionStateLimits.maximumEncodedBytes,
             hasBoundedJSONNesting(data)
         else {
+            reject(.workspaceSessionSaveRejected, byteCount: data.count)
             clear()
             return
         }
@@ -273,8 +291,9 @@ public enum SessionStore {
     ///
     /// The first caller wins and later callers get `nil` — which is what
     /// makes a newly opened *window* start empty instead of cloned. Returns
-    /// nil for corrupt or missing data either way; both mean "nothing to
-    /// restore", and neither is worth an alert.
+    /// nil for corrupt or missing data either way. Missing data is normal;
+    /// rejected data is removed and recorded in privacy-safe diagnostics so
+    /// support can distinguish it from an intentionally empty launch.
     public static func claimRestore() -> WorkspaceSnapshot? {
         guard restoreClaim.claim() else { return nil }
         return load()
@@ -283,6 +302,7 @@ public enum SessionStore {
     public static func load() -> WorkspaceSnapshot? {
         guard let stored = UserDefaults.standard.object(forKey: key) else { return nil }
         guard let data = stored as? Data else {
+            reject(.workspaceSessionRestoreRejected)
             clear()
             return nil
         }
@@ -290,6 +310,7 @@ public enum SessionStore {
             hasBoundedJSONNesting(data),
             let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: data)
         else {
+            reject(.workspaceSessionRestoreRejected, byteCount: data.count)
             clear()
             return nil
         }
@@ -298,6 +319,23 @@ public enum SessionStore {
 
     public static func clear() {
         UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    private static func reject(_ code: DiagnosticCode, byteCount: Int? = nil) {
+        let metadata: DiagnosticMetadata
+        if let byteCount {
+            metadata = DiagnosticMetadata([
+                .byteCount: .integer(Int64(clamping: byteCount))
+            ])
+        } else {
+            metadata = DiagnosticMetadata()
+        }
+        DiagnosticsEmitter.shared.emit(
+            severity: .warning,
+            subsystem: .workspace,
+            code: code,
+            operationID: DiagnosticOperationID(),
+            metadata: metadata)
     }
 
     /// Byte-level preflight keeps deeply nested ignored JSON from reaching

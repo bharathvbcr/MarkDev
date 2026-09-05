@@ -126,6 +126,51 @@ final class DiagnosticsPrivacyTests: XCTestCase {
         XCTAssertNoThrow(try JSONSerialization.jsonObject(with: data))
     }
 
+    func testExportRefusesASymlinkedDestinationDirectoryWithoutTouchingItsTarget() throws {
+        let target = root.appendingPathComponent("private-target", isDirectory: true)
+        let link = root.appendingPathComponent("selected-link", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: false)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let destination = link.appendingPathComponent("report.json", isDirectory: false)
+
+        XCTAssertThrowsError(
+            try SecureAtomicDiagnosticsFile.write(Data("private report".utf8), to: destination)
+        ) { error in
+            XCTAssertEqual(error as? DiagnosticsError, .destinationDirectoryUnavailable)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: target.appendingPathComponent("report.json").path),
+            "a selected directory link must not redirect a diagnostics export")
+    }
+
+    func testExportFailsClosedWhenTheDestinationDirectoryChangesBeforeCommit() throws {
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        let movedSelection = root.appendingPathComponent("moved-selected", isDirectory: true)
+        let replacement = root.appendingPathComponent("replacement", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: false)
+        let destination = selected.appendingPathComponent("report.json", isDirectory: false)
+
+        XCTAssertThrowsError(try SecureAtomicDiagnosticsFile.write(
+            Data("private report".utf8),
+            to: destination,
+            testingBeforeCommit: {
+                try FileManager.default.moveItem(at: selected, to: movedSelection)
+                try FileManager.default.moveItem(at: replacement, to: selected)
+            }))
+
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: selected.appendingPathComponent("report.json").path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: movedSelection.appendingPathComponent("report.json").path))
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: movedSelection.path).isEmpty,
+            "the descriptor-relative temporary must be removed from the original directory")
+    }
+
     func testCurrentMetadataNeverReadsEnvironmentValues() throws {
         let secret = "CURRENT-METADATA-MUST-NOT-READ-THIS"
         setenv("MARKDEV_DIAGNOSTICS_TEST_SECRET", secret, 1)

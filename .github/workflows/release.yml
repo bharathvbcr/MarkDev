@@ -16,9 +16,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Validate tag, commit, and release notes
         env:
           TAG: ${{ github.ref_name }}
@@ -36,14 +37,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tools
-        run: brew install just xcodegen
-      - name: Verify Xcode Toolchain
-        run: just verify-toolchain
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: 1.98.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install pinned tools
+        run: bash tools/ci/install-pinned-tools.sh release
+      - name: Verify Release Toolchain
+        run: just verify-release-toolchain
       - name: Build Release
         run: just build-release
       - name: Stage Artifact

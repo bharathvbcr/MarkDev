@@ -86,8 +86,12 @@ public struct StatusBar: View {
 
             Spacer(minLength: GlassTheme.Spacing.snug)
 
-            if let selectedWords, selectedWords > 0 {
-                Text("\(selectedWords) of \(stats.words) words")
+            if let selectionDescription = StatusBarSelectionDescription.make(
+                selectedWords: selectedWords,
+                selectedCharacters: selectedCharacters,
+                totalWords: stats.words)
+            {
+                Text(selectionDescription)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             } else {
@@ -146,6 +150,13 @@ public struct StatusBar: View {
         var description = location ?? "Unsaved document"
         if hasUnsavedChanges { description += ", edited" }
         description += ", \(measure(stats.words, singular: "word", plural: "words"))"
+        if let selectionDescription = StatusBarSelectionDescription.make(
+            selectedWords: selectedWords,
+            selectedCharacters: selectedCharacters,
+            totalWords: stats.words)
+        {
+            description += ", \(selectionDescription)"
+        }
         if stats.readingMinutes > 0 {
             description += ", \(stats.readingMinutes) minute read"
         }
@@ -156,5 +167,30 @@ public struct StatusBar: View {
     /// `12480`, in whatever grouping the reader's locale uses.
     private func measure(_ value: Int, singular: String, plural: String) -> String {
         "\(value.formatted(.number)) \(value == 1 ? singular : plural)"
+    }
+}
+
+/// A single, truthful selection summary shared by the visible status and its
+/// collapsed accessibility label. Character-only selections (punctuation or
+/// whitespace) still count as a selection even when their word count is zero.
+enum StatusBarSelectionDescription {
+    static func make(
+        selectedWords: Int?,
+        selectedCharacters: Int?,
+        totalWords: Int
+    ) -> String? {
+        let words = max(0, selectedWords ?? 0)
+        let characters = max(0, selectedCharacters ?? 0)
+        guard words > 0 || characters > 0 else { return nil }
+
+        var measures: [String] = []
+        if selectedWords != nil {
+            let total = max(0, totalWords)
+            measures.append("\(words) of \(total) \(total == 1 ? "word" : "words")")
+        }
+        if selectedCharacters != nil {
+            measures.append("\(characters) \(characters == 1 ? "character" : "characters")")
+        }
+        return measures.joined(separator: " · ") + " selected"
     }
 }

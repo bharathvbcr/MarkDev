@@ -16,6 +16,7 @@ import Foundation
 public enum DocumentOpenAttempt: Equatable, Sendable {
     case opened
     case failed(String)
+    case cancelled
 
     public var didOpen: Bool {
         if case .opened = self { return true }
@@ -28,11 +29,28 @@ public enum DocumentOpenAttempt: Equatable, Sendable {
     }
 }
 
+/// One failed item in a bounded open batch.
+///
+/// Only a basename and a pre-sanitized reason cross this boundary. Absolute
+/// paths and dependency error payloads do not belong in an alert or support
+/// report merely because several documents were opened together.
+public struct DocumentOpenFailure: Equatable, Sendable {
+    public let displayName: String
+    public let reason: String
+
+    public init(item: URL, reason: String) {
+        displayName = WorkspaceIOFailure.safeDisplayName(item)
+        self.reason = String(reason.prefix(512))
+    }
+}
+
 /// Accumulates a multi-file open without allowing one item's error UI to stand
 /// in for another item's result.
 public struct DocumentOpenBatchOutcome: Equatable, Sendable {
     public private(set) var openedCount = 0
-    public private(set) var failureMessage: String?
+    public private(set) var failures: [DocumentOpenFailure] = []
+    public private(set) var omittedFailureCount = 0
+    private var legacyFailureMessage: String?
 
     public init() {}
 
@@ -43,11 +61,41 @@ public struct DocumentOpenBatchOutcome: Equatable, Sendable {
         case .failed(let message):
             // Preserve the prior behaviour for multiple genuine failures: the
             // last attempted file is the one named by the resulting alert.
-            failureMessage = message
+            legacyFailureMessage = message
+        case .cancelled:
+            break
+        }
+    }
+
+    public mutating func record(_ attempt: DocumentOpenAttempt, item: URL) {
+        switch attempt {
+        case .opened:
+            openedCount += 1
+        case .failed(let message):
+            guard failures.count < WorkspaceIOBounds.maximumFailureItems else {
+                omittedFailureCount += 1
+                return
+            }
+            failures.append(DocumentOpenFailure(item: item, reason: message))
+        case .cancelled:
+            break
         }
     }
 
     public var openedAnything: Bool { openedCount > 0 }
+
+    public var failureMessage: String? {
+        guard !failures.isEmpty else { return legacyFailureMessage }
+        if failures.count == 1, omittedFailureCount == 0, let failure = failures.first {
+            return "\(failure.displayName): \(failure.reason)"
+        }
+        let shown = failures.map(\.displayName).joined(separator: ", ")
+        let total = failures.count + omittedFailureCount
+        let suffix = omittedFailureCount == 0
+            ? ""
+            : "; \(omittedFailureCount) more not listed"
+        return "\(total) items could not be opened: \(shown)\(suffix)."
+    }
 }
 
 /// Files to open, and what was left out.
@@ -63,6 +111,23 @@ public struct DocumentOpenRequest: Equatable, Sendable {
     public init(urls: [URL], dropped: Int = 0) {
         self.urls = urls
         self.dropped = dropped
+    }
+
+    /// Applies the same finite admission rule to Finder, Open-panel, editor,
+    /// and Launch Services batches. Capping at the request boundary means a
+    /// caller cannot accidentally do unbounded classification work first.
+    public static func bounded(
+        _ urls: [URL],
+        dropped existingDropped: Int = 0,
+        limit: Int = WorkspaceIOBounds.maximumOpenItems
+    ) -> DocumentOpenRequest {
+        let limit = min(max(0, limit), WorkspaceIOBounds.maximumOpenItems)
+        let admitted = Array(urls.prefix(limit))
+        let newlyDropped = max(0, urls.count - admitted.count)
+        let (sum, overflow) = max(0, existingDropped).addingReportingOverflow(newlyDropped)
+        return DocumentOpenRequest(
+            urls: admitted,
+            dropped: overflow ? Int.max : sum)
     }
 
     public var isEmpty: Bool { urls.isEmpty }
@@ -174,7 +239,7 @@ public final class DocumentInbox {
     ///
     /// Selecting a folder's worth of notes and pressing Return is easy to do
     /// by accident, and each one becomes a tab holding a parsed document.
-    public static let limit = 32
+    public nonisolated static let limit = WorkspaceIOBounds.maximumOpenItems
 
     /// The most surfaces that may be registered at once.
     ///
@@ -250,11 +315,11 @@ public final class DocumentInbox {
 
     /// Accepts open requests, delivering them if anyone can show them.
     ///
-    /// Only file URLs are taken. A custom-scheme URL is not a document open
-    /// and must not be turned into one — reading it as a file is, for a remote
-    /// scheme, a synchronous network fetch on the main thread.
+    /// Only strictly local file URLs are taken. `standardizedFileURL` drops a
+    /// file URL's authority, so validation must precede queue normalization;
+    /// otherwise `file://remote-host/path` aliases the local `/path`.
     public func receive(_ urls: [URL]) {
-        enqueue(urls.filter(\.isFileURL))
+        enqueue(urls.filter(BoundedRegularFileReader.hasLocalFileAuthority))
         deliverPending()
     }
 
@@ -361,7 +426,7 @@ public final class DocumentInbox {
     // MARK: - The queue
 
     private func enqueue(_ urls: [URL]) {
-        for url in urls {
+        for url in urls where BoundedRegularFileReader.hasLocalFileAuthority(url) {
             let standardized = url.standardizedFileURL
             // A second request for a file already waiting is not a second
             // file: Launch Services can deliver duplicates when an app is

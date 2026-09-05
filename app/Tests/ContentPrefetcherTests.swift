@@ -11,14 +11,64 @@ import XCTest
 
 @testable import MarkDevKit
 
+private final class ImageFileOpenCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    func open(
+        _ url: URL,
+        maximumBytes: Int
+    ) throws -> MarkDevKit.BoundedRegularFileLease {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+        return try MarkDevKit.BoundedRegularFileReader.open(
+            url,
+            maximumBytes: maximumBytes,
+            cancellationCheck: { false })
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func reset() {
+        lock.lock()
+        calls = 0
+        lock.unlock()
+    }
+}
+
 @MainActor
 final class ContentPrefetcherTests: XCTestCase {
-    private func context(width: CGFloat = 600) -> RenderContext {
-        RenderContext(width: width, dark: false, mathFontSize: 16, textColor: .black)
+    private func context(width: CGFloat = 600, dark: Bool = false) -> RenderContext {
+        RenderContext(width: width, dark: dark, mathFontSize: 16, textColor: .black)
     }
 
     private func math(_ latex: String) -> RenderedBlock {
         RenderedBlock(kind: .math, source: latex)
+    }
+
+    private func image(_ source: String) -> RenderedBlock {
+        RenderedBlock(kind: .image(alt: ""), source: source)
+    }
+
+    private func imageDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevPrefetchImages-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory
+    }
+
+    private func writeSVG(_ name: String, to directory: URL) throws {
+        try """
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="16" \
+            viewBox="0 0 32 16"><rect width="32" height="16" fill="black"/></svg>
+            """.write(
+                to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
     }
 
     /// Drains a warm without waiting on a clock.
@@ -93,6 +143,112 @@ final class ContentPrefetcherTests: XCTestCase {
 
         XCTAssertFalse(prefetcher.step(), "one step should exhaust a queue of one uncached block")
         XCTAssertEqual(prefetcher.warmed, 1)
+    }
+
+    func testOneStepExaminesAtMostOneCachedImageRequest() throws {
+        // An image cache probe opens and identifies a file generation. It is
+        // therefore file I/O even on a hit, and a run of hits must not turn
+        // one main-actor step into an unbounded directory walk.
+        let directory = try imageDirectory()
+        try writeSVG("first.svg", to: directory)
+        try writeSVG("second.svg", to: directory)
+        let first = image("first.svg")
+        let second = image("second.svg")
+        let fresh = math("not\\;warmed")
+        let renderContext = context()
+        let opens = ImageFileOpenCounter()
+        let renderer = RichContentRenderer(imageFileOpener: opens.open)
+
+        for block in [first, second] {
+            guard case .success = renderer.render(
+                RenderRequest(block: block, directory: directory, context: renderContext))
+            else { return XCTFail("the image fixture should be cached before the warm") }
+        }
+
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        prefetcher.warmDocument([first, second, fresh], in: directory, using: renderContext)
+        opens.reset()
+
+        XCTAssertTrue(prefetcher.step(), "the second image and formula should remain queued")
+        XCTAssertEqual(opens.count, 1, "one cached-image step may open exactly one descriptor")
+        XCTAssertEqual(prefetcher.warmed, 0)
+        XCTAssertFalse(
+            renderer.isCached(
+                RenderRequest(block: fresh, directory: directory, context: renderContext)),
+            "one step must not walk past a cached image to render later work")
+
+        XCTAssertTrue(prefetcher.step(), "the formula should remain after the second image")
+        XCTAssertEqual(opens.count, 2, "the second step may inspect only the second image")
+        XCTAssertEqual(prefetcher.warmed, 0)
+        XCTAssertFalse(prefetcher.step(), "the third step should render the final formula")
+        XCTAssertEqual(opens.count, 2, "a dictionary-only formula must perform no file I/O")
+        XCTAssertEqual(prefetcher.warmed, 1)
+    }
+
+    func testOneStepRendersOneFreshImageWithoutTouchingTheNextRequest() throws {
+        let directory = try imageDirectory()
+        try writeSVG("fresh.svg", to: directory)
+        let freshImage = image("fresh.svg")
+        let laterMath = math("later")
+        let renderContext = context()
+        let opens = ImageFileOpenCounter()
+        let renderer = RichContentRenderer(imageFileOpener: opens.open)
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+
+        prefetcher.warmDocument(
+            [freshImage, laterMath], in: directory, using: renderContext)
+
+        XCTAssertTrue(prefetcher.step(), "the formula must remain queued after one image render")
+        XCTAssertEqual(prefetcher.warmed, 1)
+        XCTAssertEqual(
+            opens.count,
+            2,
+            "a fresh image performs one generation probe and one retained-descriptor render")
+        XCTAssertFalse(
+            renderer.isCached(
+                RenderRequest(
+                    block: laterMath,
+                    directory: directory,
+                    context: renderContext)),
+            "the image step must not render the following request")
+
+        XCTAssertFalse(prefetcher.step())
+        XCTAssertEqual(prefetcher.warmed, 2)
+        XCTAssertEqual(opens.count, 2)
+    }
+
+    func testOneStepBoundsCheapCacheProbesBeforeRenderingFreshWork() {
+        // Dictionary probes are cheaper than image-generation probes, but a
+        // document can still contain thousands. One main-actor turn must have
+        // a finite inspection quantum rather than walking all of them.
+        let cached = (0..<ContentPrefetcher.maximumInspectionsPerStep).map {
+            math("cached_{\($0)}")
+        }
+        let fresh = math("fresh")
+        let renderContext = context()
+        let renderer = RichContentRenderer()
+        for block in cached {
+            guard case .success = renderer.render(
+                RenderRequest(block: block, directory: nil, context: renderContext))
+            else { return XCTFail("the math fixture should be cached before the warm") }
+        }
+
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        prefetcher.warmDocument(cached + [fresh], in: nil, using: renderContext)
+
+        XCTAssertTrue(
+            prefetcher.step(),
+            "the fresh tail must remain after one bounded cache-scan quantum")
+        XCTAssertEqual(prefetcher.warmed, 0)
+        XCTAssertFalse(
+            renderer.isCached(
+                RenderRequest(block: fresh, directory: nil, context: renderContext)))
+
+        XCTAssertFalse(prefetcher.step(), "the next turn may render the fresh tail")
+        XCTAssertEqual(prefetcher.warmed, 1)
+        XCTAssertTrue(
+            renderer.isCached(
+                RenderRequest(block: fresh, directory: nil, context: renderContext)))
     }
 
     // MARK: - Order
@@ -175,6 +331,57 @@ final class ContentPrefetcherTests: XCTestCase {
         XCTAssertEqual(prefetcher.declined, 1)
     }
 
+    func testSourceAdmissionRunsBeforeAnImageCacheProbe() {
+        // `isCached` for an image opens a descriptor to bind the cache hit to a
+        // file generation. An over-limit source is already declined, so doing
+        // that I/O first defeats both the source bound and per-step work bound.
+        let opens = ImageFileOpenCounter()
+        let renderer = RichContentRenderer(imageFileOpener: opens.open)
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        let source = String(
+            repeating: "a", count: ContentPrefetcher.maximumSourceLength + 1) + ".png"
+
+        prefetcher.warmDocument([image(source)], in: URL(fileURLWithPath: "/tmp"), using: context())
+
+        XCTAssertFalse(prefetcher.step())
+        XCTAssertEqual(prefetcher.declined, 1)
+        XCTAssertEqual(opens.count, 0, "a declined source must perform no file-system probe")
+    }
+
+    func testTheDocumentQueueIsBoundedAndDrainsExactlyItsAdmittedCap() {
+        let renderer = RichContentRenderer()
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        let overflow = 37
+        let blocks = (0..<(ContentPrefetcher.maximumDocumentQueue + overflow)).map {
+            RenderedBlock(kind: .htmlComment, source: "hidden-\($0)")
+        }
+
+        prefetcher.warmDocument(blocks, in: nil, using: context())
+
+        XCTAssertEqual(prefetcher.declined, overflow, "the rejected tail must be observable")
+        for _ in 0..<ContentPrefetcher.maximumDocumentQueue {
+            _ = prefetcher.step()
+        }
+        XCTAssertEqual(prefetcher.warmed, ContentPrefetcher.maximumDocumentQueue)
+        XCTAssertFalse(prefetcher.hasWork, "only the admitted prefix may enter the queue")
+    }
+
+    func testQueueStorageDoesNotShiftAnArrayTailForEveryDequeue() throws {
+        // This is a structural complexity contract. A wall-clock benchmark is
+        // too machine-dependent to distinguish an indexed FIFO from Array's
+        // quadratic repeated front-removal reliably.
+        let production = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("MarkDevKit/Editor/ContentPrefetcher.swift")
+        let source = try String(contentsOf: production, encoding: .utf8)
+        XCTAssertNil(
+            source.range(
+                of: #"\bqueue\.removeFirst\s*\("#,
+                options: .regularExpression),
+            "front-removing Array shifts the remaining queue on every step")
+    }
+
     func testTheConnectedQueueIsBounded() {
         // Connected batches accumulate — one per linked note — where a
         // document batch replaces. Without a ceiling, one note holding a
@@ -193,6 +400,95 @@ final class ContentPrefetcherTests: XCTestCase {
         while prefetcher.step() { steps += 1 }
         XCTAssertLessThanOrEqual(
             prefetcher.warmed, ContentPrefetcher.maximumConnectedQueue)
+    }
+
+    // MARK: - Multiple panes
+
+    func testOneOwnerReplacingAndCancellingItsDocumentLeavesTheOtherOwnerQueued() {
+        let renderer = RichContentRenderer()
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        let firstOwner = ContentPrefetcher.Owner()
+        let secondOwner = ContentPrefetcher.Owner()
+        let oldFirst = math("old_first")
+        let newFirst = math("new_first")
+        let second = math("second_survives")
+        let renderContext = context()
+
+        prefetcher.warmDocument(
+            [oldFirst], owner: firstOwner, in: nil, using: renderContext)
+        prefetcher.warmDocument(
+            [second], owner: secondOwner, in: nil, using: renderContext)
+        prefetcher.warmDocument(
+            [newFirst], owner: firstOwner, in: nil, using: renderContext)
+        prefetcher.cancel(owner: firstOwner)
+
+        XCTAssertTrue(prefetcher.hasWork, "cancelling one pane must not strand another pane")
+        drain(prefetcher)
+
+        XCTAssertEqual(prefetcher.warmed, 1)
+        XCTAssertTrue(
+            renderer.isCached(
+                RenderRequest(block: second, directory: nil, context: renderContext)))
+        for cancelled in [oldFirst, newFirst] {
+            XCTAssertFalse(
+                renderer.isCached(
+                    RenderRequest(block: cancelled, directory: nil, context: renderContext)))
+        }
+    }
+
+    func testDocumentOwnersMakeFairProgressAtTheSamePriority() {
+        let renderer = RichContentRenderer()
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        let firstOwner = ContentPrefetcher.Owner()
+        let secondOwner = ContentPrefetcher.Owner()
+        let first = (0..<8).map { math("first_{\($0)}") }
+        let second = math("second_gets_a_turn")
+        let renderContext = context()
+
+        prefetcher.warmDocument(first, owner: firstOwner, in: nil, using: renderContext)
+        prefetcher.warmDocument([second], owner: secondOwner, in: nil, using: renderContext)
+
+        _ = prefetcher.step()
+        _ = prefetcher.step()
+
+        XCTAssertTrue(
+            renderer.isCached(
+                RenderRequest(block: second, directory: nil, context: renderContext)),
+            "one pane must not monopolize document-priority turns")
+        XCTAssertTrue(prefetcher.hasWork, "the first pane should retain its remaining work")
+    }
+
+    func testConnectedWarmUsesTheContextBelongingToItsOwner() {
+        let renderer = RichContentRenderer()
+        let prefetcher = ContentPrefetcher(renderer: renderer)
+        let narrowOwner = ContentPrefetcher.Owner()
+        let wideOwner = ContentPrefetcher.Owner()
+        let narrowContext = context(width: 320, dark: false)
+        let wideContext = context(width: 880, dark: true)
+        let narrowBlock = math("narrow_connected")
+        let wideBlock = math("wide_connected")
+        let directory = URL(fileURLWithPath: "/tmp")
+
+        prefetcher.warmDocument([], owner: narrowOwner, in: nil, using: narrowContext)
+        prefetcher.warmDocument([], owner: wideOwner, in: nil, using: wideContext)
+        prefetcher.warmConnected([narrowBlock], owner: narrowOwner, in: directory)
+        prefetcher.warmConnected([wideBlock], owner: wideOwner, in: directory)
+        drain(prefetcher)
+
+        XCTAssertTrue(
+            renderer.isCached(
+                RenderRequest(block: narrowBlock, directory: directory, context: narrowContext)))
+        XCTAssertTrue(
+            renderer.isCached(
+                RenderRequest(block: wideBlock, directory: directory, context: wideContext)))
+        XCTAssertFalse(
+            renderer.isCached(
+                RenderRequest(block: narrowBlock, directory: directory, context: wideContext)),
+            "a connected warm must not borrow another pane's width or appearance")
+        XCTAssertFalse(
+            renderer.isCached(
+                RenderRequest(block: wideBlock, directory: directory, context: narrowContext)),
+            "a connected warm must retain its own pane context")
     }
 
     // MARK: - Lifetime

@@ -18,7 +18,7 @@ final class VaultReconciliationTests: XCTestCase {
     private var root: URL!
     private var index: VaultIndex!
 
-    override func setUpWithError() throws {
+    override func setUp() async throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("MarkDevReconcile-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -27,7 +27,7 @@ final class VaultReconciliationTests: XCTestCase {
         index.open(root)
     }
 
-    override func tearDownWithError() throws {
+    override func tearDown() async throws {
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -101,6 +101,20 @@ final class VaultReconciliationTests: XCTestCase {
             "disk text was not dragged under the buffer")
     }
 
+    func testRemoteAuthorityCannotExcludeTheMatchingLocalNoteFromReconciliation() async throws {
+        let seed = root.appendingPathComponent("Seed.md").standardizedFileURL
+        try "# Disk version".write(to: seed, atomically: true, encoding: .utf8)
+        _ = index.update(path: "Seed.md", text: "# Editor version")
+        let hostile = try XCTUnwrap(
+            URL(string: "file://remote.example\(seed.path)"))
+
+        let result = await index.reconcileWithDisk(excluding: [hostile])
+
+        XCTAssertGreaterThan(result.changedNotes, 0)
+        XCTAssertEqual(index.search("Disk version").count, 1)
+        XCTAssertEqual(index.search("Editor version").count, 0)
+    }
+
     /// A read failure (permissions) is not a deletion: the sweep keeps the
     /// indexed note when the file still exists but cannot be read.
     func testUnreadableButPresentFilesAreNotForgotten() async throws {
@@ -116,7 +130,7 @@ final class VaultReconciliationTests: XCTestCase {
         guard setPermissions(0o000, on: seed) else {
             throw XCTSkip("cannot drop permissions in this environment")
         }
-        defer { setPermissions(0o644, on: seed) }
+        defer { _ = setPermissions(0o644, on: seed) }
 
         _ = await index.reconcileWithDisk()
 

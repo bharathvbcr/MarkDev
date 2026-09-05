@@ -70,7 +70,10 @@ final class SessionStateTests: XCTestCase {
         try write("# First", to: first)
         try write("# Second", to: second)
 
-        let original = Workspace(vaultRoot: root)
+        let original = Workspace(
+            vaultRoot: root,
+            documentIO: LocalDocumentIO(),
+            transactionRegistry: ProcessFileTransactionRegistry())
         try original.open(first, in: original.focusedPane)
         let otherPane = original.split(original.focusedPane, edge: .trailing)
         try original.open(second, in: otherPane)
@@ -81,7 +84,7 @@ final class SessionStateTests: XCTestCase {
         let data = try JSONEncoder().encode(snapshot)
         let decoded = try JSONDecoder().decode(WorkspaceSnapshot.self, from: data)
 
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: decoded)
 
         XCTAssertEqual(restored.layout.paneCount, 2)
@@ -119,7 +122,7 @@ final class SessionStateTests: XCTestCase {
             focusedPane: paneID,
             vaultRoot: nil)
 
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: snapshot)
 
         let documents = restored.state(for: paneID).documents
@@ -140,7 +143,7 @@ final class SessionStateTests: XCTestCase {
             focusedPane: paneID,
             vaultRoot: nil)
 
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: snapshot)
 
         let state = restored.state(for: paneID)
@@ -149,7 +152,7 @@ final class SessionStateTests: XCTestCase {
     }
 
     func testUntitledDocumentsAreNotCarriedAcrossLaunches() {
-        let workspace = Workspace()
+        let workspace = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         workspace.updateText("Draft nobody saved", in: workspace.focusedPane)
 
         let snapshot = workspace.snapshot()
@@ -164,7 +167,7 @@ final class SessionStateTests: XCTestCase {
             focusedPane: PaneID(),
             vaultRoot: nil)
 
-        let restored = Workspace()
+        let restored = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         restored.restore(from: snapshot)
 
         XCTAssertEqual(restored.focusedPane, paneID)
@@ -178,7 +181,7 @@ final class SessionStateTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("# Before", to: file)
 
-        let workspace = Workspace()
+        let workspace = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         try workspace.open(file, in: workspace.focusedPane)
         workspace.updateText("# After", in: workspace.focusedPane)
         XCTAssertTrue(workspace.document(in: workspace.focusedPane)!.hasUnsavedChanges)
@@ -198,7 +201,7 @@ final class SessionStateTests: XCTestCase {
         let file = root.appendingPathComponent("Note.md")
         try write("# Mine", to: file)
 
-        let workspace = Workspace()
+        let workspace = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         try workspace.open(file, in: workspace.focusedPane)
         workspace.updateText("# Also mine", in: workspace.focusedPane)
 
@@ -217,7 +220,7 @@ final class SessionStateTests: XCTestCase {
     }
 
     func testAutosaveLeavesUntitledDocumentsAlone() {
-        let workspace = Workspace()
+        let workspace = Workspace(documentIO: LocalDocumentIO(), transactionRegistry: ProcessFileTransactionRegistry())
         workspace.updateText("Unsaved scratch", in: workspace.focusedPane)
 
         XCTAssertEqual(workspace.autosave(), 0)
