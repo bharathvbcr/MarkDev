@@ -123,7 +123,7 @@ final class BoundedRegularFileLease: @unchecked Sendable {
     }
 }
 
-enum BoundedRegularFileReader {
+public enum BoundedRegularFileReader {
     /// Synchronous injection seams for deterministic syscall-failure tests.
     /// Production callers always leave these nil and use Darwin directly.
     typealias Open = (
@@ -202,7 +202,7 @@ enum BoundedRegularFileReader {
     /// Foundation exposes the local path of `file://remote-host/path`; using
     /// that path without checking its authority silently turns a hostile file
     /// URL into a local read. `localhost` is the sole explicit local host.
-    static func hasLocalFileAuthority(_ url: URL) -> Bool {
+    public static func hasLocalFileAuthority(_ url: URL) -> Bool {
         guard url.isFileURL,
             url.path.hasPrefix("/"),
             url.user == nil,
