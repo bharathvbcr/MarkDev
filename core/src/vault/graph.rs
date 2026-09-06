@@ -106,7 +106,7 @@ impl Graph {
                 // Unresolved links have no node to point at. They are not lost
                 // — `Vault::broken_links` reports them — but a graph cannot
                 // draw an edge to a note that does not exist.
-                let Some(resolved) = vault.resolve(&link.target, link.anchor.as_deref()) else {
+                let Some(resolved) = vault.resolve_link(&note.path, link) else {
                     continue;
                 };
                 let Some(&target) = index_of.get(resolved.path.as_str()) else {

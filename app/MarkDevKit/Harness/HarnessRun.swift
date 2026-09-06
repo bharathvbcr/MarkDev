@@ -234,13 +234,7 @@ private final class HarnessPipeStreamController: @unchecked Sendable {
         lock.unlock()
         guard shouldRead else { return }
 
-        let data: Data
-        do {
-            data = try readable.read(upToCount: chunkLimit) ?? Data()
-        } catch {
-            finish()
-            return
-        }
+        let data = readable.availableData
         guard !data.isEmpty else {
             finish()
             return

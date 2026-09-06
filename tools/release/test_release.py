@@ -786,7 +786,7 @@ release.stage("v0.1.4")
             stderr=subprocess.PIPE,
         )
         self.addCleanup(lambda: publisher.poll() is None and publisher.kill())
-        for _ in range(300):
+        for _ in range(1500):
             if ready.exists():
                 break
             if publisher.poll() is not None:

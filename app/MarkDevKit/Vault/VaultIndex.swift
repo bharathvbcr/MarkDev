@@ -693,6 +693,26 @@ public final class VaultIndex {
         #endif
     }
 
+    /// Resolves a Markdown destination relative to the note at `from`.
+    ///
+    /// Source-relative only — no vault-wide name fallback.
+    public func resolve(from: String, target: String, anchor: String? = nil) -> LinkResolution? {
+        #if canImport(CMarkDev)
+            guard VaultBoundary.acceptsCString(
+                from, maximumBytes: VaultBoundary.maximumPathBytes),
+                VaultBoundary.acceptsCString(
+                    target, maximumBytes: VaultBoundary.maximumQueryBytes),
+                VaultBoundary.acceptsOptionalCString(
+                    anchor, maximumBytes: VaultBoundary.maximumQueryBytes)
+            else { return nil }
+            return coreLock.withLock {
+                resolveFromLocked(handle, from: from, target: target, anchor: anchor)
+            }
+        #else
+            return nil
+        #endif
+    }
+
     /// The body of ``resolve(target:anchor:)``, called with ``coreLock`` held.
     private nonisolated func resolveLocked(
         _ handle: OpaquePointer?, target: String, anchor: String?
@@ -705,6 +725,28 @@ public final class VaultIndex {
                 }
                 return anchor.withCString { anchorPointer in
                     decode(md_vault_resolve(handle, targetPointer, anchorPointer))
+                }
+            }
+        #else
+            return nil
+        #endif
+    }
+
+    private nonisolated func resolveFromLocked(
+        _ handle: OpaquePointer?, from: String, target: String, anchor: String?
+    ) -> LinkResolution? {
+        #if canImport(CMarkDev)
+            guard let handle else { return nil }
+            return from.withCString { fromPointer -> LinkResolution? in
+                target.withCString { targetPointer -> LinkResolution? in
+                    guard let anchor else {
+                        return decode(md_vault_resolve_from(handle, fromPointer, targetPointer, nil))
+                    }
+                    return anchor.withCString { anchorPointer in
+                        decode(
+                            md_vault_resolve_from(
+                                handle, fromPointer, targetPointer, anchorPointer))
+                    }
                 }
             }
         #else

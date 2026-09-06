@@ -29,6 +29,8 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public var onParse: ((ParsedDocument) -> Void)?
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
+    /// Called with a relative Markdown destination when one is clicked.
+    public var onFollowDocumentLink: ((String) -> Void)?
     /// Registers the underlying AppKit view without claiming keyboard focus.
     /// The returned token names this exact mount until ``onUnmount`` retires
     /// it; a replacement view receives a different token.
@@ -60,6 +62,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         reveal: RevealRequest? = nil,
         onParse: ((ParsedDocument) -> Void)? = nil,
         onFollowWikiLink: ((String) -> Void)? = nil,
+        onFollowDocumentLink: ((String) -> Void)? = nil,
         onMount: ((MarkdownTextView) -> EditorSurfaceMountToken?)? = nil,
         onFocus: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)? = nil,
         onUnmount: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)? = nil,
@@ -76,6 +79,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         self.reveal = reveal
         self.onParse = onParse
         self.onFollowWikiLink = onFollowWikiLink
+        self.onFollowDocumentLink = onFollowDocumentLink
         self.onMount = onMount
         self.onFocus = onFocus
         self.onUnmount = onUnmount
@@ -109,6 +113,9 @@ public struct MarkdownEditorView: NSViewRepresentable {
         textView.onFollowWikiLink = { [weak coordinator = context.coordinator] target in
             coordinator?.onFollowWikiLink?(target)
         }
+        textView.onFollowDocumentLink = { [weak coordinator = context.coordinator] destination in
+            coordinator?.onFollowDocumentLink?(destination)
+        }
         textView.onSelectionStatsChanged = { [weak coordinator = context.coordinator] words, chars in
             coordinator?.onSelectionStats?(words, chars)
         }
@@ -139,6 +146,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
 
         context.coordinator.onParse = onParse
         context.coordinator.onFollowWikiLink = onFollowWikiLink
+        context.coordinator.onFollowDocumentLink = onFollowDocumentLink
         context.coordinator.onMount = onMount
         context.coordinator.onFocus = onFocus
         context.coordinator.onUnmount = onUnmount
@@ -194,6 +202,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
     public func makeCoordinator() -> Coordinator {
         let coordinator = Coordinator(text: $text, onParse: onParse)
         coordinator.onFollowWikiLink = onFollowWikiLink
+        coordinator.onFollowDocumentLink = onFollowDocumentLink
         coordinator.onMount = onMount
         coordinator.onFocus = onFocus
         coordinator.onUnmount = onUnmount
@@ -223,6 +232,7 @@ public struct MarkdownEditorView: NSViewRepresentable {
         private let text: Binding<String>
         var onParse: ((ParsedDocument) -> Void)?
         var onFollowWikiLink: ((String) -> Void)?
+        var onFollowDocumentLink: ((String) -> Void)?
         var onMount: ((MarkdownTextView) -> EditorSurfaceMountToken?)?
         var onFocus: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?
         var onUnmount: ((EditorSurfaceMountToken, MarkdownTextView) -> Void)?

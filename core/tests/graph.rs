@@ -59,6 +59,24 @@ fn resolved_links_become_edges() {
 }
 
 #[test]
+fn wiki_and_markdown_between_the_same_pair_are_one_edge() {
+    let vault = vault(&[("A.md", "[[B]] and [B](./B.md)\n"), ("B.md", "# B\n")]);
+    let graph = whole(&vault);
+    assert_eq!(graph.edges.len(), 1);
+    assert!(linked(&graph, "A.md", "B.md"));
+}
+
+#[test]
+fn markdown_links_produce_graph_edges() {
+    let vault = vault(&[
+        ("README.md", "[Arch](./docs/architecture.md)\n"),
+        ("docs/architecture.md", "# A\n"),
+    ]);
+    let graph = whole(&vault);
+    assert!(linked(&graph, "README.md", "docs/architecture.md"));
+}
+
+#[test]
 fn broken_links_do_not_produce_edges() {
     // There is no node to point at. The link is not lost — `broken_links`
     // still reports it — but an edge to a note that does not exist would have

@@ -141,7 +141,7 @@ fn vault_rename_keeps_resolution_through_a_rename_chain() {
         for note in vault.notes() {
             let mut targets = Vec::new();
             for link in &note.links {
-                if let Some(resolved) = vault.resolve(&link.target, None) {
+                if let Some(resolved) = vault.resolve_link(&note.path, link) {
                     if resolved.path == path {
                         targets.push(link.target.clone());
                     }
@@ -171,7 +171,7 @@ fn vault_rename_keeps_resolution_through_a_rename_chain() {
     // Nothing resolves through the old path spelling any more.
     for note in vault.notes() {
         for link in &note.links {
-            if let Some(resolved) = vault.resolve(&link.target, None) {
+            if let Some(resolved) = vault.resolve_link(&note.path, link) {
                 assert_ne!(resolved.path, "A.md", "stale link {}", link.target);
             }
         }

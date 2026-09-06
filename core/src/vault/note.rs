@@ -5,6 +5,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::md::parse::{options, scan_tags};
 
+/// Markdown extensions the vault treats as notes — same set as the scanner.
+pub const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mdx", "mkd"];
+
+/// Whether a path ends in a vault note extension.
+pub fn has_markdown_extension(path: &str) -> bool {
+    path.rsplit_once('.')
+        .map(|(_, ext)| {
+            MARKDOWN_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+        .unwrap_or(false)
+}
+
+/// Strips one trailing markdown extension, case-insensitively.
+pub fn strip_markdown_extension(path: &str) -> &str {
+    match path.rsplit_once('.') {
+        Some((head, ext))
+            if !head.is_empty()
+                && MARKDOWN_EXTENSIONS
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known)) =>
+        {
+            head
+        }
+        _ => path,
+    }
+}
+
+/// How a vault link was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteLinkKind {
+    #[default]
+    Wiki,
+    Markdown,
+}
+
 /// A heading, for the outline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heading {
@@ -16,17 +54,23 @@ pub struct Heading {
     pub line: u32,
 }
 
-/// A `[[wikilink]]` occurrence.
+/// A `[[wikilink]]` or local Markdown link occurrence.
+///
+/// Named for the wiki half of the vault graph; Markdown destinations that
+/// point at notes share the same shape and carry [`NoteLinkKind::Markdown`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WikiLink {
     /// The target as written, without the `#anchor` or `|alias`.
     pub target: String,
-    /// Heading anchor, when the link was `[[Note#Heading]]`.
+    /// Heading anchor, when the link was `[[Note#Heading]]` or `[x](Note.md#Heading)`.
     pub anchor: Option<String>,
     /// What the reader sees — the alias when there is one.
     pub display: String,
     pub offset: u32,
     pub line: u32,
+    /// Wiki vs ordinary Markdown — resolution rules differ.
+    #[serde(default)]
+    pub kind: NoteLinkKind,
 }
 
 /// Everything the vault knows about one note.
@@ -67,7 +111,7 @@ impl Note {
 
         let mut heading_level: Option<(u8, usize)> = None;
         let mut heading_text = String::new();
-        let mut link_open: Option<(String, usize)> = None;
+        let mut link_open: Option<(String, usize, NoteLinkKind)> = None;
         let mut link_text = String::new();
         let mut in_frontmatter = false;
         let mut frontmatter = String::new();
@@ -99,32 +143,28 @@ impl Note {
                     dest_url,
                     ..
                 }) => {
-                    if matches!(link_type, LinkType::WikiLink { .. }) {
-                        link_open = Some((dest_url.to_string(), range.start));
+                    let kind = match link_type {
+                        LinkType::WikiLink { .. } => Some(NoteLinkKind::Wiki),
+                        LinkType::Inline
+                        | LinkType::Reference
+                        | LinkType::Collapsed
+                        | LinkType::Shortcut => Some(NoteLinkKind::Markdown),
+                        // Autolink / email / unknown are not vault note links.
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        link_open = Some((dest_url.to_string(), range.start, kind));
                         link_text.clear();
                     }
                 }
                 Event::End(TagEnd::Link) => {
-                    if let Some((dest, start)) = link_open.take() {
-                        // `dest` carries the anchor but never the alias.
-                        let (target, anchor) = match dest.split_once('#') {
-                            Some((target, anchor)) => {
-                                (target.to_string(), Some(anchor.to_string()))
-                            }
-                            None => (dest.clone(), None),
+                    if let Some((dest, start, kind)) = link_open.take() {
+                        let Some(link) =
+                            indexed_link(dest, &link_text, kind, source, start, &lines)
+                        else {
+                            continue;
                         };
-                        let display = if link_text.is_empty() {
-                            target.clone()
-                        } else {
-                            link_text.clone()
-                        };
-                        links.push(WikiLink {
-                            target: target.trim().to_string(),
-                            anchor,
-                            display,
-                            offset: utf16_offset(source, start),
-                            line: lines.line(start),
-                        });
+                        links.push(link);
                     }
                 }
 
@@ -215,6 +255,117 @@ pub fn stem(path: &str) -> String {
     match file.rsplit_once('.') {
         Some((name, _)) if !name.is_empty() => name.to_string(),
         _ => file.to_string(),
+    }
+}
+
+/// Builds a vault link row, or refuses destinations that are not notes.
+fn indexed_link(
+    dest: String,
+    link_text: &str,
+    kind: NoteLinkKind,
+    source: &str,
+    start: usize,
+    lines: &LineTable,
+) -> Option<WikiLink> {
+    match kind {
+        NoteLinkKind::Wiki => {
+            // `dest` carries the anchor but never the alias.
+            let (target, anchor) = split_target_anchor(&dest);
+            let display = if link_text.is_empty() {
+                target.clone()
+            } else {
+                link_text.to_string()
+            };
+            Some(WikiLink {
+                target: target.trim().to_string(),
+                anchor,
+                display,
+                offset: utf16_offset(source, start),
+                line: lines.line(start),
+                kind: NoteLinkKind::Wiki,
+            })
+        }
+        NoteLinkKind::Markdown => {
+            let decoded = percent_decode_once(&dest);
+            let (target, anchor) = split_target_anchor(&decoded);
+            let target = target.trim();
+            if !is_indexable_markdown_destination(target) {
+                return None;
+            }
+            let display = if link_text.is_empty() {
+                target.to_string()
+            } else {
+                link_text.to_string()
+            };
+            Some(WikiLink {
+                target: target.to_string(),
+                anchor,
+                display,
+                offset: utf16_offset(source, start),
+                line: lines.line(start),
+                kind: NoteLinkKind::Markdown,
+            })
+        }
+    }
+}
+
+fn split_target_anchor(dest: &str) -> (String, Option<String>) {
+    match dest.split_once('#') {
+        Some((target, anchor)) => (target.to_string(), Some(anchor.to_string())),
+        None => (dest.to_string(), None),
+    }
+}
+
+/// Destinations that become vault graph edges — notes only, never LICENSE or folders.
+fn is_indexable_markdown_destination(target: &str) -> bool {
+    if target.is_empty() || target.starts_with('#') || target.starts_with("//") {
+        return false;
+    }
+    if has_url_scheme(target) {
+        return false;
+    }
+    has_markdown_extension(target)
+}
+
+/// `http:`, `mailto:`, `file:` — a colon after an ASCII scheme name.
+pub(crate) fn has_url_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
+    let scheme = &target[..colon];
+    !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+/// Percent-decode once. Invalid `%` sequences stay literal.
+pub(crate) fn percent_decode_once(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    match String::from_utf8(out) {
+        Ok(text) => text,
+        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

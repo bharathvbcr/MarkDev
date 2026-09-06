@@ -304,7 +304,16 @@ fn markdown_suffix_and_alias_shapes_survive_a_rewrite() {
         source,
         &markdev::vault::rename::ProtectedRanges::none(),
         &mut |_| None,
-        &mut |target| (target.eq_ignore_ascii_case("Real")).then(|| "New/Spot".to_string()),
+        // The scanner hands over the written destination, extension included;
+        // the vault callback is what strips and resolves.
+        &mut |target| {
+            let stem = target
+                .rsplit_once('.')
+                .map(|(head, _)| head)
+                .unwrap_or(target);
+            stem.eq_ignore_ascii_case("Real")
+                .then(|| "New/Spot".to_string())
+        },
     );
     assert_eq!(count, 3, "{rewritten}");
     assert!(rewritten.contains("(New/Spot.md)"), "{rewritten}");

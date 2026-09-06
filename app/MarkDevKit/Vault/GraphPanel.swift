@@ -90,10 +90,6 @@ public struct GraphPanel: View {
         .onChange(of: current) { _, newCurrent in
             if newCurrent == nil { scope = .whole }
         }
-        .onKeyPress(.escape) {
-            onDismiss()
-            return .handled
-        }
     }
 
     /// Everything the drawn graph depends on. Collapsed into one value so the
@@ -147,6 +143,15 @@ public struct GraphPanel: View {
     }
 
     private var controls: some View {
+        ViewThatFits(in: .horizontal) {
+            regularControls
+            compactControls
+        }
+        .padding(.horizontal, GlassTheme.Spacing.regular)
+        .padding(.vertical, GlassTheme.Spacing.snug)
+    }
+
+    private var regularControls: some View {
         HStack(spacing: GlassTheme.Spacing.snug) {
             Image(systemName: "point.3.filled.connected.trianglepath.dotted")
                 .foregroundStyle(.secondary)
@@ -190,8 +195,48 @@ public struct GraphPanel: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Close graph")
         }
-        .padding(.horizontal, GlassTheme.Spacing.regular)
-        .padding(.vertical, GlassTheme.Spacing.snug)
+    }
+
+    private var compactControls: some View {
+        HStack(spacing: GlassTheme.Spacing.tight) {
+            Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+                .foregroundStyle(.secondary)
+
+            Picker(
+                "Scope",
+                selection: Binding(
+                    get: { Self.resolvedScope(scope, current: current) },
+                    set: { scope = $0 })
+            ) {
+                ForEach(Scope.allCases) { scope in
+                    Text(scope.label).tag(scope)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 180)
+            .disabled(current == nil)
+
+            if Self.resolvedScope(scope, current: current) == .local {
+                Stepper(value: $depth, in: 1...5) {
+                    Text("\(depth)h")
+                        .font(.caption)
+                        .monospacedDigit()
+                }
+                .fixedSize()
+            }
+
+            Spacer(minLength: GlassTheme.Spacing.tight)
+
+            tagFilter
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .controlTarget(Circle(), padding: GlassTheme.Spacing.tight)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close graph")
+        }
     }
 
     private var tagFilter: some View {

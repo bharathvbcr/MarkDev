@@ -131,6 +131,10 @@ public struct TransientPresentationCoordinator: Sendable {
         return true
     }
 
+    public var hidesWorkspaceAccessibility: Bool {
+        active?.presentation.hidesWorkspaceAccessibility ?? false
+    }
+
     /// Presents an overlay or review prompt under the legal priority rules.
     ///
     /// Overlays may replace one another. A protected presentation preempts an

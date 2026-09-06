@@ -340,6 +340,10 @@ struct WorkspaceView: View {
         handleTransientDismissal(transientPresentation.dismiss(active.generation))
     }
 
+    private func dismissEscapeEligibleTransient() {
+        dismissTransient(where: \.dismissesOnEscape)
+    }
+
     private func handleTransientDismissal(
         _ result: TransientPresentationCoordinator.DismissalResult
     ) {
@@ -532,6 +536,7 @@ struct WorkspaceView: View {
 
     private var workspaceWithOverlays: some View {
         workspaceBase
+        .accessibilityHidden(transientPresentation.hidesWorkspaceAccessibility)
         .disabled(transientPresentation.isPerformingDestructiveOperation)
         .overlay {
             if showPalette {
@@ -565,6 +570,7 @@ struct WorkspaceView: View {
                                     .combined(with: .opacity)
                                     .combined(with: .offset(y: -14)))
                 }
+                .accessibilityAddTraits(.isModal)
             }
         }
         .animation(
@@ -633,6 +639,7 @@ struct WorkspaceView: View {
                     .padding(GlassTheme.Spacing.loose)
                     .glassEffect(.regular, in: .rect(cornerRadius: GlassTheme.Radius.large))
                 }
+                .accessibilityAddTraits(.isModal)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(title)
                 .accessibilityIdentifier("workspace.destructive-operation")
@@ -643,6 +650,7 @@ struct WorkspaceView: View {
     var body: some View {
         workspaceWithOverlays
         .coordinateSpace(.named(Self.workspaceSpace))
+        .onExitCommand(perform: dismissEscapeEligibleTransient)
         // Keeps the last real measurement rather than clearing it. Collapsing
         // removes the header, which publishes zero; resetting on that would
         // send the rule back to its fallback and make it visibly slide into
@@ -1137,6 +1145,7 @@ struct WorkspaceView: View {
         .glassEffect(.regular.interactive(), in: .circle)
         .glassEffectID("save", in: glass)
         .help("Save (⌘S)")
+        .accessibilityLabel("Save options")
     }
 
     private var inspectorToggle: some View {
@@ -1244,7 +1253,8 @@ struct WorkspaceView: View {
                     guard let current = workspace.document(in: pane) else { return }
                     handleParse(parsed, text: current.text, document: current.id, pane: pane)
                 },
-                onFollowWikiLink: { followWikiLink($0) },
+                onFollowWikiLink: { followWikiLink($0, in: pane) },
+                onFollowDocumentLink: { followDocumentLink($0, in: pane) },
                 onMount: { surface in
                     let token = editorSurfaces.mount(surface, in: pane)
                     commandSurfaceRevision &+= 1
@@ -2742,7 +2752,7 @@ struct WorkspaceView: View {
     }
 
     /// Follows a `[[wikilink]]` from the editor.
-    private func followWikiLink(_ raw: String) {
+    private func followWikiLink(_ raw: String, in pane: PaneID) {
         let (target, anchor) = Self.splitAnchor(raw)
         guard let resolution = vault.resolve(target: target, anchor: anchor),
             let url = vault.url(for: resolution.path)
@@ -2752,9 +2762,97 @@ struct WorkspaceView: View {
             errorMessage = "No note named “\(target)” in this vault."
             return
         }
-        scheduleFileOpen(url) { pane in
+        scheduleFileOpen(url, in: pane) { opened in
             if let offset = resolution.offset {
-                reveals[pane] = RevealRequest(offset: Int(offset))
+                reveals[opened] = RevealRequest(offset: Int(offset))
+            }
+        }
+    }
+
+    /// Follows a relative Markdown / `file:` link from the editor.
+    private func followDocumentLink(_ raw: String, in pane: PaneID) {
+        guard let documentDirectory = workspace.document(in: pane)?.url?
+            .deletingLastPathComponent()
+        else {
+            errorMessage = "Save this note before following relative links."
+            return
+        }
+
+        let (target, anchor) = Self.splitAnchor(raw)
+        let destination: URL
+        if target.hasPrefix("/") {
+            // Either a `file:` absolute path inside the vault, or Obsidian's
+            // vault-root-relative `/docs/note.md`. Prefer an in-vault absolute
+            // hit; otherwise resolve from the vault root.
+            let absolute = URL(fileURLWithPath: target).standardizedFileURL
+            if vault.relativePath(for: absolute) != nil {
+                destination = absolute
+            } else if let root = vault.root {
+                let relative = String(target.drop(while: { $0 == "/" }))
+                destination = root.appendingPathComponent(relative).standardizedFileURL
+            } else {
+                errorMessage = "That link points outside this vault."
+                return
+            }
+        } else {
+            destination = URL(fileURLWithPath: target, relativeTo: documentDirectory)
+                .standardizedFileURL
+        }
+
+        guard vault.relativePath(for: destination) != nil else {
+            errorMessage = "That link points outside this vault."
+            return
+        }
+
+        let sourcePath = workspace.document(in: pane).flatMap { document in
+            document.url.flatMap { vault.relativePath(for: $0) }
+        }
+
+        workspaceIOTasks.cancel(.documentBatch(pane))
+        workspaceIOTasks.cancel(.editorDrop(pane))
+        workspaceIOLifecycle.invalidate(.documentBatch(pane))
+        workspaceIOLifecycle.invalidate(.editorDrop(pane))
+        workspaceIOLifecycle.invalidate(.sessionRestore)
+        workspaceIOTasks.cancel(.sessionRestore)
+        workspaceIOTasks.launch(in: .documentOpen(pane), priority: .userInitiated) {
+            let entry: WorkspaceLocalEntryKind?
+            do {
+                entry = try await workspace.classifyLocalEntry(at: destination)
+            } catch {
+                errorMessage = "That file could not be opened."
+                return
+            }
+
+            let kind: DocumentLinkOpenKind
+            switch entry {
+            case .some(.directory):
+                kind = .classify(isDirectory: true, isRegularFile: false, isMarkdown: false)
+            case .some(.regularFile):
+                kind = .classify(
+                    isDirectory: false,
+                    isRegularFile: true,
+                    isMarkdown: FileTree.isMarkdown(destination))
+            case .some(.unsupported), .none:
+                kind = .missing
+            }
+
+            switch kind {
+            case .markdownNote:
+                let result = await openFile(destination, in: pane)
+                guard result.didOpen else { return }
+                guard let anchor, !anchor.isEmpty, let sourcePath else { return }
+                if let resolution = vault.resolve(
+                    from: sourcePath, target: target, anchor: anchor),
+                    let offset = resolution.offset
+                {
+                    reveals[pane] = RevealRequest(offset: Int(offset))
+                }
+            case .directory:
+                NSWorkspace.shared.activateFileViewerSelecting([destination])
+            case .otherFile:
+                NSWorkspace.shared.open(destination)
+            case .missing:
+                errorMessage = "No such file: \(destination.lastPathComponent)"
             }
         }
     }

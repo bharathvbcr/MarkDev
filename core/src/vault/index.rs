@@ -6,7 +6,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::note::Note;
+use super::note::{
+    has_url_scheme, percent_decode_once, strip_markdown_extension, Note, NoteLinkKind, WikiLink,
+};
 use super::search::SearchIndex;
 
 /// A link pointing at a note, with the line it came from.
@@ -318,11 +320,7 @@ impl Vault {
             }
             // The relative path without its extension also resolves, so
             // `[[Projects/Roadmap]]` works alongside `[[Roadmap]]`.
-            let without_extension = note
-                .path
-                .rsplit_once('.')
-                .map(|(head, _)| head.to_string())
-                .unwrap_or_else(|| note.path.clone());
+            let without_extension = strip_markdown_extension(&note.path).to_string();
             self.by_name
                 .entry(without_extension.to_lowercase())
                 .or_default()
@@ -336,7 +334,7 @@ impl Vault {
         self.backlinks.clear();
         for (source_index, note) in self.notes.iter().enumerate() {
             for (link_index, link) in note.links.iter().enumerate() {
-                if let Some(target) = self.lookup(&link.target) {
+                if let Some(target) = self.resolve_link_index(&note.path, link) {
                     self.backlinks
                         .entry(target)
                         .or_default()
@@ -348,7 +346,7 @@ impl Vault {
         self.search = SearchIndex::build(&self.notes);
     }
 
-    /// Index of the note a link target names.
+    /// Index of the note a wiki / name target names.
     ///
     /// Ambiguity resolves to the shallowest path, then alphabetically — the
     /// same rule Obsidian uses, so a vault moved between the two behaves the
@@ -370,10 +368,62 @@ impl Vault {
         })
     }
 
+    /// Source-relative resolution for a Markdown note destination.
+    ///
+    /// No global stem fallback: `[x](CONTRIBUTING.md)` from `docs/` does not
+    /// open root `CONTRIBUTING.md` when the sibling is missing.
+    pub(crate) fn lookup_from(&self, from_path: &str, target: &str) -> Option<usize> {
+        let key = normalize_markdown_target(from_path, target)?;
+        // `by_name` holds the path-without-extension spelling registered in
+        // `reindex`, which is exactly this key for a vault-relative path.
+        let candidates = self.by_name.get(&key)?;
+        if key.contains('/') {
+            // A path-shaped key must name that path, not a same-stem note
+            // elsewhere that also answered to a shorter name.
+            candidates.iter().copied().find(|&index| {
+                strip_markdown_extension(&self.notes[index].path).eq_ignore_ascii_case(&key)
+            })
+        } else {
+            candidates.iter().copied().min_by_key(|&index| {
+                let path = &self.notes[index].path;
+                (path.matches('/').count(), path.clone())
+            })
+        }
+    }
+
+    /// Resolves one indexed link under the rules for its kind.
+    pub(crate) fn resolve_link_index(&self, source_path: &str, link: &WikiLink) -> Option<usize> {
+        match link.kind {
+            NoteLinkKind::Wiki => self.lookup(&link.target),
+            NoteLinkKind::Markdown => self.lookup_from(source_path, &link.target),
+        }
+    }
+
+    /// Resolves a link the same way backlinks, the graph, and `links()` do.
+    pub fn resolve_link(&self, source_path: &str, link: &WikiLink) -> Option<Resolution> {
+        let index = self.resolve_link_index(source_path, link)?;
+        self.resolution_at(index, link.anchor.as_deref())
+    }
+
     /// Resolves a `[[wikilink]]` target, with its heading anchor if any.
     pub fn resolve(&self, target: &str, anchor: Option<&str>) -> Option<Resolution> {
         let index = self.lookup(target)?;
-        let note = &self.notes[index];
+        self.resolution_at(index, anchor)
+    }
+
+    /// Resolves a Markdown destination relative to `from_path`.
+    pub fn resolve_from(
+        &self,
+        from_path: &str,
+        target: &str,
+        anchor: Option<&str>,
+    ) -> Option<Resolution> {
+        let index = self.lookup_from(from_path, target)?;
+        self.resolution_at(index, anchor)
+    }
+
+    fn resolution_at(&self, index: usize, anchor: Option<&str>) -> Option<Resolution> {
+        let note = self.notes.get(index)?;
         let offset = anchor.and_then(|anchor| {
             note.headings
                 .iter()
@@ -394,6 +444,7 @@ impl Vault {
         let Some(&index) = self.by_path.get(path) else {
             return Vec::new();
         };
+        let source_path = &self.notes[index].path;
         self.notes[index]
             .links
             .iter()
@@ -404,7 +455,7 @@ impl Vault {
                 line: link.line,
                 offset: link.offset,
                 path: self
-                    .lookup(&link.target)
+                    .resolve_link_index(source_path, link)
                     .map(|target| self.notes[target].path.clone()),
             })
             .collect()
@@ -516,7 +567,7 @@ impl Vault {
         let mut broken = Vec::new();
         for note in &self.notes {
             for link in &note.links {
-                if self.lookup(&link.target).is_none() {
+                if self.resolve_link_index(&note.path, link).is_none() {
                     broken.push((note.path.clone(), link.target.clone()));
                 }
             }
@@ -752,6 +803,73 @@ fn is_markdown(path: &Path) -> bool {
             .as_deref(),
         Some("md" | "markdown" | "mdown" | "mdx" | "mkd")
     )
+}
+
+/// Folds a Markdown destination into a vault-relative key without extension.
+///
+/// Leading `/` is vault-root-relative. `..` that would leave the vault is
+/// refused. Schemes, protocol-relative URLs, bare anchors, and empty paths
+/// are refused.
+pub(crate) fn normalize_markdown_target(from_path: &str, target: &str) -> Option<String> {
+    let decoded = percent_decode_once(target);
+    let trimmed = decoded.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+        return None;
+    }
+    if has_url_scheme(trimmed) {
+        return None;
+    }
+    let path_part = trimmed
+        .split_once('#')
+        .map(|(path, _)| path)
+        .unwrap_or(trimmed)
+        .trim();
+    if path_part.is_empty() {
+        return None;
+    }
+
+    let (base_dir, relative) = if let Some(rest) = path_part.strip_prefix('/') {
+        ("", rest.trim_start_matches('/'))
+    } else {
+        let relative = path_part.trim_start_matches("./");
+        (parent_dir(from_path), relative)
+    };
+    if relative.is_empty() {
+        return None;
+    }
+
+    let folded = fold_vault_path(base_dir, relative)?;
+    let without_extension = strip_markdown_extension(&folded);
+    if without_extension.is_empty() {
+        return None;
+    }
+    Some(without_extension.to_lowercase())
+}
+
+fn parent_dir(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((parent, _)) => parent,
+        None => "",
+    }
+}
+
+/// Joins `relative` onto `base_dir` while folding `.` / `..`. Climbing above
+/// the vault root returns `None`.
+fn fold_vault_path(base_dir: &str, relative: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if !base_dir.is_empty() {
+        parts.extend(base_dir.split('/').filter(|part| !part.is_empty()));
+    }
+    for component in relative.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 #[cfg(all(test, target_os = "macos"))]

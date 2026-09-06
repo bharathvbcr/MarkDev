@@ -839,7 +839,6 @@ public struct NavigatorView: View {
                 }
                 .focusable()
                 .focused($listFocused)
-                .focusEffectDisabled()
                 .onKeyPress(.downArrow) { moveSelection(by: 1, in: rows) }
                 .onKeyPress(.upArrow) { moveSelection(by: -1, in: rows) }
                 .onKeyPress(.rightArrow) { setExpansion(true) }

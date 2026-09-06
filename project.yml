@@ -266,6 +266,7 @@ targets:
       - path: app/MarkDevKit/Editor/HTMLImageTag.swift
       - path: app/MarkDevKit/Editor/HiddenRanges.swift
       - path: app/MarkDevKit/Editor/LaTeXNormalizer.swift
+      - path: app/MarkDevKit/Editor/LinkClick.swift
       - path: app/MarkDevKit/Editor/MarkdownLayoutFragment.swift
       - path: app/MarkDevKit/Editor/MarkdownStyler.swift
       - path: app/MarkDevKit/Editor/MarkdownTextView.swift

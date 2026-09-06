@@ -580,6 +580,124 @@ fn non_ascii_titles_and_links_work() {
     assert_eq!(vault.backlinks("Café.md").len(), 1);
 }
 
+// MARK: - Markdown note links
+
+#[test]
+fn markdown_links_to_notes_are_indexed() {
+    let note = Note::parse(
+        "README.md",
+        "[Conduct](./CODE_OF_CONDUCT.md) and [Arch](./docs/architecture.md)\n",
+    );
+    assert_eq!(note.links.len(), 2);
+    assert_eq!(note.links[0].target, "./CODE_OF_CONDUCT.md");
+    assert_eq!(note.links[0].kind, markdev::vault::NoteLinkKind::Markdown);
+    assert_eq!(note.links[1].target, "./docs/architecture.md");
+}
+
+#[test]
+fn non_note_markdown_destinations_are_not_indexed() {
+    let note = Note::parse(
+        "README.md",
+        "[docs](./docs) [license](./LICENSE) [web](https://example.com) [here](#only) [mail](mailto:a@b.c)\n",
+    );
+    // LICENSE and docs have no markdown extension; http/mailto are schemes;
+    // a bare # is refused. Autolinks are a different LinkType.
+    assert!(note.links.is_empty(), "unexpected links: {:?}", note.links);
+}
+
+#[test]
+fn percent_encoded_markdown_destinations_decode_once() {
+    let note = Note::parse("a.md", "[x](./My%20Note.md)\n");
+    assert_eq!(note.links.len(), 1);
+    assert_eq!(note.links[0].target, "./My Note.md");
+}
+
+#[test]
+fn markdown_links_resolve_source_relative_not_globally() {
+    let vault = vault(&[
+        ("architecture.md", "# Root\n"),
+        ("docs/getting-started.md", "[x](architecture.md)\n"),
+        ("docs/architecture.md", "# Nested\n"),
+    ]);
+    let resolved = vault
+        .resolve_from("docs/getting-started.md", "architecture.md", None)
+        .expect("sibling");
+    assert_eq!(resolved.path, "docs/architecture.md");
+
+    // Same spelling from a different folder is a different note.
+    let from_root = vault
+        .resolve_from("README.md", "architecture.md", None)
+        .expect("root");
+    assert_eq!(from_root.path, "architecture.md");
+}
+
+#[test]
+fn markdown_links_do_not_fall_back_to_a_global_name() {
+    let vault = vault(&[
+        ("CONTRIBUTING.md", "# Root\n"),
+        ("docs/guide.md", "[x](CONTRIBUTING.md)\n"),
+    ]);
+    assert!(
+        vault
+            .resolve_from("docs/guide.md", "CONTRIBUTING.md", None)
+            .is_none(),
+        "a missing sibling must not open the root note"
+    );
+    assert_eq!(
+        vault.links("docs/guide.md")[0].path,
+        None,
+        "links() must agree"
+    );
+    assert!(vault
+        .broken_links()
+        .iter()
+        .any(|(path, target)| path == "docs/guide.md" && target == "CONTRIBUTING.md"));
+}
+
+#[test]
+fn vault_root_relative_markdown_links_and_parent_fold() {
+    let vault = vault(&[
+        ("Welcome.md", "# W\n"),
+        ("docs/architecture.md", "# A\n"),
+        (
+            "docs/guide.md",
+            "[root](/docs/architecture.md) [up](../Welcome.md)\n",
+        ),
+    ]);
+    assert_eq!(
+        vault
+            .resolve_from("docs/guide.md", "/docs/architecture.md", None)
+            .map(|r| r.path),
+        Some("docs/architecture.md".into())
+    );
+    assert_eq!(
+        vault
+            .resolve_from("docs/guide.md", "../Welcome.md", None)
+            .map(|r| r.path),
+        Some("Welcome.md".into())
+    );
+    assert!(
+        vault
+            .resolve_from("docs/guide.md", "../../Outside.md", None)
+            .is_none(),
+        "climbing out of the vault is refused"
+    );
+}
+
+#[test]
+fn markdown_backlinks_and_graph_agree_with_resolution() {
+    let vault = vault(&[
+        ("README.md", "[Arch](./docs/architecture.md)\n"),
+        ("docs/architecture.md", "# A\n"),
+    ]);
+    assert_eq!(
+        vault.links("README.md")[0].path.as_deref(),
+        Some("docs/architecture.md")
+    );
+    assert_eq!(vault.backlinks("docs/architecture.md").len(), 1);
+    assert!(vault.broken_links().is_empty());
+}
+
 #[test]
 fn reading_a_real_directory_indexes_it() {
     let root = std::env::temp_dir().join(format!("markdev-vault-{}", std::process::id()));

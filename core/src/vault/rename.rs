@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::index::{validated_relative_path, Vault, DEFAULT_MAX_NOTE_BYTES};
-use super::note::stem;
+use super::note::{has_markdown_extension, stem, strip_markdown_extension};
 use crate::md::model::{BlockKind, SpanKind, Utf16Mapper};
 use crate::md::parse_checked;
 
@@ -222,8 +222,12 @@ impl Vault {
                     Some(new_path.clone())
                 }
             };
+            let source_note_path = note.path.clone();
             let mut resolve_markdown = |written: &str| -> Option<String> {
-                if self.lookup(written) != Some(source_index) {
+                // Same source-relative rules as the index — never a global
+                // name lookup that would rewrite a sibling path into a
+                // different note's spelling.
+                if self.lookup_from(&source_note_path, written) != Some(source_index) {
                     return None;
                 }
                 Some(new_path.clone())
@@ -399,12 +403,9 @@ fn reject_symlinked_components(
     Ok(())
 }
 
-/// `a/b/name.md` becomes `a/b/name`; a path with no extension is unchanged.
+/// `a/b/name.md` becomes `a/b/name`; non-markdown extensions are kept.
 fn without_extension(path: &str) -> String {
-    path.rsplit_once('.')
-        .map(|(head, _)| head)
-        .unwrap_or(path)
-        .to_string()
+    strip_markdown_extension(path).to_string()
 }
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -735,16 +736,20 @@ fn rewrite_markdown_targets(
         // Anchors ride along, exactly as they do in wikilinks.
         let cut = trimmed.find('#').unwrap_or(trimmed.len());
         let (target, anchor) = trimmed.split_at(cut);
-        let had_suffix = target.ends_with(".md");
-        let candidate = if had_suffix {
-            &target[..target.len() - 3]
-        } else {
-            target
-        };
+        let target = target.trim();
+        // Ask with the written spelling (extension included). The callback
+        // owns source-relative lookup; this pass only preserves the suffix
+        // the reader wrote.
+        let written_extension = trailing_markdown_extension(target);
 
-        if let Some(mut replacement) = markdown(candidate.trim()) {
-            if had_suffix {
-                replacement.push_str(".md");
+        if let Some(mut replacement) = markdown(target) {
+            // Replacements come back without an extension (vault path stems).
+            // Put back whatever suffix the link used, so `.mdx` stays `.mdx`.
+            if let Some(extension) = written_extension {
+                if !has_markdown_extension(&replacement) {
+                    replacement.push('.');
+                    replacement.push_str(extension);
+                }
             }
             result.push_str(&replacement);
             result.push_str(anchor);
@@ -759,6 +764,15 @@ fn rewrite_markdown_targets(
     result.push_str(&source[cursor.min(source.len())..]);
 
     (result, rewritten)
+}
+
+fn trailing_markdown_extension(path: &str) -> Option<&str> {
+    let stripped = strip_markdown_extension(path);
+    if stripped.len() == path.len() {
+        None
+    } else {
+        Some(&path[stripped.len() + 1..])
+    }
 }
 
 #[cfg(test)]

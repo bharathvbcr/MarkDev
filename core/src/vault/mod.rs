@@ -11,4 +11,4 @@ pub use index::{
     Backlink, OutgoingLink, Resolution, SearchHit, TagCount, UnlinkedMention, Vault,
     VaultScanLimits, VaultScanStatus, DEFAULT_MAX_NOTE_BYTES, DEFAULT_MAX_VAULT_BYTES,
 };
-pub use note::{Heading, Note, WikiLink};
+pub use note::{Heading, Note, NoteLinkKind, WikiLink};

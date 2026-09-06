@@ -895,6 +895,35 @@ pub unsafe extern "C" fn md_vault_resolve(
     handle.serve(&value)
 }
 
+/// JSON object resolving a Markdown destination relative to `from_path`.
+///
+/// Source-relative only — no vault-wide name fallback. `anchor` may be null.
+///
+/// # Safety
+///
+/// `handle` must be live; `from_path` and `target` must be NUL-terminated
+/// UTF-8. `anchor` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn md_vault_resolve_from(
+    handle: *mut VaultHandle,
+    from_path: *const c_char,
+    target: *const c_char,
+    anchor: *const c_char,
+) -> *const c_char {
+    let (Some(handle), Some(from_path), Some(target)) = (
+        handle.as_mut(),
+        read_bounded_str(from_path, VAULT_MAX_PATH_BYTES),
+        read_bounded_str(target, VAULT_MAX_QUERY_BYTES),
+    ) else {
+        return ptr::null();
+    };
+    let Ok(anchor) = read_optional_bounded_str(anchor, VAULT_MAX_QUERY_BYTES) else {
+        return ptr::null();
+    };
+    let value = handle.vault.resolve_from(from_path, target, anchor);
+    handle.serve(&value)
+}
+
 /// JSON array of every note path in the vault.
 ///
 /// # Safety

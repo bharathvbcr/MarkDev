@@ -207,6 +207,13 @@ public final class MarkdownTextView: ScrollingTextView {
     /// Called with a `[[wikilink]]` target when one is clicked.
     public var onFollowWikiLink: ((String) -> Void)?
 
+    /// Called with a relative Markdown / `file:` destination when one is clicked.
+    ///
+    /// Always invoked (even when nil handlers are wired) from the click path
+    /// so Peek and Quick Look swallow the event instead of handing a
+    /// scheme-less URL to Launch Services.
+    public var onFollowDocumentLink: ((String) -> Void)?
+
     /// Called when the selection changes, passing word and character counts of the selection.
     public var onSelectionStatsChanged: ((Int, Int) -> Void)?
 
@@ -1436,7 +1443,7 @@ public final class MarkdownTextView: ScrollingTextView {
 
     // MARK: - Overrides
 
-    /// Follows a wikilink, footnote reference, or in-document anchor jump.
+    /// Follows a wikilink, footnote, in-document heading, or local document link.
     public override func clicked(onLink link: Any, at charIndex: Int) {
         let url: URL? =
             (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
@@ -1445,27 +1452,20 @@ public final class MarkdownTextView: ScrollingTextView {
             return
         }
 
-        if url.scheme == MarkdownStyler.wikiLinkScheme {
-            let target = (url.host(percentEncoded: false) ?? url.absoluteString)
-                .replacingOccurrences(of: "\(MarkdownStyler.wikiLinkScheme)://", with: "")
-            onFollowWikiLink?(target.removingPercentEncoding ?? target)
-            return
+        switch LinkClick.classify(url) {
+        case .wiki(let target):
+            onFollowWikiLink?(target)
+        case .footnote(let target):
+            jumpToFootnote(target, from: charIndex)
+        case .heading(let anchor):
+            _ = jumpToHeading(anchor: anchor)
+        case .document(let destination):
+            // Always return — a nil handler (Peek / Quick Look) must not fall
+            // through to NSWorkspace with a scheme-less URL (-50).
+            onFollowDocumentLink?(destination)
+        case .external:
+            super.clicked(onLink: link, at: charIndex)
         }
-
-        if url.scheme == MarkdownStyler.footnoteScheme {
-            let target = (url.host(percentEncoded: false) ?? url.absoluteString)
-                .replacingOccurrences(of: "\(MarkdownStyler.footnoteScheme)://", with: "")
-            jumpToFootnote(target.removingPercentEncoding ?? target, from: charIndex)
-            return
-        }
-
-        let linkStr = url.absoluteString
-        if linkStr.hasPrefix("#") || url.scheme == nil {
-            let anchor = linkStr.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
-            if jumpToHeading(anchor: anchor) { return }
-        }
-
-        super.clicked(onLink: link, at: charIndex)
     }
 
     /// Scrolls to the definition of a footnote `[^ref]`, or back from definition to reference.
