@@ -3,10 +3,19 @@
 //! The header is generated rather than hand-written so the struct layouts
 //! Swift reads can never drift from the Rust definitions — a drift that would
 //! show up as silently misaligned text ranges rather than a build error.
-
-use std::path::PathBuf;
+//!
+//! Gated on the `ffi` feature so library consumers (GitPulse) that disable
+//! default features do not need cbindgen and do not mutate a vendored tree.
 
 fn main() {
+    #[cfg(feature = "ffi")]
+    generate_header();
+}
+
+#[cfg(feature = "ffi")]
+fn generate_header() {
+    use std::path::PathBuf;
+
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = crate_dir.join("include").join("markdev.h");
 

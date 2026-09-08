@@ -6,6 +6,10 @@ Welcome to the technical documentation for **MarkDev**. This documentation provi
 
 ## Table of Contents
 
+- [Embed the Rust Core](./core-integration.md)
+  - Parser, highlighting and C ABI feature selection
+  - Host dependency replacement and the CI feature matrix
+
 - [Getting Started & Setup](./getting-started.md)
   - System prerequisites and toolchain requirements
   - Building debug and release binaries with `just`

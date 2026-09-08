@@ -63,6 +63,13 @@ build-core-debug:
 test-core:
     cd core && cargo test --locked
 
+# Exercise every optional-library configuration used by embedding hosts.
+# Default ffi+highlight is covered by test-core; these cover the other three.
+test-core-features:
+    cd core && cargo test --locked --no-default-features
+    cd core && cargo test --locked --no-default-features --features highlight
+    cd core && cargo test --locked --no-default-features --features ffi
+
 lint-core:
     cd core && cargo clippy --locked --all-targets -- -D warnings
 
@@ -285,7 +292,7 @@ clean:
 check: test-release fmt-check lint-core test
 
 # Run full CI suite locally (matches GitHub Actions CI workflow)
-ci-core: verify-core-toolchain test-release fmt-check lint-core test-core build-core
+ci-core: verify-core-toolchain test-release fmt-check lint-core test-core test-core-features build-core
     host_target=$(rustc -vV | awk -F': ' '/^host:/ {print $2}') && cd core && cargo test --locked --release --target "$host_target" --test performance
 
 verify-core-toolchain:

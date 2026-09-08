@@ -22,6 +22,7 @@
 use std::ffi::{c_char, CString};
 use std::ptr;
 
+#[cfg(feature = "highlight")]
 use crate::highlight::{
     highlight_checked, supports_checked, HighlightSpan, MAX_HIGHLIGHT_CODE_BYTES,
     MAX_HIGHLIGHT_LANGUAGE_BYTES,
@@ -989,9 +990,10 @@ pub unsafe extern "C" fn md_vault_graph(
 }
 
 // ---------------------------------------------------------------------------
-// Syntax highlighting
+// Syntax highlighting (requires the `highlight` feature)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "highlight")]
 /// Owns one code block's highlight spans.
 ///
 /// Flat buffers rather than JSON: highlighting runs per code block on every
@@ -1009,6 +1011,7 @@ pub struct HighlightHandle {
 ///
 /// Each non-null pointer must address at least its corresponding length.
 /// Null is accepted only with a zero length.
+#[cfg(feature = "highlight")]
 #[no_mangle]
 pub unsafe extern "C" fn md_highlight(
     language: *const u8,
@@ -1035,6 +1038,7 @@ pub unsafe extern "C" fn md_highlight(
 /// # Safety
 ///
 /// `handle` must come from [`md_highlight`] and must not be used after.
+#[cfg(feature = "highlight")]
 #[no_mangle]
 pub unsafe extern "C" fn md_highlight_free(handle: *mut HighlightHandle) {
     if !handle.is_null() {
@@ -1047,6 +1051,7 @@ pub unsafe extern "C" fn md_highlight_free(handle: *mut HighlightHandle) {
 /// # Safety
 ///
 /// `handle` must be live and `count` writable.
+#[cfg(feature = "highlight")]
 #[no_mangle]
 pub unsafe extern "C" fn md_highlight_spans(
     handle: *const HighlightHandle,
@@ -1069,6 +1074,7 @@ pub unsafe extern "C" fn md_highlight_spans(
 ///
 /// `language` must address `language_len` readable bytes. Null is accepted
 /// only with a zero length.
+#[cfg(feature = "highlight")]
 #[no_mangle]
 pub unsafe extern "C" fn md_highlight_supports(language: *const u8, language_len: usize) -> u8 {
     match read_bounded_bytes(language, language_len, MAX_HIGHLIGHT_LANGUAGE_BYTES) {
@@ -1483,6 +1489,7 @@ mod tests {
         assert_eq!(status.skipped_files, 0);
     }
 
+    #[cfg(feature = "highlight")]
     #[test]
     fn highlighting_round_trips_across_the_ffi() {
         let language = b"rust";
@@ -1509,6 +1516,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "highlight")]
     #[test]
     fn highlighting_handles_unknown_languages_and_null() {
         let unknown = b"klingon";

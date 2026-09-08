@@ -258,6 +258,7 @@ For in-depth architecture explanations and engineering guides, visit the [`docs/
 
 - [Getting Started & Build Setup](./docs/getting-started.md)
 - [Architecture & FFI Boundary](./docs/architecture.md)
+- [Embed the Rust Core](./docs/core-integration.md)
 - [Editor Engine & TextKit 2 Pipeline](./docs/editor-engine.md)
 - [Vault Indexing & Graph Algorithm](./docs/vault-and-graph.md)
 - [Performance Budgets & Benchmarking](./docs/performance.md)
