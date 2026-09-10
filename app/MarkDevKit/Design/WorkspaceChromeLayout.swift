@@ -9,7 +9,7 @@ import CoreGraphics
 import Foundation
 
 /// Which optional panel keeps its place when only one fits beside the editor.
-public enum WorkspaceNarrowPanelPreference: Equatable, Sendable {
+public enum WorkspaceNarrowPanelPreference: String, Equatable, Sendable {
     case sidebar
     case inspector
 }
@@ -60,11 +60,6 @@ public struct WorkspaceChromeLayout: Equatable, Sendable {
             + GlassTheme.inspector.minimum
             + editorMinimum
             + 2 * GlassTheme.dividerHitWidth
-        let sidebarOnlyCost =
-            sidebarPreferred + editorMinimum + GlassTheme.dividerHitWidth
-        let inspectorOnlyCost =
-            GlassTheme.inspector.minimum + editorMinimum + GlassTheme.dividerHitWidth
-
         if wantsSidebar, wantsInspector, width >= bothCost {
             let preferredCost =
                 sidebarPreferred + inspectorPreferred + editorMinimum
@@ -90,95 +85,33 @@ public struct WorkspaceChromeLayout: Equatable, Sendable {
             return
         }
 
-        if wantsSidebar, wantsInspector {
-            // Only one panel fits (or neither). Honour the narrow preference.
-            switch preferredNarrowPanel {
-            case .sidebar:
-                if width >= sidebarOnlyCost {
-                    showsSidebar = true
-                    showsInspector = false
-                    sidebarWidth = sidebarPreferred
-                    inspectorWidth = 0
-                    editorWidth = max(
-                        editorMinimum,
-                        width - sidebarPreferred - GlassTheme.dividerHitWidth)
-                    return
-                }
-                if width >= inspectorOnlyCost {
-                    let inspector = min(
-                        inspectorPreferred,
-                        width - editorMinimum - GlassTheme.dividerHitWidth)
-                    showsSidebar = false
-                    showsInspector = true
-                    sidebarWidth = 0
-                    inspectorWidth = GlassTheme.inspector.clamping(inspector)
-                    editorWidth = max(
-                        editorMinimum,
-                        width - inspectorWidth - GlassTheme.dividerHitWidth)
-                    return
-                }
-            case .inspector:
-                let inspectorFit = width - editorMinimum - GlassTheme.dividerHitWidth
-                if inspectorFit >= GlassTheme.inspector.minimum {
-                    let inspector = min(inspectorPreferred, inspectorFit)
-                    showsSidebar = false
-                    showsInspector = true
-                    sidebarWidth = 0
-                    inspectorWidth = GlassTheme.inspector.clamping(inspector)
-                    editorWidth = max(
-                        editorMinimum,
-                        width - inspectorWidth - GlassTheme.dividerHitWidth)
-                    return
-                }
-                if width >= sidebarOnlyCost {
-                    showsSidebar = true
-                    showsInspector = false
-                    sidebarWidth = sidebarPreferred
-                    inspectorWidth = 0
-                    editorWidth = max(
-                        editorMinimum,
-                        width - sidebarPreferred - GlassTheme.dividerHitWidth)
-                    return
-                }
-            }
-            showsSidebar = false
+        // A single visible panel uses the same fit rule whether the other
+        // panel is unwanted or temporarily collapsed. Testing the sidebar's
+        // preferred width here used to hide it even when its minimum fit,
+        // defeating Show Saved Vaults on a constrained screen.
+        let panelSpace = width - editorMinimum - GlassTheme.dividerHitWidth
+        let sidebarFits = wantsSidebar && panelSpace >= GlassTheme.sidebar.minimum
+        let inspectorFits = wantsInspector && panelSpace >= GlassTheme.inspector.minimum
+        if sidebarFits && (!inspectorFits || preferredNarrowPanel == .sidebar) {
+            showsSidebar = true
             showsInspector = false
-            sidebarWidth = 0
+            sidebarWidth = min(sidebarPreferred, panelSpace)
             inspectorWidth = 0
-            editorWidth = width
+            editorWidth = max(
+                editorMinimum,
+                width - sidebarWidth - GlassTheme.dividerHitWidth)
             return
         }
 
-        if wantsSidebar {
-            if width >= GlassTheme.sidebar.minimum + editorMinimum + GlassTheme.dividerHitWidth {
-                let sidebar = min(
-                    sidebarPreferred,
-                    width - editorMinimum - GlassTheme.dividerHitWidth)
-                showsSidebar = true
-                showsInspector = false
-                sidebarWidth = GlassTheme.sidebar.clamping(sidebar)
-                inspectorWidth = 0
-                editorWidth = max(
-                    editorMinimum,
-                    width - sidebarWidth - GlassTheme.dividerHitWidth)
-                return
-            }
-        }
-
-        if wantsInspector {
-            if width >= GlassTheme.inspector.minimum + editorMinimum + GlassTheme.dividerHitWidth {
-                let inspector = min(
-                    inspectorPreferred,
-                    width - editorMinimum - GlassTheme.dividerHitWidth)
-                showsSidebar = false
-                showsInspector = true
-                sidebarWidth = 0
-                inspectorWidth = GlassTheme.inspector.clamping(inspector)
-                editorWidth = max(
-                    editorMinimum,
-                    width - inspectorWidth - GlassTheme.dividerHitWidth)
-                return
-            }
+        if inspectorFits {
+            showsSidebar = false
+            showsInspector = true
+            sidebarWidth = 0
+            inspectorWidth = min(inspectorPreferred, panelSpace)
+            editorWidth = max(
+                editorMinimum,
+                width - inspectorWidth - GlassTheme.dividerHitWidth)
+            return
         }
 
         showsSidebar = false

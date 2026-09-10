@@ -20,7 +20,8 @@ final class CommandAvailabilityTests: XCTestCase {
         hasTextSelection: Bool = true,
         hasProofreadingMarks: Bool = true,
         canRevealHarnessTerminal: Bool = true,
-        isPerformingDestructiveOperation: Bool = false
+        isPerformingDestructiveOperation: Bool = false,
+        canSaveVault: Bool = false
     ) -> CommandAvailability {
         CommandAvailability(
             hasFocusedPane: hasFocusedPane,
@@ -32,7 +33,17 @@ final class CommandAvailabilityTests: XCTestCase {
             hasTextSelection: hasTextSelection,
             hasProofreadingMarks: hasProofreadingMarks,
             canRevealHarnessTerminal: canRevealHarnessTerminal,
-            isPerformingDestructiveOperation: isPerformingDestructiveOperation)
+            isPerformingDestructiveOperation: isPerformingDestructiveOperation,
+            canSaveVault: canSaveVault)
+    }
+
+    func testSavingVaultsRequiresAnUnsavedOpenVaultAndViewingWorksWithoutADocument() {
+        XCTAssertFalse(availability().allows(.saveVault))
+        XCTAssertTrue(availability(hasDocument: false, canSaveVault: true).allows(.saveVault))
+        XCTAssertTrue(availability(hasDocument: false).allows(.showSavedVaults))
+        let busy = availability(isPerformingDestructiveOperation: true, canSaveVault: true)
+        XCTAssertFalse(busy.allows(.saveVault))
+        XCTAssertFalse(busy.allows(.showSavedVaults))
     }
 
     func testNoDocumentDisablesOnlyCommandsThatNeedDocumentAuthority() {
@@ -133,7 +144,7 @@ final class CommandAvailabilityTests: XCTestCase {
     func testDestructiveOperationRejectsEveryWorkspaceActionAndPaletteFile() {
         let state = availability(isPerformingDestructiveOperation: true)
         for action in [
-            CommandAction.newDocument, .openFile, .openVault, .save, .saveAs,
+            CommandAction.newDocument, .openFile, .openVault, .saveVault, .showSavedVaults, .save, .saveAs,
             .toggleCommandPalette, .toggleSidebar, .toggleInspector, .toggleTerminal,
             .toggleGraph, .splitRight, .splitDown, .closePane, .focusNextPane,
             .focusPreviousPane, .setMode(.source), .writingTools, .proofreadDocument,

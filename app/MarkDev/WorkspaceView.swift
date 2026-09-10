@@ -22,11 +22,13 @@ struct WorkspaceView: View {
     }
 
     @State private var workspace = Workspace()
+    @State private var savedVaults = SavedVaultStore.shared
     @State private var workspaceIOLifecycle = WorkspaceIOLifecycle()
     @State private var workspaceIOTasks = WorkspaceIOTaskBag()
     @State private var closeReviews = CloseReviewCoordinator()
     @State private var autosaveSuspensions = AutosaveSuspensionGate()
     @State private var transientPresentation = TransientPresentationCoordinator()
+    @State private var focusRestorer = WindowFocusRestorer()
     @State private var dropTargetPane: PaneID?
 
     // Shell preferences outlive the window. Resizing the navigator or picking
@@ -34,7 +36,10 @@ struct WorkspaceView: View {
     // document in front of them, and making them re-make it at every launch
     // is the whole reason chrome settings feel disposable.
     @AppStorage("shell.showSidebar") private var showSidebar = true
+    @AppStorage("shell.showSavedVaults") private var showSavedVaults = true
     @AppStorage("shell.showInspector") private var showInspector = true
+    @AppStorage("shell.preferredNarrowPanel") private var preferredNarrowPanel:
+        WorkspaceNarrowPanelPreference = .sidebar
     @AppStorage(EditorPreferences.Key.mode)
     private var mode: EditorMode = EditorPreferences.defaultMode
     @AppStorage(EditorPreferences.Key.themePreset)
@@ -66,6 +71,17 @@ struct WorkspaceView: View {
 
     private var inspectorWidth: CGFloat {
         GlassTheme.inspector.clamping(CGFloat(storedInspectorWidth))
+    }
+
+    private func chromeLayout(for availableWidth: CGFloat) -> WorkspaceChromeLayout {
+        WorkspaceChromeLayout(
+            availableWidth: availableWidth,
+            layout: workspace.layout,
+            wantsSidebar: showSidebar,
+            wantsInspector: showInspector,
+            preferredNarrowPanel: preferredNarrowPanel,
+            sidebarWidth: sidebarWidth,
+            inspectorWidth: inspectorWidth)
     }
 
     /// Compatibility projections for the existing view builders. These are
@@ -118,6 +134,7 @@ struct WorkspaceView: View {
         get { transientPresentation.errorMessage }
         nonmutating set {
             if let newValue {
+                captureFocusIfIdle()
                 _ = transientPresentation.presentError(
                     newValue,
                     restoringFocusTo: workspace.focusedPane)
@@ -295,7 +312,15 @@ struct WorkspaceView: View {
             })
     }
 
+    private func captureFocusIfIdle() {
+        guard transientPresentation.active == nil else { return }
+        focusRestorer.capture(
+            in: windowForFocus,
+            fallbackPane: workspace.focusedPane)
+    }
+
     private func presentTransient(_ presentation: WorkspaceTransientPresentation) {
+        captureFocusIfIdle()
         _ = transientPresentation.present(
             presentation,
             restoringFocusTo: workspace.focusedPane)
@@ -307,6 +332,7 @@ struct WorkspaceView: View {
     /// ownership.
     private func beginNativePanel() -> NativePanelLease? {
         let id = UUID()
+        captureFocusIfIdle()
         let result = transientPresentation.present(
             .nativePanel(id),
             restoringFocusTo: workspace.focusedPane)
@@ -360,7 +386,12 @@ struct WorkspaceView: View {
         Task { @MainActor in
             await Task.yield()
             guard transientPresentation.consumeFocusRestoration(intent) else { return }
-            moveKeyboard(to: intent.pane ?? workspace.focusedPane)
+            let result = focusRestorer.restore(in: windowForFocus) { pane in
+                moveKeyboard(to: pane ?? workspace.focusedPane)
+            }
+            if result == .nothingCaptured {
+                moveKeyboard(to: intent.pane ?? workspace.focusedPane)
+            }
         }
     }
 
@@ -391,6 +422,7 @@ struct WorkspaceView: View {
         case .document, .terminals:
             presentation = .closeReview(newPrompt.id)
         }
+        captureFocusIfIdle()
         let result = transientPresentation.present(
             presentation,
             restoringFocusTo: workspace.focusedPane)
@@ -403,84 +435,94 @@ struct WorkspaceView: View {
     }
 
     private var workspaceShell: some View {
-        ZStack(alignment: .topLeading) {
-            HStack(spacing: 0) {
-                if showSidebar {
-                    sidebar
-                        .frame(width: sidebarWidth)
-                        .transition(.move(edge: .leading).combined(with: .opacity))
-                    ResizeHandle(
-                        axis: .horizontal,
-                        label: "Navigator divider",
-                        onDrag: {
-                            storedSidebarWidth = Double(
-                                GlassTheme.sidebar.clamping(sidebarWidth + $0))
-                        },
-                        onReset: {
-                            storedSidebarWidth = Double(GlassTheme.sidebar.preferred)
-                        })
-                }
-
-                VStack(spacing: 0) {
-                    SplitTreeView(layout: workspace.layoutBinding) { pane in
-                        paneView(pane)
-                    }
-                    // Cleared from the floating toolbar once, at the container,
-                    // rather than per pane: padding each pane individually
-                    // pushes every pane in a vertical split down, and leaves
-                    // the tab bars colliding with the toolbar the moment a
-                    // split appears.
-                    .padding(.top, Self.toolbarHeight)
-                    // Content still runs under the chrome's edges, giving the
-                    // glass something to refract instead of a flat panel.
-                    .backgroundExtensionEffect()
-
-                    if showTerminal && terminalPlacement == .drawer {
+        GeometryReader { geo in
+            let chrome = chromeLayout(for: geo.size.width)
+            ZStack(alignment: .topLeading) {
+                HStack(spacing: 0) {
+                    if chrome.showsSidebar {
+                        sidebar
+                            .frame(width: chrome.sidebarWidth)
+                            .transition(.move(edge: .leading).combined(with: .opacity))
                         ResizeHandle(
-                            axis: .vertical,
-                            label: "Terminal divider",
+                            axis: .horizontal,
+                            label: "Navigator divider",
                             onDrag: {
-                                storedTerminalHeight = Double(
-                                    GlassTheme.terminal.clamping(terminalHeight - $0))
+                                storedSidebarWidth = Double(
+                                    GlassTheme.sidebar.clamping(sidebarWidth + $0))
                             },
                             onReset: {
-                                storedTerminalHeight = Double(GlassTheme.terminal.preferred)
+                                storedSidebarWidth = Double(GlassTheme.sidebar.preferred)
                             })
                     }
-                    if terminalMounted && terminalPlacement == .drawer {
-                        // Collapsed rather than removed. The shells no longer
-                        // depend on it — they are owned by ``TerminalSessions``
-                        // so that the terminal can be moved to the inspector
-                        // without restarting — but rebuilding the whole panel
-                        // on every ⌘J still costs a relayout of every session's
-                        // view for nothing.
-                        terminalPanel(placement: .drawer)
-                        .frame(height: showTerminal ? terminalHeight : 0)
-                        .clipped()
-                        .opacity(showTerminal ? 1 : 0)
-                        .allowsHitTesting(showTerminal)
-                        .accessibilityHidden(!showTerminal)
+
+                    VStack(spacing: 0) {
+                        SplitTreeView(layout: workspace.layoutBinding) { pane in
+                            paneView(pane)
+                        }
+                        // Cleared from the floating toolbar once, at the container,
+                        // rather than per pane: padding each pane individually
+                        // pushes every pane in a vertical split down, and leaves
+                        // the tab bars colliding with the toolbar the moment a
+                        // split appears.
+                        .padding(.top, Self.toolbarHeight)
+                        // Content still runs under the chrome's edges, giving the
+                        // glass something to refract instead of a flat panel.
+                        .backgroundExtensionEffect()
+
+                        if showTerminal && terminalPlacement == .drawer {
+                            ResizeHandle(
+                                axis: .vertical,
+                                label: "Terminal divider",
+                                onDrag: {
+                                    storedTerminalHeight = Double(
+                                        GlassTheme.terminal.clamping(terminalHeight - $0))
+                                },
+                                onReset: {
+                                    storedTerminalHeight = Double(GlassTheme.terminal.preferred)
+                                })
+                        }
+                        if terminalMounted && terminalPlacement == .drawer {
+                            // Collapsed rather than removed. The shells no longer
+                            // depend on it — they are owned by ``TerminalSessions``
+                            // so that the terminal can be moved to the inspector
+                            // without restarting — but rebuilding the whole panel
+                            // on every ⌘J still costs a relayout of every session's
+                            // view for nothing.
+                            terminalPanel(placement: .drawer)
+                            .frame(height: showTerminal ? terminalHeight : 0)
+                            .clipped()
+                            .opacity(showTerminal ? 1 : 0)
+                            .allowsHitTesting(showTerminal)
+                            .accessibilityHidden(!showTerminal)
+                        }
+                    }
+
+                    if chrome.showsInspector {
+                        ResizeHandle(
+                            axis: .horizontal,
+                            label: "Inspector divider",
+                            onDrag: {
+                                storedInspectorWidth = Double(
+                                    GlassTheme.inspector.clamping(inspectorWidth - $0))
+                            },
+                            onReset: {
+                                storedInspectorWidth = Double(GlassTheme.inspector.preferred)
+                            })
+                        inspector
+                            .frame(width: chrome.inspectorWidth)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
                 }
 
-                if showInspector {
-                    ResizeHandle(
-                        axis: .horizontal,
-                        label: "Inspector divider",
-                        onDrag: {
-                            storedInspectorWidth = Double(
-                                GlassTheme.inspector.clamping(inspectorWidth - $0))
-                        },
-                        onReset: {
-                            storedInspectorWidth = Double(GlassTheme.inspector.preferred)
-                        })
-                    inspector
-                        .frame(width: inspectorWidth)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
+                toolbar(chrome)
             }
-
-            toolbar
+            .frame(width: geo.size.width, height: geo.size.height)
+            .animation(
+                GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
+                value: chrome.showsSidebar)
+            .animation(
+                GlassTheme.motion(GlassTheme.spring, reduceMotion: reduceMotion),
+                value: chrome.showsInspector)
         }
     }
 
@@ -726,6 +768,7 @@ struct WorkspaceView: View {
         workspaceIOTasks.cancelAll()
         closeReviews.cancelActivePrompt()
         transientPresentation.invalidateAll()
+        focusRestorer.clear()
         discardWindowCloseApproval(resumeAutosave: false)
         _ = autosaveSuspensions.invalidateAll()
         autosaveTask?.cancel()
@@ -853,6 +896,7 @@ struct WorkspaceView: View {
         case .inspector:
             if visible {
                 showInspector = true
+                preferredNarrowPanel = .inspector
                 inspectorTab = .terminal
             } else if inspectorTab == .terminal {
                 // Leaving the tab selected would mean ⌘J appeared to do
@@ -950,20 +994,20 @@ struct WorkspaceView: View {
     /// drift out of step with the panels below — adding the brand chip pushed
     /// the search capsule across the sidebar's edge, so the chrome no longer
     /// agreed with the layout it sat on.
-    private var toolbar: some View {
+    private func toolbar(_ chrome: WorkspaceChromeLayout) -> some View {
         GlassEffectContainer(spacing: GlassTheme.Spacing.snug) {
             ViewThatFits(in: .horizontal) {
-                regularToolbarContent
+                regularToolbarContent(chrome)
                 compactToolbarContent
             }
         }
         .padding(.top, GlassTheme.Spacing.snug)
     }
 
-    private var regularToolbarContent: some View {
+    private func regularToolbarContent(_ chrome: WorkspaceChromeLayout) -> some View {
         HStack(spacing: 0) {
             HStack(spacing: GlassTheme.Spacing.snug) {
-                if showSidebar {
+                if chrome.showsSidebar {
                     brandChip
                         .transition(.move(edge: .leading).combined(with: .opacity))
                     Spacer(minLength: GlassTheme.Spacing.snug)
@@ -971,10 +1015,10 @@ struct WorkspaceView: View {
                 sidebarToggle
             }
             .padding(.leading, GlassTheme.Spacing.snug)
-            .padding(.trailing, showSidebar ? GlassTheme.Spacing.snug : 0)
-            .frame(width: showSidebar ? sidebarWidth : nil, alignment: .leading)
+            .padding(.trailing, chrome.showsSidebar ? GlassTheme.Spacing.snug : 0)
+            .frame(width: chrome.showsSidebar ? chrome.sidebarWidth : nil, alignment: .leading)
             .background {
-                if showSidebar {
+                if chrome.showsSidebar {
                     GeometryReader { proxy in
                         Color.clear.preference(
                             key: SidebarHeaderBottomKey.self,
@@ -1057,6 +1101,7 @@ struct WorkspaceView: View {
             reduceMotion: reduceMotion
         ) {
             showSidebar.toggle()
+            if showSidebar { preferredNarrowPanel = .sidebar }
         }
         .glassEffectID("sidebar", in: glass)
     }
@@ -1156,6 +1201,7 @@ struct WorkspaceView: View {
             reduceMotion: reduceMotion
         ) {
             showInspector.toggle()
+            if showInspector { preferredNarrowPanel = .inspector }
         }
         .glassEffectID("inspector", in: glass)
     }
@@ -1186,6 +1232,19 @@ struct WorkspaceView: View {
             .onChange(of: vaultRevision) { _, _ in
                 refreshVault()
             }
+
+            Divider()
+                .padding(.horizontal, GlassTheme.Spacing.snug)
+            SavedVaultsView(
+                store: savedVaults,
+                currentRoot: workspace.vaultRoot,
+                canSave: commandAvailability.allows(.saveVault),
+                isExpanded: $showSavedVaults,
+                onSave: { run(.saveVault) },
+                onOpen: { scheduleVaultOpen($0) },
+                onError: { errorMessage = $0 }
+            )
+            .disabled(transientPresentation.isPerformingDestructiveOperation)
         }
         .glassPanel(radius: GlassTheme.Radius.large, padding: EdgeInsets())
         .padding(GlassTheme.Spacing.snug)
@@ -1581,7 +1640,7 @@ struct WorkspaceView: View {
     /// Unsupported items are not claimed by this pane target.
     @discardableResult
     private func openDroppedMarkdown(_ urls: [URL], beside pane: PaneID) -> Bool {
-        let markdown = urls.filter { FileTree.isMarkdown($0) && !$0.hasDirectoryPath }
+        let markdown = urls.filter(MarkdownDropPolicy.accepts)
         let request = DocumentOpenRequest.bounded(
             markdown,
             limit: WorkspaceIOBounds.maximumOpenItems)
@@ -1697,6 +1756,7 @@ struct WorkspaceView: View {
     }
 
     private func scheduleVaultOpen(_ url: URL) {
+        guard commandAvailability.allows(.openVault) else { return }
         workspaceIOLifecycle.invalidateAll()
         workspaceIOTasks.cancelAll()
         workspaceIOTasks.launch(in: .vault, priority: .userInitiated) {
@@ -2034,7 +2094,7 @@ struct WorkspaceView: View {
         var moves: [(source: URL, destination: URL)] = []
         moves.reserveCapacity(request.urls.count)
         for fileURL in request.urls {
-            guard FileTree.isMarkdown(fileURL), !fileURL.hasDirectoryPath,
+            guard MarkdownDropPolicy.accepts(fileURL),
                 workspace.isInsideVault(fileURL)
             else { continue }
 
@@ -2909,7 +2969,9 @@ struct WorkspaceView: View {
                 && !writingTools.document.issues.isEmpty,
             canRevealHarnessTerminal: canRevealHarnessTerminal,
             isPerformingDestructiveOperation:
-                transientPresentation.isPerformingDestructiveOperation)
+                transientPresentation.isPerformingDestructiveOperation,
+            canSaveVault: workspace.vaultRoot.map { !savedVaults.contains($0) } == true
+                && savedVaults.loadError == nil)
     }
 
     private var commands: [Command] {
@@ -2926,6 +2988,12 @@ struct WorkspaceView: View {
             Command(
                 title: "Open Vault…", symbol: "folder",
                 kind: .action(.openVault), shortcut: "⇧⌘O"),
+            Command(
+                title: "Save Current Vault", symbol: "bookmark",
+                kind: .action(.saveVault)),
+            Command(
+                title: "Show Saved Vaults", symbol: "books.vertical",
+                kind: .action(.showSavedVaults)),
             Command(
                 title: "Save", symbol: "square.and.arrow.down",
                 kind: .action(.save), shortcut: "⌘S"),
@@ -3107,10 +3175,28 @@ struct WorkspaceView: View {
         case .toggleCommandPalette: showPalette.toggle()
         case .openFile: openFilePanel()
         case .openVault: openVault()
+        case .saveVault:
+            guard let root = workspace.vaultRoot else { return }
+            do {
+                try savedVaults.save(root)
+                showSidebar = true
+                preferredNarrowPanel = .sidebar
+                showSavedVaults = true
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        case .showSavedVaults:
+            showSidebar = true
+            preferredNarrowPanel = .sidebar
+            showSavedVaults = true
         case .save: saveDocument()
         case .saveAs: saveDocumentAs()
-        case .toggleSidebar: showSidebar.toggle()
-        case .toggleInspector: showInspector.toggle()
+        case .toggleSidebar:
+            showSidebar.toggle()
+            if showSidebar { preferredNarrowPanel = .sidebar }
+        case .toggleInspector:
+            showInspector.toggle()
+            if showInspector { preferredNarrowPanel = .inspector }
         case .toggleTerminal: setTerminal(visible: !isTerminalVisible)
         case .toggleGraph: showGraph.toggle()
         case .splitRight:
@@ -3205,6 +3291,7 @@ struct WorkspaceView: View {
     /// did nothing.
     private func showAssist(engine: AssistEngine) {
         showInspector = true
+        preferredNarrowPanel = .inspector
         inspectorTab = .assist
         assistEngine = engine
         if engine == .harness {
@@ -3495,6 +3582,7 @@ struct WorkspaceView: View {
         discardWindowCloseApproval(resumeAutosave: false)
         closeReviews.cancelActivePrompt()
         transientPresentation.invalidateAll()
+        focusRestorer.clear()
         _ = autosaveSuspensions.invalidateAll()
         autosaveTask?.cancel()
         autosaveTask = nil

@@ -2,6 +2,16 @@
 
 MarkDev treats folders of Markdown documents as interconnected **Knowledge Vaults**. The Rust core parses note metadata and maintains an in-memory link graph that powers backlinks, unlinked mentions, and interactive graph visualizations.
 
+## Saving and reopening vaults
+
+Open a folder with **File → Open Vault…** (`⇧⌘O`), then choose **File → Save Current Vault** or use **Save Current Vault** in the sidebar's **Saved Vaults** section. **File → Show Saved Vaults** reveals that section even when the sidebar is hidden. Both commands are also available in the command palette (`⌘K`).
+
+Saved Vaults shows each folder's name and path. Click an entry to open it; use its minus button to remove it from the saved list. Removing an entry leaves the folder, its notes, and the current workspace intact. Saving remembers a folder location, not a copy or backup of its contents.
+
+The list persists across launches and is shared by all windows. Missing folders and disconnected volumes stay listed; reopening uses the normal vault loader and reports any access failure. If a folder moves, open and save its new location and remove the old entry. Up to 50 vaults can be saved, with an explicit error if the list is full.
+
+`SavedVaultStore` owns the list in the `vaults.saved` preference, separately from workspace session restoration and macOS Recents. It validates local URLs before normalization and bounds stored data. Invalid saved data is reported in the sidebar and retained until **Reset Saved List** is selected; resetting only clears the saved locations.
+
 ---
 
 ## 1. Vault Index Architecture

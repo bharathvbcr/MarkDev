@@ -57,6 +57,8 @@ MarkDev combines the safety and parsing throughput of a compiled Rust core with 
 - **AI-Assisted Editing Controls**: Writing and proofreading tools verify source-document ownership before applying model output.
 
 ### 🧠 Knowledge Vault & Link Graph
+
+- **Saved Vaults**: Save the current folder from the File menu or sidebar, then reopen it from the sidebar's Saved Vaults list across launches. Removing a saved entry leaves its files in place.
 - **Obsidian-Compatible Wikilinks**: Full `[[Note]]`, `[[Note#Heading]]`, and `[[Note|Alias]]` link resolution with deterministic tie-breaking (shallowest path first).
 - **Backlinks & Unlinked Mentions**: Fast inverted index that tracks backlinks and extracts whole-word unlinked mentions across the entire vault.
 - **Force-Directed Graph**: Interactive visual canvas displaying the relational link structure of your vault.

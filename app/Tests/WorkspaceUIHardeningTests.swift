@@ -207,6 +207,14 @@ final class WorkspaceChromeLayoutTests: XCTestCase {
         XCTAssertEqual(layout.sidebarWidth, GlassTheme.sidebar.preferred)
         XCTAssertEqual(layout.inspectorWidth, GlassTheme.inspector.minimum)
     }
+
+    func testNarrowPanelPreferenceRawValuesAreStableForStoredChrome() {
+        XCTAssertEqual(WorkspaceNarrowPanelPreference.sidebar.rawValue, "sidebar")
+        XCTAssertEqual(WorkspaceNarrowPanelPreference.inspector.rawValue, "inspector")
+        XCTAssertEqual(WorkspaceNarrowPanelPreference(rawValue: "sidebar"), .sidebar)
+        XCTAssertEqual(WorkspaceNarrowPanelPreference(rawValue: "inspector"), .inspector)
+        XCTAssertNil(WorkspaceNarrowPanelPreference(rawValue: "graph"))
+    }
 }
 
 final class WorkspacePresentationAccessibilityTests: XCTestCase {
@@ -306,5 +314,54 @@ final class WorkspaceUIIntegrationContractTests: XCTestCase {
         let controls = String(graph[start..<end])
         XCTAssertTrue(controls.contains("ViewThatFits(in: .horizontal)"))
         XCTAssertTrue(controls.contains("compactControls"))
+    }
+
+    func testWindowFocusRestorerOwnsTransientResponderHandoff() throws {
+        let workspace = try source("app/MarkDev/WorkspaceView.swift")
+        XCTAssertTrue(workspace.contains("WindowFocusRestorer()"))
+        XCTAssertTrue(workspace.contains("focusRestorer.capture("))
+        XCTAssertTrue(workspace.contains("focusRestorer.restore("))
+        XCTAssertTrue(workspace.contains("focusRestorer.clear()"))
+    }
+
+    func testWorkspaceChromeLayoutDrivesPanelVisibility() throws {
+        let workspace = try source("app/MarkDev/WorkspaceView.swift")
+        XCTAssertTrue(workspace.contains("WorkspaceChromeLayout("))
+        XCTAssertTrue(workspace.contains("chrome.showsSidebar"))
+        XCTAssertTrue(workspace.contains("chrome.showsInspector"))
+        XCTAssertTrue(workspace.contains("chrome.sidebarWidth"))
+        XCTAssertTrue(workspace.contains("chrome.inspectorWidth"))
+        XCTAssertTrue(workspace.contains("preferredNarrowPanel"))
+    }
+
+    func testMarkdownDropPolicyIsTheDropBoundary() throws {
+        let workspace = try source("app/MarkDev/WorkspaceView.swift")
+        XCTAssertTrue(workspace.contains("MarkdownDropPolicy.accepts"))
+        let dropNotes = try slice(
+            workspace,
+            from: "private func dropNotes(",
+            until: "private func isLexicallyInside(")
+        XCTAssertTrue(dropNotes.contains("MarkdownDropPolicy.accepts"))
+        XCTAssertFalse(
+            dropNotes.contains("FileTree.isMarkdown"),
+            "vault drops must use the same directory-and-authority checks as editor drops")
+        let editorDrop = try slice(
+            workspace,
+            from: "private func openDroppedMarkdown(",
+            until: "private func openVaultRoot(")
+        XCTAssertTrue(editorDrop.contains("MarkdownDropPolicy.accepts"))
+        XCTAssertFalse(editorDrop.contains("FileTree.isMarkdown"))
+    }
+
+    private func slice(_ source: String, from: String, until: String) throws -> String {
+        guard let start = source.range(of: from)?.lowerBound,
+            let end = source.range(of: until, range: start..<source.endIndex)?.lowerBound
+        else {
+            throw NSError(
+                domain: "WorkspaceUIIntegrationContractTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "missing \(from) .. \(until)"])
+        }
+        return String(source[start..<end])
     }
 }

@@ -86,6 +86,8 @@ struct WorkspaceCommands: Commands {
             actionButton("Open File…", action: .openFile, key: "o")
             actionButton(
                 "Open Vault…", action: .openVault, key: "o", modifiers: [.command, .shift])
+            actionButton("Save Current Vault", action: .saveVault)
+            actionButton("Show Saved Vaults", action: .showSavedVaults)
         }
 
         CommandGroup(before: .saveItem) {

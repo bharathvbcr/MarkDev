@@ -17,6 +17,8 @@ public enum CommandAction: Sendable, Equatable {
     case toggleCommandPalette
     case openFile
     case openVault
+    case saveVault
+    case showSavedVaults
     case save
     case saveAs
     case toggleSidebar
@@ -78,6 +80,7 @@ public struct CommandAvailability: Equatable, Sendable {
     public let hasProofreadingMarks: Bool
     public let canRevealHarnessTerminal: Bool
     public let isPerformingDestructiveOperation: Bool
+    public let canSaveVault: Bool
 
     public init(
         hasFocusedPane: Bool,
@@ -89,7 +92,8 @@ public struct CommandAvailability: Equatable, Sendable {
         hasTextSelection: Bool,
         hasProofreadingMarks: Bool,
         canRevealHarnessTerminal: Bool,
-        isPerformingDestructiveOperation: Bool
+        isPerformingDestructiveOperation: Bool,
+        canSaveVault: Bool = false
     ) {
         self.hasFocusedPane = hasFocusedPane
         self.paneCount = max(0, paneCount)
@@ -101,6 +105,7 @@ public struct CommandAvailability: Equatable, Sendable {
         self.hasProofreadingMarks = hasProofreadingMarks
         self.canRevealHarnessTerminal = canRevealHarnessTerminal
         self.isPerformingDestructiveOperation = isPerformingDestructiveOperation
+        self.canSaveVault = canSaveVault
     }
 
     /// Whether invoking `action` now can reach its canonical handler.
@@ -119,12 +124,14 @@ public struct CommandAvailability: Equatable, Sendable {
             return true
         case .newDocument:
             return hasFocusedPane
-        case .toggleCommandPalette, .openFile, .openVault,
+        case .toggleCommandPalette, .openFile, .openVault, .showSavedVaults,
             .toggleSidebar, .toggleInspector, .toggleTerminal, .toggleGraph,
             .setMode, .moveTerminal:
             return true
         case .save, .saveAs, .exportHTML:
             return hasDocument
+        case .saveVault:
+            return canSaveVault
         case .splitRight, .splitDown:
             return hasFocusedPane && paneCount < maximumPaneCount
         case .closePane, .focusNextPane, .focusPreviousPane:
