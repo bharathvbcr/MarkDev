@@ -4,6 +4,8 @@ MarkDev is structured as a two-tier hybrid system:
 1. **Rust Core (`core/`)**: High-performance Markdown parsing, syntax highlighting, AST extraction, and vault indexing.
 2. **Swift Front-End (`app/`)**: Native macOS application built with AppKit and SwiftUI using Liquid Glass chrome and TextKit 2.
 
+The Rust core is independently selectable by Cargo feature so another host can take only the pieces it needs. That is the same modularity as the rest of this stack: **DevCouncil** is components and modules, **Manvi** wraps them, and **GitPulse** uses Manvi plus selected DevCouncil modules. MarkDev's Assist panel can drive Manvi without taking the DevCouncil suite.
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    Swift Front-End                       │

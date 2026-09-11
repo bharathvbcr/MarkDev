@@ -10,6 +10,8 @@ A fast, native macOS Markdown editor and knowledge vault tool built with **Swift
 
 MarkDev combines the safety and parsing throughput of a compiled Rust core with the fluid elegance of macOS Liquid Glass design. It is built for developers and technical writers who want a low-latency native editor and first-class developer tooling inside their note-taking workflow.
 
+**Ecosystem.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi and selected DevCouncil components for their respective jobs. MarkDev is the same kind of host: its Rust core exposes independently selectable Cargo features (GitPulse takes highlighting without the C ABI), and Assist can drive Manvi without taking the rest of DevCouncil. Update one module at a time.
+
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                        Workspace                           │

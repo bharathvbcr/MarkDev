@@ -2,6 +2,8 @@
 
 Welcome to the technical documentation for **MarkDev**. This documentation provides in-depth technical guides, architectural breakdowns, design invariants, and performance budgets for contributors and developers.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi and selected DevCouncil components for their respective jobs. MarkDev follows the same modularity: take only the Rust-core features an embedder needs, and drive Manvi from Assist without taking the rest of DevCouncil.
+
 ---
 
 ## Table of Contents

@@ -2,6 +2,8 @@
 
 This guide explains how to set up your local development environment, build MarkDev from source, run tests, and troubleshoot common environment quirks.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi and selected DevCouncil components for their respective jobs. MarkDev is a selectable-module host of the same kind: Cargo features on `core/`, and Manvi from Assist without the rest of DevCouncil.
+
 ---
 
 ## Prerequisites

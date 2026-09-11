@@ -1,7 +1,11 @@
 # Embed the Markdown core
 
 `core/` is a Rust library independent of the macOS application. A host chooses
-the parts it needs through Cargo features:
+the parts it needs through Cargo features. That is the same modularity as the
+rest of this stack: **DevCouncil** is independently selectable components, **Manvi**
+wraps them, and **GitPulse** takes only the MarkDev and DevCouncil features it
+needs. Update the canonical crate and rebuild the host; do not fork a second
+parser.
 
 | Configuration | APIs | Native build dependencies |
 | --- | --- | --- |

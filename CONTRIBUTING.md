@@ -4,6 +4,8 @@ Thank you for your interest in contributing to MarkDev!
 
 MarkDev is a high-performance, native macOS Markdown editor and knowledge vault built with **Swift + Rust**. We care deeply about native Mac app polish, sub-frame editing performance, and rock-solid reliability.
 
+**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi and selected DevCouncil components for their respective jobs. MarkDev is a selectable-module host of the same kind: Cargo features on `core/`, and Manvi from Assist without the rest of DevCouncil.
+
 ---
 
 ## Code of Conduct
