@@ -48,9 +48,9 @@ class ReleaseTests(unittest.TestCase):
                 "CFBundleShortVersionString": "0.1.4", "CFBundleVersion": "9",
                 "CFBundleExecutable": executable, "CFBundleIdentifier": identifier,
                 "LSMinimumSystemVersion": "26.0",
-                "DTXcode": "2660",
-                "DTXcodeBuild": "17F113",
-                "DTSDKBuild": "25F70",
+                "DTXcode": "2700",
+                "DTXcodeBuild": "27A266a",
+                "DTSDKBuild": "26A425",
                 "CFBundlePackageType": {
                     "MarkDev": "APPL",
                     "MarkDevQuickLook": "XPC!",
@@ -155,13 +155,13 @@ class ReleaseTests(unittest.TestCase):
                 "CFBundleName": name,
                 "CFBundlePackageType": "BNDL",
                 "CFBundleSupportedPlatforms": ["MacOSX"],
-                "DTPlatformBuild": "25F70",
+                "DTPlatformBuild": "26A425",
                 "DTPlatformName": "macosx",
-                "DTPlatformVersion": "26.5",
-                "DTSDKBuild": "25F70",
-                "DTSDKName": "macosx26.5",
-                "DTXcode": "2660",
-                "DTXcodeBuild": "17F113",
+                "DTPlatformVersion": "27.0",
+                "DTSDKBuild": "26A425",
+                "DTSDKName": "macosx27.0",
+                "DTXcode": "2700",
+                "DTXcodeBuild": "27A266a",
                 "LSMinimumSystemVersion": minimum_system,
             }
         for resources in (
@@ -186,7 +186,7 @@ class ReleaseTests(unittest.TestCase):
         (swift_term / "Resources").mkdir(parents=True)
         (swift_term / "Info.plist").write_bytes(plistlib.dumps(
             resource_bundle_info(
-                "swiftterm.SwiftTerm.resources", "SwiftTerm_SwiftTerm", "11.0"
+                "swiftterm.SwiftTerm.resources", "SwiftTerm_SwiftTerm", "12.0"
             )
         ))
         (swift_term / "Resources/default.metallib").write_text("fixture metallib\n")
@@ -282,7 +282,7 @@ elif name == "vtool":
         print("  cmdsize 32")
         print(" platform " + build_option("platform", "MACOS"))
         print("    minos " + build_option("minos", "26.0"))
-        print("      sdk " + build_option("sdk", "26.5"))
+        print("      sdk " + build_option("sdk", "27.0"))
         print("   ntools 1")
 elif name == "ditto":
     if state.get("zip_fail"):
@@ -406,9 +406,9 @@ elif name == "gh":
             "notarized": False,
         })
         self.assertEqual(manifest["toolchain"], {
-            "xcode": "2660",
-            "xcode_build": "17F113",
-            "sdk_build": "25F70",
+            "xcode": "2700",
+            "xcode_build": "27A266a",
+            "sdk_build": "26A425",
         })
 
     def test_automated_distribution_profile_is_verified_for_every_owned_bundle(self):
@@ -596,7 +596,7 @@ elif name == "gh":
         for field, value in (
             ("platform", "IOS"),
             ("minos", "27.0"),
-            ("sdk", "27.0"),
+            ("sdk", "28.0"),
             ("build_commands", 0),
             ("build_commands", 2),
         ):
@@ -1087,7 +1087,7 @@ release.stage("v0.1.4")
     def test_manifest_contract_constants_are_immutable(self):
         cases = (
             (release_module.AUTOMATED_DISTRIBUTION, "signature", "ad-hoc"),
-            (release_module.RELEASE_TOOLCHAIN, "xcode", "2660"),
+            (release_module.RELEASE_TOOLCHAIN, "xcode", "2700"),
         )
         for values, key, expected in cases:
             with self.subTest(key=key):
@@ -1210,13 +1210,13 @@ release.stage("v0.1.4")
                     "CFBundleName": "SwiftMath_SwiftMath",
                     "CFBundlePackageType": "BNDL",
                     "CFBundleSupportedPlatforms": ["MacOSX"],
-                    "DTPlatformBuild": "25F70",
+                    "DTPlatformBuild": "26A425",
                     "DTPlatformName": "macosx",
-                    "DTPlatformVersion": "26.5",
-                    "DTSDKBuild": "25F70",
-                    "DTSDKName": "macosx26.5",
-                    "DTXcode": "2660",
-                    "DTXcodeBuild": "17F113",
+                    "DTPlatformVersion": "27.0",
+                    "DTSDKBuild": "26A425",
+                    "DTSDKName": "macosx27.0",
+                    "DTXcode": "2700",
+                    "DTXcodeBuild": "27A266a",
                     "LSMinimumSystemVersion": "12.0",
                 },
             ),
@@ -1228,13 +1228,13 @@ release.stage("v0.1.4")
                     "CFBundleName": "SwiftMath_SwiftMath",
                     "CFBundlePackageType": "BNDL",
                     "CFBundleSupportedPlatforms": ["MacOSX"],
-                    "DTPlatformBuild": "25F70",
+                    "DTPlatformBuild": "26A425",
                     "DTPlatformName": "macosx",
-                    "DTPlatformVersion": "26.5",
-                    "DTSDKBuild": "25F70",
-                    "DTSDKName": "macosx26.5",
-                    "DTXcode": "2660",
-                    "DTXcodeBuild": "17F113",
+                    "DTPlatformVersion": "27.0",
+                    "DTSDKBuild": "26A425",
+                    "DTSDKName": "macosx27.0",
+                    "DTXcode": "2700",
+                    "DTXcodeBuild": "27A266a",
                     "LSMinimumSystemVersion": "12.0",
                 },
             ),
@@ -1246,14 +1246,14 @@ release.stage("v0.1.4")
                     "CFBundleName": "SwiftTerm_SwiftTerm",
                     "CFBundlePackageType": "BNDL",
                     "CFBundleSupportedPlatforms": ["MacOSX"],
-                    "DTPlatformBuild": "25F70",
+                    "DTPlatformBuild": "26A425",
                     "DTPlatformName": "macosx",
-                    "DTPlatformVersion": "26.5",
-                    "DTSDKBuild": "25F70",
-                    "DTSDKName": "macosx26.5",
-                    "DTXcode": "2660",
-                    "DTXcodeBuild": "17F113",
-                    "LSMinimumSystemVersion": "11.0",
+                    "DTPlatformVersion": "27.0",
+                    "DTSDKBuild": "26A425",
+                    "DTSDKName": "macosx27.0",
+                    "DTXcode": "2700",
+                    "DTXcodeBuild": "27A266a",
+                    "LSMinimumSystemVersion": "12.0",
                 },
             ),
         )

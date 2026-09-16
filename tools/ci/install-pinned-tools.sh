@@ -207,7 +207,7 @@ if [[ "$mode" == "all" || "$mode" == "release" ]]; then
         echo "pinned XcodeGen executable is not executable" >&2
         exit 1
     fi
-    lipo "$xcodegen_binary" -verify_arch arm64 x86_64
+    lipo "$xcodegen_binary" -verify_arch arm64 && lipo "$xcodegen_binary" -verify_arch x86_64
     xcodegen_version=$("$xcodegen_binary" --version)
     [[ "$xcodegen_version" == "Version: 2.45.4" ]] || {
         echo "pinned XcodeGen binary reported an unexpected version" >&2

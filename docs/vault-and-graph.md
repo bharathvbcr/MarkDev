@@ -12,81 +12,59 @@ The list persists across launches and is shared by all windows. Missing folders 
 
 `SavedVaultStore` owns the list in the `vaults.saved` preference, separately from workspace session restoration and macOS Recents. It validates local URLs before normalization and bounds stored data. Invalid saved data is reported in the sidebar and retained until **Reset Saved List** is selected; resetting only clears the saved locations.
 
----
+## Index and link resolution
 
-## 1. Vault Index Architecture
+The Rust [note parser](../core/src/vault/note.rs) extracts metadata, headings,
+links, and tags. [Vault](../core/src/vault/index.rs) owns resolution, backlinks,
+unlinked mentions, and the search index. Swift's `VaultIndex` coordinates disk
+scans and UI updates. Vault query data crosses the C ABI as JSON; editor parse
+records use flat structures.
 
-```
-Vault Directory (Local Filesystem)
-        │
-        ▼
-core/src/vault/note.rs
-  • Extracts Title & Headings Outline
-  • Extracts Tags (#tag)
-  • Extracts Wikilinks ([[target]]) & standard Markdown links
-        │
-        ▼
-core/src/vault/index.rs (VaultIndex)
-  • Builds Forward Link Map
-  • Inverts Map into Backlinks
-  • Scans for Unlinked Whole-Word Mentions
-        │
-        ▼
-app/MarkDevKit/Vault/ (Swift Wrapper)
-  • InspectorView (Outline, Backlinks, Mentions)
-  • GraphView (Interactive Force-Directed Canvas)
-```
+Supported forms include `[[Note]]`, `[[Note#Heading]]`, and
+`[[Note|Label]]`, plus relative Markdown links. Resolution uses source-relative
+paths where appropriate and case-insensitive name lookup. Ambiguous name matches
+are ordered by shallowest path, then alphabetically. These are MarkDev's rules,
+not a guarantee of complete compatibility with another application's vault.
+The Rust resolver matches anchors against heading text. Block-ID anchors such
+as `#^blockid` do not have a dedicated block-target resolver; a resolved note
+can carry no matching anchor offset.
 
----
+Unlinked mentions match whole words case-insensitively against a note's names.
+The current implementation omits notes already backlinking to the target and
+returns the first matching name/location per remaining note. It is not an
+exhaustive list of every textual occurrence. The result carries a UTF-16 offset
+for editor navigation.
 
-## 2. Obsidian-Compatible Wikilink Resolution
+`Vault.update` reparses changed content and calls `reindex`; unchanged content
+returns without rebuilding. Removal also rebuilds derived indexes. This keeps
+cross-note dependencies coherent without separately patching each edge. No
+universal rebuild-time guarantee is made.
 
-MarkDev follows Obsidian's link resolution specification to ensure vaults are 100% portable between tools.
+## Disk changes and renames
 
-### Supported Wikilink Syntaxes:
-- Standard: `[[Note Name]]`
-- Heading Anchor: `[[Note Name#Section Heading]]`
-- Block Anchor: `[[Note Name#^blockid]]`
-- Custom Alias: `[[Note Name|Display Label]]`
+The Swift watcher is paired with reconciliation to cover missed filesystem
+events. Deletion requires proven absence; an unreadable note must not be treated
+as a deleted note. Rename updates supported wikilinks and Markdown destinations
+while protecting ranges the parser identifies as code or machine-read content.
+See [architecture](architecture.md) for the I/O and recovery boundaries.
 
-### Resolution Rules:
-1. **Case-Insensitive Match**: Links match regardless of case (`[[architecture]]` resolves to `Architecture.md`).
-2. **Deterministic Tie-Breaking**: If multiple files share the same name across different subfolders, resolution selects:
-   1. The match with the **shallowest folder depth** relative to the vault root.
-   2. The match that is **alphabetically first** among ties.
-3. **No Non-Deterministic Iteration**: Links never resolve based on filesystem directory traversal order.
+## Graph behavior
 
----
+[Graph::build](../core/src/vault/graph.rs) constructs adjacency, applies focus,
+depth, tag, and folder filters, and computes a deterministic force-directed
+layout. Nodes start on a golden-angle spiral and use 220 iterations of pairwise
+repulsion and edge attraction. This is an O(n²) repulsion pass, not Barnes–Hut.
 
-## 3. Whole-Word Unlinked Mentions
+Edges are **undirected and deduplicated** for drawing: two notes linking to one
+another form one visible relationship. Unresolved destinations have no graph
+node; broken-link queries report them separately.
 
-When inspecting a note (e.g. `Compiler.md`), MarkDev searches all other notes in the vault for unlinked occurrences of the title "Compiler".
+The graph caps output at 1,500 nodes, retaining the best-connected candidates.
+It carries both `total_notes` and `truncated`, so filtering and capacity limits
+remain distinguishable. The legend reports displayed and total counts.
 
-> [!NOTE]
-> **Whole-Word Matching Invariant**:
-> Unlinked mentions strictly match complete words with word boundary regexes (`\bCompiler\b`). Substring matching is forbidden because it floods the inspector with false positives (such as matching "Roadmap" inside "Roadmapping").
-
----
-
-## 4. Rebuild Over Patching Policy
-
-When a note is edited or saved, `VaultIndex.update()` rebuilds the entire vault graph rather than attempting incremental edge updates.
-
-### Why?
-- Editing a heading in Note A can simultaneously alter backlink targets for Note B, Note C, and Note D.
-- In Rust, rebuilding an in-memory graph for a vault of 10,000 notes takes under **5 milliseconds**.
-- A full rebuild eliminates entire categories of stale edge synchronization bugs.
-
----
-
-## 5. Force-Directed Graph Canvas (`GraphView`)
-
-The Vault Graph panel renders an interactive 2D physics simulation of all interconnected notes:
-
-- **Nodes**: Notes (sized by backlink connectivity).
-- **Edges**: Directed wikilink connections between notes.
-- **Physics Simulation**:
-  - **Repulsion Force**: Barnes-Hut n-body repulsive force keeping unrelated nodes separated.
-  - **Spring Attraction**: Hooke's law spring force drawing linked notes together into topical clusters.
-  - **Damping**: Friction deceleration to stabilize the layout at equilibrium.
-- **Interactivity**: Zoom, pan, drag nodes, and click to immediately navigate to a document in the active editor pane.
+Swift's [GraphView](../app/MarkDevKit/Vault/GraphView.swift) fits the finished
+coordinates into a Canvas. Hover highlights a neighborhood; clicking a node
+opens its note, and clicking empty space clears selection. The current view
+does not implement user zoom, pan, or node dragging. Accessible node actions are
+ordered by connectivity and capped at 100; this is a subset of the graph.

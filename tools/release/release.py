@@ -33,16 +33,16 @@ EXPECTED_PRIVACY_MANIFEST = {
 RELEASE_ARCHITECTURES = ("arm64", "x86_64")
 RELEASE_DERIVED_DATA = "build/DerivedData/Release"
 RELEASE_MINIMUM_MACOS = "26.0"
-RELEASE_SDK_VERSION = "26.5"
+RELEASE_SDK_VERSION = "27.0"
 AUTOMATED_DISTRIBUTION = MappingProxyType({
     "signature": "ad-hoc",
     "hardened_runtime": False,
     "notarized": False,
 })
 RELEASE_TOOLCHAIN = MappingProxyType({
-    "xcode": "2660",
-    "xcode_build": "17F113",
-    "sdk_build": "25F70",
+    "xcode": "2700",
+    "xcode_build": "27A266a",
+    "sdk_build": "26A425",
 })
 EXPECTED_MAIN_FINDER_METADATA = {
     "CFBundleName": "MarkDev",
@@ -93,13 +93,13 @@ EXPECTED_MAIN_FINDER_METADATA = {
 RESOURCE_BUNDLE_TOOLCHAIN_METADATA = {
     "CFBundlePackageType": "BNDL",
     "CFBundleSupportedPlatforms": ["MacOSX"],
-    "DTPlatformBuild": "25F70",
+    "DTPlatformBuild": "26A425",
     "DTPlatformName": "macosx",
-    "DTPlatformVersion": "26.5",
-    "DTSDKBuild": "25F70",
-    "DTSDKName": "macosx26.5",
-    "DTXcode": "2660",
-    "DTXcodeBuild": "17F113",
+    "DTPlatformVersion": "27.0",
+    "DTSDKBuild": "26A425",
+    "DTSDKName": "macosx27.0",
+    "DTXcode": "2700",
+    "DTXcodeBuild": "27A266a",
 }
 SWIFTMATH_RESOURCE_METADATA = {
     **RESOURCE_BUNDLE_TOOLCHAIN_METADATA,
@@ -111,7 +111,7 @@ SWIFTTERM_RESOURCE_METADATA = {
     **RESOURCE_BUNDLE_TOOLCHAIN_METADATA,
     "CFBundleIdentifier": "swiftterm.SwiftTerm.resources",
     "CFBundleName": "SwiftTerm_SwiftTerm",
-    "LSMinimumSystemVersion": "11.0",
+    "LSMinimumSystemVersion": "12.0",
 }
 MAX_RELEASE_ARCHIVE_BYTES = 1024 * 1024 * 1024
 MAX_RELEASE_ARCHIVE_ENTRIES = 100_000

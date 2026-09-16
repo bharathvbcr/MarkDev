@@ -40,7 +40,7 @@ build-core:
         core/target/aarch64-apple-darwin/release/libmarkdev.a \
         core/target/x86_64-apple-darwin/release/libmarkdev.a \
         -output "$staged"
-    lipo "$staged" -verify_arch arm64 x86_64
+    lipo "$staged" -verify_arch arm64 && lipo "$staged" -verify_arch x86_64
     actual_arches=$(lipo -archs "$staged")
     if ! print -r -- "$actual_arches" | awk '
         {
@@ -289,10 +289,10 @@ clean:
     cd core && cargo clean
     rm -rf build/ app/MarkDev/Assets.xcassets app/MarkDev/Resources
 
-check: test-release fmt-check lint-core test
+check: check-site test-release fmt-check lint-core test
 
 # Run full CI suite locally (matches GitHub Actions CI workflow)
-ci-core: verify-core-toolchain test-release fmt-check lint-core test-core test-core-features build-core
+ci-core: verify-core-toolchain check-site test-release fmt-check lint-core test-core test-core-features build-core
     host_target=$(rustc -vV | awk -F': ' '/^host:/ {print $2}') && cd core && cargo test --locked --release --target "$host_target" --test performance
 
 verify-core-toolchain:
@@ -350,7 +350,7 @@ verify-toolchain: verify-core-toolchain
         exit 1
     fi
     version=$(xcodebuild -version)
-    expected_version=$'Xcode 26.6\nBuild version 17F113'
+    expected_version=$'Xcode 27.0\nBuild version 27A266a'
     if [[ "$version" != "$expected_version" ]]; then
         echo "Xcode toolchain mismatch; expected:" >&2
         echo "$expected_version" >&2
@@ -364,3 +364,15 @@ verify-toolchain: verify-core-toolchain
 ci-local: verify-toolchain ci-core test-app build-release
 
 ci: ci-local
+
+# --- Documentation and product website -------------------------------------
+
+check-site:
+    python3 tools/docs/check_site.py
+
+check-docs: check-site
+    cd core && cargo test --locked --test docs_contract
+
+# Static preview: no build or package installation, loopback only.
+website $PORT="8000":
+    python3 -m http.server "$PORT" --bind 127.0.0.1 --directory website

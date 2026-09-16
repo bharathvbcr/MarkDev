@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="MarkDev is a native macOS Markdown workspace. Write with live preview, connect local notes, and keep your terminal beside your ideas.">
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1b1b1d" media="(prefers-color-scheme: dark)">
+  <meta property="og:title" content="MarkDev — A little more room to think.">
+  <meta property="og:description" content="Native Markdown. Connected notes. Ordinary files. A workspace made for your Mac.">
+  <meta property="og:type" content="website">
+  <title>MarkDev — A little more room to think.</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="#" aria-label="MarkDev home"><span class="brand-symbol" aria-hidden="true">∨</span> MarkDev<span class="brand-period">.</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#workspace">Workspace</a><a href="#guides">Guides</a>
+      <a class="nav-download" href="#get">Get MarkDev <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> A native Markdown workspace for macOS</p>
+      <h1 id="hero-title">A little more room<br>to <em>think.</em></h1>
+      <p class="hero-description">For the note that becomes an idea.<br>The idea that becomes a project.<br>Your words, connections, and tools. Together.</p>
+      <div class="actions"><a class="button primary" href="#get">Get MarkDev <span aria-hidden="true">↗</span></a><a class="text-link" href="#workspace">Explore the workspace <span aria-hidden="true">↓</span></a></div>
+      <p class="fine-print">macOS 26+ <span aria-hidden="true">·</span> Open source <span aria-hidden="true">·</span> Your notes stay files</p>
+    </section>
+
+    <section class="workspace-section wrap" id="workspace" aria-labelledby="workspace-title">
+      <div class="section-caption"><h2 id="workspace-title">Less switching. More making.</h2><span>01 / THE WORKSPACE</span></div>
+      <div class="app-example">
+        <div class="app-toolbar"><div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div><span>Field notes <span class="toolbar-divider">/</span> A place to begin.md</span><span class="toolbar-end" aria-hidden="true">◧</span></div>
+        <div class="app-body">
+          <aside class="demo-sidebar" aria-label="Illustrated vault sidebar">
+            <p class="sidebar-label">VAULT</p><p class="vault-name">⌑ &nbsp; Field notes</p>
+            <div class="file-list"><span class="selected">▤ &nbsp; A place to begin</span><span>▤ &nbsp; Small experiments</span><span>▤ &nbsp; Reading list</span><span>▤ &nbsp; Loose threads</span></div>
+            <p class="sidebar-label saved-label">SAVED VAULTS</p><p class="saved-vault">⌑ &nbsp; Field notes</p><p class="saved-vault">⌑ &nbsp; Projects</p>
+            <div class="sidebar-bottom">Ordinary folders.<br>Extraordinary possibilities.</div>
+          </aside>
+          <div class="demo-editor">
+            <div class="editor-top"><span>A place to begin.md</span><div class="demo-controls" role="group" aria-label="Example display mode" hidden><button type="button" data-mode="preview" aria-pressed="true" aria-controls="preview-example source-example">Preview</button><button type="button" data-mode="source" aria-pressed="false" aria-controls="preview-example source-example">Source</button></div></div>
+            <div class="note-content" id="preview-example">
+              <p class="note-kicker">A WORK IN PROGRESS</p><h3>A place to begin.</h3>
+              <p>Good ideas rarely arrive fully formed.<br>Give them a little space.</p>
+              <h4>Follow the interesting thread</h4><p>Keep a question close. Make a connection.<br>Leave yourself something to come back to.</p>
+              <p class="wikilink">[[Small experiments]] <span aria-hidden="true">↗</span></p>
+              <div class="note-callout"><span aria-hidden="true">✳</span><p>The best tool is the one that lets you<br>stay with the thought.</p></div>
+              <div class="note-tasks"><p><span aria-hidden="true">☑</span> Collect the loose pieces</p><p><span aria-hidden="true">☐</span> See what connects</p></div>
+            </div>
+            <pre class="note-source" id="source-example" hidden><code># A place to begin.
+
+Good ideas rarely arrive fully formed.
+Give them a little space.
+
+## Follow the interesting thread
+
+Keep a question close. Make a connection.
+Leave yourself something to come back to.
+
+[[Small experiments]]
+
+&gt; [!NOTE]
+&gt; The best tool is the one that lets you
+&gt; stay with the thought.
+
+- [x] Collect the loose pieces
+- [ ] See what connects</code></pre>
+            <div class="editor-status"><span>Markdown</span><span id="mode-status" role="status">Preview example</span><span>UTF-8</span></div>
+          </div>
+          <aside class="demo-inspector" aria-label="Illustrated note outline"><p class="sidebar-label">OUTLINE</p><p class="outline-active">A place to begin.</p><p>Follow the interesting thread</p><div class="connection-sketch" aria-hidden="true"><svg viewBox="0 0 160 155" fill="none"><path d="M79 76L29 32M79 76L137 43M79 76L126 128M79 76L28 120M29 32L137 43M28 120L126 128"/><circle cx="79" cy="76" r="10"/><circle cx="29" cy="32" r="5"/><circle cx="137" cy="43" r="6"/><circle cx="126" cy="128" r="5"/><circle cx="28" cy="120" r="7"/></svg></div><p class="sketch-caption">Leave room for connections.</p></aside>
+        </div>
+        <div class="terminal-example"><span class="terminal-label">TERMINAL</span><code><span class="terminal-prompt">~/Field notes</span> <span aria-hidden="true">❯</span> <span class="terminal-cursor" aria-hidden="true"></span></code><span class="terminal-shell">zsh</span></div>
+      </div>
+      <p class="example-caption">An illustrative workspace, not an app screenshot. <span class="interactive-hint" hidden>Try Preview and Source to see the same note two ways.</span></p>
+    </section>
+
+    <section class="principles wrap" aria-label="Product principles"><p>Native to your Mac.</p><span aria-hidden="true">✳</span><p>Close to your words.</p><span aria-hidden="true">✳</span><p>Built around your files.</p></section>
+
+    <nav class="page-index wrap" aria-label="Explore MarkDev">
+      <span>Explore</span>
+      <a href="#writing">Writing</a><a href="#connections">Connected notes</a>
+      <a href="#tools">Workspace tools</a><a href="#assistance">Assistance</a><a href="#faq">Questions</a>
+    </nav>
+
+    <section class="features wrap" id="features" aria-labelledby="features-title">
+      <div class="section-heading"><p class="eyebrow">02 / A THOUGHTFUL TOOLKIT</p><h2 id="features-title">From a blank page<br>to a bigger picture.</h2><p>Start with a note. Bring in the tools<br>when the work asks for them.</p></div>
+      <div class="feature-grid">
+        <article class="feature"><span class="feature-number">01</span><h3>Write in the moment.</h3><p>Markdown that reads like a document and edits like text. Source, Live Preview, and Reading modes share the same underlying note.</p><div class="feature-detail"><span class="type-sample">Aa</span><span>Plain text.<br>Considered presentation.</span></div></article>
+        <article class="feature"><span class="feature-number">02</span><h3>Let notes meet.</h3><p>Wikilinks, backlinks, and a filtered graph help you follow a thought across your vault. Save a folder and pick it up again later.</p><div class="link-sample"><span>[[An idea]]</span><span aria-hidden="true">↔</span><span>[[Another]]</span></div></article>
+        <article class="feature"><span class="feature-number">03</span><h3>Keep the detail.</h3><p>Math, supported Mermaid diagrams, tables, and local images belong beside the explanation. Native rendering keeps them in the page.</p><div class="formula-sample" aria-label="Integral from a to b of f of x dx">∫<sub>a</sub><sup>b</sup> f(x) dx</div></article>
+        <article class="feature"><span class="feature-number">04</span><h3>Make space for work.</h3><p>Arrange notes in split panes. Keep a terminal below or beside them. Find your next file or action with the command palette.</p><div class="shortcut-sample"><kbd>⌘</kbd><kbd>K</kbd><span>A shorter path to the next thing.</span></div></article>
+      </div>
+    </section>
+
+    <section class="detail-section wrap" id="writing" aria-labelledby="writing-title">
+      <div class="section-heading">
+        <p class="eyebrow">03 / STAY WITH THE SENTENCE</p>
+        <h2 id="writing-title">Readable when you’re thinking.<br>Editable when you’re ready.</h2>
+      </div>
+      <div class="detail-columns">
+        <div class="detail-copy">
+          <p class="section-lede">Keep the clarity of a finished page and the freedom of a text file.</p>
+          <p>In Live Preview, formatting settles into place around your writing. Move into a block and its Markdown becomes visible. Switch to Source to see every marker, or Reading to put editing aside.</p>
+          <ul class="benefit-list">
+            <li><strong>Keep your Markdown.</strong> Copy, find, and undo work on the original text.</li>
+            <li><strong>Keep your place.</strong> An outline helps you move between headings in a longer note.</li>
+            <li><strong>Keep the technical detail.</strong> Tables, math, supported diagrams, and local images sit beside the explanation.</li>
+          </ul>
+          <a class="text-link" href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/markdown-support.md">Explore supported Markdown <span aria-hidden="true">↗</span></a>
+        </div>
+        <figure class="content-example">
+          <div class="example-bar"><span>Experiment notes.md</span><span>Reading</span></div>
+          <div class="technical-note">
+            <span class="sample-label">ILLUSTRATIVE NOTE</span>
+            <h3>Make the next step clear.</h3>
+            <p>A little structure turns a loose observation into something you can work with.</p>
+            <table><caption>Plan for a small experiment</caption><thead><tr><th scope="col">Step</th><th scope="col">Question</th></tr></thead><tbody><tr><td>Observe</td><td>What changed?</td></tr><tr><td>Compare</td><td>What stayed the same?</td></tr><tr><td>Repeat</td><td>Does it happen again?</td></tr></tbody></table>
+            <div class="code-example"><span>python</span><pre><code>observations = ["notice", "compare"]
+for step in observations:
+    print(step)</code></pre></div>
+            <details class="source-disclosure"><summary>See the table’s Markdown</summary><pre><code>| Step    | Question                  |
+| ------- | ------------------------- |
+| Observe | What changed?             |
+| Compare | What stayed the same?     |
+| Repeat  | Does it happen again?     |</code></pre></details>
+          </div>
+          <figcaption>Illustrated content. Native rendering supports a defined subset of Markdown extensions.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="detail-section wrap" id="connections" aria-labelledby="connections-title">
+      <div class="section-heading"><p class="eyebrow">04 / FOLLOW THE CONNECTION</p><h2 id="connections-title">One note opens<br>another possibility.</h2></div>
+      <div class="detail-columns">
+        <div class="connection-example" aria-label="Illustrative note relationships">
+          <div class="connection-note"><span class="sample-label">THE NOTE IN FRONT OF YOU</span><h3>Small experiments</h3><p>Try one change at a time.<br>Write down what happens.</p><code>[[Field observations]]</code></div>
+          <div class="relationship-list"><div><span class="relationship-arrow" aria-hidden="true">↗</span><div><span class="sample-label">OUTGOING LINK</span><strong>Field observations</strong><p>Where the next question came from.</p></div></div><div><span class="relationship-arrow" aria-hidden="true">↙</span><div><span class="sample-label">BACKLINK</span><strong>A place to begin</strong><p>Another note that points here.</p></div></div></div>
+          <p class="example-caption">An example of how notes connect, not a live vault.</p>
+        </div>
+        <div class="detail-copy">
+          <p class="section-lede">A vault starts with a folder you already understand.</p>
+          <p>Open a folder of Markdown files and work from its navigator. Save the folder to Saved Vaults so you can return to it across launches. Your documents remain in their original location.</p>
+          <ul class="benefit-list">
+            <li><strong>Link as you write.</strong> Connect a note, a heading, or a relative Markdown destination.</li>
+            <li><strong>Look in both directions.</strong> Follow outgoing links, backlinks, and whole-word unlinked mentions.</li>
+            <li><strong>Take a wider view.</strong> Filter the link graph and open notes from their connections. The graph reports when its display is capped.</li>
+          </ul>
+          <a class="text-link" href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/vault-and-graph.md">Get to know vaults and links <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+    </section>
+
+    <section class="detail-section wrap" id="tools" aria-labelledby="tools-title">
+      <div class="section-heading"><p class="eyebrow">05 / ROOM FOR THE REST OF THE WORK</p><h2 id="tools-title">Read. Write. Run.<br>Without losing the thread.</h2></div>
+      <div class="workspace-cards">
+        <article><span class="tool-glyph" aria-hidden="true">◫</span><h3>Keep two thoughts open.</h3><p>Put a reference beside a draft. Split right or down, resize the panes, and give each pane its own tabs.</p><p class="card-footnote">Up to 16 panes in the current source.</p></article>
+        <article><span class="tool-glyph terminal-glyph" aria-hidden="true">&gt;_</span><h3>Bring your tools along.</h3><p>Keep a real terminal below your notes or in the inspector. Moving the panel preserves its sessions.</p><p class="card-footnote">Commands run with your user account’s permissions.</p></article>
+        <article><span class="tool-glyph" aria-hidden="true">⌘</span><h3>Find the next thing.</h3><p>Jump to files, headings, and actions from the command palette. Hold Space over a supported link or file to peek.</p><p class="card-footnote">In-app peek is separate from Finder Quick Look.</p></article>
+      </div>
+      <div class="keyboard-strip" aria-label="Useful app keyboard shortcuts"><div><kbd>⌘ K</kbd><span>Command palette</span></div><div><kbd>⌘ J</kbd><span>Terminal</span></div><div><kbd>⌥ ⌘ I</kbd><span>Inspector</span></div><div><kbd>⌥ ⌘ G</kbd><span>Link graph</span></div></div>
+    </section>
+
+    <section class="assist wrap" id="assistance" aria-labelledby="assist-title">
+      <div><p class="eyebrow">06 / ASSISTANCE, WHEN YOU WANT IT</p><h2 id="assist-title">Your voice.<br>A second pair of eyes.</h2><p class="assist-intro">Choose the help that fits the work. Review the result before making it yours.</p></div>
+      <div class="assist-options">
+        <article><span class="sample-label">FOR THE WORDS IN FRONT OF YOU</span><h3>Apple Intelligence</h3><p>Rewrite a selection, proofread a passage, or get a reading of your note with the on-device system model. The app explains when your Mac, language, or model isn’t ready.</p></article>
+        <article><span class="sample-label">FOR WORK ACROSS YOUR VAULT</span><h3>Optional MANVI connection</h3><p>Connect a separately installed harness and choose its provider, model, and authority. Advisory and file-editing modes are separate choices; a configured provider may process text remotely after confirmation.</p></article>
+        <a class="text-link" href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/user-guide.md#optional-writing-assistance">How writing assistance works <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+
+    <section class="detail-section wrap" id="first-note" aria-labelledby="first-note-title">
+      <div class="section-heading"><p class="eyebrow">07 / A SMALL START</p><h2 id="first-note-title">From opening the app<br>to your first connection.</h2></div>
+      <ol class="start-steps">
+        <li><span class="step-number" aria-hidden="true">1</span><h3>Open a note.</h3><p>Use <kbd>⌘ N</kbd> for a new document or <kbd>⌘ O</kbd> for an existing file. Start with a heading and a sentence.</p></li>
+        <li><span class="step-number" aria-hidden="true">2</span><h3>Give it a home.</h3><p>Save the note. Open a folder as a vault with <kbd>⇧ ⌘ O</kbd>, then use Save Current Vault to remember it.</p></li>
+        <li><span class="step-number" aria-hidden="true">3</span><h3>Follow an idea.</h3><p>Add a <code>[[wikilink]]</code> to another note. Open the inspector to explore the outline and link information.</p></li>
+      </ol>
+      <a class="text-link" href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/user-guide.md">Walk through the user guide <span aria-hidden="true">↗</span></a>
+    </section>
+
+    <section class="guides wrap" id="guides" aria-labelledby="guides-title"><div class="section-caption"><div><p class="eyebrow">08 / FIND YOUR WAY</p><h2 id="guides-title">A good place to start.</h2></div><a class="text-link" href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/README.md">All documentation <span aria-hidden="true">↗</span></a></div>
+      <div class="guide-links"><a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/user-guide.md"><span class="guide-number">01</span><div><h3>Your first note</h3><p>Open a file, save a vault, and make yourself at home.</p></div><span aria-hidden="true">↗</span></a><a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/markdown-support.md"><span class="guide-number">02</span><div><h3>What Markdown can do here</h3><p>Syntax, rich content, and the edges of compatibility.</p></div><span aria-hidden="true">↗</span></a><a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/getting-started.md"><span class="guide-number">03</span><div><h3>Build something native</h3><p>The toolchain, architecture, and contribution guide.</p></div><span aria-hidden="true">↗</span></a><a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/troubleshooting.md"><span class="guide-number">04</span><div><h3>A little help</h3><p>Find answers, understand an error, and get support.</p></div><span aria-hidden="true">↗</span></a></div>
+    </section>
+
+    <section class="faq-section wrap" id="faq" aria-labelledby="faq-title">
+      <div class="section-heading"><p class="eyebrow">09 / A FEW GOOD QUESTIONS</p><h2 id="faq-title">Before you begin.</h2></div>
+      <div class="faq-list">
+        <details><summary>Can I use MarkDev with files I already have?</summary><div><p>Yes. Open a Markdown file directly, or open a folder as a vault. Saved Vaults remembers a folder’s location. It does not import, duplicate, or back up its contents.</p></div></details>
+        <details><summary>Do I need AI to use the editor?</summary><div><p>No. Writing, reading, and connecting notes do not require Apple Intelligence or MANVI. Assistance is optional. Apple Intelligence needs a supported, enabled, and ready system model; MANVI is installed and configured separately.</p></div></details>
+        <details><summary>Does my writing stay on my Mac?</summary><div><p>Notes are local files, and the Apple Intelligence writing path uses the on-device model. MANVI has its own provider settings and can use remote processing after confirmation. Files stored in a folder managed by a sync service follow that service’s behavior.</p><p>The integrated terminal can run networked tools with your account’s permissions. See the <a href="https://github.com/bharathvbcr/MarkDev/blob/main/SECURITY.md">security policy</a> for the full boundaries.</p></div></details>
+        <details><summary>Will every Markdown extension render?</summary><div><p>MarkDev supports CommonMark with selected extensions, a native HTML subset, and supported LaTeX and Mermaid forms. It does not provide a browser or JSX runtime, and it does not fetch remote images while reading a note. Check the <a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/markdown-support.md">syntax guide</a> for compatibility limits.</p></div></details>
+        <details><summary>Can I export or print a note?</summary><div><p>Use File → Export as HTML… or Print… (<kbd>⌘ P</kbd>). HTML export uses a separate renderer. Inspect the output before sharing if you need the exact appearance of native math, diagrams, or other rich content.</p></div></details>
+        <details><summary>Which Macs can run MarkDev?</summary><div><p>The app requires macOS 26 or later. CPU support depends on the artifact: the published v0.0.3 archive is Apple silicon only, while current source has universal Release build settings. Read the <a href="#get">download notes below</a> before choosing a build.</p></div></details>
+        <details><summary>Why might Finder previews behave differently?</summary><div><p>Finder uses a separate Quick Look extension and chooses a provider through macOS. A registered extension is not proof Finder selected it, and ad-hoc signing does not provide notarization. The in-app peek uses MarkDev’s own preview surface. See <a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/troubleshooting.md">troubleshooting</a> for the checks.</p></div></details>
+        <details><summary>How do I report a problem or contribute?</summary><div><p>Start with a small, non-sensitive example and the exact app and macOS versions. Settings → Support offers bounded local diagnostic reports to review before sharing. Use <a href="https://github.com/bharathvbcr/MarkDev/issues">GitHub issues</a> for bugs and ideas, the <a href="https://github.com/bharathvbcr/MarkDev/blob/main/CONTRIBUTING.md">contribution guide</a> for development, and <a href="https://github.com/bharathvbcr/MarkDev/security/advisories/new">private vulnerability reporting</a> for security findings.</p></div></details>
+      </div>
+    </section>
+
+    <section class="download wrap" id="get" aria-labelledby="download-title"><p class="eyebrow">MAKE ROOM FOR YOUR NEXT IDEA</p><h2 id="download-title">Begin with a note.</h2><p>Free, open source, and made for macOS.</p><div class="actions"><a class="button primary" href="https://github.com/bharathvbcr/MarkDev/releases">View releases <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/bharathvbcr/MarkDev">Explore the source <span aria-hidden="true">↗</span></a></div><div class="release-note"><p><strong>Before you download</strong> · macOS 26 or later</p><p>Latest published release verified September 13, 2026: <strong>v0.0.3, Apple silicon only</strong>. It is ad-hoc signed and not notarized. The current source is v0.0.5 with universal Release build settings; newer features may require a source build.</p><a href="https://github.com/bharathvbcr/MarkDev/blob/main/docs/releases/README.md">Read the version and signing notes <span aria-hidden="true">↗</span></a></div></section>
+  </main>
+  <footer class="site-footer wrap"><a class="wordmark" href="#">MarkDev<span class="brand-period">.</span></a><p>A home for unfinished thoughts.</p><nav aria-label="Footer navigation"><a href="https://github.com/bharathvbcr/MarkDev">GitHub</a><a href="https://github.com/bharathvbcr/MarkDev/blob/main/SECURITY.md">Security</a><a href="https://github.com/bharathvbcr/MarkDev/blob/main/LICENSE">MIT license</a></nav></footer>
+</body>
+</html>

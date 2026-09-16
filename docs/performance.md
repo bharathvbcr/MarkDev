@@ -1,5 +1,7 @@
 # Performance Budgets & Benchmarking
 
+[Documentation](README.md) / Performance
+
 MarkDev targets fluid **60fps / 120fps ProMotion** interaction while editing large Markdown documents. The table below separates that design target from the looser thresholds the automated suite actually enforces.
 
 ---

@@ -14,7 +14,7 @@ The Rust core is independently selectable by Cargo feature so another host can t
 │  │ (Splits, Tabs, Glass) │    │ (Fragments, Styler)   │  │
 │  └───────────┬───────────┘    └───────────┬───────────┘  │
 └──────────────┼────────────────────────────┼──────────────┘
-               │ C-ABI / Flat Buffers       │ UTF-16 Offsets
+               │ C-ABI / JSON queries       │ UTF-16 records
 ┌──────────────┼────────────────────────────┼──────────────┐
 │  ┌───────────▼───────────┐    ┌───────────▼───────────┐  │
 │  │  Vault Index & Graph  │    │  Markdown & Highlight │  │
@@ -28,22 +28,22 @@ The Rust core is independently selectable by Cargo feature so another host can t
 
 ## 1. Rust Core Engine (`core/`)
 
-The Rust core is a pure static library (`libmarkdev.a`) that knows nothing about macOS or AppKit. It is designed for single-digit millisecond latency on documents exceeding 10,000 lines.
+The Rust core builds as a Rust library and a static C-ABI library (`libmarkdev.a`) that knows nothing about macOS or AppKit. Its measured thresholds and sampling rules are documented in [Performance](performance.md); no latency guarantee applies to every document.
 
 ### Key Components:
 
 - **Markdown Parser (`src/md/parse.rs`)**:
   Built on `pulldown-cmark`. Its optional `simd` feature selects a runtime-detected SSSE3 scanner on supported `x86_64` CPUs; the `arm64` slice uses the crate's scalar scanner. It tokenizes CommonMark blocks, headings, lists, tables, code blocks, task lists, and inline formatting.
 - **Incremental Engine (`src/md/incremental.rs`)**:
-  Features a provably safe **shift-only** fast path. When inert prose is typed away from block markers or line-start indentation, the previous parse tree is retained and offsets are simply shifted in memory without running the parser. Any ambiguous edit safely falls back to a complete reparse.
+  Uses a guarded **shift-only** fast path. When inert prose is typed away from block markers or line-start indentation, the previous parse tree is retained and offsets are simply shifted in memory without running the parser. Any ambiguous edit safely falls back to a complete reparse.
 - **HTML Export (`src/html.rs`)**:
   Renders notes to browser-ready HTML with strict bounds checking, link/image destination sanitization, and strict CSP framing for safe local consumption.
 - **Tree-sitter Syntax Highlighting (`src/highlight/`)**:
-  High-accuracy, AST-based syntax highlighting for fenced code blocks. Uses real grammars for Rust, Swift, JavaScript/TypeScript, Python, JSON, and Bash.
+  High-accuracy, AST-based syntax highlighting for fenced code blocks. Uses real grammars for Rust, Swift, JavaScript, Python, JSON, and Bash.
 - **Vault Index & Graph (`src/vault/`)**:
   Extracts note metadata (headings, tags, wikilinks) into an in-memory graph. Computes backlinks, resolves Obsidian-style wikilinks (`[[Note#Anchor]]`), and performs whole-word search for unlinked mentions.
 - **C-ABI FFI Layer (`src/ffi.rs`)**:
-  Exposes flat C structures across the FFI. Offset calculations are mapped from Rust byte indices to **UTF-16 code units** via `Utf16Mapper` so `NSTextStorage` receives exact string bounds without decoding overhead.
+  Exposes flat C structures across the FFI. Offset calculations are mapped from Rust byte indices to **UTF-16 code units** via `Utf16Mapper` so `NSTextStorage` receives exact string bounds against the same source revision. Swift copies returned records into its own model; the boundary is not universally zero-copy.
 
 ---
 
@@ -56,13 +56,15 @@ The main application links `MarkDevKit`, which owns the editable workspace, term
 | Module | Purpose |
 |---|---|
 | **`Core/`** | Swift models and types mapping directly to the Rust FFI structs. |
-| **`Editor/`** | TextKit 2 styling, `NSTextLayoutFragment` subclasses, and marker collapsing. |
-| **`Render/`** | LaTeX formula rendering via `SwiftMath`, Mermaid diagram rendering via `BeautifulMermaid`. |
+| **`Editor/`** | TextKit 2 styling, fragments, native math/diagram/image rendering, and marker collapsing. |
+| **`Render/`** | Read-only preview, in-app peek, and zoom-viewer surfaces. |
 | **`Splits/`** | `SplitLayout` pure value-type layout engine for recursive horizontal/vertical panes. |
 | **`Vault/`** | `VaultIndex` wrapper, backlinks engine, and interactive force-directed graph canvas. |
 | **`Terminal/`** | Integrated VT100/xterm pty terminal drawer built on `SwiftTerm`. |
 | **`Diagnostics/`** | Bounded local event ring, OS and file sinks, support-report export, and lifecycle contracts. |
 | **`Intelligence/`** | AI-powered writing/proofreading panel and services with guarded source validation before edits. |
+| **`Harness/`** | Optional MANVI subprocess, executable/provider settings, bounded run lifecycle. |
+| **`Workspace/`** | Documents, save transactions, session restoration, commands, and close review. |
 | **`Brand/`** | Vector geometry for the MarkDev mark and icon generation logic. |
 
 ---
@@ -78,7 +80,7 @@ Raw Text Edit (NSTextStorage)
 MarkdownStyler (Apply Attributes)
   • Collapses syntax markers to 0.01pt hidden font
   • Applies typography, colors, and line spacing
-  • Draws GFM tables as a grid (not kerned pipes)
+  • Styles source while preserving text and offsets
         │
         ▼
 SyntaxHighlighter (Tree-sitter Spans)
@@ -89,7 +91,7 @@ NSTextLayoutManagerDelegate
   • Yields custom MarkdownLayoutFragment instances
   • Draws block decorations (code panels, callout borders)
   • Draws embedded LaTeX & Mermaid bitmap renders
-  • Draws gutter checkboxes
+  • Draws table grids and gutter checkboxes
 ```
 
 ---
@@ -98,17 +100,16 @@ NSTextLayoutManagerDelegate
 
 Pane geometry is governed by `SplitLayout.swift` — a recursive, pure value-type tree:
 
-```swift
-public enum SplitLayout: Equatable, Sendable {
-    case leaf(PaneID)
-    case split(axis: Axis, fraction: Double, leading: SplitLayout, trailing: SplitLayout)
-}
-```
+`SplitLayout` is a struct containing a `SplitNode` root. A node is either
+`.leaf(PaneID)` or `.split(SplitNodeGroup)`; each group owns its axis, child
+array, and fractions. It is not a binary enum with `leading` and `trailing`
+fields.
 
-### Architectural Guarantees:
-- **No Zero-Size Panes**: Divider clamping logic lives entirely within `SplitLayout.adjustDivider()`.
-- **Automatic Tree Flattening**: Nested splits on the same axis are automatically flattened.
-- **Orphan Pruning**: When panes are closed, `Workspace.pruneOrphanedPanes()` cleans up associated document models to prevent memory leaks.
+- Divider resizing and fraction normalization live in the model.
+- Same-axis groups flatten, one-child groups collapse, and closed panes are pruned by the workspace.
+- Persisted layouts use bounded decoding and validation: at most 16 panes, depth 15, and 12 direct children per split. Invalid structure is rejected or explicitly recovered according to the entry point.
+
+The source of truth is [SplitLayout.swift](../app/MarkDevKit/Splits/SplitLayout.swift).
 
 ---
 
@@ -148,3 +149,20 @@ Diagnostics is local, typed, and bounded; it is not remote telemetry.
 The `SwiftTerm` drawer hosts the user's interactive login shell and can execute arbitrary commands with the main app's user authority. Before launching a shell or the configured MANVI executable, MarkDev resolves the candidate and walks its physical path descriptor-relatively without following replacement links. It rejects unsafe mounts, non-regular or oversized executables, set-ID bits, unexpected owners, group/world-writable components, and writable allow ACLs; discovery hashes the executable and launch-time checks revalidate its device, inode, size, and nanosecond change time. MANVI is checked before `Foundation.Process` launch, and terminal startup checks again before the shell fork and immediately before sending the fixed environment-variable command.
 
 The final execution APIs still consume a pathname rather than MarkDev's open descriptor. A hostile same-UID process that can rename or modify an owner-writable ancestor can therefore swap the path after the last validation and before `posix_spawn` or the shell reopens it. The checks substantially narrow this time-of-check/time-of-use window but do not eliminate it; the current integration has no `fexecve`/`execveat`-style launch seam.
+
+## 9. Optional assistance and product website
+
+`IntelligenceService` owns Foundation Models requests. Availability is explicit;
+unsupported hardware, disabled intelligence, a preparing model, and unsupported
+language are distinct states. Assisted replacements validate their source identity
+and generation before applying results.
+
+`HarnessRun` launches MANVI separately. `HarnessSettings` owns executable trust,
+provider/model configuration, remote-provider consent, and advisory/editing
+posture. The subprocess can use a configured remote provider; “on-device” applies
+to the Apple Intelligence path, not every Assist engine. A local executable does
+not imply local inference.
+
+The [static product website](../website/README.md) is independent of every app
+target. It introduces the product and links to canonical Markdown guides; it
+adds no browser runtime or dependency to MarkDev.app.

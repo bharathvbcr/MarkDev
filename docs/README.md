@@ -1,50 +1,32 @@
-# MarkDev Documentation
+# MarkDev documentation
 
-Welcome to the technical documentation for **MarkDev**. This documentation provides in-depth technical guides, architectural breakdowns, design invariants, and performance budgets for contributors and developers.
+MarkDev is a native macOS workspace for Markdown and connected notes. These guides describe the current source tree; published downloads can lag behind it. Start with the [release index](releases/README.md) when comparing versions.
 
-**Product stack.** DevCouncil is components and modules. Manvi wraps them. GitPulse uses Manvi and selected DevCouncil components for their respective jobs. MarkDev follows the same modularity: take only the Rust-core features an embedder needs, and drive Manvi from Assist without taking the rest of DevCouncil.
+## Use MarkDev
 
----
+1. [User guide](user-guide.md) — open your first note, save a vault, arrange panes, and use keyboard shortcuts.
+2. [Markdown support](markdown-support.md) — supported syntax, rich content, and compatibility limits.
+3. [Troubleshooting](troubleshooting.md) — missing images, save conflicts, writing tools, Quick Look, and support reports.
 
-## Table of Contents
+## Build and understand it
 
-- [Embed the Rust Core](./core-integration.md)
-  - Parser, highlighting and C ABI feature selection
-  - Host dependency replacement and the CI feature matrix
+| Guide | What it covers |
+| --- | --- |
+| [Getting started](getting-started.md) | Exact toolchain, build/test commands, generated inputs, and package lock |
+| [Architecture](architecture.md) | Runtime owners, Swift/Rust contracts, I/O, and extension boundaries |
+| [Editor engine](editor-engine.md) | Source preservation, reveal policy, fragment rendering, and rich content |
+| [Vault and graph](vault-and-graph.md) | Saved roots, link resolution, indexing, deterministic graph layout |
+| [Core integration](core-integration.md) | Embedding the Rust crate with selectable features |
+| [Performance](performance.md) | Automated thresholds, measurement methods, and unverified paths |
+| [Contributing](../CONTRIBUTING.md) | Invariants, change scope, and validation expectations |
 
-- [Getting Started & Setup](./getting-started.md)
-  - System prerequisites and toolchain requirements
-  - Building debug and release binaries with `just`
-  - Xcode project generation and gotchas
-  - Running automated tests and linter suites
+## Maintain and release it
 
-- [Architecture & Design Invariants](./architecture.md)
-  - Swift + Rust hybrid engine design
-  - The C-ABI FFI boundary and UTF-16 code unit indexing
-  - App framework and isolated read-only Quick Look target
-  - Value-type layout engines (`SplitLayout`)
-  - Sandboxing, privacy manifests, and terminal trust boundaries
-  - Bounded async I/O, recovery journal, and asset ingestion
-  - Current-process diagnostics and separately inspected previous-run exports
+- [Release history](releases/README.md) distinguishes published artifacts from source milestones.
+- [Release process](releasing.md) covers local validation, staging, draft upload, and publication checks.
+- [Website maintenance](../website/README.md) covers local preview and publishing the static product site.
+- [Security policy](../SECURITY.md) describes reporting and actual runtime boundaries.
 
-- [Editor Engine & Rendering Pipeline](./editor-engine.md)
-  - TextKit 2 layout fragment architecture (`NSTextLayoutFragment`)
-  - Non-destructive marker collapsing with 0.01pt fonts
-  - GFM tables drawn as a grid (`TableGrid` / `TableRowLayout`)
-  - Native rich block rendering (LaTeX via SwiftMath, Mermaid via BeautifulMermaid)
-  - Bounded image paste/drop ingestion into document-local assets
-  - Incremental shift parsing vs full reparsing
-  - AI-assisted writing/proofreading panel data ownership checks
+Documentation changes should follow the source, commands, and tests they describe. Historical measurements are not current benchmarks, a registered extension is not proof of Finder delivery, and unavailable checks must remain visibly unverified.
 
-- [Vault Indexing & Knowledge Graph](./vault-and-graph.md)
-  - Note metadata extraction and tag indexing
-  - Obsidian-compatible wikilink resolution algorithms
-  - Whole-word unlinked mention extraction
-  - Deterministic tie-breaking and backlink resolution
-  - Interactive force-directed graph canvas
-
-- [Performance Budgets & Benchmarking](./performance.md)
-  - Performance targets and separately documented automated gates
-  - Architecture-aware Rust parser benchmark suite
-  - Keystroke latency profiling in TextKit 2
-  - Best runs vs median variance in CI/testing
+[Back to MarkDev](../README.md)

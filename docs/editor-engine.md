@@ -1,15 +1,12 @@
 # Editor Engine & TextKit 2 Pipeline
 
-MarkDev features an in-place rich Markdown editor built on Apple's **TextKit 2** framework. It bridges the gap between raw text editors and visual WYSIWYG tools by rendering rich styling and diagrams inline while keeping the underlying text buffer 100% standard CommonMark.
+MarkDev features an in-place rich Markdown editor built on Apple's **TextKit 2** framework. It bridges the gap between raw text editors and visual WYSIWYG tools by rendering rich styling and diagrams inline while keeping the underlying Markdown source intact, including supported extensions.
 
 ---
 
 ## 1. Non-Destructive Marker Collapsing
 
-Most visual Markdown editors strip markdown syntax markers (such as `**`, `_`, ```` ``` ````, or `#`) from their internal text models. This creates severe drawbacks:
-- Copying text (`⌘C`) copies stripped plain text instead of Markdown.
-- Find and replace breaks on formatting syntax.
-- The document cannot be safely edited by external tools while open.
+MarkDev keeps source text and presentation separate. Rich styling must not silently rewrite the note or discard syntax.
 
 ### The 0.01pt Font Solution
 
@@ -24,7 +21,7 @@ let attributes: [NSAttributedString.Key: Any] = [
 ```
 
 ### Benefits:
-1. **Clipboard Fidelity**: Copying any selection places valid CommonMark onto the pasteboard.
+1. **Clipboard Fidelity**: Copying a text selection preserves its Markdown source; an arbitrary partial selection is not guaranteed to form a complete Markdown construct.
 2. **Native Undo**: Character insertions and deletions follow standard text undo semantics.
 3. **Caret Handling**: `MarkdownTextView` inspects `HiddenRanges` to gracefully step the caret over collapsed marker runs without the cursor getting trapped.
 
@@ -32,7 +29,7 @@ let attributes: [NSAttributedString.Key: Any] = [
 
 ## 2. Reveal Policy & Caret Interaction
 
-When the user moves the insertion caret inside a formatted run (e.g. inside `**bold text**`), the `RevealPolicy` temporarily expands the surrounding markers to normal font size so the syntax can be edited.
+In Live Preview, `RevealPolicy` reveals the blocks intersecting the selection. Revealing is per block rather than per inline marker, and touching a table reveals the whole table. Source mode reveals all blocks; Reading mode reveals none.
 
 ### Protected Markers (`markersRequiringReplacement`):
 Constructs that consist *entirely* of syntax (such as `- [ ]` checkboxes and `---` horizontal rules) are never collapsed into invisibility unless a replacement view or fragment drawing is actively rendered in their place. This prevents the perception of data loss.
@@ -83,7 +80,7 @@ Columns are solved by lowering a common ceiling until the table fits, so a table
 
 For mathematical formulas (`$E=mc^2$` / `$$\int f(x)dx$$`) and Mermaid diagrams, `RichContentRenderer` renders high-resolution bitmaps directly into layout fragments.
 
-- **LaTeX**: Rendered using Core Text via `SwiftMath` (pure Swift).
+- **LaTeX**: Rendered using Core Text via `SwiftMath` (a native typesetter).
 - **Mermaid**: Rendered via `BeautifulMermaid` using layout engines ported from the Eclipse Layout Kernel (ELK).
 - **Bounded Shared Cache**: Rendered bitmaps are cached using the full render context under entry and pixel budgets. On-demand rendering occurs on the main actor. Each opportunistic prefetch step performs at most one render or one image filesystem probe; cheap dictionary-only hits and refusals for non-image content may drain in the same step. The Quick Look build compiles prefetch out.
 - **Relayout Invalidation**: When formula source code is edited, `invalidateFragments` forces TextKit to discard cached fragment heights and recalculate document bounds.
@@ -105,3 +102,21 @@ Those limits bound the retained descriptor input, requested thumbnail, admitted 
 Image ingestion is app-only and is compiled out of the Quick Look renderer. `MarkdownTextView` snapshots a finite pasteboard representation, while `DocumentAssetStore` validates at most 16 inputs with 32 MiB per-item and 64 MiB batch limits. Local file inputs use bounded regular-file reads that detect replacement during the read; image type, raster dimensions, and bounded SVG structure are checked before a unique name is reserved.
 
 The actor retains the document directory handle while decoding. Only after the editor accepts the Markdown mutation does it transactionally publish the corresponding file under `assets/`. Cancellation or a stale document generation discards unpublished reservations. Proven failures remove the exact pending Markdown insertion; an indeterminate publication remains visible for explicit review so MarkDev does not manufacture an orphan by guessing that no file was written.
+
+## 9. Ownership and appearance
+
+`MarkdownTextView` coordinates parsing, styling, reveal state, and fragment
+resolution. `InlineMathTypesetter` handles both prose and table-cell formulas.
+`canonicalMathSource` normalizes supported entities and command aliases for both
+rendering and cache lookup. Tables reveal as a unit when source editing requires
+it; cells use separately styled source copies for measurement.
+
+Fragments share a palette store and track render generations. Resizing or
+changing appearance must refresh cached grid geometry and bitmaps even when
+TextKit reuses fragments. `ContentZoomViewer` requests a new render for supported
+rich content; it is absent from the Quick Look build.
+
+HTML support lives in the native HTML flow/parser/layout sources and accepts a
+bounded subset. It is not browser execution. The [syntax guide](markdown-support.md)
+describes user-facing limits, and [performance](performance.md) separates measured
+thresholds from intended interaction budgets.

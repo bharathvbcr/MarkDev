@@ -1,44 +1,28 @@
-# Security Policy
+# Security policy
 
-MarkDev treats security and user data privacy with top priority. Because MarkDev is designed as a local-first, native Markdown editor with zero remote telemetries, your documents, notes, and system access remain entirely within your machine.
+## Report privately
 
----
+Use [GitHub private vulnerability reporting](https://github.com/bharathvbcr/MarkDev/security/advisories/new).
+Private reporting was verified enabled on 2026-09-13. Include the app version,
+macOS version, affected path, reproducible input, and observed impact. Avoid
+posting sensitive notes, credentials, or exploit details in a public issue.
 
-## Supported Versions
+This repository is in the 0.0.x app release series. The Rust crate's version is
+separate from the app version. See the [release index](docs/releases/README.md)
+for published artifacts; this policy does not promise maintenance of an
+unpublished 0.1.x application line or a guaranteed response deadline.
 
-We provide security updates for the following versions of MarkDev:
+## Runtime boundaries
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
-| < 0.1.0 | :x:                |
+- **Main application:** intentionally unsandboxed. The terminal executes commands with the user's authority. Validated local file operations are not process containment.
+- **Quick Look:** a separate sandboxed, read-only extension built from selected canonical renderer sources. It does not link the application framework or terminal.
+- **Rendering:** remote images and arbitrary script execution are excluded. Local inputs have validation and resource limits; platform decoders remain a trust boundary.
+- **Rust/Swift FFI:** bounded inputs and validated UTF-16 records cross an in-process C ABI. FFI is not a sandbox; its pointer and ownership contracts still matter.
+- **Assistance:** Apple Intelligence uses the on-device system model. Optional MANVI runs through separately configured executable, provider, and authority settings. Remote-provider consent and file-editing authority are explicit choices.
+- **Diagnostics:** bounded local events and exports exclude note text, prompts, commands, environment values, full paths, and URL credentials or queries. Diagnostics are not remote telemetry.
+- **Distribution:** ad-hoc signing is not notarization or Gatekeeper-trusted distribution. Consult the specific release's signing notes.
 
----
-
-## Reporting a Vulnerability
-
-If you discover a security vulnerability or potential exploit in MarkDev, please follow responsible disclosure guidelines and **do not disclose it publicly in an open GitHub issue**.
-
-### How to Report
-
-1. Email a report to **[security@markdev.dev](mailto:security@markdev.dev)** or open a private security advisory on GitHub if enabled.
-2. Include the following details in your report:
-   - A clear description of the vulnerability.
-   - Exact steps or proof-of-concept (PoC) code/markdown file to reproduce the issue.
-   - Operating system and MarkDev version tested.
-   - Any potential impact on user data or system integrity.
-
-### What to Expect
-
-- **Acknowledgment**: We aim to acknowledge receipt of security reports within 48 hours.
-- **Assessment**: We will investigate and confirm the issue within 5 business days.
-- **Resolution**: Once verified, we will develop a patch and coordinate a release timeline with you before making any public advisory.
-
----
-
-## Security Invariants in MarkDev
-
-- **No Remote Fetching**: MarkDev never downloads remote images or scripts dynamically during Markdown rendering. Image resolution is strictly confined to local paths.
-- **Terminal Isolation**: The integrated terminal emulator runs with user-scoped standard permissions and does not expose open ports or unauthenticated inter-process bridges.
-- **Sandboxed FFI Boundary**: Rust/Swift FFI bridges pass validated data buffers without direct memory leaks or unsafe raw pointer escapes across actors.
-- **Local-Only Diagnostics**: diagnostic reports are generated from local runtime telemetry only and are designed for support workflows; they do not include file bodies or unbounded path payloads.
+See [Architecture](docs/architecture.md) for descriptor-based I/O, recovery,
+resource bounds, and the residual same-user pathname race before process launch.
+Recovery checksums detect corruption; they do not authenticate data against a
+hostile process running as the same user.
