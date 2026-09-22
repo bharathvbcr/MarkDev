@@ -1,5 +1,7 @@
 # MarkDev
 
+[![Website](https://img.shields.io/badge/website-markdev.vbcr.dev-B91C1C?style=flat&logo=safari&logoColor=white)](https://markdev.vbcr.dev/)
+
 **A native home for Markdown, connected notes, and the work around them.**
 
 Write in a single document or open a folder as a vault. MarkDev brings in-place Markdown editing, native math and diagrams, backlinks, split panes, and a terminal into one macOS workspace. Your notes stay ordinary files.
