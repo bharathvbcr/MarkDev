@@ -33,6 +33,12 @@ Wikilink anchor navigation resolves supported headings. Do not assume Obsidian-s
 
 ## Export is a separate surface
 
-**Export as HTML…** calls the Rust HTML renderer with destination sanitization and payload limits. It does not capture the native editor or include a web math/diagram engine. Inspect exported output before sharing when exact visual fidelity matters.
+**Export as HTML…** and **Preview in Browser** (`⌥⌘P`) call the Rust HTML renderer with destination sanitization and payload limits. The page is a single self-contained file that works in current Safari, Chrome, Edge, and Firefox without script or network access:
+
+- Local pictures referenced with Markdown image syntax are copied in as `data:` URIs when their bytes identify as SVG, PNG, JPEG, GIF, WebP, AVIF, BMP, or ICO (up to 8 MiB each, 32 MiB per export). Other files keep their relative destination; remote images are still never fetched.
+- Headings receive GitHub-style `id` anchors, so `#heading` links and `[[#Heading]]` wikilinks navigate within the page. Other wikilinks point at the matching `.md` file.
+- GitHub callouts, task lists, footnotes, definition lists, tables, and code fences are styled for light and dark appearance and for print.
+
+It does not capture the native editor or include a web math/diagram engine: math and Mermaid source appear as labelled text. Inspect exported output before sharing when exact visual fidelity matters.
 
 Implementation owners: [Markdown parser](../core/src/md/parse.rs), [native rich renderer](../app/MarkDevKit/Editor/RichContentRenderer.swift), [HTML export](../core/src/html.rs).

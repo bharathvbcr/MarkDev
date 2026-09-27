@@ -98,6 +98,9 @@ struct WorkspaceCommands: Commands {
 
         CommandGroup(after: .saveItem) {
             actionButton("Export as HTML…", action: .exportHTML)
+            actionButton(
+                "Preview in Browser", action: .previewInBrowser, key: "p",
+                modifiers: [.command, .option])
             actionButton("Print…", action: .printDocument, key: "p")
         }
 

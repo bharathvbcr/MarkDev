@@ -57,6 +57,9 @@ public enum CommandAction: Sendable, Equatable {
     case resetZoom
     /// Exports the current document as HTML.
     case exportHTML
+    /// Renders the current document as HTML and opens it in the default
+    /// browser.
+    case previewInBrowser
     /// Prints or exports the current document as PDF.
     case printDocument
 }
@@ -128,7 +131,7 @@ public struct CommandAvailability: Equatable, Sendable {
             .toggleSidebar, .toggleInspector, .toggleTerminal, .toggleGraph,
             .setMode, .moveTerminal:
             return true
-        case .save, .saveAs, .exportHTML:
+        case .save, .saveAs, .exportHTML, .previewInBrowser:
             return hasDocument
         case .saveVault:
             return canSaveVault

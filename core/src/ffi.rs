@@ -20,6 +20,7 @@
 //! on a missing symbol, or worse, links against a stale declaration.
 
 use std::ffi::{c_char, CString};
+use std::path::Path;
 use std::ptr;
 
 #[cfg(feature = "highlight")]
@@ -27,7 +28,7 @@ use crate::highlight::{
     highlight_checked, supports_checked, HighlightSpan, MAX_HIGHLIGHT_CODE_BYTES,
     MAX_HIGHLIGHT_LANGUAGE_BYTES,
 };
-use crate::html::render_document;
+use crate::html::{render_document, render_document_with_options, ExportOptions};
 use crate::md::{
     parse_checked, BlockDescriptor, Document, ParseResult, Reparse, StyleSpan, SyntaxMarker,
     MAX_DOCUMENT_BYTES,
@@ -240,6 +241,49 @@ pub unsafe extern "C" fn md_html_render(
     }))
 }
 
+/// Renders like `md_html_render`, and copies local pictures the note
+/// references into the document as `data:` URIs.
+///
+/// `base` is the UTF-8 path of the folder the note lives in; relative image
+/// destinations resolve against it. An empty `base` renders exactly like
+/// `md_html_render`. Pictures that are missing, too large, or not a browser
+/// image format keep their original destination.
+///
+/// # Safety
+///
+/// Non-null pointers must each address at least their corresponding length.
+#[no_mangle]
+pub unsafe extern "C" fn md_html_render_with_base(
+    source: *const u8,
+    source_len: usize,
+    title: *const u8,
+    title_len: usize,
+    base: *const u8,
+    base_len: usize,
+) -> *mut HTMLHandle {
+    let Some(source) = read_utf8(source, source_len) else {
+        return ptr::null_mut();
+    };
+    let Some(title) = read_utf8(title, title_len) else {
+        return ptr::null_mut();
+    };
+    let Some(base) = read_utf8(base, base_len) else {
+        return ptr::null_mut();
+    };
+    if base.contains('\0') {
+        return ptr::null_mut();
+    }
+    let options = ExportOptions {
+        asset_base: (!base.is_empty()).then(|| Path::new(base)),
+    };
+    let Ok(html) = render_document_with_options(source, title, &options) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(HTMLHandle {
+        bytes: html.into_bytes().into_boxed_slice(),
+    }))
+}
+
 /// Borrows the rendered bytes until `md_html_free` is called.
 ///
 /// # Safety
@@ -262,7 +306,8 @@ pub unsafe extern "C" fn md_html_bytes(handle: *const HTMLHandle, count: *mut us
 ///
 /// # Safety
 ///
-/// `handle` must come from `md_html_render` and must not be freed twice.
+/// `handle` must come from `md_html_render` or `md_html_render_with_base`
+/// and must not be freed twice.
 #[no_mangle]
 pub unsafe extern "C" fn md_html_free(handle: *mut HTMLHandle) {
     if !handle.is_null() {

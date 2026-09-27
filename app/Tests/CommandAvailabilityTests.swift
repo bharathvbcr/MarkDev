@@ -50,7 +50,7 @@ final class CommandAvailabilityTests: XCTestCase {
         let state = availability(hasDocument: false)
 
         for action in [
-            CommandAction.save, .saveAs, .exportHTML, .printDocument,
+            CommandAction.save, .saveAs, .exportHTML, .previewInBrowser, .printDocument,
             .writingTools, .proofreadDocument, .clearProofreading, .analyzeNote, .askHarness,
         ] {
             XCTAssertFalse(state.allows(action), "\(action) requires a current document")
@@ -149,7 +149,8 @@ final class CommandAvailabilityTests: XCTestCase {
             .toggleGraph, .splitRight, .splitDown, .closePane, .focusNextPane,
             .focusPreviousPane, .setMode(.source), .writingTools, .proofreadDocument,
             .clearProofreading, .analyzeNote, .askHarness, .openHarnessTerminal,
-            .moveTerminal, .zoomIn, .zoomOut, .resetZoom, .exportHTML, .printDocument,
+            .moveTerminal, .zoomIn, .zoomOut, .resetZoom, .exportHTML, .previewInBrowser,
+            .printDocument,
         ] {
             XCTAssertFalse(state.allows(action), "\(action) must wait for the operation")
         }

@@ -34,7 +34,7 @@ Tables, task lists, local images, math, and supported Mermaid diagrams render in
 
 Save your note before adding image assets. Image paste/drop validates supported inputs and publishes them under the document's `assets/` directory. Remote images are not fetched while reading a note. See [Markdown support](markdown-support.md) for limitations.
 
-Choose **File → Export as HTML…** to export a note through the bounded HTML renderer, or **Print…** (`⌘P`) to print. The HTML export is a separate rendering path; native math and diagram appearance should not be assumed to transfer identically.
+Choose **File → Export as HTML…** to export a note through the bounded HTML renderer, **File → Preview in Browser** (`⌥⌘P`) to open the same rendering in your default browser, or **Print…** (`⌘P`) to print. Exported pages embed the note's local pictures (SVG, PNG, JPEG, GIF, WebP, AVIF, BMP, ICO), follow the system light or dark appearance, and give every heading a link anchor. The HTML export is a separate rendering path; native math and diagram appearance should not be assumed to transfer identically.
 
 ## Optional writing assistance
 
@@ -58,7 +58,7 @@ The Assist panel also offers **MANVI**, installed and configured separately. Cho
 | `⌥⌘→` / `⌥⌘←` | Next / previous pane |
 | `⌃⌘W` | Close pane |
 | `⌘=` / `⌘-` / `⌘0` | Zoom in / out / actual size |
-| `⌘P` | Print |
+| `⌘P` / `⌥⌘P` | Print / preview in browser |
 | `⇧⌘E` / `⇧⌘P` | Rewrite selection / proofread document |
 | Hold `Space` | Peek over a supported link or tree item |
 

@@ -3060,8 +3060,15 @@ struct WorkspaceView: View {
                 title: "Actual Size", symbol: "1.magnifyingglass",
                 kind: .action(.resetZoom), shortcut: "⌘0"),
             Command(
-                title: "Export as HTML…", symbol: "square.and.arrow.up",
+                title: "Export as HTML…",
+                subtitle: "A standalone page with pictures embedded",
+                symbol: "square.and.arrow.up",
                 kind: .action(.exportHTML)),
+            Command(
+                title: "Preview in Browser",
+                subtitle: "Open the rendered note in your default browser",
+                symbol: "safari",
+                kind: .action(.previewInBrowser), shortcut: "⌥⌘P"),
             Command(
                 title: "Print…", symbol: "printer",
                 kind: .action(.printDocument), shortcut: "⌘P"),
@@ -3226,6 +3233,8 @@ struct WorkspaceView: View {
             editorSurfaces.surface(in: workspace.focusedPane)?.resetZoom()
         case .exportHTML:
             exportHTML()
+        case .previewInBrowser:
+            previewInBrowser()
         case .printDocument:
             printDocument()
         }
@@ -3255,12 +3264,36 @@ struct WorkspaceView: View {
         guard response == .OK, let url = savePanel.url else { return }
 
         let title = doc.url?.deletingPathExtension().lastPathComponent ?? "Document"
+        let baseDirectory = doc.url?.deletingLastPathComponent()
         do {
             try await Task.detached(priority: .userInitiated) {
-                try HTMLExporter.write(markdown: doc.text, title: title, to: url)
+                try HTMLExporter.write(
+                    markdown: doc.text, title: title, baseDirectory: baseDirectory, to: url)
             }.value
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Renders the focused note to a private temporary file and hands it to
+    /// the default browser. Rendering and file I/O stay off the window actor.
+    private func previewInBrowser() {
+        guard let doc = workspace.document(in: workspace.focusedPane) else { return }
+        let markdown = doc.text
+        let title = doc.url?.deletingPathExtension().lastPathComponent ?? "Untitled"
+        let baseDirectory = doc.url?.deletingLastPathComponent()
+        Task { @MainActor in
+            do {
+                let url = try await Task.detached(priority: .userInitiated) {
+                    try HTMLExporter.writeBrowserPreview(
+                        markdown: markdown, title: title, baseDirectory: baseDirectory)
+                }.value
+                if !NSWorkspace.shared.open(url) {
+                    errorMessage = "MarkDev could not open a browser for the preview."
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 

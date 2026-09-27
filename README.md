@@ -75,6 +75,7 @@ These are test thresholds, not a promise about every keystroke or Mac. The [perf
 | `⌥ ⌘ I` | Toggle Metadata & Backlinks Inspector |
 | `⌘ J` | Toggle Terminal Drawer |
 | `⌥ ⌘ G` | Toggle Vault Graph View |
+| `⌥ ⌘ P` | Preview Note in Browser |
 | `⌘ F` | Find in Document |
 | `⌥ ⌘ F` | Find and Replace |
 | `⌘ G` / `⇧ ⌘ G` | Find Next / Previous Match |

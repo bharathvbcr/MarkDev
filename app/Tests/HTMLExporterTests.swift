@@ -8,7 +8,7 @@ final class HTMLExporterTests: XCTestCase {
             markdown: "# Heading\n\nA **strong** idea.\n\n<script>owned()</script>",
             title: "<img src=x onerror=owned()>")
 
-        XCTAssertTrue(html.contains("<h1>Heading</h1>"))
+        XCTAssertTrue(html.contains("<h1 id=\"heading\">Heading"))
         XCTAssertTrue(html.contains("<strong>strong</strong>"))
         XCTAssertFalse(html.contains("<script>"))
         XCTAssertFalse(html.contains("<img src=x"))
@@ -68,5 +68,48 @@ final class HTMLExporterTests: XCTestCase {
                 error as? HTMLExporterError,
                 .titleTooLarge(maximumBytes: HTMLExporter.maximumTitleBytes))
         }
+    }
+
+    func testBaseDirectoryEmbedsLocalSVGForBrowsers() throws {
+        let folder = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevEmbed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try Data(#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"/>"#.utf8)
+            .write(to: folder.appendingPathComponent("mark.svg"))
+
+        let embedded = try HTMLExporter.render(
+            markdown: "![Mark](mark.svg)", title: "Note", baseDirectory: folder)
+        let plain = try HTMLExporter.render(markdown: "![Mark](mark.svg)", title: "Note")
+
+        XCTAssertTrue(embedded.contains("src=\"data:image/svg+xml;base64,"))
+        XCTAssertTrue(plain.contains("src=\"mark.svg\""))
+    }
+
+    func testBrowserPreviewIsWrittenToAPrivateUniqueFile() throws {
+        let first = try HTMLExporter.writeBrowserPreview(
+            markdown: "# Preview", title: "Same", baseDirectory: nil)
+        let second = try HTMLExporter.writeBrowserPreview(
+            markdown: "# Preview", title: "Same", baseDirectory: nil)
+        defer {
+            try? FileManager.default.removeItem(at: first.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: second.deletingLastPathComponent())
+        }
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(first.lastPathComponent, "Same.html")
+        XCTAssertTrue(
+            first.path.hasPrefix(HTMLExporter.browserPreviewDirectory.standardizedFileURL.path)
+                || first.path.hasPrefix(HTMLExporter.browserPreviewDirectory.path))
+        let html = try String(contentsOf: first, encoding: .utf8)
+        XCTAssertTrue(html.contains("<h1 id=\"preview\">Preview"))
+    }
+
+    func testPreviewFileNamesAreSinglePathComponents() {
+        XCTAssertEqual(HTMLExporter.previewFileName(for: "Plan"), "Plan.html")
+        XCTAssertEqual(HTMLExporter.previewFileName(for: "a/b:c"), "a-b-c.html")
+        XCTAssertEqual(HTMLExporter.previewFileName(for: "   "), "Document.html")
+        XCTAssertEqual(HTMLExporter.previewFileName(for: ".hidden"), "Document.hidden.html")
+        XCTAssertFalse(HTMLExporter.previewFileName(for: "../../etc").contains("/"))
     }
 }
