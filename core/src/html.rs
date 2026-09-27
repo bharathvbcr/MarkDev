@@ -75,6 +75,23 @@ pub struct ExportOptions<'a> {
     /// When absent, the nearest folder above the note holding `.obsidian` or
     /// `.git` is used, else the note's own folder.
     pub vault_root: Option<&'a Path>,
+    /// Where local links and media point from. Defaults to the note's
+    /// folder, which is right when the page is saved beside the note.
+    pub link_base: LinkBase<'a>,
+}
+
+/// How an exported page refers to local files it does not embed: other
+/// notes, audio and video, PDFs, and pictures too large to copy in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkBase<'a> {
+    /// Relative to the note's own folder.
+    #[default]
+    NoteFolder,
+    /// Relative to the folder the page is written to.
+    Directory(&'a Path),
+    /// Absolute `file://` URLs, for a page in a temporary location such as
+    /// a browser preview.
+    FileUrl,
 }
 
 /// Renders a complete browser-ready document from MarkDev's Markdown dialect.
@@ -136,7 +153,7 @@ pub fn render_document_with_options(
         .write_all(DOCUMENT_MIDDLE.as_bytes())
         .map_err(|_| output.error())?;
 
-    let mut context = ExportContext::new(export.asset_base, export.vault_root);
+    let mut context = ExportContext::new(export.asset_base, export.vault_root, export.link_base);
     let prepared = prepare_source(clean_source.as_ref());
     let events = ExportEvents::new(
         prepared.text.as_ref(),
@@ -565,10 +582,19 @@ struct ExportContext {
     visited: Vec<PathBuf>,
     vault_root: Option<PathBuf>,
     vault_files: Option<Vec<PathBuf>>,
+    /// The folder links are written relative to, or `None` for `file://`.
+    link_from: Option<PathBuf>,
+    /// Whether links should be absolute `file://` URLs.
+    file_urls: bool,
 }
 
 impl ExportContext {
-    fn new(base: Option<&Path>, vault_root: Option<&Path>) -> Self {
+    fn new(base: Option<&Path>, vault_root: Option<&Path>, link_base: LinkBase<'_>) -> Self {
+        let (link_from, file_urls) = match link_base {
+            LinkBase::NoteFolder => (base.map(absolute_path), false),
+            LinkBase::Directory(dir) => (Some(absolute_path(dir)), false),
+            LinkBase::FileUrl => (None, true),
+        };
         let vault_root = match vault_root {
             Some(root) => Some(root.to_path_buf()),
             None => base.and_then(find_vault_root),
@@ -580,6 +606,20 @@ impl ExportContext {
             visited: Vec::new(),
             vault_root,
             vault_files: None,
+            link_from,
+            file_urls,
+        }
+    }
+
+    /// How the page refers to a local file it does not embed.
+    fn href_for(&self, path: &Path) -> String {
+        let path = absolute_path(path);
+        if self.file_urls {
+            return file_url(&path);
+        }
+        match &self.link_from {
+            Some(from) => relative_href(from, &path),
+            None => file_url(&path),
         }
     }
 
@@ -721,6 +761,25 @@ fn scan_vault(root: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `file:///…` for an absolute path, percent-encoded per component.
+fn file_url(path: &Path) -> String {
+    let mut url = String::from("file://");
+    for component in path.components() {
+        if let Component::Normal(part) = component {
+            url.push('/');
+            url.push_str(&encode_path_component(&part.to_string_lossy()));
+        }
+    }
+    if url.len() == "file://".len() {
+        url.push('/');
+    }
+    url
 }
 
 /// A relative URL from `from_dir` to `to`, percent-encoded per component.
@@ -1043,7 +1102,11 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                 let dest_url = if matches!(link_type, LinkType::WikiLink { .. }) {
                     CowStr::Boxed(self.wikilink_href(&dest_url).into_boxed_str())
                 } else {
-                    sanitize_destination(dest_url, true, link_type)
+                    let safe = sanitize_destination(dest_url, true, link_type);
+                    match self.rebase_relative(&safe) {
+                        Some(rebased) => CowStr::Boxed(rebased.into_boxed_str()),
+                        None => safe,
+                    }
                 };
                 self.pending.push_back(Event::Start(Tag::Link {
                     dest_url,
@@ -1165,6 +1228,43 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             .push_back(Event::Text(CowStr::Boxed(literal.into_boxed_str())));
     }
 
+    /// A relative local destination written in this note (`other.md#x`,
+    /// `media/clip.mp4`), rewritten to point there from the page. `None` for
+    /// anything that is not a relative path: fragments, URLs, e-mail.
+    fn rebase_relative(&self, destination: &str) -> Option<String> {
+        let base = self.base.as_ref()?;
+        let (path, fragment) = match destination.split_once('#') {
+            Some((path, fragment)) => (path, Some(fragment)),
+            None => (destination, None),
+        };
+        let (path, query) = match path.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path, None),
+        };
+        let lower = path.to_ascii_lowercase();
+        let has_scheme = lower.find(':').is_some_and(|colon| {
+            let boundary = lower.find('/').unwrap_or(usize::MAX);
+            colon < boundary
+        });
+        if path.is_empty() || has_scheme || path.starts_with("//") || path.starts_with('/') {
+            return None;
+        }
+        let decoded = percent_decode(path)?;
+        let mut href = self.context.href_for(&base.join(decoded));
+        if path.ends_with('/') && !href.ends_with('/') {
+            href.push('/');
+        }
+        if let Some(query) = query {
+            href.push('?');
+            href.push_str(query);
+        }
+        if let Some(fragment) = fragment {
+            href.push('#');
+            href.push_str(fragment);
+        }
+        Some(href)
+    }
+
     /// Where a `[[wikilink]]` points in the browser: the note's file,
     /// relative to this page when the vault can find it, and `#^id` or a
     /// heading slug for the fragment.
@@ -1188,7 +1288,23 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                     } else {
                         self.context.resolve_note(&base, page)
                     }?;
-                Some(relative_href(&base, &found))
+                Some(self.context.href_for(&found))
+            });
+            let unresolved = || {
+                let has_extension = Path::new(page)
+                    .extension()
+                    .is_some_and(|extension| !extension.is_empty());
+                if has_extension {
+                    page.to_owned()
+                } else {
+                    format!("{page}.md")
+                }
+            };
+            let resolved = resolved.or_else(|| {
+                // Not found: still point where it would be, from the page.
+                self.base
+                    .as_ref()
+                    .map(|base| self.context.href_for(&base.join(unresolved())))
             });
             match resolved {
                 Some(relative) => href.push_str(&relative),
@@ -1287,13 +1403,18 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             }
         };
         let href = match (&found, &self.base) {
-            (Some(path), Some(base)) => relative_href(base, path),
+            (Some(path), Some(_)) => self.context.href_for(path),
+            (None, Some(base)) if wiki && safe.as_ref() != "#" => {
+                self.context.href_for(&base.join(destination))
+            }
             _ if wiki && safe.as_ref() != "#" => destination
                 .split('/')
                 .map(encode_path_component)
                 .collect::<Vec<_>>()
                 .join("/"),
-            _ => safe.to_string(),
+            _ => self
+                .rebase_relative(safe.as_ref())
+                .unwrap_or_else(|| safe.to_string()),
         };
         let href = escape_html(&href);
         let size_attrs = match size {

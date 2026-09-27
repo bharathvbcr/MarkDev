@@ -112,4 +112,28 @@ final class HTMLExporterTests: XCTestCase {
         XCTAssertEqual(HTMLExporter.previewFileName(for: ".hidden"), "Document.hidden.html")
         XCTAssertFalse(HTMLExporter.previewFileName(for: "../../etc").contains("/"))
     }
+
+    func testExportLinksPointFromTheSavedPageAndPreviewsUseFileURLs() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevLinks-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notes = root.appendingPathComponent("Notes", isDirectory: true)
+        let exports = root.appendingPathComponent("Exports", isDirectory: true)
+        try FileManager.default.createDirectory(at: notes, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
+        try Data("# Other".utf8).write(to: notes.appendingPathComponent("Other.md"))
+
+        let destination = exports.appendingPathComponent("Page.html")
+        try HTMLExporter.write(
+            markdown: "[[Other]]", title: "Page", baseDirectory: notes, to: destination)
+        let saved = try String(contentsOf: destination, encoding: .utf8)
+        XCTAssertTrue(saved.contains("href=\"../Notes/Other.md\""))
+
+        let preview = try HTMLExporter.writeBrowserPreview(
+            markdown: "[[Other]]", title: "Page", baseDirectory: notes)
+        defer { try? FileManager.default.removeItem(at: preview.deletingLastPathComponent()) }
+        let previewed = try String(contentsOf: preview, encoding: .utf8)
+        XCTAssertTrue(previewed.contains("href=\"file://"))
+        XCTAssertTrue(previewed.contains("/Notes/Other.md\""))
+    }
 }

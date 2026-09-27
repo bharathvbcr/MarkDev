@@ -43,8 +43,15 @@ public enum HTMLExporter {
     /// else keeps its original relative destination. `![[Note]]` embeds are
     /// transcluded, and Obsidian's by-name `![[picture.png]]` is searched for
     /// inside `vaultRoot` (or the nearest `.obsidian`/`.git` folder).
+    ///
+    /// Local files the page links to without embedding (other notes, audio,
+    /// video, PDFs) are addressed from `outputDirectory`, the folder the page
+    /// is saved in, or from the note's folder when it is `nil`. `fileURLs`
+    /// makes them absolute `file://` URLs instead, for a page in a temporary
+    /// location.
     public static func render(
-        markdown: String, title: String, baseDirectory: URL? = nil, vaultRoot: URL? = nil
+        markdown: String, title: String, baseDirectory: URL? = nil, vaultRoot: URL? = nil,
+        outputDirectory: URL? = nil, fileURLs: Bool = false
     ) throws -> String {
         guard markdown.utf8.count <= maximumSourceBytes else {
             throw HTMLExporterError.sourceTooLarge(maximumBytes: maximumSourceBytes)
@@ -68,17 +75,26 @@ public enum HTMLExporter {
                 BoundedRegularFileReader.hasLocalFileAuthority(url)
                     ? Array(url.standardizedFileURL.path.utf8) : nil
             } ?? []
+        let outputPath: [UInt8] =
+            outputDirectory.flatMap { url in
+                BoundedRegularFileReader.hasLocalFileAuthority(url)
+                    ? Array(url.standardizedFileURL.path.utf8) : nil
+            } ?? []
 
         #if canImport(CMarkDev)
             let handle = source.withUnsafeBufferPointer { sourceBuffer in
                 titleBytes.withUnsafeBufferPointer { titleBuffer in
                     basePath.withUnsafeBufferPointer { baseBuffer in
                         vaultPath.withUnsafeBufferPointer { vaultBuffer in
-                            md_html_render_with_base(
-                                sourceBuffer.baseAddress, UInt(sourceBuffer.count),
-                                titleBuffer.baseAddress, UInt(titleBuffer.count),
-                                baseBuffer.baseAddress, UInt(baseBuffer.count),
-                                vaultBuffer.baseAddress, UInt(vaultBuffer.count))
+                            outputPath.withUnsafeBufferPointer { outputBuffer in
+                                md_html_render_with_base(
+                                    sourceBuffer.baseAddress, UInt(sourceBuffer.count),
+                                    titleBuffer.baseAddress, UInt(titleBuffer.count),
+                                    baseBuffer.baseAddress, UInt(baseBuffer.count),
+                                    vaultBuffer.baseAddress, UInt(vaultBuffer.count),
+                                    outputBuffer.baseAddress, UInt(outputBuffer.count),
+                                    fileURLs)
+                            }
                         }
                     }
                 }
@@ -106,7 +122,7 @@ public enum HTMLExporter {
     /// leave a plausible-looking partial export behind.
     public static func write(
         markdown: String, title: String, baseDirectory: URL? = nil, vaultRoot: URL? = nil,
-        to destination: URL
+        fileURLs: Bool = false, to destination: URL
     ) throws {
         // `isFileURL` alone is insufficient: Foundation exposes the local
         // path of `file://remote-host/path`, and its write APIs silently use
@@ -115,8 +131,11 @@ public enum HTMLExporter {
         guard BoundedRegularFileReader.hasLocalFileAuthority(destination) else {
             throw HTMLExporterError.unsupportedLocation(destination)
         }
+        // Links are written from where the page will live, so an export saved
+        // away from its note still reaches the note's neighbours.
         let output = try render(
-            markdown: markdown, title: title, baseDirectory: baseDirectory, vaultRoot: vaultRoot)
+            markdown: markdown, title: title, baseDirectory: baseDirectory, vaultRoot: vaultRoot,
+            outputDirectory: destination.deletingLastPathComponent(), fileURLs: fileURLs)
         try output.write(to: destination, atomically: true, encoding: .utf8)
     }
 
@@ -144,9 +163,11 @@ public enum HTMLExporter {
             attributes: [.posixPermissions: 0o700])
         let destination = folder.appendingPathComponent(
             previewFileName(for: title), isDirectory: false)
+        // The preview sits in a temporary folder, so relative links would
+        // point nowhere: address the vault by absolute `file://` URLs.
         try write(
             markdown: markdown, title: title, baseDirectory: baseDirectory, vaultRoot: vaultRoot,
-            to: destination)
+            fileURLs: true, to: destination)
         return destination
     }
 

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use markdev::ffi::{md_html_bytes, md_html_free, md_html_render, md_html_render_with_base};
 use markdev::html::{
     render_document, render_document_with_options, slugify, sniff_image, ExportOptions,
-    HTMLExportError, MAX_EMBEDDED_IMAGE_BYTES, MAX_SOURCE_BYTES, MAX_TITLE_BYTES,
+    HTMLExportError, LinkBase, MAX_EMBEDDED_IMAGE_BYTES, MAX_SOURCE_BYTES, MAX_TITLE_BYTES,
 };
 
 #[test]
@@ -167,6 +167,7 @@ fn export_with_base(source: &str, scratch: &Scratch) -> String {
         &ExportOptions {
             asset_base: Some(&scratch.0),
             vault_root: None,
+            ..Default::default()
         },
     )
     .expect("document should export")
@@ -348,6 +349,9 @@ fn ffi_with_base_embeds_images_and_empty_base_matches_plain_render() {
             base.len(),
             std::ptr::null(),
             0,
+            std::ptr::null(),
+            0,
+            false,
         );
         assert!(!handle.is_null());
         let mut count = 0;
@@ -373,6 +377,9 @@ fn ffi_with_base_embeds_images_and_empty_base_matches_plain_render() {
             invalid.len(),
             std::ptr::null(),
             0,
+            std::ptr::null(),
+            0,
+            false,
         )
     };
     assert!(rejected.is_null());
@@ -500,6 +507,7 @@ fn attachments_are_found_in_vault_folders_like_obsidian() {
         &ExportOptions {
             asset_base: Some(&note_dir),
             vault_root: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -521,6 +529,7 @@ fn note_embeds_transclude_sections_blocks_and_stop_at_cycles() {
         &ExportOptions {
             asset_base: Some(&scratch.0),
             vault_root: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -553,6 +562,7 @@ fn wikilinks_resolve_to_notes_in_other_folders() {
         &ExportOptions {
             asset_base: Some(&note_dir),
             vault_root: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -644,4 +654,78 @@ fn without_mathml_formulas_stay_as_source() {
     assert!(!body.contains("<math"));
     assert!(body.contains("<span class=\"math math-inline math-source\">x^2</span>"));
     assert!(body.contains("<span class=\"math math-inline math-source\">y</span>"));
+}
+
+// MARK: - Link bases
+
+#[test]
+fn links_point_from_where_the_page_is_saved() {
+    let scratch = Scratch::new("linkbase");
+    std::fs::create_dir_all(scratch.0.join(".obsidian")).unwrap();
+    scratch.write("Notes/Other.md", b"# Other");
+    scratch.write("Notes/media/clip.mp4", b"not really video");
+    let notes = scratch.0.join("Notes");
+    let out = scratch.0.join("Exports/2026");
+    std::fs::create_dir_all(&out).unwrap();
+    let source = "[[Other]] [md](Other.md#top) ![[clip.mp4]] [web](https://example.com) [here](#x)";
+
+    let html = render_document_with_options(
+        source,
+        "L",
+        &ExportOptions {
+            asset_base: Some(&notes),
+            link_base: LinkBase::Directory(&out),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(html.contains("href=\"../../Notes/Other.md\""), "wikilink");
+    assert!(
+        html.contains("href=\"../../Notes/Other.md#top\""),
+        "markdown link"
+    );
+    assert!(html.contains("src=\"../../Notes/media/clip.mp4\""), "media");
+    assert!(html.contains("href=\"https://example.com\""));
+    assert!(html.contains("href=\"#x\""));
+}
+
+#[test]
+fn browser_previews_use_absolute_file_urls() {
+    let scratch = Scratch::new("fileurl");
+    scratch.write("My Notes/Other.md", b"# Other");
+    let notes = scratch.0.join("My Notes");
+    let html = render_document_with_options(
+        "[[Other]] [x](Missing%20File.md)",
+        "P",
+        &ExportOptions {
+            asset_base: Some(&notes),
+            link_base: LinkBase::FileUrl,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let expected = format!(
+        "href=\"file://{}/My%20Notes/Other.md\"",
+        scratch.0.to_str().unwrap()
+    );
+    assert!(html.contains(&expected), "{html}");
+    assert!(html.contains("/My%20Notes/Missing%20File.md\""));
+}
+
+#[test]
+fn links_inside_transcluded_notes_point_from_the_page() {
+    let scratch = Scratch::new("translinks");
+    scratch.write("Sub/Embedded.md", b"See [[Sibling]] and ![[pic.mp3]].");
+    scratch.write("Sub/Sibling.md", b"# Sibling");
+    let html = render_document_with_options(
+        "![[Sub/Embedded]]",
+        "T",
+        &ExportOptions {
+            asset_base: Some(&scratch.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(html.contains("href=\"Sub/Sibling.md\""), "{html}");
+    assert!(html.contains("src=\"Sub/pic.mp3\""));
 }

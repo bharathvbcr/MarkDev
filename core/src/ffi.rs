@@ -28,7 +28,7 @@ use crate::highlight::{
     highlight_checked, supports_checked, HighlightSpan, MAX_HIGHLIGHT_CODE_BYTES,
     MAX_HIGHLIGHT_LANGUAGE_BYTES,
 };
-use crate::html::{render_document, render_document_with_options, ExportOptions};
+use crate::html::{render_document, render_document_with_options, ExportOptions, LinkBase};
 use crate::md::{
     parse_checked, BlockDescriptor, Document, ParseResult, Reparse, StyleSpan, SyntaxMarker,
     MAX_DOCUMENT_BYTES,
@@ -251,6 +251,12 @@ pub unsafe extern "C" fn md_html_render(
 /// may be empty: an empty `base` renders exactly like `md_html_render`, and
 /// an empty `vault` falls back to the nearest `.obsidian`/`.git` folder.
 ///
+/// Local files the page links to without embedding (other notes, audio,
+/// video, PDFs) are addressed from `output`, the folder the page will be
+/// written to, or from the note's folder when `output` is empty. When
+/// `file_urls` is true they are absolute `file://` URLs instead, for a page
+/// in a temporary location.
+///
 /// # Safety
 ///
 /// Non-null pointers must each address at least their corresponding length.
@@ -264,6 +270,9 @@ pub unsafe extern "C" fn md_html_render_with_base(
     base_len: usize,
     vault: *const u8,
     vault_len: usize,
+    output: *const u8,
+    output_len: usize,
+    file_urls: bool,
 ) -> *mut HTMLHandle {
     let Some(source) = read_utf8(source, source_len) else {
         return ptr::null_mut();
@@ -277,12 +286,23 @@ pub unsafe extern "C" fn md_html_render_with_base(
     let Some(vault) = read_utf8(vault, vault_len) else {
         return ptr::null_mut();
     };
-    if base.contains('\0') || vault.contains('\0') {
+    let Some(output) = read_utf8(output, output_len) else {
+        return ptr::null_mut();
+    };
+    if base.contains('\0') || vault.contains('\0') || output.contains('\0') {
         return ptr::null_mut();
     }
+    let link_base = if file_urls {
+        LinkBase::FileUrl
+    } else if output.is_empty() {
+        LinkBase::NoteFolder
+    } else {
+        LinkBase::Directory(Path::new(output))
+    };
     let options = ExportOptions {
         asset_base: (!base.is_empty()).then(|| Path::new(base)),
         vault_root: (!vault.is_empty() && !base.is_empty()).then(|| Path::new(vault)),
+        link_base,
     };
     let Ok(html) = render_document_with_options(source, title, &options) else {
         return ptr::null_mut();
