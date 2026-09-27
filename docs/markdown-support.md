@@ -59,6 +59,6 @@ Not supported: Dataview and other plugin query blocks, Canvas files, and live tr
 - Headings receive GitHub-style `id` anchors, so `#heading` links and `[[#Heading]]` wikilinks navigate within the page. Other wikilinks point at the matching `.md` file, relative to the page when the vault can find it.
 - Callouts, task lists, footnotes, definition lists, tables, code fences, and the rest of the [Obsidian syntax](#obsidian-syntax) are styled for light and dark appearance and for print.
 
-It does not capture the native editor or include a web math/diagram engine: math and Mermaid source appear as labelled text. Inspect exported output before sharing when exact visual fidelity matters.
+Math — `$…$`, `$$…$$`, the editor's `\(…\)` / `\[…\]` forms, and ```` ```math ```` fences — is typeset as MathML, which current Safari, Chrome, Edge, and Firefox draw natively without script, fonts, or network access. The editor's rules decide what is math, so `$5 and $10` stays prose. A formula the typesetter does not fully understand is shown as its LaTeX source rather than with error markup, and generated MathML is checked against an element and attribute allowlist before it reaches the page. The export does not include a diagram engine: Mermaid source appears as labelled text. It does not capture the native editor, so inspect exported output before sharing when exact visual fidelity matters.
 
 Implementation owners: [Markdown parser](../core/src/md/parse.rs), [native rich renderer](../app/MarkDevKit/Editor/RichContentRenderer.swift), [HTML export](../core/src/html.rs).

@@ -860,7 +860,7 @@ fn delimiter_run(source: &str, range: &Range<usize>, byte: u8) -> usize {
 /// The two pulldown rules — non-space after the opener, non-space before
 /// the closer — are re-checked rather than trusted, so this function stays
 /// correct even if the upstream pairing ever loosens.
-fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub(crate) fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$` at both ends with something between, and both
     // ends on character boundaries so the adjacency reads below cannot slice
@@ -943,7 +943,7 @@ fn crosses_link_destination(bytes: &[u8], content: Range<usize>) -> bool {
 /// own lines ends at a newline or the end of the document and passes
 /// untouched; so does inline display math between words (`text $$x$$ more`),
 /// which notes in the wild rely on.
-fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub(crate) fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$$` at both ends with something between, on
     // character boundaries, for the same reason the inline check insists.

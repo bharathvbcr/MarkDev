@@ -19,11 +19,13 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
-use pulldown_cmark::{html, CowStr, Event, LinkType, Parser, Tag, TagEnd};
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, TagEnd};
 
-use crate::md::model::{CalloutKind, CALLOUT_FOLD_COLLAPSED};
+use crate::md::model::{BlockKind, CalloutKind, SpanKind, Utf16Mapper, CALLOUT_FOLD_COLLAPSED};
 use crate::md::obsidian;
-use crate::md::parse::{options, scan_highlights, scan_tags};
+use crate::md::parse::{
+    display_math_is_valid, inline_math_is_valid, options, parse_checked, scan_highlights, scan_tags,
+};
 
 /// Rendering is linear but necessarily allocates output proportional to the
 /// document. Refuse pathological inputs before duplicating them across the
@@ -137,7 +139,8 @@ pub fn render_document_with_options(
     let mut context = ExportContext::new(export.asset_base, export.vault_root);
     let prepared = prepare_source(clean_source.as_ref());
     let events = ExportEvents::new(
-        prepared.as_ref(),
+        prepared.text.as_ref(),
+        prepared.math,
         export.asset_base.map(Path::to_path_buf),
         &mut context,
     );
@@ -151,18 +154,48 @@ pub fn render_document_with_options(
     Ok(String::from_utf8(output.into_bytes()).expect("HTML writer emitted invalid UTF-8"))
 }
 
-/// Rewrites Obsidian syntax CommonMark would otherwise print literally:
-/// `%%comments%%` are removed, and `^[inline footnotes]` become ordinary
-/// footnote references whose definitions are appended, so the browser gets
-/// numbered notes at the foot of the page exactly as Obsidian shows them.
-fn prepare_source(source: &str) -> Cow<'_, str> {
+/// Math pulldown-cmark does not see (`\(…\)`, `\[…\]`), lifted out of the
+/// source before parsing and put back when its placeholder is reached.
+#[derive(Clone, Debug)]
+struct MathToken {
+    latex: String,
+    display: bool,
+}
+
+/// Opens and closes a math placeholder. Private-use characters, so they
+/// cannot collide with anything pulldown-cmark treats as syntax; authored
+/// occurrences are replaced before placeholders are inserted.
+const MATH_OPEN: char = '\u{E000}';
+const MATH_CLOSE: char = '\u{E001}';
+
+/// Source ready to render, and the math lifted out of it.
+struct Prepared<'s> {
+    text: Cow<'s, str>,
+    math: Vec<MathToken>,
+}
+
+/// Rewrites syntax CommonMark would otherwise print literally:
+/// `%%comments%%` are removed, `^[inline footnotes]` become ordinary
+/// footnote references whose definitions are appended (so the browser gets
+/// numbered notes at the foot of the page exactly as Obsidian shows them),
+/// and the editor's `\(…\)` / `\[…\]` math becomes placeholders.
+fn prepare_source(source: &str) -> Prepared<'_> {
     let has_comment = source.contains("%%");
     let has_inline_note = source.contains("^[");
-    if !has_comment && !has_inline_note {
-        return Cow::Borrowed(source);
+    let has_delimited_math = source.contains("\\(") || source.contains("\\[");
+    let has_placeholder_chars = source.contains([MATH_OPEN, MATH_CLOSE]);
+    if !has_comment && !has_inline_note && !has_delimited_math && !has_placeholder_chars {
+        return Prepared {
+            text: Cow::Borrowed(source),
+            math: Vec::new(),
+        };
     }
 
-    let mut text: Cow<'_, str> = Cow::Borrowed(source);
+    let mut text: Cow<'_, str> = if has_placeholder_chars {
+        Cow::Owned(source.replace([MATH_OPEN, MATH_CLOSE], "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(source)
+    };
     if has_comment {
         let literal = obsidian::verbatim_ranges(&text);
         let comments = obsidian::comment_ranges(&text, &literal);
@@ -208,7 +241,318 @@ fn prepare_source(source: &str) -> Cow<'_, str> {
             text = Cow::Owned(rewritten);
         }
     }
-    text
+
+    let mut math = Vec::new();
+    if has_delimited_math {
+        let ranges = delimited_math_ranges(&text);
+        if !ranges.is_empty() {
+            let mut rewritten = String::with_capacity(text.len());
+            let mut at = 0;
+            for (full, inner, display) in ranges {
+                rewritten.push_str(&text[at..full.start]);
+                rewritten.push(MATH_OPEN);
+                rewritten.push_str(&math.len().to_string());
+                rewritten.push(MATH_CLOSE);
+                math.push(MathToken {
+                    latex: text[inner].to_owned(),
+                    display,
+                });
+                at = full.end;
+            }
+            rewritten.push_str(&text[at..]);
+            text = Cow::Owned(rewritten);
+        }
+    }
+    Prepared { text, math }
+}
+
+/// `\(…\)`, `\[…\]` and their Markdown-escaped `\\(…\\)` forms, exactly as
+/// the editor recognises them: full range, formula range, display.
+fn delimited_math_ranges(text: &str) -> Vec<(Range<usize>, Range<usize>, bool)> {
+    let Ok(parsed) = parse_checked(text) else {
+        return Vec::new();
+    };
+    let mapper = Utf16Mapper::new(text);
+    let mut found: Vec<(Range<usize>, Range<usize>, bool)> = Vec::new();
+    for span in &parsed.spans {
+        if span.kind != SpanKind::InlineMath as u16 {
+            continue;
+        }
+        let inner = mapper.to_byte(span.start)..mapper.to_byte(span.end);
+        let before = &text[..inner.start];
+        let after = &text[inner.end..];
+        let open = if before.ends_with("\\\\(") {
+            3
+        } else if before.ends_with("\\(") {
+            2
+        } else {
+            continue;
+        };
+        let close = if after.starts_with("\\\\)") {
+            3
+        } else if after.starts_with("\\)") {
+            2
+        } else {
+            continue;
+        };
+        found.push((inner.start - open..inner.end + close, inner, false));
+    }
+    for block in &parsed.blocks {
+        if block.kind != BlockKind::MathBlock as u16 {
+            continue;
+        }
+        let full = mapper.to_byte(block.start)..mapper.to_byte(block.end);
+        let body = &text[full.clone()];
+        let open = if body.starts_with("\\\\[") {
+            3
+        } else if body.starts_with("\\[") {
+            2
+        } else {
+            continue;
+        };
+        let trimmed = body.trim_end();
+        let close = if trimmed.ends_with("\\\\]") {
+            3
+        } else if trimmed.ends_with("\\]") {
+            2
+        } else {
+            continue;
+        };
+        let end = full.start + trimmed.len();
+        if end < full.start + open + close {
+            continue;
+        }
+        found.push((full.start..end, full.start + open..end - close, true));
+    }
+    found.sort_by_key(|(full, _, _)| full.start);
+    let mut disjoint: Vec<(Range<usize>, Range<usize>, bool)> = Vec::new();
+    for item in found {
+        if disjoint
+            .last()
+            .is_some_and(|(last, _, _)| item.0.start < last.end)
+        {
+            continue;
+        }
+        disjoint.push(item);
+    }
+    disjoint
+}
+
+/// Largest formula typeset; longer ones stay as source.
+#[cfg(feature = "mathml")]
+const MAX_MATH_BYTES: usize = 16 * 1024;
+/// Deepest `{…}` nesting typeset, so a hostile formula cannot recurse deep.
+#[cfg(feature = "mathml")]
+const MAX_MATH_NESTING: usize = 48;
+
+/// A formula as browser-native MathML, or `None` when it is not something
+/// the typesetter fully understands — the caller then shows the source, the
+/// same bargain the editor makes.
+#[cfg(feature = "mathml")]
+fn render_math(latex: &str, display: bool) -> Option<String> {
+    use pulldown_latex::config::DisplayMode;
+    use pulldown_latex::{push_mathml, Parser as LatexParser, RenderConfig, Storage};
+
+    if latex.trim().is_empty() || latex.len() > MAX_MATH_BYTES {
+        return None;
+    }
+    let mut depth = 0usize;
+    for byte in latex.bytes() {
+        match byte {
+            b'{' => {
+                depth += 1;
+                if depth > MAX_MATH_NESTING {
+                    return None;
+                }
+            }
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    // A typesetting bug must cost one formula, not the export.
+    let rendered = std::panic::catch_unwind(|| {
+        let storage = Storage::new();
+        let events: Vec<_> = LatexParser::new(latex, &storage).collect();
+        if events.iter().any(Result::is_err) {
+            return None;
+        }
+        let config = RenderConfig {
+            display_mode: if display {
+                DisplayMode::Block
+            } else {
+                DisplayMode::Inline
+            },
+            // The library writes annotations unescaped; never ask for one.
+            annotation: None,
+            ..RenderConfig::default()
+        };
+        let mut out = String::new();
+        push_mathml(&mut out, events.into_iter(), config).ok()?;
+        Some(out)
+    })
+    .ok()
+    .flatten()?;
+    sanitize_mathml(&rendered)
+}
+
+#[cfg(not(feature = "mathml"))]
+fn render_math(_latex: &str, _display: bool) -> Option<String> {
+    None
+}
+
+/// Elements a typeset formula may contain.
+#[cfg(feature = "mathml")]
+const MATHML_ELEMENTS: &[&str] = &[
+    "math",
+    "semantics",
+    "mrow",
+    "mi",
+    "mn",
+    "mo",
+    "ms",
+    "mtext",
+    "mspace",
+    "msup",
+    "msub",
+    "msubsup",
+    "mfrac",
+    "msqrt",
+    "mroot",
+    "munder",
+    "mover",
+    "munderover",
+    "mtable",
+    "mtr",
+    "mtd",
+    "mlabeledtr",
+    "mstyle",
+    "mpadded",
+    "mphantom",
+    "menclose",
+    "mmultiscripts",
+    "mprescripts",
+    "none",
+];
+
+/// Re-validates typesetter output against an allowlist.
+///
+/// The generated markup is not trusted to be well-formed HTML: it writes
+/// comparison operators as a bare `<mo><</mo>`. Tags must be allowlisted
+/// MathML with plain attributes (no event handlers, links, or `url()`
+/// styles); every other `<`, `>` or `&` is escaped. Anything that does not
+/// fit returns `None`, and the caller shows the formula's source instead.
+#[cfg(feature = "mathml")]
+fn sanitize_mathml(markup: &str) -> Option<String> {
+    let bytes = markup.as_bytes();
+    let mut out = String::with_capacity(markup.len() + 32);
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => {
+                let closing = bytes.get(i + 1) == Some(&b'/');
+                let name_start = i + 1 + usize::from(closing);
+                let mut j = name_start;
+                while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let name = &markup[name_start..j];
+                if name.is_empty() || !MATHML_ELEMENTS.contains(&name) {
+                    out.push_str("&lt;");
+                    i += 1;
+                    continue;
+                }
+                let end = i + markup[i..].find('>')?;
+                let attributes = markup[j..end].trim_end_matches('/').trim();
+                if closing && !attributes.is_empty() {
+                    return None;
+                }
+                if !attributes_are_safe(attributes) {
+                    return None;
+                }
+                out.push_str(&markup[i..=end]);
+                i = end + 1;
+            }
+            b'>' => {
+                out.push_str("&gt;");
+                i += 1;
+            }
+            b'&' => {
+                let entity = markup[i + 1..].find(';').filter(|&n| {
+                    n > 0
+                        && n <= 10
+                        && markup[i + 1..i + 1 + n]
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'#')
+                });
+                match entity {
+                    Some(_) => out.push('&'),
+                    None => out.push_str("&amp;"),
+                }
+                i += 1;
+            }
+            _ => {
+                let next = markup[i..]
+                    .find(['<', '>', '&'])
+                    .map_or(markup.len(), |n| i + n);
+                out.push_str(&markup[i..next]);
+                i = next;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `name="value"` pairs with inert names and values.
+#[cfg(feature = "mathml")]
+fn attributes_are_safe(attributes: &str) -> bool {
+    let mut rest = attributes;
+    while !rest.is_empty() {
+        let Some(eq) = rest.find('=') else {
+            return false;
+        };
+        let name = rest[..eq].trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+            || name.starts_with("on")
+            || matches!(name.as_str(), "href" | "src" | "xlink" | "xmlns")
+        {
+            return false;
+        }
+        let after = rest[eq + 1..].trim_start();
+        let Some(value_and_rest) = after.strip_prefix('"') else {
+            return false;
+        };
+        let Some(close) = value_and_rest.find('"') else {
+            return false;
+        };
+        let value = &value_and_rest[..close];
+        let lower = value.to_ascii_lowercase();
+        if value.contains(['<', '>', '\\', '@'])
+            || lower.contains("url")
+            || lower.contains("expression")
+            || lower.contains("javascript")
+        {
+            return false;
+        }
+        rest = value_and_rest[close + 1..].trim_start();
+    }
+    true
+}
+
+/// A formula for the page: MathML when it typesets, else its source.
+fn math_html(latex: &str, display: bool) -> String {
+    let class = if display {
+        "math math-display"
+    } else {
+        "math math-inline"
+    };
+    match render_math(latex, display) {
+        Some(mathml) => format!("<span class=\"{class}\">{mathml}</span>"),
+        None => format!(
+            "<span class=\"{class} math-source\">{}</span>",
+            escape_html(latex)
+        ),
+    }
 }
 
 /// State shared by the top-level render and every transcluded note.
@@ -445,6 +789,8 @@ enum Quote {
 struct ExportEvents<'a, 'c> {
     inner: pulldown_cmark::OffsetIter<'a, pulldown_cmark::DefaultBrokenLinkCallback>,
     source: &'a str,
+    /// Formulas lifted out by [`prepare_source`], by placeholder index.
+    math: Vec<MathToken>,
     base: Option<PathBuf>,
     context: &'c mut ExportContext,
     /// Events already pulled from the parser, to be processed again.
@@ -460,10 +806,16 @@ struct ExportEvents<'a, 'c> {
 }
 
 impl<'a, 'c> ExportEvents<'a, 'c> {
-    fn new(source: &'a str, base: Option<PathBuf>, context: &'c mut ExportContext) -> Self {
+    fn new(
+        source: &'a str,
+        math: Vec<MathToken>,
+        base: Option<PathBuf>,
+        context: &'c mut ExportContext,
+    ) -> Self {
         Self {
             inner: Parser::new_ext(source, options()).into_offset_iter(),
             source,
+            math,
             base,
             context,
             replay: VecDeque::new(),
@@ -700,6 +1052,49 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                     id,
                 }));
             }
+            Event::InlineMath(latex) => {
+                // The editor's currency rules decide, not pulldown's: `$5 and
+                // $10` is prose on the page just as it is in the editor.
+                if inline_math_is_valid(self.source, &range) {
+                    self.html(math_html(&latex, false));
+                } else {
+                    self.push_literal(range);
+                }
+            }
+            Event::DisplayMath(latex) => {
+                if display_math_is_valid(self.source, &range) {
+                    self.html(math_html(&latex, true));
+                } else {
+                    self.push_literal(range);
+                }
+            }
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(language)))
+                if language.trim().eq_ignore_ascii_case("math") =>
+            {
+                let mut body: Vec<Event<'a>> = Vec::new();
+                let mut latex = String::new();
+                while let Some((event, _)) = self.pull() {
+                    let end = matches!(event, Event::End(TagEnd::CodeBlock));
+                    if let Event::Text(value) = &event {
+                        latex.push_str(value);
+                    }
+                    body.push(event);
+                    if end {
+                        break;
+                    }
+                }
+                match render_math(&latex, true) {
+                    Some(mathml) => {
+                        self.html(format!("<p class=\"math math-display\">{mathml}</p>\n"))
+                    }
+                    None => {
+                        self.pending.push_back(Event::Start(Tag::CodeBlock(
+                            CodeBlockKind::Fenced(language),
+                        )));
+                        self.pending.extend(body);
+                    }
+                }
+            }
             Event::Text(value) => self.push_text(value, range),
             // Preserve what the author typed, but never interpret it in the
             // browser. `push_html` escapes Text events for us.
@@ -723,27 +1118,37 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
         } else {
             (text, None)
         };
-        let highlights = if body.contains("==") {
-            scan_highlights(body)
-        } else {
-            Vec::new()
-        };
+        let has_math = body.contains(MATH_OPEN);
+        let has_highlight = body.contains("==") && !scan_highlights(body).is_empty();
         let has_tag = body.contains('#') && !scan_tags(body).is_empty();
-        if highlights.is_empty() && !has_tag && block_id.is_none() {
+        if !has_math && !has_highlight && !has_tag && block_id.is_none() {
             self.pending.push_back(Event::Text(value));
             return;
         }
 
         let mut pieces: Vec<Event<'a>> = Vec::new();
-        let mut at = 0;
-        for inner in &highlights {
-            push_tagged(&body[at..inner.start - 2], &mut pieces);
-            pieces.push(Event::Html(CowStr::Borrowed("<mark>")));
-            push_tagged(&body[inner.clone()], &mut pieces);
-            pieces.push(Event::Html(CowStr::Borrowed("</mark>")));
-            at = inner.end + 2;
+        let mut rest = body;
+        while let Some(open) = rest.find(MATH_OPEN) {
+            let after = &rest[open + MATH_OPEN.len_utf8()..];
+            let Some(close) = after.find(MATH_CLOSE) else {
+                break;
+            };
+            let token = after[..close]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| self.math.get(index));
+            push_rich(&rest[..open], &mut pieces);
+            match token {
+                Some(token) => pieces.push(Event::Html(CowStr::Boxed(
+                    math_html(&token.latex, token.display).into_boxed_str(),
+                ))),
+                None => pieces.push(Event::Text(CowStr::Boxed(
+                    rest[open..open + MATH_OPEN.len_utf8() + close + MATH_CLOSE.len_utf8()].into(),
+                ))),
+            }
+            rest = &after[close + MATH_CLOSE.len_utf8()..];
         }
-        push_tagged(&body[at..], &mut pieces);
+        push_rich(rest, &mut pieces);
         if let Some(id) = block_id {
             // Ids are `[A-Za-z0-9-]`, safe inside the attribute as written.
             pieces.push(Event::Html(CowStr::Boxed(
@@ -751,6 +1156,13 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             )));
         }
         self.pending.extend(pieces);
+    }
+
+    /// The source of `range`, shown as typed.
+    fn push_literal(&mut self, range: Range<usize>) {
+        let literal = self.source.get(range).unwrap_or_default().to_owned();
+        self.pending
+            .push_back(Event::Text(CowStr::Boxed(literal.into_boxed_str())));
     }
 
     /// Where a `[[wikilink]]` points in the browser: the note's file,
@@ -824,7 +1236,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
     /// Renders a short run of Markdown (a callout title) as inline HTML.
     fn render_inline(&mut self, markdown: &str) -> String {
         let mut out = String::new();
-        let events = ExportEvents::new(markdown, self.base.clone(), &mut *self.context);
+        let events = ExportEvents::new(markdown, Vec::new(), self.base.clone(), &mut *self.context);
         html::push_html(&mut out, events);
         let trimmed = out.trim();
         match trimmed
@@ -967,7 +1379,9 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
         let text = read_bounded_utf8(&path, limit)?;
         self.context.transclusion_remaining -= text.len();
         let section = select_section(&text, anchor)?;
-        let prepared = prepare_source(section).into_owned();
+        let prepared = prepare_source(section);
+        let math = prepared.math;
+        let prepared = prepared.text.into_owned();
 
         self.context.depth += 1;
         self.context.visited.push(canonical);
@@ -975,6 +1389,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
         {
             let events = ExportEvents::new(
                 &prepared,
+                math,
                 path.parent().map(Path::to_path_buf),
                 &mut *self.context,
             );
@@ -1001,6 +1416,19 @@ impl<'a> Iterator for ExportEvents<'a, '_> {
             self.handle(event, range);
         }
     }
+}
+
+/// Text with `==highlights==` and `#tags` turned into markup.
+fn push_rich<'a>(body: &str, pieces: &mut Vec<Event<'a>>) {
+    let mut at = 0;
+    for inner in scan_highlights(body) {
+        push_tagged(&body[at..inner.start - 2], pieces);
+        pieces.push(Event::Html(CowStr::Borrowed("<mark>")));
+        push_tagged(&body[inner.clone()], pieces);
+        pieces.push(Event::Html(CowStr::Borrowed("</mark>")));
+        at = inner.end + 2;
+    }
+    push_tagged(&body[at..], pieces);
 }
 
 /// Text with any `#tags` wrapped, appended to `pieces`.
@@ -1565,6 +1993,9 @@ pre > code.language-mermaid::before { content: "Mermaid"; }
 pre > code.language-math::before, pre > code.language-latex::before, pre > code.language-tex::before { content: "Math"; }
 kbd { font-size: .8em; padding: .1em .4em; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; background: var(--subtle); }
 .math { font-family: math, "STIX Two Math", "Cambria Math", "Latin Modern Math", "Times New Roman", serif; }
+math { font-family: math, "STIX Two Math", "Cambria Math", "Latin Modern Math", serif; font-size: 1.08em; }
+.math-source { font-style: italic; }
+p.math-display { margin: 1em 0; }
 .math-display { display: block; overflow-x: auto; margin: 1em 0; padding: .5em 0; text-align: center; font-size: 1.1em; }
 blockquote { padding: .1em 1em; border-inline-start: 4px solid var(--border); color: var(--muted); }
 blockquote > :last-child { margin-bottom: 0; }
@@ -1648,5 +2079,33 @@ mod tests {
         assert!(writer.write_all(b"5").is_err());
         assert_eq!(writer.bytes, b"1234");
         assert_eq!(writer.attempted, 5);
+    }
+}
+
+#[cfg(all(test, feature = "mathml"))]
+mod mathml_tests {
+    use super::sanitize_mathml;
+
+    #[test]
+    fn sanitizer_escapes_stray_markup_and_refuses_active_attributes() {
+        assert_eq!(
+            sanitize_mathml("<math><mo><</mo><mi>x</mi><mo>></mo></math>").as_deref(),
+            Some("<math><mo>&lt;</mo><mi>x</mi><mo>&gt;</mo></math>")
+        );
+        assert_eq!(
+            sanitize_mathml("<math><script>x</script></math>").as_deref(),
+            Some("<math>&lt;script&gt;x&lt;/script&gt;</math>")
+        );
+        assert_eq!(sanitize_mathml("<math onload=\"x()\"></math>"), None);
+        assert_eq!(sanitize_mathml("<math href=\"javascript:x\"></math>"), None);
+        assert_eq!(
+            sanitize_mathml("<mrow style=\"background:url(x)\"></mrow>"),
+            None
+        );
+        assert_eq!(
+            sanitize_mathml("<mi>a &amp; b & c</mi>").as_deref(),
+            Some("<mi>a &amp; b &amp; c</mi>")
+        );
+        assert!(sanitize_mathml("<mrow style=\"color: rgb(255 0 0)\"><mi>x</mi></mrow>").is_some());
     }
 }

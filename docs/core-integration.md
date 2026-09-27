@@ -3,16 +3,17 @@
 [Documentation](README.md) / Core integration
 
 `core/` builds as a Rust library and a static library, independently of the
-macOS application. Cargo features select the optional highlighting and C ABI
-surfaces. Keep one canonical implementation and rebuild consuming hosts when
+macOS application. Cargo features select the optional highlighting, C ABI,
+and MathML surfaces. Keep one canonical implementation and rebuild consuming hosts when
 replacing it.
 
 | Configuration | APIs | Native build dependencies |
 | --- | --- | --- |
-| `default-features = false` | Markdown parsing, HTML rendering, vault model | No tree-sitter grammars or C header generator |
+| `default-features = false` | Markdown parsing, HTML rendering (formulas as source), vault model | No tree-sitter grammars, C header generator, or LaTeX typesetter |
 | `default-features = false, features = ["highlight"]` | Core APIs plus tree-sitter highlighting | Highlight grammars, no cbindgen |
 | `default-features = false, features = ["ffi"]` | Core APIs plus C ABI | cbindgen header generation, no highlight grammars |
-| Defaults | All APIs, including C highlighting ABI | Grammars and cbindgen; used by MarkDev.app |
+| `default-features = false, features = ["mathml"]` | Core APIs; HTML export typesets math as MathML | `pulldown-latex` (pure Rust) |
+| Defaults | All APIs, including C highlighting ABI and MathML export | Grammars, cbindgen, and `pulldown-latex`; used by MarkDev.app |
 
 A host that needs highlighting without the C header generator can use:
 

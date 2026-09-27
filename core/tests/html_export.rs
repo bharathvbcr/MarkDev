@@ -326,7 +326,7 @@ fn exported_document_supports_dark_mode_print_and_callouts() {
     assert!(html.contains("prefers-color-scheme: dark"));
     assert!(html.contains("@media print"));
     assert!(html.contains("<div class=\"callout\" data-callout=\"warning\""));
-    assert!(html.contains("class=\"math math-display\""));
+    assert!(html.contains("class=\"math math-display"));
     assert!(html.contains("name=\"color-scheme\""));
 }
 
@@ -558,4 +558,90 @@ fn wikilinks_resolve_to_notes_in_other_folders() {
     .unwrap();
     assert!(html.contains("href=\"../Projects/Roadmap.md\""));
     assert!(html.contains("href=\"../Projects/Roadmap.md#q3-goals\""));
+}
+
+// MARK: - Math
+
+#[cfg(feature = "mathml")]
+#[test]
+fn dollar_math_is_typeset_as_mathml() {
+    let html = render_document("Euler: $e^{i\\pi}+1=0$\n\n$$\\int_0^1 x^2\\,dx$$", "Math").unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("<span class=\"math math-inline\"><math display=\"inline\">"));
+    assert!(body.contains("<mi>π</mi>"));
+    assert!(body.contains("<span class=\"math math-display\"><math display=\"block\">"));
+    assert!(body.contains("∫"));
+    assert!(!body.contains("math-source"));
+}
+
+#[cfg(feature = "mathml")]
+#[test]
+fn editor_math_delimiters_and_math_fences_are_typeset_too() {
+    let html = render_document(
+        "Inline \\(x^2\\) here.\n\n\\[\n\\frac{a}{b}\n\\]\n\n```math\n\\sqrt{2}\n```",
+        "Delimiters",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("<msup><mi>x</mi><mn>2</mn></msup>"));
+    assert!(body.contains("<mfrac>"));
+    assert!(body.contains("<msqrt>"));
+    assert!(!body.contains("\\("), "delimiters are not left behind");
+    assert!(
+        !body.contains("<pre>"),
+        "a typeset math fence is not a code block"
+    );
+}
+
+#[cfg(feature = "mathml")]
+#[test]
+fn currency_is_prose_and_unknown_commands_fall_back_to_source() {
+    let html = render_document(
+        "It costs $5 and $10 today.\n\nBad $\\notacommand{x}$ here.",
+        "Money",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("It costs $5 and $10 today."));
+    assert!(body.contains("<span class=\"math math-inline math-source\">\\notacommand{x}</span>"));
+    assert!(!body.contains("merror"));
+}
+
+#[cfg(feature = "mathml")]
+#[test]
+fn typeset_math_stays_inert() {
+    let html = render_document(
+        "$a<b>c$ and $\\text{<script>alert(1)</script>}$ and $\\text{</math><img src=x onerror=alert(1)>}$",
+        "Inert",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(!body.contains("<script"));
+    assert!(!body.contains("<img"));
+    assert!(body.contains("<mo>&lt;</mo>"));
+    assert!(body.contains("<mo>&gt;</mo>"));
+    assert_eq!(
+        body.matches("<math").count(),
+        body.matches("</math>").count()
+    );
+}
+
+#[cfg(feature = "mathml")]
+#[test]
+fn math_inside_code_is_never_typeset() {
+    let html = render_document("`$x^2$` and\n\n```\n\\(y\\)\n```", "Code").unwrap();
+    let body = main_of(&html);
+    assert!(!body.contains("<math"));
+    assert!(body.contains("<code>$x^2$</code>"));
+    assert!(body.contains("\\(y\\)"));
+}
+
+#[cfg(not(feature = "mathml"))]
+#[test]
+fn without_mathml_formulas_stay_as_source() {
+    let html = render_document("$x^2$ and \\(y\\)", "Plain").unwrap();
+    let body = main_of(&html);
+    assert!(!body.contains("<math"));
+    assert!(body.contains("<span class=\"math math-inline math-source\">x^2</span>"));
+    assert!(body.contains("<span class=\"math math-inline math-source\">y</span>"));
 }
