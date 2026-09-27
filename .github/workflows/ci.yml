@@ -59,6 +59,8 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Install pinned tools
         run: bash tools/ci/install-pinned-tools.sh all
+      - name: Select pinned Xcode
+        run: bash tools/ci/select-pinned-xcode.sh
       - name: Verify Xcode Toolchain
         run: just verify-toolchain
       - name: Build and Test AppKit Targets
