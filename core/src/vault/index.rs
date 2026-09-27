@@ -430,10 +430,22 @@ impl Vault {
             if let Some(id) = anchor.strip_prefix('^') {
                 return block_offset(&note.text, id);
             }
-            note.headings
+            // Exact text first, then Obsidian's nested `Heading#Subheading`
+            // path and punctuation-insensitive spelling.
+            if let Some(heading) = note
+                .headings
                 .iter()
                 .find(|heading| heading.text.eq_ignore_ascii_case(anchor))
-                .map(|heading| heading.offset)
+            {
+                return Some(heading.offset);
+            }
+            let outline: Vec<(u8, &str)> = note
+                .headings
+                .iter()
+                .map(|heading| (heading.level, heading.text.as_str()))
+                .collect();
+            crate::md::obsidian::heading_path_index(&outline, anchor)
+                .map(|index| note.headings[index].offset)
         });
         Some(Resolution {
             path: note.path.clone(),

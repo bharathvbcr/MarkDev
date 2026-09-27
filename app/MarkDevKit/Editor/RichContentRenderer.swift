@@ -1966,6 +1966,22 @@ public final class RichContentRenderer {
     /// root (a folder holding `.obsidian` or `.git`) and after eight levels.
     static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
         let fileManager = FileManager.default
+        func existingFile(_ candidate: URL) -> URL? {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                !isDirectory.boolValue
+            else { return nil }
+            return candidate
+        }
+        // Obsidian's own "Default location for new attachments" setting,
+        // when the note sits in an Obsidian vault that sets one.
+        if let configured = configuredAttachmentFolder(from: folder),
+            let found = existingFile(
+                URL(fileURLWithPath: relativePath, relativeTo: configured)
+                    .absoluteURL.standardizedFileURL)
+        {
+            return found
+        }
         var directory = folder
         for _ in 0...8 {
             for subfolder in ["", "attachments", "Attachments", "assets", "_attachments", "media"] {
@@ -1987,6 +2003,44 @@ public final class RichContentRenderer {
             let parent = directory.deletingLastPathComponent()
             if isVaultRoot || parent.standardizedFileURL.path == directory.standardizedFileURL.path {
                 break
+            }
+            directory = parent
+        }
+        return nil
+    }
+
+    /// The folder `attachmentFolderPath` in the nearest vault's
+    /// `.obsidian/app.json` names: `/` is the vault root, `./sub` is relative
+    /// to the note's folder, anything else is relative to the vault root.
+    static func configuredAttachmentFolder(from folder: URL) -> URL? {
+        let fileManager = FileManager.default
+        var directory = folder
+        for _ in 0...8 {
+            let config = directory.appendingPathComponent(".obsidian/app.json")
+            if fileManager.fileExists(atPath: config.path) {
+                guard
+                    let attributes = try? fileManager.attributesOfItem(atPath: config.path),
+                    let size = attributes[.size] as? NSNumber, size.intValue <= 256 * 1024,
+                    let data = try? Data(contentsOf: config),
+                    let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                    let raw = object["attachmentFolderPath"] as? String
+                else { return nil }
+                let setting = raw.trimmingCharacters(in: .whitespaces)
+                guard !setting.isEmpty,
+                    !setting.split(separator: "/").contains("..")
+                else { return nil }
+                if setting == "/" { return directory }
+                if setting == "." || setting == "./" { return folder }
+                if setting.hasPrefix("./") {
+                    return folder.appendingPathComponent(
+                        String(setting.dropFirst(2)), isDirectory: true)
+                }
+                let trimmed = setting.drop(while: { $0 == "/" })
+                return directory.appendingPathComponent(String(trimmed), isDirectory: true)
+            }
+            let parent = directory.deletingLastPathComponent()
+            if parent.standardizedFileURL.path == directory.standardizedFileURL.path {
+                return nil
             }
             directory = parent
         }

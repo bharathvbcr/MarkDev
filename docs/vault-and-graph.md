@@ -20,7 +20,9 @@ unlinked mentions, and the search index. Swift's `VaultIndex` coordinates disk
 scans and UI updates. Vault query data crosses the C ABI as JSON; editor parse
 records use flat structures.
 
-Supported forms include `[[Note]]`, `[[Note#Heading]]`, `[[Note#^block-id]]`,
+Supported forms include `[[Note]]`, `[[Note#Heading]]`, nested
+`[[Note#Heading#Subheading]]` (each segment is found inside the previous
+heading's section), `[[Note#^block-id]]`,
 `[[Note|Label]]`, and Obsidian `![[Note]]` embeds (indexed as links, so they
 appear in backlinks and the graph; `![[picture.png]]` and other media embeds
 are not note links), plus relative Markdown links. Tags and links inside an

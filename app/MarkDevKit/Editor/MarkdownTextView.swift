@@ -1521,6 +1521,11 @@ public final class MarkdownTextView: ScrollingTextView {
         if anchor.hasPrefix("^") {
             return jumpToBlock(id: String(anchor.dropFirst()))
         }
+        let segments = anchor.split(separator: "#").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        if segments.count > 1 {
+            return jumpToHeadingPath(segments)
+        }
         let text = storage.string as NSString
         let normalisedAnchor = anchor.lowercased().replacingOccurrences(of: "-", with: " ")
         for block in parsed.blocks where block.kind == .heading {
@@ -1536,6 +1541,51 @@ public final class MarkdownTextView: ScrollingTextView {
             }
         }
         return false
+    }
+
+    /// Obsidian's nested heading link, `[[#Setup#macOS]]`: each segment is
+    /// looked for inside the section of the heading before it.
+    private func jumpToHeadingPath(_ segments: [String]) -> Bool {
+        guard let storage = textStorage else { return false }
+        let text = storage.string as NSString
+        func key(_ value: String) -> String {
+            var scalars = String.UnicodeScalarView()
+            for scalar in value.lowercased().unicodeScalars
+            where CharacterSet.alphanumerics.contains(scalar) {
+                scalars.append(scalar)
+            }
+            return String(scalars)
+        }
+        let headings: [(level: Int, key: String, range: NSRange)] = parsed.blocks.compactMap {
+            block -> (level: Int, key: String, range: NSRange)? in
+            guard block.kind == .heading, let level = block.headingLevel else { return nil }
+            let range = NSIntersectionRange(block.range, NSRange(location: 0, length: text.length))
+            guard range.length > 0 else { return nil }
+            let title = text.substring(with: range)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "# \t\r\n"))
+            return (level, key(title), range)
+        }
+        var start = 0
+        var end = headings.count
+        var parentLevel = 0
+        var found: NSRange?
+        for segment in segments {
+            let wanted = key(segment)
+            guard
+                let index = (start..<end).first(where: {
+                    headings[$0].level > parentLevel && headings[$0].key == wanted
+                })
+            else { return false }
+            let level = headings[index].level
+            found = headings[index].range
+            parentLevel = level
+            start = index + 1
+            end = (start..<end).first(where: { headings[$0].level <= level }) ?? end
+        }
+        guard let found else { return false }
+        setSelectedRange(NSRange(location: found.location, length: 0))
+        scrollRangeToVisible(found)
+        return true
     }
 
     /// Scrolls to the line carrying Obsidian block id `^id`.

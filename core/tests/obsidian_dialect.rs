@@ -272,3 +272,46 @@ mod vault {
         assert_eq!(at("Title"), Some(0));
     }
 }
+
+#[test]
+fn highlights_may_wrap_formatting_but_never_cut_through_it() {
+    let source = "==**bold**== ==[[Link]]== ==a *b* c== **x ==y** z== `a==b==c`";
+    assert_eq!(
+        spans_of(source, SpanKind::Highlight),
+        ["**bold**", "[[Link]]", "a *b* c"]
+    );
+    assert_eq!(revealed("==**bold**=="), "bold");
+    // Across a blank line is two paragraphs, not one highlight.
+    assert!(spans_of("==a *b*\n\nc==", SpanKind::Highlight).is_empty());
+}
+
+#[test]
+fn nested_callouts_are_each_callouts() {
+    let result = parse("> [!note] Outer\n> text\n> > [!warning] Inner\n> > deep");
+    let kinds: Vec<u32> = result
+        .blocks
+        .iter()
+        .filter(|b| b.kind == BlockKind::Callout as u16)
+        .map(|b| b.data & CALLOUT_KIND_MASK)
+        .collect();
+    assert_eq!(
+        kinds,
+        [CalloutKind::Note as u32, CalloutKind::Warning as u32]
+    );
+}
+
+#[test]
+fn nested_heading_links_resolve_inside_their_parent() {
+    use markdev::vault::{Note, Vault};
+    let text = "# Guide\n\n## Setup\n\n### macOS\n\nA\n\n## Usage\n\n### macOS\n\nB\n";
+    let vault = Vault::build(
+        std::path::PathBuf::from("/vault"),
+        vec![Note::parse("Guide.md".to_string(), text)],
+    );
+    let at = |anchor: &str| vault.resolve("Guide", Some(anchor)).and_then(|r| r.offset);
+    let second = text.rfind("### macOS").unwrap() as u32;
+    let first = text.find("### macOS").unwrap() as u32;
+    assert_eq!(at("Usage#macOS"), Some(second));
+    assert_eq!(at("Setup#macOS"), Some(first));
+    assert_eq!(at("macOS"), Some(first));
+}

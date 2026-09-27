@@ -24,7 +24,7 @@ use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, 
 use crate::md::model::{BlockKind, CalloutKind, SpanKind, Utf16Mapper, CALLOUT_FOLD_COLLAPSED};
 use crate::md::obsidian;
 use crate::md::parse::{
-    display_math_is_valid, inline_math_is_valid, options, parse_checked, scan_highlights, scan_tags,
+    display_math_is_valid, inline_math_is_valid, options, parse_checked, scan_tags,
 };
 
 /// Rendering is linear but necessarily allocates output proportional to the
@@ -184,6 +184,12 @@ struct MathToken {
 /// occurrences are replaced before placeholders are inserted.
 const MATH_OPEN: char = '\u{E000}';
 const MATH_CLOSE: char = '\u{E001}';
+/// Stand in for the `==` of a highlight the editor recognises, so export
+/// highlights exactly what the editor does — including `==**bold**==`,
+/// whose content pulldown-cmark splits across several events.
+const MARK_OPEN: char = '\u{E002}';
+const MARK_CLOSE: char = '\u{E003}';
+const PLACEHOLDERS: [char; 4] = [MATH_OPEN, MATH_CLOSE, MARK_OPEN, MARK_CLOSE];
 
 /// Source ready to render, and the math lifted out of it.
 struct Prepared<'s> {
@@ -200,8 +206,14 @@ fn prepare_source(source: &str) -> Prepared<'_> {
     let has_comment = source.contains("%%");
     let has_inline_note = source.contains("^[");
     let has_delimited_math = source.contains("\\(") || source.contains("\\[");
-    let has_placeholder_chars = source.contains([MATH_OPEN, MATH_CLOSE]);
-    if !has_comment && !has_inline_note && !has_delimited_math && !has_placeholder_chars {
+    let has_highlight = source.contains("==");
+    let has_placeholder_chars = source.contains(PLACEHOLDERS);
+    if !has_comment
+        && !has_inline_note
+        && !has_delimited_math
+        && !has_highlight
+        && !has_placeholder_chars
+    {
         return Prepared {
             text: Cow::Borrowed(source),
             math: Vec::new(),
@@ -209,7 +221,7 @@ fn prepare_source(source: &str) -> Prepared<'_> {
     }
 
     let mut text: Cow<'_, str> = if has_placeholder_chars {
-        Cow::Owned(source.replace([MATH_OPEN, MATH_CLOSE], "\u{FFFD}"))
+        Cow::Owned(source.replace(PLACEHOLDERS, "\u{FFFD}"))
     } else {
         Cow::Borrowed(source)
     };
@@ -260,21 +272,48 @@ fn prepare_source(source: &str) -> Prepared<'_> {
     }
 
     let mut math = Vec::new();
-    if has_delimited_math {
-        let ranges = delimited_math_ranges(&text);
-        if !ranges.is_empty() {
+    if has_delimited_math || has_highlight {
+        if let Ok(parsed) = parse_checked(&text) {
+            // (range to replace, replacement): math placeholders and the
+            // delimiters of every highlight the editor draws.
+            let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+            if has_delimited_math {
+                for (full, inner, display) in delimited_math_ranges(&text, &parsed) {
+                    let token = format!("{MATH_OPEN}{}{MATH_CLOSE}", math.len());
+                    math.push(MathToken {
+                        latex: text[inner].to_owned(),
+                        display,
+                    });
+                    edits.push((full, token));
+                }
+            }
+            if has_highlight {
+                let mapper = Utf16Mapper::new(&text);
+                for span in &parsed.spans {
+                    if span.kind != SpanKind::Highlight as u16 {
+                        continue;
+                    }
+                    let inner = mapper.to_byte(span.start)..mapper.to_byte(span.end);
+                    if inner.start < 2
+                        || text.get(inner.start - 2..inner.start) != Some("==")
+                        || text.get(inner.end..inner.end + 2) != Some("==")
+                    {
+                        continue;
+                    }
+                    edits.push((inner.start - 2..inner.start, MARK_OPEN.to_string()));
+                    edits.push((inner.end..inner.end + 2, MARK_CLOSE.to_string()));
+                }
+            }
+            edits.sort_by_key(|(range, _)| range.start);
             let mut rewritten = String::with_capacity(text.len());
             let mut at = 0;
-            for (full, inner, display) in ranges {
-                rewritten.push_str(&text[at..full.start]);
-                rewritten.push(MATH_OPEN);
-                rewritten.push_str(&math.len().to_string());
-                rewritten.push(MATH_CLOSE);
-                math.push(MathToken {
-                    latex: text[inner].to_owned(),
-                    display,
-                });
-                at = full.end;
+            for (range, replacement) in edits {
+                if range.start < at {
+                    continue;
+                }
+                rewritten.push_str(&text[at..range.start]);
+                rewritten.push_str(&replacement);
+                at = range.end;
             }
             rewritten.push_str(&text[at..]);
             text = Cow::Owned(rewritten);
@@ -285,10 +324,10 @@ fn prepare_source(source: &str) -> Prepared<'_> {
 
 /// `\(…\)`, `\[…\]` and their Markdown-escaped `\\(…\\)` forms, exactly as
 /// the editor recognises them: full range, formula range, display.
-fn delimited_math_ranges(text: &str) -> Vec<(Range<usize>, Range<usize>, bool)> {
-    let Ok(parsed) = parse_checked(text) else {
-        return Vec::new();
-    };
+fn delimited_math_ranges(
+    text: &str,
+    parsed: &crate::md::ParseResult,
+) -> Vec<(Range<usize>, Range<usize>, bool)> {
     let mapper = Utf16Mapper::new(text);
     let mut found: Vec<(Range<usize>, Range<usize>, bool)> = Vec::new();
     for span in &parsed.spans {
@@ -645,6 +684,18 @@ impl ExportContext {
             .vault_root
             .clone()
             .unwrap_or_else(|| base.to_path_buf());
+        // The folder Obsidian's own "Default location for new attachments"
+        // setting names, when the vault has one.
+        if let Some(folder) = self
+            .vault_root
+            .as_deref()
+            .and_then(|root| attachment_folder(root, base))
+        {
+            let candidate = folder.join(relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
         let mut folder = Some(base.to_path_buf());
         for _ in 0..=MAX_VAULT_ROOT_ASCENT {
             let Some(dir) = folder else { break };
@@ -713,6 +764,34 @@ impl ExportContext {
             .map(|e| e.to_string_lossy().to_ascii_lowercase());
         matches!(extension.as_deref(), Some("md" | "markdown")).then_some(found)
     }
+}
+
+/// Where Obsidian's `attachmentFolderPath` setting (in the vault's
+/// `.obsidian/app.json`) puts attachments for a note in `note_folder`:
+/// `/` is the vault root, `./sub` is relative to the note, anything else is
+/// relative to the vault root. `None` when unset, unreadable, or when the
+/// setting would climb out of the vault.
+pub fn attachment_folder(vault_root: &Path, note_folder: &Path) -> Option<PathBuf> {
+    let config = read_bounded_utf8(&vault_root.join(".obsidian").join("app.json"), 256 * 1024)?;
+    let value: serde_json::Value = serde_json::from_str(&config).ok()?;
+    let setting = value.get("attachmentFolderPath")?.as_str()?.trim();
+    if setting.is_empty()
+        || setting.contains('\0')
+        || Path::new(setting)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(if setting == "/" {
+        vault_root.to_path_buf()
+    } else if setting == "." || setting == "./" {
+        note_folder.to_path_buf()
+    } else if let Some(sub) = setting.strip_prefix("./") {
+        note_folder.join(sub)
+    } else {
+        vault_root.join(setting.trim_start_matches('/'))
+    })
 }
 
 /// The nearest folder at or above `base` that looks like a vault root.
@@ -1182,7 +1261,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             (text, None)
         };
         let has_math = body.contains(MATH_OPEN);
-        let has_highlight = body.contains("==") && !scan_highlights(body).is_empty();
+        let has_highlight = body.contains([MARK_OPEN, MARK_CLOSE]);
         let has_tag = body.contains('#') && !scan_tags(body).is_empty();
         if !has_math && !has_highlight && !has_tag && block_id.is_none() {
             self.pending.push_back(Event::Text(value));
@@ -1335,7 +1414,9 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                     href.push_str(&id);
                 }
             } else {
-                let slug = slugify(fragment);
+                // `Heading#Subheading` targets the innermost heading.
+                let innermost = fragment.rsplit('#').find(|s| !s.trim().is_empty());
+                let slug = slugify(innermost.unwrap_or(fragment));
                 if !slug.is_empty() {
                     href.push('#');
                     href.push_str(&slug);
@@ -1352,7 +1433,12 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
     /// Renders a short run of Markdown (a callout title) as inline HTML.
     fn render_inline(&mut self, markdown: &str) -> String {
         let mut out = String::new();
-        let events = ExportEvents::new(markdown, Vec::new(), self.base.clone(), &mut *self.context);
+        let events = ExportEvents::new(
+            markdown,
+            self.math.clone(),
+            self.base.clone(),
+            &mut *self.context,
+        );
         html::push_html(&mut out, events);
         let trimmed = out.trim();
         match trimmed
@@ -1539,15 +1625,18 @@ impl<'a> Iterator for ExportEvents<'a, '_> {
     }
 }
 
-/// Text with `==highlights==` and `#tags` turned into markup.
+/// Text with highlight placeholders and `#tags` turned into markup.
 fn push_rich<'a>(body: &str, pieces: &mut Vec<Event<'a>>) {
     let mut at = 0;
-    for inner in scan_highlights(body) {
-        push_tagged(&body[at..inner.start - 2], pieces);
-        pieces.push(Event::Html(CowStr::Borrowed("<mark>")));
-        push_tagged(&body[inner.clone()], pieces);
-        pieces.push(Event::Html(CowStr::Borrowed("</mark>")));
-        at = inner.end + 2;
+    for (index, character) in body.char_indices() {
+        let markup = match character {
+            MARK_OPEN => "<mark>",
+            MARK_CLOSE => "</mark>",
+            _ => continue,
+        };
+        push_tagged(&body[at..index], pieces);
+        pieces.push(Event::Html(CowStr::Borrowed(markup)));
+        at = index + character.len_utf8();
     }
     push_tagged(&body[at..], pieces);
 }
@@ -1658,10 +1747,14 @@ fn select_section<'t>(text: &'t str, anchor: Option<&str>) -> Option<&'t str> {
         start = start.max(body_start);
         return Some(&text[start..end]);
     }
-    let wanted = slugify(anchor);
+    let outline: Vec<(u8, &str)> = headings
+        .iter()
+        .map(|(level, name, _)| (*level, name.as_str()))
+        .collect();
     let index = headings
         .iter()
-        .position(|(_, name, _)| name.eq_ignore_ascii_case(anchor) || slugify(name) == wanted)?;
+        .position(|(_, name, _)| name.eq_ignore_ascii_case(anchor))
+        .or_else(|| obsidian::heading_path_index(&outline, anchor))?;
     let (level, _, start) = headings[index];
     let end = headings[index + 1..]
         .iter()

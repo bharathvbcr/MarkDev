@@ -22,7 +22,7 @@ MarkDev preserves Markdown source and renders it with native text and drawing AP
 
 ## Compatibility boundaries
 
-Remote images are not fetched. Keep an image alongside the document, in its `assets/` directory, or where Obsidian puts pasted pictures — an `attachments`, `assets`, `_attachments`, or `media` folder beside the note or in any folder above it up to the vault root (a folder holding `.obsidian` or `.git`). Inline image rendering and image ingestion have different limits; see [editor engine](editor-engine.md).
+Remote images are not fetched. Keep an image alongside the document, in its `assets/` directory, or where Obsidian puts pasted pictures — the folder named by Obsidian's own **Default location for new attachments** setting (`attachmentFolderPath` in `.obsidian/app.json`), or an `attachments`, `assets`, `_attachments`, or `media` folder beside the note or in any folder above it up to the vault root (a folder holding `.obsidian` or `.git`). Inline image rendering and image ingestion have different limits; see [editor engine](editor-engine.md).
 
 Math is constrained by the commands SwiftMath can typeset. MarkDev normalizes supported command spellings and checks delimiters so ordinary currency is less likely to become math. Unsupported expressions must not be treated as successful renders.
 
@@ -37,8 +37,10 @@ Wikilink anchor navigation resolves supported headings and Obsidian block ids (`
 | Syntax | In the editor | In HTML export |
 | --- | --- | --- |
 | `> [!type] Title` callouts | All Obsidian types — note, abstract/summary/tldr, info, todo, tip/hint, important, success/check/done, question/help/faq, warning/caution/attention, failure/fail/missing, danger/error, bug, example, quote/cite — plus GitHub's five. Unknown types draw as a note titled by their name | Coloured callout with icon and title; Markdown in the title is rendered |
+| Nested callouts (`> > [!type]`) | Each level is its own callout | Nested callout boxes |
+| `[[Note#Heading#Subheading]]` | Resolves the subheading inside its parent's section | Links and embeds target that section |
 | `> [!type]-` / `> [!type]+` | Foldable; `-` folds the body to its title line in live preview until the caret enters it (reading mode shows it open) | `<details>`: folds in the browser without script, closed for `-` and open for `+` |
-| `==highlight==` | Highlighted | `<mark>` |
+| `==highlight==` | Highlighted, including around formatting and links (`==**bold**==`, `==[[Note]]==`); a pair that would cut through other formatting stays text | `<mark>`, matching the editor |
 | `#tag`, `#nested/tag` | Tag pill, indexed by the vault | Tag pill |
 | `%%comment%%`, inline or across lines | Hidden until the caret enters its block, then shown dimmed; nothing inside is a tag, link, or picture. An unclosed `%%` stays text | Removed |
 | `^[inline footnote]` | Small, dimmed note with its brackets collapsed | A numbered footnote |

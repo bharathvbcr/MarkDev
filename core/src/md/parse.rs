@@ -512,6 +512,7 @@ pub fn parse_checked(source: &str) -> Result<ParseResult, ParseError> {
     collect_delimited_math(source, &mapper, &mut result)?;
     collect_link_reference_definitions(source, &mapper, &mut result)?;
     collect_obsidian_extensions(source, &mapper, &mut result)?;
+    collect_cross_run_highlights(source, &mapper, &mut result)?;
 
     result.spans.sort_by_key(|s| (s.start, s.end));
     result.markers.sort_by_key(|m| (m.start, m.end));
@@ -1443,6 +1444,107 @@ fn collect_obsidian_extensions(
 
     if has_task {
         collect_custom_tasks(source, mapper, result, &excluded)?;
+    }
+    Ok(())
+}
+
+/// `==highlights==` whose content is not one plain text run — `==**bold**==`,
+/// `==[[link]]==`, `==a *b* c==` — which the per-run scan cannot pair.
+///
+/// Uses the same adjacency rules as the per-run scan, pairs only within one
+/// block and never across a blank line, and refuses a pair that would cut
+/// through another construct (`**a ==b** c==`), so a highlight always nests.
+fn collect_cross_run_highlights(
+    source: &str,
+    mapper: &Utf16Mapper,
+    result: &mut ParseAccumulator,
+) -> Result<(), ParseError> {
+    if result.blocks.is_empty() || !source.contains("==") {
+        return Ok(());
+    }
+    // A delimiter cannot sit inside existing syntax (which already covers the
+    // `==` of every per-run highlight), code, math, or a comment.
+    let mut blocked = verbatim_byte_ranges(mapper, result);
+    blocked.extend(
+        result
+            .markers
+            .iter()
+            .map(|m| mapper.to_byte(m.start)..mapper.to_byte(m.end)),
+    );
+    blocked.extend(
+        result
+            .spans
+            .iter()
+            .filter(|s| s.kind == SpanKind::Comment as u16)
+            .map(|s| mapper.to_byte(s.start)..mapper.to_byte(s.end)),
+    );
+    let blocked = obsidian::normalise(blocked);
+
+    let bytes = source.as_bytes();
+    let mut candidates = Vec::new();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'=' && bytes[i + 1] == b'=' && !obsidian::overlaps(&blocked, i, i + 2) {
+            candidates.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if candidates.len() < 2 {
+        return Ok(());
+    }
+    let owners = block_owners(mapper, result, &candidates);
+
+    // Constructs a highlight must not cut through, sorted by start.
+    let mut spans: Vec<(usize, usize)> = result
+        .spans
+        .iter()
+        .filter(|s| s.kind != SpanKind::Heading as u16)
+        .map(|s| (mapper.to_byte(s.start), mapper.to_byte(s.end)))
+        .collect();
+    spans.sort_unstable();
+
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    let mut k = 0;
+    while k + 1 < candidates.len() {
+        let (open, close) = (candidates[k], candidates[k + 1]);
+        let owner = owners[k];
+        let valid = owner.is_some()
+            && owners[k + 1] == owner
+            && highlight_is_valid(source, open, close)
+            && !source[open..close].contains("\n\n")
+            && !source[open..close].contains("\r\n\r\n")
+            && {
+                let block_start = owner.map_or(0, |o| mapper.to_byte(result.blocks[o].start));
+                let (inner_start, inner_end) = (open + 2, close);
+                let from = spans.partition_point(|&(s, _)| s < block_start);
+                let to = spans.partition_point(|&(s, _)| s < inner_end);
+                spans[from..to].iter().all(|&(s, e)| {
+                    let inside = s >= inner_start && e <= inner_end;
+                    let around = s <= open && e >= close + 2;
+                    let apart = e <= inner_start || s >= inner_end;
+                    inside || around || apart
+                })
+            };
+        if valid {
+            found.push((open, close, owner.unwrap_or(0)));
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+    for (open, close, owner) in found {
+        push_span(
+            result,
+            mapper,
+            &(open + 2..close),
+            SpanKind::Highlight,
+            0,
+            0,
+        )?;
+        mark(result, mapper, open..open + 2, owner as u32)?;
+        mark(result, mapper, close..close + 2, owner as u32)?;
     }
     Ok(())
 }

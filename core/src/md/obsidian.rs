@@ -551,3 +551,68 @@ mod tests {
         assert_eq!(default_callout_title(custom.type_name), "My recipe");
     }
 }
+
+/// Resolves a heading path like `Setup#Install#macOS` (Obsidian's nested
+/// heading link) against a note's headings, given as `(level, text)` in
+/// document order. Each segment must be found inside the section of the one
+/// before it. A single segment matches any heading. Comparison ignores
+/// case and punctuation, so `Q3 Goals`, `q3-goals` and `Q3: Goals` agree.
+pub fn heading_path_index(headings: &[(u8, &str)], anchor: &str) -> Option<usize> {
+    let segments: Vec<&str> = anchor
+        .split('#')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let mut start = 0;
+    let mut end = headings.len();
+    let mut parent_level = 0u8;
+    let mut found = None;
+    for segment in segments {
+        let wanted = heading_key(segment);
+        let index = (start..end).find(|&i| {
+            let (level, text) = headings[i];
+            level > parent_level && heading_key(text) == wanted
+        })?;
+        let level = headings[index].0;
+        found = Some(index);
+        parent_level = level;
+        start = index + 1;
+        end = (start..end)
+            .find(|&i| headings[i].0 <= level)
+            .unwrap_or(end);
+    }
+    found
+}
+
+fn heading_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(test)]
+mod heading_path_tests {
+    use super::heading_path_index;
+
+    #[test]
+    fn nested_paths_search_inside_their_parent_section() {
+        let headings = [
+            (1, "Guide"),
+            (2, "Setup"),
+            (3, "macOS"),
+            (2, "Usage"),
+            (3, "macOS"),
+            (3, "Q3: Goals"),
+        ];
+        assert_eq!(heading_path_index(&headings, "Usage#macOS"), Some(4));
+        assert_eq!(heading_path_index(&headings, "Setup#macOS"), Some(2));
+        assert_eq!(heading_path_index(&headings, "macOS"), Some(2));
+        assert_eq!(heading_path_index(&headings, "q3-goals"), Some(5));
+        assert_eq!(heading_path_index(&headings, "Setup#Q3 Goals"), None);
+        assert_eq!(heading_path_index(&headings, ""), None);
+    }
+}

@@ -137,4 +137,26 @@ final class ObsidianDialectTests: XCTestCase {
         XCTAssertEqual(found?.lastPathComponent, "Pasted image.png")
         XCTAssertNil(RichContentRenderer.attachmentFallback(for: "missing.png", from: notes))
     }
+
+    func testObsidianAttachmentFolderSettingIsHonoured() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MarkDevSetting-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notes = root.appendingPathComponent("Notes", isDirectory: true)
+        let configured = root.appendingPathComponent("Files/Images", isDirectory: true)
+        let obsidian = root.appendingPathComponent(".obsidian", isDirectory: true)
+        for folder in [notes, configured, obsidian] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try Data(#"{"attachmentFolderPath": "Files/Images"}"#.utf8)
+            .write(to: obsidian.appendingPathComponent("app.json"))
+        try Data([0x89]).write(to: configured.appendingPathComponent("shot.png"))
+
+        XCTAssertEqual(
+            RichContentRenderer.configuredAttachmentFolder(from: notes)?.standardizedFileURL.path,
+            configured.standardizedFileURL.path)
+        XCTAssertEqual(
+            RichContentRenderer.attachmentFallback(for: "shot.png", from: notes)?
+                .lastPathComponent, "shot.png")
+    }
 }

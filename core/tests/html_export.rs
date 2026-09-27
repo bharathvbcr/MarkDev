@@ -729,3 +729,97 @@ fn links_inside_transcluded_notes_point_from_the_page() {
     assert!(html.contains("href=\"Sub/Sibling.md\""), "{html}");
     assert!(html.contains("src=\"Sub/pic.mp3\""));
 }
+
+#[test]
+fn highlights_wrap_formatting_links_and_match_the_editor() {
+    let html = render_document(
+        "A ==**bold**== and ==[[Note]]== and ==a *b* c==, not **x ==y** z== or `==code==`.\n\n> [!note] A ==titled== callout\n> body",
+        "Marks",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("<mark><strong>bold</strong></mark>"));
+    assert!(body.contains("<mark><a href=\"Note.md\">Note</a></mark>"));
+    assert!(body.contains("<mark>a <em>b</em> c</mark>"));
+    assert!(body.contains("<strong>x ==y</strong> z=="));
+    assert!(body.contains("<code>==code==</code>"));
+    assert!(body.contains("A <mark>titled</mark> callout"));
+    assert_eq!(
+        body.matches("<mark>").count(),
+        body.matches("</mark>").count()
+    );
+}
+
+#[test]
+fn nested_callouts_render_inside_their_parent() {
+    let html = render_document(
+        "> [!note] Outer\n> text\n> > [!warning] Inner\n> > deep",
+        "Nested",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    let outer = body.find("data-callout=\"note\"").unwrap();
+    let inner = body.find("data-callout=\"warning\"").unwrap();
+    assert!(outer < inner);
+    assert!(body.contains("<span class=\"callout-title-inner\">Inner</span>"));
+    assert!(!body.contains("[!warning]"));
+    assert!(!body.contains("<blockquote"));
+}
+
+#[test]
+fn nested_heading_links_and_embeds_target_the_inner_heading() {
+    let scratch = Scratch::new("nested-headings");
+    scratch.write(
+        "Guide.md",
+        b"# Guide\n\n## Setup\n\n### macOS\n\nSetup text.\n\n## Usage\n\n### macOS\n\nUsage text.\n",
+    );
+    let html = render_document_with_options(
+        "[[Guide#Usage#macOS|mac]]\n\n![[Guide#Usage#macOS]]",
+        "N",
+        &ExportOptions {
+            asset_base: Some(&scratch.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(html.contains("href=\"Guide.md#macos\""));
+    let embed = main_of(&html)
+        .split("markdown-embed-content")
+        .nth(1)
+        .unwrap();
+    assert!(embed.contains("Usage text.") && !embed.contains("Setup text."));
+}
+
+#[test]
+fn obsidians_attachment_folder_setting_is_honoured() {
+    for (setting, stored) in [
+        ("Files/Images", "Files/Images/shot.png"),
+        ("./assets-here", "Notes/assets-here/shot.png"),
+        ("/", "shot.png"),
+    ] {
+        let scratch = Scratch::new("attachment-setting");
+        scratch.write(
+            ".obsidian/app.json",
+            format!("{{\"attachmentFolderPath\": \"{setting}\"}}").as_bytes(),
+        );
+        scratch.write(stored, PNG_1X1);
+        // A same-named decoy on a shorter path, which the by-name search
+        // alone would prefer.
+        if setting != "/" {
+            scratch.write("Other/shot.png", b"GIF89a\x01\x00\x01\x00\x00\x00\x00;");
+        }
+        let notes = scratch.0.join("Notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        let html = render_document_with_options(
+            "![[shot.png]]",
+            "A",
+            &ExportOptions {
+                asset_base: Some(&notes),
+                vault_root: Some(&scratch.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(html.contains("src=\"data:image/png;base64,"), "{setting}");
+    }
+}
