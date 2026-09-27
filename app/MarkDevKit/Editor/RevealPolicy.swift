@@ -171,7 +171,8 @@ extension HiddenRanges {
         mode: EditorMode = .livePreview,
         isEditing: Bool = true,
         rendered: RenderedBlocks = .none,
-        text: NSString? = nil
+        text: NSString? = nil,
+        calloutToggles: Set<Int> = []
     ) {
         guard mode != .source else {
             self.init(merging: [])
@@ -208,12 +209,13 @@ extension HiddenRanges {
         } else {
             comments = []
         }
-        // A `> [!note]-` callout folds to its title line in live preview until
-        // the caret enters it, as Obsidian's does. Reading mode has no caret
-        // to unfold it with, so there it stays open rather than unreachable.
+        // A `> [!note]-` callout folds to its title line until the caret
+        // enters it, as Obsidian's does. Clicking its title strip flips it
+        // (`calloutToggles`), which is also how reading mode unfolds one.
         let folded: [NSRange]
-        if let text, mode == .livePreview {
-            folded = Self.foldedCalloutBodies(in: document, revealed: revealed, text: text)
+        if let text {
+            folded = Self.foldedCalloutBodies(
+                in: document, revealed: revealed, text: text, toggles: calloutToggles)
         } else {
             folded = []
         }
@@ -243,10 +245,14 @@ extension HiddenRanges {
     /// its title line to its last character, so the callout draws as one
     /// labelled line and the text after it keeps its own line.
     static func foldedCalloutBodies(
-        in document: ParsedDocument, revealed: Set<Int>, text: NSString
+        in document: ParsedDocument, revealed: Set<Int>, text: NSString,
+        toggles: Set<Int> = []
     ) -> [NSRange] {
         document.blocks.enumerated().compactMap { index, block -> NSRange? in
-            guard block.kind == .callout, block.calloutFold == .collapsed,
+            let fold = block.calloutFold ?? .fixed
+            let folded =
+                fold != .fixed && (fold == .collapsed) != toggles.contains(block.range.location)
+            guard block.kind == .callout, folded,
                 !revealed.contains(index),
                 block.range.location >= 0, block.range.length > 0,
                 NSMaxRange(block.range) <= text.length

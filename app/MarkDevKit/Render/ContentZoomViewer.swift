@@ -84,6 +84,10 @@ public enum ZoomedContent {
             }
         case .htmlComment:
             return .failure(RenderFailure(reason: "Nothing to open large"))
+        case .noteEmbed(let title):
+            return RichContentRenderer.shared.noteEmbed(
+                block.source, title: title, relativeTo: documentDirectory, maxWidth: 900,
+                textColor: textColor, dark: dark)
         case .htmlFlow(let flow):
             guard flow.images.count == 1, let image = flow.images.first else {
                 return .failure(RenderFailure(reason: "Nothing to open large"))
@@ -115,6 +119,8 @@ public enum ZoomedContent {
             return name.isEmpty ? "Image" : name
         case .htmlComment:
             return "Comment"
+        case .noteEmbed(let title):
+            return title
         case .htmlFlow(let flow):
             if flow.images.count == 1, let image = flow.images.first {
                 let name = (image.source as NSString).lastPathComponent

@@ -34,7 +34,7 @@ use super::model::{
     BlockDescriptor, BlockKind, CalloutKind, ParseResult, SpanKind, StyleSpan, SyntaxMarker,
     TableAlignment, Utf16Mapper, CALLOUT_FOLD_SHIFT, MAX_DOCUMENT_BYTES, MAX_INTERNED_STRINGS,
     MAX_INTERNED_STRING_BYTES, MAX_PARSE_EVENTS, MAX_PARSE_NESTING, MAX_STRUCTURAL_RECORDS,
-    MAX_TOTAL_STRING_BYTES, NO_INFO, TABLE_ALIGNMENT_BITS,
+    MAX_TOTAL_STRING_BYTES, NO_INFO, TABLE_ALIGNMENT_BITS, TASK_STATUS_SHIFT,
 };
 use super::obsidian;
 
@@ -722,6 +722,10 @@ fn open_frame(
                 && !obsidian::is_media_target(dest_url)
             {
                 SpanKind::WikiLink
+            } else if obsidian::is_audio_target(dest_url) || obsidian::is_video_target(dest_url) {
+                // The editor draws pictures, not players: an audio or video
+                // embed is a link that opens the file in the system player.
+                SpanKind::Link
             } else {
                 SpanKind::Image
             };
@@ -1585,7 +1589,10 @@ fn collect_custom_tasks(
         if existing.binary_search(&at).is_ok() {
             continue;
         }
-        push_span(result, mapper, &task.marker, SpanKind::TaskMarker, 0, 1)?;
+        // Bit 0 is "done", as for `[x]`; the status character rides above it
+        // so the editor can draw `[/]`, `[-]`, `[>]` distinctly.
+        let data = 1 | (u32::from(task.status) << TASK_STATUS_SHIFT);
+        push_span(result, mapper, &task.marker, SpanKind::TaskMarker, 0, data)?;
         // The box and the space after it, exactly as pulldown's own `[x]`.
         let bytes = source.as_bytes();
         let mut end = task.marker.end;

@@ -200,13 +200,21 @@ fn inline_footnotes_collapse_their_brackets() {
 fn custom_task_statuses_are_checked_tasks() {
     let source = "- [/] in progress\n- [-] cancelled\n- [x] done\n- [ ] open";
     let result = parse(source);
-    let tasks: Vec<u32> = result
+    let tasks: Vec<(u32, Option<char>)> = result
         .spans
         .iter()
         .filter(|s| s.kind == SpanKind::TaskMarker as u16)
-        .map(|s| s.data)
+        .map(|s| (s.data & 1, char::from_u32(s.data >> 8)))
         .collect();
-    assert_eq!(tasks, [1, 1, 1, 0]);
+    assert_eq!(
+        tasks,
+        [
+            (1, Some('/')),
+            (1, Some('-')),
+            (1, Some('\0')),
+            (0, Some('\0'))
+        ]
+    );
     // Collapses exactly like the `[x]` pulldown recognises.
     assert_eq!(
         revealed(source),
@@ -314,4 +322,11 @@ fn nested_heading_links_resolve_inside_their_parent() {
     assert_eq!(at("Usage#macOS"), Some(second));
     assert_eq!(at("Setup#macOS"), Some(first));
     assert_eq!(at("macOS"), Some(first));
+}
+
+#[test]
+fn audio_and_video_embeds_are_links_to_the_file() {
+    let source = "![[song.mp3]] ![clip](media/clip.mp4) ![[photo.png]]";
+    assert_eq!(spans_of(source, SpanKind::Link), ["song.mp3", "clip"]);
+    assert_eq!(spans_of(source, SpanKind::Image).len(), 1);
 }

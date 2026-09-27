@@ -397,12 +397,14 @@ final class BlockLayoutTests: XCTestCase {
 
     func testAnAlertIsLabelledWithItsFlavour() throws {
         let view = makeView("> [!WARNING]\n> mind the gap\n")
-        XCTAssertEqual(fragments(view).compactMap(\.blockLabel), ["WARNING"])
+        XCTAssertEqual(
+            fragments(view).compactMap(\.blockLabel), ["\(CalloutKind.warning.symbol) WARNING"])
     }
 
     func testAnAlertShowsItsCustomTitleBesideTheFlavour() throws {
         let view = makeView("> [!NOTE] Custom\n> body\n")
-        XCTAssertEqual(fragments(view).compactMap(\.blockLabel), ["NOTE Custom"])
+        XCTAssertEqual(
+            fragments(view).compactMap(\.blockLabel), ["\(CalloutKind.note.symbol) NOTE Custom"])
         let storage = try XCTUnwrap(view.textStorage)
         let custom = (view.markdown as NSString).range(of: "Custom")
         let font = storage.attribute(.font, at: custom.location, effectiveRange: nil) as? NSFont

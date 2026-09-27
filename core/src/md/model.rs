@@ -51,7 +51,9 @@ pub enum SpanKind {
     InlineMath = 9,
     /// Heading text itself; `data` carries the level (1–6).
     Heading = 10,
-    /// `- [ ]` / `- [x]`; `data` is 1 when checked.
+    /// `- [ ]` / `- [x]`; bit 0 of `data` is set when checked. An Obsidian
+    /// status such as `[/]` also carries its character above
+    /// [`TASK_STATUS_SHIFT`].
     TaskMarker = 11,
     FootnoteReference = 12,
     /// `#tag`, detected by MarkDev rather than pulldown-cmark.
@@ -175,6 +177,9 @@ impl CalloutKind {
         name.eq_ignore_ascii_case("note") || Self::from_type_name(name) != CalloutKind::Note
     }
 }
+
+/// Shift of a custom task status character within a task marker's `data`.
+pub const TASK_STATUS_SHIFT: u32 = 8;
 
 /// Bits of a callout's `data` holding its [`CalloutKind`].
 pub const CALLOUT_KIND_MASK: u32 = 0xFF;

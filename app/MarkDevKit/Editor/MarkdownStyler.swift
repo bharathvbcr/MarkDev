@@ -519,7 +519,7 @@ public enum MarkdownStyler {
                 paragraph.firstLineHeadIndent = indent
                 paragraph.headIndent = indent
                 storage.addAttribute(.paragraphStyle, value: paragraph, range: lines)
-                if marker?.data == 1 {
+                if ((marker?.data ?? 0) & 1) == 1 {
                     let textRange = NSIntersectionRange(own, scope)
                     if textRange.length > 0 {
                         storage.addAttribute(
@@ -812,11 +812,14 @@ public enum MarkdownStyler {
                 // note to self rather than part of the prose.
                 storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
             case .inlineFootnote:
+                // Raised and small, like the footnote marker it stands for
+                // in Obsidian's reading view, with the note itself as its text.
                 let noteFont = NSFont.systemFont(
-                    ofSize: max((theme.bodyFont.pointSize * 0.8).rounded(), 9))
+                    ofSize: max((theme.bodyFont.pointSize * 0.72).rounded(), 9))
                 storage.addAttributes([
                     .font: noteFont,
-                    .foregroundColor: theme.secondaryColor,
+                    .baselineOffset: theme.bodyFont.pointSize * 0.3,
+                    .foregroundColor: theme.accentColor,
                 ], range: range)
             }
         }

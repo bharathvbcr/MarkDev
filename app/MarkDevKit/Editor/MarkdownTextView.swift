@@ -1107,6 +1107,12 @@ public final class MarkdownTextView: ScrollingTextView {
     /// budget can only infer it, and infers it worst on a busy machine.
     private(set) var lastRestyleScope: NSRange?
 
+    /// Foldable callouts the reader has clicked open or shut, keyed by where
+    /// the callout starts. A click flips the callout from how its `+`/`-`
+    /// asked to start; clicking again restores it. View state only: nothing
+    /// here is written to the note.
+    private(set) var toggledCallouts: Set<Int> = []
+
     /// Reapplies attributes for the current parse and selection.
     private func restyle(scope: NSRange? = nil) {
         guard !isStyling, let storage = textStorage else { return }
@@ -1121,7 +1127,8 @@ public final class MarkdownTextView: ScrollingTextView {
         #endif
         hiddenRanges = HiddenRanges(
             document: parsed, selection: selectedRange(), mode: mode, isEditing: isEditing,
-            rendered: renderedBlocks, text: storage.string as NSString)
+            rendered: renderedBlocks, text: storage.string as NSString,
+            calloutToggles: toggledCallouts)
         // The styler grows the scope to whole lines and reports what it
         // actually wrote. Every layer below is scoped to *that*, not to
         // `scope`: the styler opens by clearing the range it settled on, so a
@@ -1635,6 +1642,10 @@ public final class MarkdownTextView: ScrollingTextView {
         // Before anything else, and before the caret moves: a chip is drawn on
         // top of the block, so a click that lands on one was meant for it.
         if handleControlClick(at: point) { return }
+        // A folded or foldable callout's title strip is its fold control, as
+        // in Obsidian — in reading mode too, where there is no caret to
+        // unfold it with.
+        if toggleCalloutFold(at: point) { return }
         // Only the gutter counts: clicking the item's text should place the
         // caret, not toggle the task.
         if isInCheckboxGutter(point), let marker = taskMarker(atCheckbox: point) {
@@ -1642,6 +1653,50 @@ public final class MarkdownTextView: ScrollingTextView {
             return
         }
         super.mouseDown(with: event)
+    }
+
+    /// Flips the fold of the foldable callout whose collapsed title line is
+    /// under `point`. Returns whether it did.
+    ///
+    /// Only while the title line is collapsed to its label: once the caret
+    /// has revealed the callout's source, a click there edits the title.
+    @discardableResult
+    func toggleCalloutFold(at point: CGPoint) -> Bool {
+        guard mode != .source, let storage = textStorage, storage.length > 0 else {
+            return false
+        }
+        let text = storage.string as NSString
+        let offset = min(max(characterIndexForInsertion(at: point), 0), text.length - 1)
+        guard
+            let callout = parsed.blocks.first(where: { block in
+                guard block.kind == .callout, (block.calloutFold ?? .fixed) != .fixed,
+                    block.range.location >= 0, block.range.location < text.length
+                else { return false }
+                let title = text.lineRange(
+                    for: NSRange(location: block.range.location, length: 0))
+                return NSLocationInRange(offset, title)
+            }),
+            hiddenRanges.hidesWholeLine(at: callout.range.location, in: text)
+        else { return false }
+        toggleCalloutFold(startingAt: callout.range.location)
+        return true
+    }
+
+    /// Flips the fold of the callout starting at `location`.
+    func toggleCalloutFold(startingAt location: Int) {
+        if toggledCallouts.contains(location) {
+            toggledCallouts.remove(location)
+        } else {
+            toggledCallouts.insert(location)
+        }
+        restyle()
+    }
+
+    /// Whether a callout currently shows folded, after the reader's clicks.
+    private func isCalloutFolded(_ block: BlockDescriptor) -> Bool {
+        let fold = block.calloutFold ?? .fixed
+        guard fold != .fixed else { return false }
+        return (fold == .collapsed) != toggledCallouts.contains(block.range.location)
     }
 
     /// Whether `point` lands in the gutter the checkbox is drawn into.
@@ -2935,8 +2990,13 @@ extension MarkdownTextView {
             fragment.listMarker = listMarker(forFragmentAt: range, in: text)
         case .task:
             // The checkbox is the stand-in; a bullet beside it would be a
-            // second marker for one item.
-            break
+            // second marker for one item. An Obsidian status (`[/]`, `[-]`)
+            // rides in the marker's data above the checked bit.
+            if let marker = parsed.taskMarker(overlapping: range), marker.data >> 8 > 0,
+                let scalar = Unicode.Scalar(marker.data >> 8)
+            {
+                fragment.taskStatus = Character(scalar)
+            }
         case .frontmatter:
             break
         default:
@@ -2950,16 +3010,15 @@ extension MarkdownTextView {
             $0.kind == .callout && NSIntersectionRange($0.range, range).length > 0
         }
         // A foldable callout says so, and which way it currently sits.
-        let fold: String
-        switch block?.calloutFold ?? CalloutFold.fixed {
-        case .fixed: fold = ""
-        case .expanded: fold = " ▾"
-        case .collapsed: fold = " ▸"
+        var fold = ""
+        if let block, (block.calloutFold ?? .fixed) != .fixed {
+            fold = isCalloutFolded(block) ? " ▸" : " ▾"
         }
-        if let title = block?.info, !title.isEmpty {
-            return "\(kind.title) \(title)\(fold)"
+        let name = "\(kind.symbol) \(kind.title)"
+        if let title = block?.info.map(CalloutKind.plainTitle), !title.isEmpty {
+            return "\(name) \(title)\(fold)"
         }
-        return kind.title + fold
+        return name + fold
     }
 
     /// The bullet or number for a list item opening at this fragment.

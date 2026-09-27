@@ -22,6 +22,10 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
         /// An HTML comment. GitHub draws nothing for it; the source collapses
         /// and nothing stands in its place.
         case htmlComment
+        /// An Obsidian `![[Note]]` embed standing alone in its paragraph: a
+        /// read-only card showing the start of the note, or of the section
+        /// or block the embed names. `source` is the embed target as written.
+        case noteEmbed(title: String)
     }
 
     public let kind: Kind
@@ -211,7 +215,9 @@ public struct RenderedBlocks: Sendable, Equatable {
                 images = spans
             }
 
-            guard let content = Self.image(block, in: document, text: text, images: spans),
+            guard
+                let content = Self.image(block, in: document, text: text, images: spans)
+                    ?? Self.noteEmbed(block, in: document, text: text),
                 let range = Self.clamp(block.range, to: text.length)
             else { continue }
             found.append(Entry(block: index, range: range, content: content))
@@ -528,6 +534,35 @@ public struct RenderedBlocks: Sendable, Equatable {
         let (alt, width) = obsidianSize(written)
         let shown = alt.isEmpty && isEmbed ? (source as NSString).lastPathComponent : alt
         return RenderedBlock(kind: .image(alt: shown), source: source, width: width)
+    }
+
+    /// A paragraph that is one `![[Note]]` embed and nothing else.
+    ///
+    /// The parser reports a note embed as a wikilink (so the vault counts
+    /// it), which is why the image span index above does not see it.
+    private static func noteEmbed(
+        _ block: BlockDescriptor, in document: ParsedDocument, text: NSString
+    ) -> RenderedBlock? {
+        guard let body = clamp(block.range, to: text.length) else { return nil }
+        let paragraph = text.substring(with: body).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard paragraph.hasPrefix("![["), paragraph.hasSuffix("]]"),
+            paragraph.components(separatedBy: "[[").count == 2
+        else { return nil }
+        let links = document.spans.filter {
+            $0.kind == .wikiLink && NSIntersectionRange($0.range, body).length > 0
+        }
+        guard links.count == 1, let target = document.target(for: links[0]), !target.isEmpty
+        else { return nil }
+        let inner = paragraph.dropFirst(3).dropLast(2)
+        let title: String
+        if let bar = inner.lastIndex(of: "|") {
+            title = String(inner[inner.index(after: bar)...]).trimmingCharacters(in: .whitespaces)
+        } else {
+            let page = target.split(separator: "#", maxSplits: 1).first.map(String.init) ?? target
+            title = (page as NSString).lastPathComponent
+        }
+        return RenderedBlock(
+            kind: .noteEmbed(title: title.isEmpty ? target : title), source: target)
     }
 
     /// The text after the last `|` of `![[pic.png|…]]`, or nothing.

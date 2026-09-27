@@ -2875,9 +2875,23 @@ struct WorkspaceView: View {
         workspaceIOLifecycle.invalidate(.sessionRestore)
         workspaceIOTasks.cancel(.sessionRestore)
         workspaceIOTasks.launch(in: .documentOpen(pane), priority: .userInitiated) {
-            let entry: WorkspaceLocalEntryKind?
+            var destination = destination
+            var entry: WorkspaceLocalEntryKind?
             do {
                 entry = try await workspace.classifyLocalEntry(at: destination)
+                // Obsidian keeps embedded audio, video and pasted files in an
+                // attachments folder rather than beside the note. Look there,
+                // off the window actor, only once the direct path is missing.
+                if entry == nil || entry == .unsupported, !target.hasPrefix("/") {
+                    let found = await Task.detached(priority: .userInitiated) {
+                        RichContentRenderer.attachmentFallback(
+                            for: target, from: documentDirectory)
+                    }.value
+                    if let found, vault.relativePath(for: found) != nil {
+                        destination = found
+                        entry = try await workspace.classifyLocalEntry(at: found)
+                    }
+                }
             } catch {
                 errorMessage = "That file could not be opened."
                 return

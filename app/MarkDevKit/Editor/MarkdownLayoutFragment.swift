@@ -168,6 +168,8 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
                 return text.isEmpty ? "HTML content" : text
             case .htmlComment:
                 return nil
+            case .noteEmbed(let title):
+                return "Embedded note: \(title)"
             }
         }
         return nil
@@ -240,6 +242,11 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
     /// a list into a stack of indented sentences, which is the failure
     /// ``RevealPolicy/markersRequiringReplacement`` exists to prevent.
     var listMarker: String?
+
+    /// An Obsidian task status other than `x` — `/`, `-`, `>`, `?`, `!` —
+    /// drawn in the checked box in place of the tick, so an in-progress or
+    /// cancelled item is told apart from a done one.
+    var taskStatus: Character?
 
     /// The drawn grid this fragment's table row belongs to, resolved by the
     /// delegate while the row's source is collapsed.
@@ -1243,6 +1250,7 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
         case .diagram: "Diagram"
         case .image: "Image"
         case .htmlFlow: "Image"
+        case .noteEmbed: "Embedded note"
         case .htmlComment, nil: nil
         }
     }
@@ -1323,6 +1331,19 @@ final class MarkdownLayoutFragment: NSTextLayoutFragment {
             context.addPath(path)
             context.setFillColor(palette.accent)
             context.fillPath()
+
+            if let status = taskStatus, status != "x", status != "X",
+                let font = CTFontCreateUIFontForLanguage(.emphasizedSystem, side * 0.8, nil)
+            {
+                let glyph = measuredLine(text: String(status), font: font, kern: 0)
+                context.setFillColor(palette.checkmark)
+                context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+                context.textPosition = CGPoint(
+                    x: rect.midX - glyph.width / 2,
+                    y: rect.midY + (glyph.ascent - glyph.descent) / 2)
+                CTLineDraw(glyph.line, context)
+                return
+            }
 
             // A tick, drawn rather than set in a font: a glyph would depend on
             // which symbol font happens to be installed.

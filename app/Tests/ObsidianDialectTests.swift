@@ -67,8 +67,9 @@ final class ObsidianDialectTests: XCTestCase {
 
     func testCustomTaskStatusesAreCheckedTasks() {
         let doc = ParsedDocument.parse("- [/] half\n- [ ] open")
-        let markers = doc.spans.filter { $0.kind == .taskMarker }.map(\.data)
-        XCTAssertEqual(markers, [1, 0])
+        let markers = doc.spans.filter { $0.kind == .taskMarker }
+        XCTAssertEqual(markers.map { $0.data & 1 }, [1, 0])
+        XCTAssertEqual(markers.first.map { $0.data >> 8 }, UInt32(("/" as Unicode.Scalar).value))
     }
 
     func testStandaloneEmbedRendersAsASizedPicture() {
@@ -117,7 +118,36 @@ final class ObsidianDialectTests: XCTestCase {
         let reading = HiddenRanges(
             document: parsed, selection: NSRange(location: 0, length: 0),
             mode: .reading, text: text)
-        XCTAssertFalse(reading.covers(body), "reading mode has no caret to unfold with")
+        XCTAssertTrue(reading.covers(body), "reading mode folds too")
+
+        let clickedOpen = HiddenRanges(
+            document: parsed, selection: NSRange(location: 0, length: 0),
+            mode: .reading, text: text, calloutToggles: [0])
+        XCTAssertFalse(clickedOpen.covers(body), "a click on the title unfolds it")
+    }
+
+    func testAnExpandedFoldableCalloutFoldsWhenToggled() {
+        let source = "> [!bug]+ Open\n> shown body\n\nAfter"
+        let text = source as NSString
+        let parsed = ParsedDocument.parse(source)
+        let body = text.range(of: "shown body")
+        let away = NSRange(location: text.length, length: 0)
+        XCTAssertFalse(
+            HiddenRanges(document: parsed, selection: away, mode: .reading, text: text)
+                .covers(body))
+        XCTAssertTrue(
+            HiddenRanges(
+                document: parsed, selection: away, mode: .reading, text: text,
+                calloutToggles: [0]
+            ).covers(body))
+    }
+
+    func testCalloutLabelsCarryASymbolAndAPlainTitle() {
+        XCTAssertTrue(CalloutKind.allCases.allSatisfy { $0.symbol.hasSuffix("\u{FE0E}") })
+        XCTAssertEqual(Set(CalloutKind.allCases.map(\.symbol)).count, CalloutKind.allCases.count)
+        XCTAssertEqual(CalloutKind.plainTitle("**Why** [[Plan|this]] ==now=="), "Why this now")
+        XCTAssertEqual(CalloutKind.plainTitle("See [docs](https://x.y) and `code`"), "See docs and code")
+        XCTAssertEqual(CalloutKind.plainTitle("snake_case stays"), "snake_case stays")
     }
 
     func testAttachmentFallbackFindsObsidianAttachmentFolders() throws {
@@ -158,5 +188,67 @@ final class ObsidianDialectTests: XCTestCase {
         XCTAssertEqual(
             RichContentRenderer.attachmentFallback(for: "shot.png", from: notes)?
                 .lastPathComponent, "shot.png")
+    }
+
+    func testPicturesAreFoundAnywhereInTheVaultByName() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MarkDevIndex-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notes = root.appendingPathComponent("Journal/2026", isDirectory: true)
+        let deep = root.appendingPathComponent("Projects/Alpha/Screens", isDirectory: true)
+        for folder in [notes, deep, root.appendingPathComponent(".obsidian")] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try Data([0x89]).write(to: deep.appendingPathComponent("Pasted image 1.png"))
+
+        let found = RichContentRenderer.attachmentFallback(
+            for: "Pasted image 1.png", from: notes)
+        XCTAssertEqual(found?.standardizedFileURL.path,
+            deep.appendingPathComponent("Pasted image 1.png").standardizedFileURL.path)
+        XCTAssertEqual(
+            VaultFileIndex.shared.find("screens/pasted IMAGE 1.png", in: root)?.lastPathComponent,
+            "Pasted image 1.png")
+        XCTAssertNil(VaultFileIndex.shared.find("../escape.png", in: root))
+    }
+
+    func testStandaloneNoteEmbedBecomesAnEmbedCard() {
+        let source = "Intro\n\n![[Project Plan#Goals|Our goals]]\n\nText with ![[Inline]] embed."
+        let parsed = ParsedDocument.parse(source)
+        let rendered = RenderedBlocks(document: parsed, text: source as NSString)
+        XCTAssertEqual(rendered.entries.count, 1, "only the standalone embed becomes a card")
+        XCTAssertEqual(rendered.entries.first?.content.kind, .noteEmbed(title: "Our goals"))
+        XCTAssertEqual(rendered.entries.first?.content.source, "Project Plan#Goals")
+    }
+
+    func testNoteExcerptsFollowTheEmbedAnchor() {
+        let note = """
+            ---
+            tags: [x]
+            ---
+            # Plan
+
+            Intro. %%private%%
+
+            ## Goals
+
+            Ship it. ^ship
+
+            ## Later
+
+            Not now.
+            """
+        let whole = RichContentRenderer.noteExcerpt(note, anchor: nil)
+        XCTAssertTrue(whole.hasPrefix("Plan"))
+        XCTAssertFalse(whole.contains("tags:"))
+        XCTAssertFalse(whole.contains("private"))
+        XCTAssertFalse(whole.contains("^ship"))
+
+        let goals = RichContentRenderer.noteExcerpt(note, anchor: "Goals")
+        XCTAssertTrue(goals.contains("Ship it."))
+        XCTAssertFalse(goals.contains("Not now."))
+        XCTAssertEqual(RichContentRenderer.noteExcerpt(note, anchor: "Plan#Goals"), goals)
+
+        XCTAssertEqual(RichContentRenderer.noteExcerpt(note, anchor: "^ship"), "Ship it.")
+        XCTAssertEqual(RichContentRenderer.noteExcerpt(note, anchor: "Missing"), "")
     }
 }

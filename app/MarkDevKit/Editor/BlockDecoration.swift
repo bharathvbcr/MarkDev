@@ -47,6 +47,53 @@ extension CalloutKind {
         case .quote: "QUOTE"
         }
     }
+
+    /// A text symbol for the callout's strip, standing in for Obsidian's icon.
+    ///
+    /// Text rather than an image so it sets in the label's own font and
+    /// colour; each carries U+FE0E so the system never swaps in a coloured
+    /// emoji.
+    public var symbol: String {
+        let glyph: String
+        switch self {
+        case .note: glyph = "✎"
+        case .abstract: glyph = "≣"
+        case .info: glyph = "ⓘ"
+        case .todo: glyph = "☑"
+        case .tip: glyph = "✦"
+        case .important: glyph = "❢"
+        case .success: glyph = "✓"
+        case .question: glyph = "?"
+        case .warning: glyph = "⚠"
+        case .caution: glyph = "⊘"
+        case .failure: glyph = "✗"
+        case .danger: glyph = "⚡"
+        case .bug: glyph = "✱"
+        case .example: glyph = "☰"
+        case .quote: glyph = "❝"
+        }
+        return glyph + "\u{FE0E}"
+    }
+
+    /// A callout title as it reads on the strip: Markdown punctuation
+    /// removed, links reduced to their text, so `**Why** [[Plan|this]]`
+    /// reads `Why this`.
+    public static func plainTitle(_ title: String) -> String {
+        var text = title
+        let replacements: [(String, String)] = [
+            (#"\[\[(?:[^\]|]*\|)?([^\]]*)\]\]"#, "$1"),
+            (#"!?\[([^\]]*)\]\([^)]*\)"#, "$1"),
+            (#"(\*\*|__|==|~~|`)"#, ""),
+            (#"(?<![\w])[*_]|[*_](?![\w])"#, ""),
+        ]
+        for (pattern, template) in replacements {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+            text = expression.stringByReplacingMatches(
+                in: text, range: NSRange(location: 0, length: (text as NSString).length),
+                withTemplate: template)
+        }
+        return text.trimmingCharacters(in: .whitespaces)
+    }
 }
 
 /// Decoration drawn behind or in place of a block's text.
@@ -223,7 +270,8 @@ extension BlockDecoration {
         for range: NSRange, in document: ParsedDocument
     ) -> BlockDecoration? {
         guard let marker = document.taskMarker(overlapping: range) else { return nil }
-        return .task(checked: marker.data == 1)
+        // Bit 0 is "done"; an Obsidian status character rides above it.
+        return .task(checked: (marker.data & 1) == 1)
     }
 
     /// The row decoration for a fragment inside a GFM table.

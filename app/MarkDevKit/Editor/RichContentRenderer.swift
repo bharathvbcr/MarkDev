@@ -362,7 +362,233 @@ public final class RichContentRenderer {
         case .htmlComment:
             return .failure(
                 RenderFailure(reason: "HTML comments are hidden, not drawn"))
+        case .noteEmbed(let title):
+            return noteEmbed(
+                request.block.source, title: title, relativeTo: request.directory,
+                maxWidth: request.context.width, textColor: request.context.textColor,
+                dark: request.context.dark)
         }
+    }
+
+    // MARK: - Note embeds
+
+    /// Largest note an embed card reads.
+    private static let maxEmbeddedNoteBytes = 512 * 1_024
+
+    /// Drawn embed cards, keyed by note, section, title, width and appearance,
+    /// and dropped when the note's modification date moves on.
+    private var noteEmbedCache: [String: (modified: Date, content: RenderedContent)] = [:]
+
+    /// A read-only card showing the start of the note an `![[embed]]` names
+    /// (or of its `#Heading` section or `#^block`). Obsidian draws the note
+    /// in full; the editor shows an excerpt, and the card opens large.
+    public func noteEmbed(
+        _ target: String, title: String, relativeTo base: URL?, maxWidth: CGFloat,
+        textColor: NSColor, dark: Bool
+    ) -> Result<RenderedContent, RenderFailure> {
+        let parts = target.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+        let page = parts.first.map(String.init) ?? target
+        let anchor = parts.count > 1 ? String(parts[1]) : nil
+        guard !page.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return .failure(RenderFailure(reason: "Sections of this note are not embedded"))
+        }
+        let lower = page.lowercased()
+        let file = lower.hasSuffix(".md") || lower.hasSuffix(".markdown") ? page : page + ".md"
+        guard let url = resolve(file, relativeTo: base),
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            (attributes[.type] as? FileAttributeType) == .typeRegular
+        else {
+            return .failure(RenderFailure(reason: "No note named \(page)"))
+        }
+        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        guard size <= Self.maxEmbeddedNoteBytes else {
+            return .failure(RenderFailure(reason: "\(page) is too large to embed"))
+        }
+        let modified = attributes[.modificationDate] as? Date ?? .distantPast
+        let width = max(160, min(maxWidth, 760)).rounded()
+        let cacheKey = [url.path, anchor ?? "", title, "\(width)", "\(dark)"]
+            .joined(separator: "\u{1F}")
+        if let cached = noteEmbedCache[cacheKey], cached.modified == modified {
+            return .success(cached.content)
+        }
+        guard let data = try? Data(contentsOf: url),
+            let text = String(data: data, encoding: .utf8)
+        else {
+            return .failure(RenderFailure(reason: "\(page) could not be read"))
+        }
+        let excerpt = Self.noteExcerpt(text, anchor: anchor)
+        guard
+            let content = Self.drawNoteCard(
+                title: title, body: excerpt, width: width, textColor: textColor)
+        else {
+            return .failure(RenderFailure(reason: "\(page) could not be drawn"))
+        }
+        if noteEmbedCache.count >= 64 { noteEmbedCache.removeAll() }
+        noteEmbedCache[cacheKey] = (modified, content)
+        return .success(content)
+    }
+
+    /// The text an embed card shows: the note without its frontmatter, or the
+    /// section under `anchor` (`Heading` or `Heading#Subheading`), or the block
+    /// carrying `^id`. Heading markers, comments and block ids are removed,
+    /// and the excerpt is clipped to `maxLines` lines.
+    public nonisolated static func noteExcerpt(
+        _ text: String, anchor: String?, maxLines: Int = 24, maxCharacters: Int = 1_600
+    ) -> String {
+        var lines = text.components(separatedBy: "\n").map {
+            $0.hasSuffix("\r") ? String($0.dropLast()) : $0
+        }
+        func isBlank(_ line: String) -> Bool {
+            line.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        func headingLevel(_ line: String) -> Int? {
+            let hashes = line.prefix(while: { $0 == "#" }).count
+            guard (1...6).contains(hashes), line.dropFirst(hashes).first == " " else { return nil }
+            return hashes
+        }
+        func key(_ value: String) -> String {
+            var scalars = String.UnicodeScalarView()
+            for scalar in value.lowercased().unicodeScalars
+            where CharacterSet.alphanumerics.contains(scalar) {
+                scalars.append(scalar)
+            }
+            return String(scalars)
+        }
+        if lines.first?.trimmingCharacters(in: .whitespaces) == "---",
+            let close = lines.indices.dropFirst().first(where: {
+                lines[$0].trimmingCharacters(in: .whitespaces) == "---"
+            })
+        {
+            lines.removeSubrange(0...close)
+        }
+
+        if let anchor = anchor?.trimmingCharacters(in: .whitespaces), !anchor.isEmpty {
+            if anchor.hasPrefix("^") {
+                let id = String(anchor.dropFirst())
+                guard
+                    let hit = lines.firstIndex(where: { line in
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        return trimmed == "^" + id || trimmed.hasSuffix(" ^" + id)
+                    })
+                else { return "" }
+                var end = hit
+                if lines[hit].trimmingCharacters(in: .whitespaces) == "^" + id {
+                    end = hit - 1
+                    while end >= 0, isBlank(lines[end]) { end -= 1 }
+                    guard end >= 0 else { return "" }
+                }
+                var start = end
+                while start > 0, !isBlank(lines[start - 1]) { start -= 1 }
+                lines = Array(lines[start...end])
+            } else {
+                let segments = anchor.split(separator: "#").map { key(String($0)) }
+                    .filter { !$0.isEmpty }
+                var from = 0
+                var upTo = lines.count
+                var parent = 0
+                var found: (index: Int, level: Int)?
+                for segment in segments {
+                    guard
+                        let index = (from..<upTo).first(where: { index in
+                            guard let level = headingLevel(lines[index]), level > parent else {
+                                return false
+                            }
+                            return key(String(lines[index].dropFirst(level))) == segment
+                        }),
+                        let level = headingLevel(lines[index])
+                    else { return "" }
+                    found = (index, level)
+                    parent = level
+                    from = index + 1
+                    upTo =
+                        (from..<upTo).first(where: { (headingLevel(lines[$0]) ?? 7) <= level })
+                        ?? upTo
+                }
+                guard let found else { return "" }
+                lines = Array(lines[found.index..<upTo])
+            }
+        }
+
+        var shown: [String] = []
+        for line in lines {
+            var line = line
+            if let level = headingLevel(line) {
+                line = String(line.dropFirst(level + 1))
+            }
+            if let comment = try? NSRegularExpression(pattern: "%%.*?%%") {
+                line = comment.stringByReplacingMatches(
+                    in: line, range: NSRange(location: 0, length: (line as NSString).length),
+                    withTemplate: "")
+            }
+            if let blockID = try? NSRegularExpression(pattern: "\\s\\^[A-Za-z0-9-]+\\s*$") {
+                line = blockID.stringByReplacingMatches(
+                    in: line, range: NSRange(location: 0, length: (line as NSString).length),
+                    withTemplate: "")
+            }
+            if shown.isEmpty, isBlank(line) { continue }
+            shown.append(line)
+            if shown.count >= maxLines { break }
+        }
+        while let last = shown.last, isBlank(last) { shown.removeLast() }
+        var excerpt = shown.joined(separator: "\n")
+        if excerpt.count > maxCharacters {
+            excerpt = String(excerpt.prefix(maxCharacters)) + "…"
+        } else if shown.count >= maxLines {
+            excerpt += "\n…"
+        }
+        return excerpt
+    }
+
+    /// Draws an embed card at twice its point size, so the text stays sharp.
+    private static func drawNoteCard(
+        title: String, body: String, width: CGFloat, textColor: NSColor
+    ) -> RenderedContent? {
+        let padding: CGFloat = 12
+        let bar: CGFloat = 3
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 2
+        let heading = NSAttributedString(
+            string: "↪ " + title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                .foregroundColor: textColor.withAlphaComponent(0.7),
+            ])
+        let text = NSAttributedString(
+            string: body.isEmpty ? "Nothing to show." : body,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5),
+                .foregroundColor: textColor,
+                .paragraphStyle: paragraph,
+            ])
+        let inner = max(width - padding * 2 - bar, 40)
+        let options: NSString.DrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
+        let headingHeight = ceil(
+            heading.boundingRect(with: CGSize(width: inner, height: 1_000), options: options)
+                .height)
+        let textHeight = min(
+            ceil(
+                text.boundingRect(with: CGSize(width: inner, height: 10_000), options: options)
+                    .height), 420)
+        let size = CGSize(width: width, height: padding * 2 + headingHeight + 6 + textHeight)
+        let image = NSImage(size: size, flipped: true) { rect in
+            textColor.withAlphaComponent(0.05).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6).fill()
+            textColor.withAlphaComponent(0.25).setFill()
+            NSRect(x: 0, y: 0, width: bar, height: rect.height).fill()
+            heading.draw(
+                with: NSRect(x: bar + padding, y: padding, width: inner, height: headingHeight),
+                options: options)
+            text.draw(
+                with: NSRect(
+                    x: bar + padding, y: padding + headingHeight + 6, width: inner,
+                    height: textHeight),
+                options: options.union(.truncatesLastVisibleLine))
+            return true
+        }
+        var pixels = CGRect(origin: .zero, size: CGSize(width: size.width * 2, height: size.height * 2))
+        guard let bitmap = image.cgImage(forProposedRect: &pixels, context: nil, hints: nil)
+        else { return nil }
+        return RenderedContent(cgImage: bitmap, size: size)
     }
 
     /// The width a picture asked for: a point size, or the column when it
@@ -443,6 +669,9 @@ public final class RichContentRenderer {
                 kind: "htmlFlow", source: request.block.source, scale: .absent, dark: false)
         case .htmlComment:
             return Key(kind: "htmlComment", source: "", scale: .absent, dark: false)
+        case .noteEmbed:
+            // Cached by ``noteEmbed``, against the note's modification date.
+            return nil
         }
     }
 
@@ -1964,7 +2193,7 @@ public final class RichContentRenderer {
     /// folder and each folder above it — plain, and its `attachments`,
     /// `assets`, `_attachments` or `media` subfolder — stopping at the vault
     /// root (a folder holding `.obsidian` or `.git`) and after eight levels.
-    static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
+    nonisolated static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
         let fileManager = FileManager.default
         func existingFile(_ candidate: URL) -> URL? {
             var isDirectory: ObjCBool = false
@@ -2000,8 +2229,13 @@ public final class RichContentRenderer {
             let isVaultRoot =
                 fileManager.fileExists(atPath: directory.appendingPathComponent(".obsidian").path)
                 || fileManager.fileExists(atPath: directory.appendingPathComponent(".git").path)
+            if isVaultRoot {
+                // Obsidian finally looks anywhere in the vault by name, the
+                // shortest path winning.
+                return VaultFileIndex.shared.find(relativePath, in: directory)
+            }
             let parent = directory.deletingLastPathComponent()
-            if isVaultRoot || parent.standardizedFileURL.path == directory.standardizedFileURL.path {
+            if parent.standardizedFileURL.path == directory.standardizedFileURL.path {
                 break
             }
             directory = parent
@@ -2012,7 +2246,7 @@ public final class RichContentRenderer {
     /// The folder `attachmentFolderPath` in the nearest vault's
     /// `.obsidian/app.json` names: `/` is the vault root, `./sub` is relative
     /// to the note's folder, anything else is relative to the vault root.
-    static func configuredAttachmentFolder(from folder: URL) -> URL? {
+    nonisolated static func configuredAttachmentFolder(from folder: URL) -> URL? {
         let fileManager = FileManager.default
         var directory = folder
         for _ in 0...8 {
@@ -2185,5 +2419,102 @@ public final class RichContentRenderer {
         let area = content.size.width * content.size.height
         guard area.isFinite, area > 0 else { return 0 }
         return Int(min(area, CGFloat(Int32.max)))
+    }
+}
+
+/// A vault's files by lowercased name, so `![[Pasted image.png]]` is found
+/// anywhere in the vault the way Obsidian finds it.
+///
+/// The first lookup in a vault scans up to ``quickScanLimit`` entries on the
+/// spot — a personal vault usually fits, and a picture must not be missing
+/// the first time its note opens. A larger vault finishes in the background,
+/// and every index is refreshed in the background once it is a minute old.
+final class VaultFileIndex: @unchecked Sendable {
+    static let shared = VaultFileIndex()
+
+    static let quickScanLimit = 5_000
+    static let fullScanLimit = 50_000
+    private static let lifetime: TimeInterval = 60
+
+    private struct Index {
+        let built: Date
+        let byName: [String: [URL]]
+    }
+
+    private let lock = NSLock()
+    private var indexes: [String: Index] = [:]
+    private var building: Set<String> = []
+
+    /// The shortest path under `root` whose trailing components match
+    /// `relativePath`, ignoring case.
+    func find(_ relativePath: String, in root: URL) -> URL? {
+        let wanted = relativePath.split(separator: "/").map { $0.lowercased() }
+        guard let name = wanted.last, !name.isEmpty, !wanted.contains("..") else { return nil }
+        let key = root.standardizedFileURL.path
+
+        lock.lock()
+        var index = indexes[key]
+        lock.unlock()
+
+        if index == nil {
+            let quick = Self.scan(root, limit: Self.quickScanLimit)
+            let built = Index(built: Date(), byName: quick.byName)
+            lock.lock()
+            indexes[key] = built
+            lock.unlock()
+            index = built
+            if !quick.complete { refresh(root, key: key) }
+        } else if let current = index, Date().timeIntervalSince(current.built) > Self.lifetime {
+            refresh(root, key: key)
+        }
+
+        guard let candidates = index?.byName[name] else { return nil }
+        return candidates.filter { url in
+            let parts = url.pathComponents.map { $0.lowercased() }
+            return parts.count >= wanted.count && Array(parts.suffix(wanted.count)) == wanted
+        }.min { $0.pathComponents.count < $1.pathComponents.count }
+    }
+
+    /// Rebuilds `root`'s index in the background, once at a time.
+    private func refresh(_ root: URL, key: String) {
+        lock.lock()
+        let start = !building.contains(key)
+        if start { building.insert(key) }
+        lock.unlock()
+        guard start else { return }
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let full = Self.scan(root, limit: Self.fullScanLimit)
+            lock.lock()
+            indexes[key] = Index(built: Date(), byName: full.byName)
+            building.remove(key)
+            lock.unlock()
+        }
+    }
+
+    /// Regular files under `root`, skipping hidden entries, packages and
+    /// `node_modules`, stopping after `limit` entries.
+    static func scan(_ root: URL, limit: Int) -> (byName: [String: [URL]], complete: Bool) {
+        var byName: [String: [URL]] = [:]
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey]
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: keys,
+                options: [.skipsHiddenFiles, .skipsPackageDescendants])
+        else { return (byName, true) }
+        var seen = 0
+        while let url = enumerator.nextObject() as? URL {
+            seen += 1
+            if seen > limit { return (byName, false) }
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            if values?.isDirectory == true {
+                if url.lastPathComponent == "node_modules" || enumerator.level > 16 {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            guard values?.isRegularFile == true else { continue }
+            byName[url.lastPathComponent.lowercased(), default: []].append(url)
+        }
+        return (byName, true)
     }
 }
