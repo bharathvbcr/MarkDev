@@ -303,12 +303,63 @@ pub unsafe extern "C" fn md_html_render_with_base(
         asset_base: (!base.is_empty()).then(|| Path::new(base)),
         vault_root: (!vault.is_empty() && !base.is_empty()).then(|| Path::new(vault)),
         link_base,
+        site: None,
     };
     let Ok(html) = render_document_with_options(source, title, &options) else {
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(HTMLHandle {
         bytes: html.into_bytes().into_boxed_slice(),
+    }))
+}
+
+/// Exports every note under `vault` as a linked static site in `output`.
+///
+/// Returns UTF-8 JSON, read with `md_html_bytes` and released with
+/// `md_html_free`: on success `{"pages", "skipped", "index", "truncated"}`,
+/// on failure `{"error": "…"}`. Returns null only for invalid arguments.
+///
+/// # Safety
+///
+/// Non-null pointers must each address at least their corresponding length.
+#[no_mangle]
+pub unsafe extern "C" fn md_site_export(
+    vault: *const u8,
+    vault_len: usize,
+    output: *const u8,
+    output_len: usize,
+) -> *mut HTMLHandle {
+    let Some(vault) = read_utf8(vault, vault_len) else {
+        return ptr::null_mut();
+    };
+    let Some(output) = read_utf8(output, output_len) else {
+        return ptr::null_mut();
+    };
+    if vault.is_empty() || output.is_empty() || vault.contains('\0') || output.contains('\0') {
+        return ptr::null_mut();
+    }
+    let json = match crate::site::export_site(Path::new(vault), Path::new(output)) {
+        Ok(report) => serde_json::to_string(&report),
+        Err(error) => {
+            let message = match error {
+                crate::site::SiteExportError::VaultUnreadable => {
+                    "The vault folder could not be read.".to_owned()
+                }
+                crate::site::SiteExportError::OutputIsVault => {
+                    "Choose a folder other than the vault itself.".to_owned()
+                }
+                crate::site::SiteExportError::OutputUnwritable(detail) => {
+                    format!("The site folder could not be written: {detail}")
+                }
+            };
+            serde_json::to_string(&serde_json::json!({ "error": message }))
+        }
+    };
+    let Ok(json) = json else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(HTMLHandle {
+        bytes: json.into_bytes().into_boxed_slice(),
     }))
 }
 

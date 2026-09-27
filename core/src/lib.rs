@@ -19,6 +19,7 @@ pub mod ffi;
 pub mod highlight;
 pub mod html;
 pub mod md;
+pub mod site;
 pub mod vault;
 
 pub use md::{parse_checked, BlockKind, ParseError, ParseResult, SpanKind};

@@ -21,7 +21,8 @@ final class CommandAvailabilityTests: XCTestCase {
         hasProofreadingMarks: Bool = true,
         canRevealHarnessTerminal: Bool = true,
         isPerformingDestructiveOperation: Bool = false,
-        canSaveVault: Bool = false
+        canSaveVault: Bool = false,
+        hasVault: Bool = false
     ) -> CommandAvailability {
         CommandAvailability(
             hasFocusedPane: hasFocusedPane,
@@ -34,7 +35,8 @@ final class CommandAvailabilityTests: XCTestCase {
             hasProofreadingMarks: hasProofreadingMarks,
             canRevealHarnessTerminal: canRevealHarnessTerminal,
             isPerformingDestructiveOperation: isPerformingDestructiveOperation,
-            canSaveVault: canSaveVault)
+            canSaveVault: canSaveVault,
+            hasVault: hasVault)
     }
 
     func testSavingVaultsRequiresAnUnsavedOpenVaultAndViewingWorksWithoutADocument() {
@@ -44,6 +46,14 @@ final class CommandAvailabilityTests: XCTestCase {
         let busy = availability(isPerformingDestructiveOperation: true, canSaveVault: true)
         XCTAssertFalse(busy.allows(.saveVault))
         XCTAssertFalse(busy.allows(.showSavedVaults))
+    }
+
+    func testExportingAVaultSiteNeedsAVaultButNoDocument() {
+        XCTAssertFalse(availability().allows(.exportVaultSite))
+        XCTAssertTrue(availability(hasDocument: false, hasVault: true).allows(.exportVaultSite))
+        XCTAssertFalse(
+            availability(isPerformingDestructiveOperation: true, hasVault: true)
+                .allows(.exportVaultSite))
     }
 
     func testNoDocumentDisablesOnlyCommandsThatNeedDocumentAuthority() {
@@ -150,7 +160,7 @@ final class CommandAvailabilityTests: XCTestCase {
             .focusPreviousPane, .setMode(.source), .writingTools, .proofreadDocument,
             .clearProofreading, .analyzeNote, .askHarness, .openHarnessTerminal,
             .moveTerminal, .zoomIn, .zoomOut, .resetZoom, .exportHTML, .previewInBrowser,
-            .printDocument,
+            .exportVaultSite, .printDocument,
         ] {
             XCTAssertFalse(state.allows(action), "\(action) must wait for the operation")
         }

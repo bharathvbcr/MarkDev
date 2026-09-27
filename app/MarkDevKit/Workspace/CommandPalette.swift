@@ -60,6 +60,8 @@ public enum CommandAction: Sendable, Equatable {
     /// Renders the current document as HTML and opens it in the default
     /// browser.
     case previewInBrowser
+    /// Exports every note in the open vault as a linked HTML site.
+    case exportVaultSite
     /// Prints or exports the current document as PDF.
     case printDocument
 }
@@ -84,6 +86,8 @@ public struct CommandAvailability: Equatable, Sendable {
     public let canRevealHarnessTerminal: Bool
     public let isPerformingDestructiveOperation: Bool
     public let canSaveVault: Bool
+    /// Whether a vault folder is open, so there is a vault to export.
+    public let hasVault: Bool
 
     public init(
         hasFocusedPane: Bool,
@@ -96,7 +100,8 @@ public struct CommandAvailability: Equatable, Sendable {
         hasProofreadingMarks: Bool,
         canRevealHarnessTerminal: Bool,
         isPerformingDestructiveOperation: Bool,
-        canSaveVault: Bool = false
+        canSaveVault: Bool = false,
+        hasVault: Bool = false
     ) {
         self.hasFocusedPane = hasFocusedPane
         self.paneCount = max(0, paneCount)
@@ -109,6 +114,7 @@ public struct CommandAvailability: Equatable, Sendable {
         self.canRevealHarnessTerminal = canRevealHarnessTerminal
         self.isPerformingDestructiveOperation = isPerformingDestructiveOperation
         self.canSaveVault = canSaveVault
+        self.hasVault = hasVault
     }
 
     /// Whether invoking `action` now can reach its canonical handler.
@@ -135,6 +141,8 @@ public struct CommandAvailability: Equatable, Sendable {
             return hasDocument
         case .saveVault:
             return canSaveVault
+        case .exportVaultSite:
+            return hasVault
         case .splitRight, .splitDown:
             return hasFocusedPane && paneCount < maximumPaneCount
         case .closePane, .focusNextPane, .focusPreviousPane:

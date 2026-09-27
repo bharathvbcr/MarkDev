@@ -101,6 +101,7 @@ struct WorkspaceCommands: Commands {
             actionButton(
                 "Preview in Browser", action: .previewInBrowser, key: "p",
                 modifiers: [.command, .option])
+            actionButton("Export Vault as Website…", action: .exportVaultSite)
             actionButton("Print…", action: .printDocument, key: "p")
         }
 

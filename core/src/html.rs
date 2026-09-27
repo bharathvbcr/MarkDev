@@ -78,6 +78,16 @@ pub struct ExportOptions<'a> {
     /// Where local links and media point from. Defaults to the note's
     /// folder, which is right when the page is saved beside the note.
     pub link_base: LinkBase<'a>,
+    /// Set when the page is one of a whole-vault site: links to notes in the
+    /// vault point at their `.html` pages in the site instead of `.md` files.
+    pub site: Option<SiteLayout<'a>>,
+}
+
+/// Where a whole-vault site mirrors the vault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiteLayout<'a> {
+    pub vault_root: &'a Path,
+    pub output_root: &'a Path,
 }
 
 /// How an exported page refers to local files it does not embed: other
@@ -154,6 +164,12 @@ pub fn render_document_with_options(
         .map_err(|_| output.error())?;
 
     let mut context = ExportContext::new(export.asset_base, export.vault_root, export.link_base);
+    context.site = export.site.map(|site| {
+        (
+            absolute_path(site.vault_root),
+            absolute_path(site.output_root),
+        )
+    });
     let prepared = prepare_source(clean_source.as_ref());
     let events = ExportEvents::new(
         prepared.text.as_ref(),
@@ -620,7 +636,9 @@ struct ExportContext {
     /// becomes a link instead of a loop.
     visited: Vec<PathBuf>,
     vault_root: Option<PathBuf>,
-    vault_files: Option<Vec<PathBuf>>,
+    vault_files: Option<std::sync::Arc<Vec<PathBuf>>>,
+    /// `(vault root, site root)` when rendering one page of a vault site.
+    site: Option<(PathBuf, PathBuf)>,
     /// The folder links are written relative to, or `None` for `file://`.
     link_from: Option<PathBuf>,
     /// Whether links should be absolute `file://` URLs.
@@ -645,9 +663,26 @@ impl ExportContext {
             visited: Vec::new(),
             vault_root,
             vault_files: None,
+            site: None,
             link_from,
             file_urls,
         }
+    }
+
+    /// How the page refers to a note: its page in the site when rendering a
+    /// vault site, else the note's own file.
+    fn note_href(&self, path: &Path) -> String {
+        if let Some((vault, output)) = &self.site {
+            let absolute = absolute_path(path);
+            let is_note = absolute
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .is_some_and(|e| e == "md" || e == "markdown");
+            if let (true, Ok(relative)) = (is_note, absolute.strip_prefix(vault)) {
+                return self.href_for(&output.join(relative).with_extension("html"));
+            }
+        }
+        self.href_for(path)
     }
 
     /// How the page refers to a local file it does not embed.
@@ -732,7 +767,10 @@ impl ExportContext {
         if wanted.is_empty() {
             return None;
         }
-        let files = self.vault_files.get_or_insert_with(|| scan_vault(&root));
+        let files = self
+            .vault_files
+            .get_or_insert_with(|| cached_vault_scan(&root))
+            .clone();
         files
             .iter()
             .filter(|path| {
@@ -807,6 +845,31 @@ fn find_vault_root(base: &Path) -> Option<PathBuf> {
     None
 }
 
+/// [`scan_vault`], shared for a short while: exporting a whole vault renders
+/// every note, and each would otherwise walk the vault again.
+fn cached_vault_scan(root: &Path) -> std::sync::Arc<Vec<PathBuf>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Cache = Mutex<HashMap<PathBuf, (Instant, Arc<Vec<PathBuf>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(entries) = cache.lock() {
+        if let Some((built, files)) = entries.get(root) {
+            if built.elapsed() < Duration::from_secs(30) {
+                return files.clone();
+            }
+        }
+    }
+    let files = Arc::new(scan_vault(root));
+    if let Ok(mut entries) = cache.lock() {
+        if entries.len() > 16 {
+            entries.clear();
+        }
+        entries.insert(root.to_path_buf(), (Instant::now(), files.clone()));
+    }
+    files
+}
+
 /// Every regular file under `root`, skipping hidden folders and
 /// `node_modules`, bounded by [`MAX_VAULT_SCAN_ENTRIES`].
 fn scan_vault(root: &Path) -> Vec<PathBuf> {
@@ -878,7 +941,7 @@ fn relative_href(from_dir: &Path, to: &Path) -> String {
     parts.join("/")
 }
 
-fn encode_path_component(part: &str) -> String {
+pub(crate) fn encode_path_component(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     for character in part.chars() {
         match character {
@@ -1329,7 +1392,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             return None;
         }
         let decoded = percent_decode(path)?;
-        let mut href = self.context.href_for(&base.join(decoded));
+        let mut href = self.context.note_href(&base.join(decoded));
         if path.ends_with('/') && !href.ends_with('/') {
             href.push('/');
         }
@@ -1367,7 +1430,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                     } else {
                         self.context.resolve_note(&base, page)
                     }?;
-                Some(self.context.href_for(&found))
+                Some(self.context.note_href(&found))
             });
             let unresolved = || {
                 let has_extension = Path::new(page)
@@ -1383,7 +1446,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                 // Not found: still point where it would be, from the page.
                 self.base
                     .as_ref()
-                    .map(|base| self.context.href_for(&base.join(unresolved())))
+                    .map(|base| self.context.note_href(&base.join(unresolved())))
             });
             match resolved {
                 Some(relative) => href.push_str(&relative),

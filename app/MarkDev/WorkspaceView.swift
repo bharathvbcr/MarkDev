@@ -2985,7 +2985,8 @@ struct WorkspaceView: View {
             isPerformingDestructiveOperation:
                 transientPresentation.isPerformingDestructiveOperation,
             canSaveVault: workspace.vaultRoot.map { !savedVaults.contains($0) } == true
-                && savedVaults.loadError == nil)
+                && savedVaults.loadError == nil,
+            hasVault: workspace.vaultRoot != nil)
     }
 
     private var commands: [Command] {
@@ -3083,6 +3084,11 @@ struct WorkspaceView: View {
                 subtitle: "Open the rendered note in your default browser",
                 symbol: "safari",
                 kind: .action(.previewInBrowser), shortcut: "⌥⌘P"),
+            Command(
+                title: "Export Vault as Website…",
+                subtitle: "Every note as a linked HTML page, with an index",
+                symbol: "globe",
+                kind: .action(.exportVaultSite)),
             Command(
                 title: "Print…", symbol: "printer",
                 kind: .action(.printDocument), shortcut: "⌘P"),
@@ -3249,6 +3255,8 @@ struct WorkspaceView: View {
             exportHTML()
         case .previewInBrowser:
             previewInBrowser()
+        case .exportVaultSite:
+            exportVaultSite()
         case .printDocument:
             printDocument()
         }
@@ -3312,6 +3320,51 @@ struct WorkspaceView: View {
             } catch {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+
+    /// Asks for a folder, renders the whole vault into it off the window
+    /// actor, and opens the site's index in the default browser.
+    private func exportVaultSite() {
+        Task { @MainActor in await chooseVaultSiteDestination() }
+    }
+
+    private func chooseVaultSiteDestination() async {
+        guard let vaultRoot = workspace.vaultRoot else { return }
+        guard let window = windowForFocus else {
+            errorMessage = "The Export sheet needs an open vault window."
+            return
+        }
+        guard window.attachedSheet == nil else {
+            errorMessage = "Finish the current dialog before exporting the vault."
+            return
+        }
+        guard let lease = beginNativePanel() else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Export"
+        panel.message = "Choose a folder for the website. Each note becomes a page."
+        let response = await panel.beginSheetModal(for: window)
+        guard nativePanelIsCurrent(lease) else { return }
+        finishNativePanel(lease)
+        guard response == .OK, let output = panel.url else { return }
+
+        do {
+            let report = try await Task.detached(priority: .userInitiated) {
+                try HTMLExporter.exportVaultSite(vaultRoot: vaultRoot, to: output)
+            }.value
+            if !report.skipped.isEmpty || report.truncated {
+                errorMessage =
+                    "Exported \(report.pages) notes. "
+                    + (report.truncated ? "The vault had more notes than one export includes. " : "")
+                    + (report.skipped.isEmpty ? "" : "\(report.skipped.count) could not be exported.")
+            }
+            NSWorkspace.shared.open(report.indexURL)
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 

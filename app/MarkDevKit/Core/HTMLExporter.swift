@@ -11,6 +11,7 @@ public enum HTMLExporterError: Error, Equatable, LocalizedError {
     case titleTooLarge(maximumBytes: Int)
     case renderingFailed
     case invalidRendererOutput
+    case siteExportFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -24,6 +25,8 @@ public enum HTMLExporterError: Error, Equatable, LocalizedError {
             "MarkDev could not render this note as HTML."
         case .invalidRendererOutput:
             "The HTML renderer returned invalid text."
+        case .siteExportFailed(let reason):
+            reason
         }
     }
 }
@@ -198,5 +201,65 @@ public enum HTMLExporter {
                 try? fileManager.removeItem(at: entry)
             }
         }
+    }
+
+    // MARK: - Vault site
+
+    /// What exporting a vault as a site did.
+    public struct VaultSiteReport: Decodable, Equatable, Sendable {
+        /// Pages written, not counting the index.
+        public let pages: Int
+        /// Notes not exported, each with the reason.
+        public let skipped: [String]
+        /// The site's front page.
+        public let index: String
+        /// Whether the vault had more notes than one export renders.
+        public let truncated: Bool
+
+        public var indexURL: URL { URL(fileURLWithPath: index) }
+    }
+
+    /// Renders every note in `vaultRoot` into `outputDirectory` as a linked
+    /// static site — each note a page at the same relative path, links
+    /// between notes pointing at each other's pages, and an `index.html`
+    /// listing everything. Blocking: call it off the main actor.
+    public static func exportVaultSite(vaultRoot: URL, to outputDirectory: URL) throws
+        -> VaultSiteReport
+    {
+        guard BoundedRegularFileReader.hasLocalFileAuthority(vaultRoot),
+            BoundedRegularFileReader.hasLocalFileAuthority(outputDirectory)
+        else {
+            throw HTMLExporterError.unsupportedLocation(outputDirectory)
+        }
+        let vault = Array(vaultRoot.standardizedFileURL.path.utf8)
+        let output = Array(outputDirectory.standardizedFileURL.path.utf8)
+        #if canImport(CMarkDev)
+            let handle = vault.withUnsafeBufferPointer { vaultBuffer in
+                output.withUnsafeBufferPointer { outputBuffer in
+                    md_site_export(
+                        vaultBuffer.baseAddress, UInt(vaultBuffer.count),
+                        outputBuffer.baseAddress, UInt(outputBuffer.count))
+                }
+            }
+            guard let handle else { throw HTMLExporterError.renderingFailed }
+            defer { md_html_free(handle) }
+            var count: UInt = 0
+            guard let bytes = md_html_bytes(handle, &count), count <= UInt(maximumOutputBytes)
+            else {
+                throw HTMLExporterError.invalidRendererOutput
+            }
+            let data = Data(bytes: bytes, count: Int(count))
+            if let failure = try? JSONDecoder().decode([String: String].self, from: data),
+                let reason = failure["error"]
+            {
+                throw HTMLExporterError.siteExportFailed(reason)
+            }
+            guard let report = try? JSONDecoder().decode(VaultSiteReport.self, from: data) else {
+                throw HTMLExporterError.invalidRendererOutput
+            }
+            return report
+        #else
+            throw HTMLExporterError.renderingFailed
+        #endif
     }
 }

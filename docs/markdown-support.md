@@ -36,21 +36,21 @@ Wikilink anchor navigation resolves supported headings and Obsidian block ids (`
 
 | Syntax | In the editor | In HTML export |
 | --- | --- | --- |
-| `> [!type] Title` callouts | All Obsidian types — note, abstract/summary/tldr, info, todo, tip/hint, important, success/check/done, question/help/faq, warning/caution/attention, failure/fail/missing, danger/error, bug, example, quote/cite — plus GitHub's five. Unknown types draw as a note titled by their name | Coloured callout with icon and title; Markdown in the title is rendered |
+| `> [!type] Title` callouts | All Obsidian types — note, abstract/summary/tldr, info, todo, tip/hint, important, success/check/done, question/help/faq, warning/caution/attention, failure/fail/missing, danger/error, bug, example, quote/cite — plus GitHub's five. Unknown types draw as a note titled by their name. The strip shows a symbol per type and the title as plain text | Coloured callout with icon and title; Markdown in the title is rendered |
 | Nested callouts (`> > [!type]`) | Each level is its own callout | Nested callout boxes |
 | `[[Note#Heading#Subheading]]` | Resolves the subheading inside its parent's section | Links and embeds target that section |
-| `> [!type]-` / `> [!type]+` | Foldable; `-` folds the body to its title line in live preview until the caret enters it (reading mode shows it open) | `<details>`: folds in the browser without script, closed for `-` and open for `+` |
+| `> [!type]-` / `> [!type]+` | Foldable; `-` starts folded to its title line. Click the title strip to fold or unfold (▸/▾), in live preview and reading mode; the caret entering the callout also reveals it | `<details>`: folds in the browser without script, closed for `-` and open for `+` |
 | `==highlight==` | Highlighted, including around formatting and links (`==**bold**==`, `==[[Note]]==`); a pair that would cut through other formatting stays text | `<mark>`, matching the editor |
 | `#tag`, `#nested/tag` | Tag pill, indexed by the vault | Tag pill |
 | `%%comment%%`, inline or across lines | Hidden until the caret enters its block, then shown dimmed; nothing inside is a tag, link, or picture. An unclosed `%%` stays text | Removed |
-| `^[inline footnote]` | Small, dimmed note with its brackets collapsed | A numbered footnote |
+| `^[inline footnote]` | Raised, small, accent-coloured note with its brackets collapsed | A numbered footnote |
 | `text ^block-id` | The id collapses; `[[Note#^block-id]]` and `[[#^block-id]]` jump to the block | An anchor; block links navigate to it |
-| `![[Note]]`, `![[Note#Heading]]`, `![[Note#^id]]` | A wikilink to the note (counted as a backlink) | The note, section, or block transcluded in a frame (three levels deep, 2 MiB per note, 8 MiB per export, cycles become links) |
-| `![[picture.png]]`, `![[picture.png\|300]]`, or a Markdown image whose alt text ends in `\|300x200` | The picture, at the requested width when it stands alone in a paragraph | Embedded picture with `width`/`height` |
-| `![[song.mp3]]`, `![[clip.mp4]]`, `![[file.pdf]]` | Drawn where supported (PDF); otherwise the filename | `<audio>` / `<video>` players and a PDF link |
-| `- [/]`, `- [-]`, `- [>]`, any single status character | A done checkbox; clicking unticks to `[ ]` | A checked, struck-through item |
+| `![[Note]]`, `![[Note#Heading]]`, `![[Note#^id]]` | Standing alone in a paragraph: a read-only card with the start of the note, section, or block (opens large; refreshed when the note changes). Inside a sentence: a wikilink. Always counted as a backlink | The note, section, or block transcluded in a frame (three levels deep, 2 MiB per note, 8 MiB per export, cycles become links) |
+| `![[picture.png]]`, `![[picture.png\|300]]`, or a Markdown image whose alt text ends in `\|300x200` | The picture, at the requested width when it stands alone in a paragraph; found beside the note, in attachment folders, or anywhere in the vault by name | Embedded picture with `width`/`height` |
+| `![[song.mp3]]`, `![[clip.mp4]]`, `![[file.pdf]]` | PDF drawn; audio and video are links that open in the system player | `<audio>` / `<video>` players and a PDF link |
+| `- [/]`, `- [-]`, `- [>]`, any single status character | A done checkbox showing the status character in place of the tick; clicking unticks to `[ ]` | A checked, struck-through item |
 
-Not supported: Dataview and other plugin query blocks, Canvas files, and live transclusion inside the native editor (an embed there is a link to the note). A folded callout cannot be toggled in reading mode.
+Not supported: Dataview and other plugin query blocks, Canvas and Excalidraw files, editable transclusion (the editor's embed card is a read-only excerpt), and in-editor audio/video playback.
 
 ## Export is a separate surface
 
@@ -62,5 +62,9 @@ Not supported: Dataview and other plugin query blocks, Canvas files, and live tr
 - Callouts, task lists, footnotes, definition lists, tables, code fences, and the rest of the [Obsidian syntax](#obsidian-syntax) are styled for light and dark appearance and for print.
 
 Math — `$…$`, `$$…$$`, the editor's `\(…\)` / `\[…\]` forms, and ```` ```math ```` fences — is typeset as MathML, which current Safari, Chrome, Edge, and Firefox draw natively without script, fonts, or network access. The editor's rules decide what is math, so `$5 and $10` stays prose. A formula the typesetter does not fully understand is shown as its LaTeX source rather than with error markup, and generated MathML is checked against an element and attribute allowlist before it reaches the page. The export does not include a diagram engine: Mermaid source appears as labelled text. It does not capture the native editor, so inspect exported output before sharing when exact visual fidelity matters.
+
+Links to files a page does not embed (other notes, audio, video, PDFs) are written relative to where the page is saved; **Preview in Browser** uses absolute `file://` links because its page lives in a temporary folder.
+
+**File → Export Vault as Website…** renders every note in the open vault into a folder you choose: each note becomes a page at the same relative path, links and embeds between notes point at each other's pages, and an `index.html` lists every page by folder. Hidden folders, `node_modules`, and the site folder itself are skipped; up to 20,000 notes are exported, and notes that cannot be read are reported rather than stopping the export.
 
 Implementation owners: [Markdown parser](../core/src/md/parse.rs), [native rich renderer](../app/MarkDevKit/Editor/RichContentRenderer.swift), [HTML export](../core/src/html.rs).

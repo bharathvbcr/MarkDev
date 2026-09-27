@@ -136,4 +136,31 @@ final class HTMLExporterTests: XCTestCase {
         XCTAssertTrue(previewed.contains("href=\"file://"))
         XCTAssertTrue(previewed.contains("/Notes/Other.md\""))
     }
+
+    func testVaultSiteExportWritesLinkedPagesAndAnIndex() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("MarkDevSite-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let vault = root.appendingPathComponent("Vault", isDirectory: true)
+        let projects = vault.appendingPathComponent("Projects", isDirectory: true)
+        try FileManager.default.createDirectory(at: projects, withIntermediateDirectories: true)
+        try Data("Go to [[Plan]].".utf8).write(to: vault.appendingPathComponent("Home.md"))
+        try Data("# Plan".utf8).write(to: projects.appendingPathComponent("Plan.md"))
+        let site = root.appendingPathComponent("Site", isDirectory: true)
+
+        let report = try HTMLExporter.exportVaultSite(vaultRoot: vault, to: site)
+        XCTAssertEqual(report.pages, 2)
+        XCTAssertTrue(report.skipped.isEmpty)
+        let home = try String(
+            contentsOf: site.appendingPathComponent("Home.html"), encoding: .utf8)
+        XCTAssertTrue(home.contains("href=\"Projects/Plan.html\""))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: report.indexURL.path))
+
+        XCTAssertThrowsError(try HTMLExporter.exportVaultSite(vaultRoot: vault, to: vault)) {
+            error in
+            guard case .siteExportFailed = error as? HTMLExporterError else {
+                return XCTFail("expected a site failure, got \(error)")
+            }
+        }
+    }
 }
