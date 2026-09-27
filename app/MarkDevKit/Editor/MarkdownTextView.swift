@@ -1393,8 +1393,11 @@ public final class MarkdownTextView: ScrollingTextView {
         guard marker.range.location + marker.range.length <= text.length else { return false }
 
         // The state character sits between the brackets: `[ ]` / `[x]`.
+        // Any status but a space counts as done, as in Obsidian: `[x]`,
+        // `[/]`, `[-]` and friends all untick to `[ ]`.
         let current = text.substring(with: marker.range)
-        let replacement = current.contains("x") || current.contains("X") ? "[ ]" : "[x]"
+        let status = current.dropFirst().dropLast().trimmingCharacters(in: .whitespaces)
+        let replacement = status.isEmpty ? "[x]" : "[ ]"
         guard current != replacement else { return false }
 
         // `insertText` rather than editing the storage directly: it is the
@@ -1453,6 +1456,10 @@ public final class MarkdownTextView: ScrollingTextView {
         }
 
         switch LinkClick.classify(url) {
+        case .wiki(let target) where target.hasPrefix("#"):
+            // `[[#Heading]]` and `[[#^block]]` point inside this note; there
+            // is no other note to resolve.
+            _ = jumpToHeading(anchor: String(target.dropFirst()))
         case .wiki(let target):
             onFollowWikiLink?(target)
         case .footnote(let target):
@@ -1511,6 +1518,9 @@ public final class MarkdownTextView: ScrollingTextView {
     @discardableResult
     public func jumpToHeading(anchor: String) -> Bool {
         guard let storage = textStorage else { return false }
+        if anchor.hasPrefix("^") {
+            return jumpToBlock(id: String(anchor.dropFirst()))
+        }
         let text = storage.string as NSString
         let normalisedAnchor = anchor.lowercased().replacingOccurrences(of: "-", with: " ")
         for block in parsed.blocks where block.kind == .heading {
@@ -1526,6 +1536,28 @@ public final class MarkdownTextView: ScrollingTextView {
             }
         }
         return false
+    }
+
+    /// Scrolls to the line carrying Obsidian block id `^id`.
+    @discardableResult
+    public func jumpToBlock(id: String) -> Bool {
+        guard let storage = textStorage, !id.isEmpty,
+            id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") })
+        else { return false }
+        let pattern = "(?:^|[ \\t])\\^" + NSRegularExpression.escapedPattern(for: id) + "[ \\t]*$"
+        guard
+            let expression = try? NSRegularExpression(
+                pattern: pattern, options: [.anchorsMatchLines, .caseInsensitive])
+        else { return false }
+        let text = storage.string as NSString
+        guard
+            let match = expression.firstMatch(
+                in: storage.string, range: NSRange(location: 0, length: text.length))
+        else { return false }
+        let line = text.lineRange(for: NSRange(location: match.range.location, length: 0))
+        setSelectedRange(NSRange(location: line.location, length: 0))
+        scrollRangeToVisible(line)
+        return true
     }
 
     #if MARKDEV_QUICKLOOK
@@ -2864,13 +2896,20 @@ extension MarkdownTextView {
 
     /// Flavour, plus an authored title when the alert wrote one on the same line.
     private func calloutLabel(kind: CalloutKind, at range: NSRange) -> String {
-        let title = parsed.blocks.first {
+        let block = parsed.blocks.first {
             $0.kind == .callout && NSIntersectionRange($0.range, range).length > 0
-        }?.info
-        if let title, !title.isEmpty {
-            return "\(kind.title) \(title)"
         }
-        return kind.title
+        // A foldable callout says so, and which way it currently sits.
+        let fold: String
+        switch block?.calloutFold ?? CalloutFold.fixed {
+        case .fixed: fold = ""
+        case .expanded: fold = " ▾"
+        case .collapsed: fold = " ▸"
+        }
+        if let title = block?.info, !title.isEmpty {
+            return "\(kind.title) \(title)\(fold)"
+        }
+        return kind.title + fold
     }
 
     /// The bullet or number for a list item opening at this fragment.

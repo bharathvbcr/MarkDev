@@ -1946,7 +1946,51 @@ public final class RichContentRenderer {
             in: URL(fileURLWithPath: base.path, isDirectory: true))
         let candidate = URL(fileURLWithPath: decoded, relativeTo: folder)
             .absoluteURL.standardizedFileURL
-        return BoundedRegularFileReader.replacingSystemCompatibilityAlias(in: candidate)
+        let resolved = BoundedRegularFileReader.replacingSystemCompatibilityAlias(in: candidate)
+        if !FileManager.default.fileExists(atPath: resolved.path),
+            let found = Self.attachmentFallback(for: decoded, from: folder)
+        {
+            return BoundedRegularFileReader.replacingSystemCompatibilityAlias(in: found)
+        }
+        return resolved
+    }
+
+    /// Where Obsidian would have put a picture the note names but that is
+    /// not beside it.
+    ///
+    /// Obsidian saves pasted pictures to an attachments folder (or the vault
+    /// root) and writes `![[Pasted image.png]]` by name alone, so a note in a
+    /// subfolder names a file that lives elsewhere. Looks in the note's
+    /// folder and each folder above it — plain, and its `attachments`,
+    /// `assets`, `_attachments` or `media` subfolder — stopping at the vault
+    /// root (a folder holding `.obsidian` or `.git`) and after eight levels.
+    static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
+        let fileManager = FileManager.default
+        var directory = folder
+        for _ in 0...8 {
+            for subfolder in ["", "attachments", "Attachments", "assets", "_attachments", "media"] {
+                let base =
+                    subfolder.isEmpty
+                    ? directory : directory.appendingPathComponent(subfolder, isDirectory: true)
+                let candidate = URL(fileURLWithPath: relativePath, relativeTo: base)
+                    .absoluteURL.standardizedFileURL
+                var isDirectory: ObjCBool = false
+                if fileManager.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                    !isDirectory.boolValue
+                {
+                    return candidate
+                }
+            }
+            let isVaultRoot =
+                fileManager.fileExists(atPath: directory.appendingPathComponent(".obsidian").path)
+                || fileManager.fileExists(atPath: directory.appendingPathComponent(".git").path)
+            let parent = directory.deletingLastPathComponent()
+            if isVaultRoot || parent.standardizedFileURL.path == directory.standardizedFileURL.path {
+                break
+            }
+            directory = parent
+        }
+        return nil
     }
 
     // MARK: - Cache

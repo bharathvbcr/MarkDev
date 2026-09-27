@@ -241,13 +241,15 @@ pub unsafe extern "C" fn md_html_render(
     }))
 }
 
-/// Renders like `md_html_render`, and copies local pictures the note
-/// references into the document as `data:` URIs.
+/// Renders like `md_html_render`, with the note's folder and vault known.
 ///
-/// `base` is the UTF-8 path of the folder the note lives in; relative image
-/// destinations resolve against it. An empty `base` renders exactly like
-/// `md_html_render`. Pictures that are missing, too large, or not a browser
-/// image format keep their original destination.
+/// `base` is the UTF-8 path of the folder the note lives in: relative image
+/// destinations resolve against it, local pictures are copied into the
+/// document as `data:` URIs, and `![[note]]` embeds are transcluded.
+/// `vault` is the UTF-8 path of the vault root, which bounds the by-name
+/// search Obsidian-style `![[picture.png]]` and `![[Note]]` rely on. Either
+/// may be empty: an empty `base` renders exactly like `md_html_render`, and
+/// an empty `vault` falls back to the nearest `.obsidian`/`.git` folder.
 ///
 /// # Safety
 ///
@@ -260,6 +262,8 @@ pub unsafe extern "C" fn md_html_render_with_base(
     title_len: usize,
     base: *const u8,
     base_len: usize,
+    vault: *const u8,
+    vault_len: usize,
 ) -> *mut HTMLHandle {
     let Some(source) = read_utf8(source, source_len) else {
         return ptr::null_mut();
@@ -270,11 +274,15 @@ pub unsafe extern "C" fn md_html_render_with_base(
     let Some(base) = read_utf8(base, base_len) else {
         return ptr::null_mut();
     };
-    if base.contains('\0') {
+    let Some(vault) = read_utf8(vault, vault_len) else {
+        return ptr::null_mut();
+    };
+    if base.contains('\0') || vault.contains('\0') {
         return ptr::null_mut();
     }
     let options = ExportOptions {
         asset_base: (!base.is_empty()).then(|| Path::new(base)),
+        vault_root: (!vault.is_empty() && !base.is_empty()).then(|| Path::new(vault)),
     };
     let Ok(html) = render_document_with_options(source, title, &options) else {
         return ptr::null_mut();

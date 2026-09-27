@@ -3265,10 +3265,12 @@ struct WorkspaceView: View {
 
         let title = doc.url?.deletingPathExtension().lastPathComponent ?? "Document"
         let baseDirectory = doc.url?.deletingLastPathComponent()
+        let vaultRoot = workspace.vaultRoot
         do {
             try await Task.detached(priority: .userInitiated) {
                 try HTMLExporter.write(
-                    markdown: doc.text, title: title, baseDirectory: baseDirectory, to: url)
+                    markdown: doc.text, title: title, baseDirectory: baseDirectory,
+                    vaultRoot: vaultRoot, to: url)
             }.value
         } catch {
             errorMessage = error.localizedDescription
@@ -3282,11 +3284,13 @@ struct WorkspaceView: View {
         let markdown = doc.text
         let title = doc.url?.deletingPathExtension().lastPathComponent ?? "Untitled"
         let baseDirectory = doc.url?.deletingLastPathComponent()
+        let vaultRoot = workspace.vaultRoot
         Task { @MainActor in
             do {
                 let url = try await Task.detached(priority: .userInitiated) {
                     try HTMLExporter.writeBrowserPreview(
-                        markdown: markdown, title: title, baseDirectory: baseDirectory)
+                        markdown: markdown, title: title, baseDirectory: baseDirectory,
+                        vaultRoot: vaultRoot)
                 }.value
                 if !NSWorkspace.shared.open(url) {
                     errorMessage = "MarkDev could not open a browser for the preview."

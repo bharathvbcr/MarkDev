@@ -30,7 +30,7 @@ Hold **Space** over a supported link or navigator item to peek at its content. F
 
 ## Technical writing
 
-Tables, task lists, local images, math, and supported Mermaid diagrams render in the editor. Click a task checkbox to update its Markdown; the edit is undoable. Rich blocks offer controls where available, such as copying a code listing or opening a rendered picture at a larger size.
+Tables, task lists, local images, math, and supported Mermaid diagrams render in the editor, and so does Obsidian's formatting syntax — callouts, highlights, comments, embeds, block references, inline footnotes, and custom task statuses. See [Obsidian syntax](markdown-support.md#obsidian-syntax). Click a task checkbox to update its Markdown; the edit is undoable. Rich blocks offer controls where available, such as copying a code listing or opening a rendered picture at a larger size.
 
 Save your note before adding image assets. Image paste/drop validates supported inputs and publishes them under the document's `assets/` directory. Remote images are not fetched while reading a note. See [Markdown support](markdown-support.md) for limitations.
 

@@ -35,6 +35,16 @@ extension CalloutKind {
         case .important: "IMPORTANT"
         case .warning: "WARNING"
         case .caution: "CAUTION"
+        case .abstract: "ABSTRACT"
+        case .info: "INFO"
+        case .todo: "TODO"
+        case .success: "SUCCESS"
+        case .question: "QUESTION"
+        case .failure: "FAILURE"
+        case .danger: "DANGER"
+        case .bug: "BUG"
+        case .example: "EXAMPLE"
+        case .quote: "QUOTE"
         }
     }
 }

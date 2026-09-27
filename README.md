@@ -13,6 +13,7 @@ Write in a single document or open a folder as a vault. MarkDev brings in-place 
 - **Keep the source.** Live preview styles Markdown in place; Source and Reading modes give you different views of the same text. Copy, find, and undo operate on that source.
 - **Make technical notes readable.** Render tables, task lists, LaTeX, supported Mermaid diagrams, local images, and a supported subset of HTML without a browser renderer in the app.
 - **Work across notes.** Open a folder, save it to Saved Vaults, follow wikilinks and relative Markdown links, inspect backlinks, and explore a filtered link graph.
+- **Bring an Obsidian vault as it is.** Callouts of every type (with folding), `==highlights==`, `%%comments%%`, `![[embeds]]`, `^block` references, inline footnotes, and custom task statuses render without plugins or a vault config. See [Obsidian syntax](docs/markdown-support.md#obsidian-syntax).
 - **Arrange your workspace.** Use tabs, split panes, a command palette, and an integrated terminal that can sit below or beside your document.
 - **Use assistance when you choose.** Apple Intelligence writing tools run on-device when available. Optional MANVI integration uses your configured harness and provider; its permissions and data destination are separate choices.
 

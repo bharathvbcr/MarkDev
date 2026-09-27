@@ -40,9 +40,11 @@ public enum HTMLExporter {
     /// note references (SVG, PNG, JPEG, GIF, WebP, AVIF, BMP, ICO) are copied
     /// into the document, so the export displays correctly in any browser and
     /// from any location. Pictures are identified by their bytes; anything
-    /// else keeps its original relative destination.
+    /// else keeps its original relative destination. `![[Note]]` embeds are
+    /// transcluded, and Obsidian's by-name `![[picture.png]]` is searched for
+    /// inside `vaultRoot` (or the nearest `.obsidian`/`.git` folder).
     public static func render(
-        markdown: String, title: String, baseDirectory: URL? = nil
+        markdown: String, title: String, baseDirectory: URL? = nil, vaultRoot: URL? = nil
     ) throws -> String {
         guard markdown.utf8.count <= maximumSourceBytes else {
             throw HTMLExporterError.sourceTooLarge(maximumBytes: maximumSourceBytes)
@@ -61,15 +63,23 @@ public enum HTMLExporter {
                 BoundedRegularFileReader.hasLocalFileAuthority(url)
                     ? Array(url.standardizedFileURL.path.utf8) : nil
             } ?? []
+        let vaultPath: [UInt8] =
+            vaultRoot.flatMap { url in
+                BoundedRegularFileReader.hasLocalFileAuthority(url)
+                    ? Array(url.standardizedFileURL.path.utf8) : nil
+            } ?? []
 
         #if canImport(CMarkDev)
             let handle = source.withUnsafeBufferPointer { sourceBuffer in
                 titleBytes.withUnsafeBufferPointer { titleBuffer in
                     basePath.withUnsafeBufferPointer { baseBuffer in
-                        md_html_render_with_base(
-                            sourceBuffer.baseAddress, UInt(sourceBuffer.count),
-                            titleBuffer.baseAddress, UInt(titleBuffer.count),
-                            baseBuffer.baseAddress, UInt(baseBuffer.count))
+                        vaultPath.withUnsafeBufferPointer { vaultBuffer in
+                            md_html_render_with_base(
+                                sourceBuffer.baseAddress, UInt(sourceBuffer.count),
+                                titleBuffer.baseAddress, UInt(titleBuffer.count),
+                                baseBuffer.baseAddress, UInt(baseBuffer.count),
+                                vaultBuffer.baseAddress, UInt(vaultBuffer.count))
+                        }
                     }
                 }
             }
@@ -95,7 +105,8 @@ public enum HTMLExporter {
     /// atomic sibling-file replacement, so a render or write failure cannot
     /// leave a plausible-looking partial export behind.
     public static func write(
-        markdown: String, title: String, baseDirectory: URL? = nil, to destination: URL
+        markdown: String, title: String, baseDirectory: URL? = nil, vaultRoot: URL? = nil,
+        to destination: URL
     ) throws {
         // `isFileURL` alone is insufficient: Foundation exposes the local
         // path of `file://remote-host/path`, and its write APIs silently use
@@ -104,7 +115,8 @@ public enum HTMLExporter {
         guard BoundedRegularFileReader.hasLocalFileAuthority(destination) else {
             throw HTMLExporterError.unsupportedLocation(destination)
         }
-        let output = try render(markdown: markdown, title: title, baseDirectory: baseDirectory)
+        let output = try render(
+            markdown: markdown, title: title, baseDirectory: baseDirectory, vaultRoot: vaultRoot)
         try output.write(to: destination, atomically: true, encoding: .utf8)
     }
 
@@ -121,7 +133,7 @@ public enum HTMLExporter {
     /// Pictures are embedded, so the preview does not depend on its location
     /// relative to the note. Previews older than a day are removed first.
     public static func writeBrowserPreview(
-        markdown: String, title: String, baseDirectory: URL?
+        markdown: String, title: String, baseDirectory: URL?, vaultRoot: URL? = nil
     ) throws -> URL {
         let fileManager = FileManager.default
         let root = browserPreviewDirectory
@@ -133,7 +145,8 @@ public enum HTMLExporter {
         let destination = folder.appendingPathComponent(
             previewFileName(for: title), isDirectory: false)
         try write(
-            markdown: markdown, title: title, baseDirectory: baseDirectory, to: destination)
+            markdown: markdown, title: title, baseDirectory: baseDirectory, vaultRoot: vaultRoot,
+            to: destination)
         return destination
     }
 

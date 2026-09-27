@@ -20,14 +20,17 @@ unlinked mentions, and the search index. Swift's `VaultIndex` coordinates disk
 scans and UI updates. Vault query data crosses the C ABI as JSON; editor parse
 records use flat structures.
 
-Supported forms include `[[Note]]`, `[[Note#Heading]]`, and
-`[[Note|Label]]`, plus relative Markdown links. Resolution uses source-relative
+Supported forms include `[[Note]]`, `[[Note#Heading]]`, `[[Note#^block-id]]`,
+`[[Note|Label]]`, and Obsidian `![[Note]]` embeds (indexed as links, so they
+appear in backlinks and the graph; `![[picture.png]]` and other media embeds
+are not note links), plus relative Markdown links. Tags and links inside an
+Obsidian `%%comment%%` are not indexed. Resolution uses source-relative
 paths where appropriate and case-insensitive name lookup. Ambiguous name matches
 are ordered by shallowest path, then alphabetically. These are MarkDev's rules,
 not a guarantee of complete compatibility with another application's vault.
-The Rust resolver matches anchors against heading text. Block-ID anchors such
-as `#^blockid` do not have a dedicated block-target resolver; a resolved note
-can carry no matching anchor offset.
+The Rust resolver matches anchors against heading text. A `#^blockid` anchor
+resolves to the line ending in `^blockid`; a `^blockid` on its own line (after
+a table or quote) resolves to the block above it.
 
 Unlinked mentions match whole words case-insensitively against a note's names.
 The current implementation omits notes already backlinking to the target and

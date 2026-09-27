@@ -29,8 +29,8 @@ public struct RenderedBlock: Sendable, Equatable, Hashable {
     public let source: String
     /// A width the note asked for, in points, if it said one.
     ///
-    /// Only an `<img width=…>` can: Markdown has no way to spell it, so this
-    /// is `nil` for everything a `![](…)` produces. Carried on the block
+    /// An `<img width=…>` can, and so can Obsidian's `![alt|300](…)` and
+    /// `![[pic.png|300]]`; a plain `![](…)` cannot. Carried on the block
     /// rather than resolved here because it is part of *what to draw*, which
     /// is what the render cache is keyed on — deciding it a second time at the
     /// render call is how a warmed entry becomes one nothing ever hits.
@@ -520,10 +520,54 @@ public struct RenderedBlocks: Sendable, Equatable {
         // The paragraph must be the image and nothing else of substance.
         guard let body = clamp(block.range, to: text.length) else { return nil }
         let paragraph = text.substring(with: body).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard paragraph.hasPrefix("!["), paragraph.hasSuffix(")") else { return nil }
+        // `![alt](pic.png)`, or Obsidian's `![[pic.png]]` embed.
+        let isEmbed = paragraph.hasPrefix("![[") && paragraph.hasSuffix("]]")
+        guard paragraph.hasPrefix("!["), isEmbed || paragraph.hasSuffix(")") else { return nil }
 
-        let alt = markdownImageAlt(paragraph)
-        return RenderedBlock(kind: .image(alt: alt), source: source)
+        let written = isEmbed ? embedAlt(paragraph) : markdownImageAlt(paragraph)
+        let (alt, width) = obsidianSize(written)
+        let shown = alt.isEmpty && isEmbed ? (source as NSString).lastPathComponent : alt
+        return RenderedBlock(kind: .image(alt: shown), source: source, width: width)
+    }
+
+    /// The text after the last `|` of `![[pic.png|…]]`, or nothing.
+    private static func embedAlt(_ paragraph: String) -> String {
+        let inner = paragraph.dropFirst(3).dropLast(2)
+        guard let bar = inner.lastIndex(of: "|") else { return "" }
+        return String(inner[inner.index(after: bar)...])
+    }
+
+    /// Obsidian writes a display width where the alt text goes:
+    /// `![caption|300](pic.png)`, `![[pic.png|300]]`, `![[pic.png|300x200]]`.
+    /// Returns the alt without the size, and the width in points. Anything
+    /// that is not a plain number keeps its text as alt.
+    static func obsidianSize(_ alt: String) -> (alt: String, width: CGFloat?) {
+        func width(_ spec: Substring) -> CGFloat? {
+            let trimmed = spec.trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(
+                separator: "x", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let first = parts.first, (1...5).contains(first.count),
+                first.allSatisfy(\.isASCII), first.allSatisfy(\.isNumber),
+                let value = Int(first), (1...10_000).contains(value)
+            else { return nil }
+            if parts.count == 2 {
+                let second = parts[1]
+                guard (1...5).contains(second.count), second.allSatisfy(\.isASCII),
+                    second.allSatisfy(\.isNumber)
+                else { return nil }
+            }
+            return CGFloat(value)
+        }
+        if let bar = alt.lastIndex(of: "|") {
+            if let size = width(alt[alt.index(after: bar)...]) {
+                return (String(alt[..<bar]).trimmingCharacters(in: .whitespaces), size)
+            }
+            return (alt, nil)
+        }
+        if let size = width(alt[...]) {
+            return ("", size)
+        }
+        return (alt, nil)
     }
 
     /// `http(s):` and protocol-relative URLs. Opening a note must not fetch.

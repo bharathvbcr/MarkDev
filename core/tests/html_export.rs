@@ -166,6 +166,7 @@ fn export_with_base(source: &str, scratch: &Scratch) -> String {
         "Assets",
         &ExportOptions {
             asset_base: Some(&scratch.0),
+            vault_root: None,
         },
     )
     .expect("document should export")
@@ -324,7 +325,7 @@ fn exported_document_supports_dark_mode_print_and_callouts() {
 
     assert!(html.contains("prefers-color-scheme: dark"));
     assert!(html.contains("@media print"));
-    assert!(html.contains("<blockquote class=\"markdown-alert-warning\">"));
+    assert!(html.contains("<div class=\"callout\" data-callout=\"warning\""));
     assert!(html.contains("class=\"math math-display\""));
     assert!(html.contains("name=\"color-scheme\""));
 }
@@ -345,6 +346,8 @@ fn ffi_with_base_embeds_images_and_empty_base_matches_plain_render() {
             title.len(),
             base.as_ptr(),
             base.len(),
+            std::ptr::null(),
+            0,
         );
         assert!(!handle.is_null());
         let mut count = 0;
@@ -368,7 +371,191 @@ fn ffi_with_base_embeds_images_and_empty_base_matches_plain_render() {
             title.len(),
             invalid.as_ptr(),
             invalid.len(),
+            std::ptr::null(),
+            0,
         )
     };
     assert!(rejected.is_null());
+}
+
+// MARK: - Obsidian dialect
+
+fn main_of(html: &str) -> &str {
+    let start = html.find("<main>").unwrap();
+    &html[start..]
+}
+
+#[test]
+fn highlights_tags_and_comments_render_like_obsidian_reading_view() {
+    let html = render_document(
+        "A ==key== idea #project/alpha %%private note%% done.\n\n%%\nhidden block\n%%\n\n`==code== #no %%x%%`",
+        "Dialect",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("<mark>key</mark>"));
+    assert!(body.contains("<span class=\"tag\">#project/alpha</span>"));
+    assert!(!body.contains("private note"));
+    assert!(!body.contains("hidden block"));
+    assert!(body.contains("<code>==code== #no %%x%%</code>"));
+}
+
+#[test]
+fn obsidian_callouts_have_titles_icons_and_fold_with_details() {
+    let html = render_document(
+        "> [!faq]- Why **fold**?\n> Because.\n\n> [!info]\n> Plain.\n\n> [!recipe]+\n> Custom.\n\n> [!NOTE]\n> GitHub.",
+        "Callouts",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains(
+        "<details class=\"callout\" data-callout=\"question\" data-callout-type=\"faq\">"
+    ));
+    assert!(body.contains("<span class=\"callout-title-inner\">Why <strong>fold</strong>?</span>"));
+    assert!(
+        body.contains("<div class=\"callout\" data-callout=\"info\" data-callout-type=\"info\">")
+    );
+    assert!(body.contains("<span class=\"callout-title-inner\">Info</span>"));
+    assert!(body.contains("data-callout-type=\"recipe\" open>"));
+    assert!(body.contains("<span class=\"callout-title-inner\">Recipe</span>"));
+    assert!(body.contains("data-callout=\"note\" data-callout-type=\"note\""));
+    assert!(body.contains("<p>Because.</p>"));
+    assert!(!body.contains("[!faq]"));
+    assert!(!body.contains("<blockquote"));
+    assert_eq!(body.matches("<svg class=\"callout-icon\"").count(), 4);
+    assert_eq!(body.matches("</details>").count(), 2);
+}
+
+#[test]
+fn callout_titles_stay_inert() {
+    let html = render_document("> [!note] <img src=x onerror=alert(1)>\n> body", "T").unwrap();
+    assert!(!html.contains("<img src=x"));
+}
+
+#[test]
+fn inline_footnotes_become_numbered_notes() {
+    let html = render_document("Claim^[Source, p. 4] and more^[Second].", "Notes").unwrap();
+    let body = main_of(&html);
+    assert_eq!(body.matches("class=\"footnote-reference\"").count(), 2);
+    assert!(body.contains("Source, p. 4"));
+    assert!(!body.contains("^["));
+}
+
+#[test]
+fn block_ids_become_anchors_and_block_links_target_them() {
+    let html = render_document(
+        "A key claim. ^claim-1\n\nSee [[#^claim-1]] and [[Other#^b2|there]].",
+        "B",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("A key claim.<span class=\"block-id\" id=\"^claim-1\"></span>"));
+    assert!(!body.contains("^claim-1</p>"));
+    assert!(body.contains("href=\"#^claim-1\""));
+    assert!(body.contains("href=\"Other.md#^b2\""));
+}
+
+#[test]
+fn custom_task_statuses_render_as_checked_boxes() {
+    let html = render_document(
+        "- [/] started\n- [-] dropped\n- [ ] open\n- [x] done",
+        "Tasks",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("data-task=\"/\"/>\nstarted"));
+    assert!(body.contains("data-task=\"-\"/>\ndropped"));
+    assert!(!body.contains("[/]"));
+    assert_eq!(body.matches("checked=\"\"").count(), 3);
+}
+
+#[test]
+fn image_sizes_and_media_embeds_follow_obsidian_syntax() {
+    let html = render_document(
+        "![A cat|250](cat.png) ![[pic.png|300x200]] ![[song.mp3]] ![[clip.mp4|640]] ![[Spec.pdf]]",
+        "Media",
+    )
+    .unwrap();
+    let body = main_of(&html);
+    assert!(body.contains("<img src=\"cat.png\" alt=\"A cat\" width=\"250\" loading=\"lazy\" />"));
+    assert!(body.contains("<img src=\"pic.png\" alt=\"\" width=\"300\" height=\"200\""));
+    assert!(body.contains("<audio class=\"media-embed\" controls src=\"song.mp3\">"));
+    assert!(body.contains("<video class=\"media-embed\" controls src=\"clip.mp4\" width=\"640\">"));
+    assert!(body.contains("<a class=\"embed-link pdf-embed\" href=\"Spec.pdf\">Spec.pdf</a>"));
+    assert!(html.contains("media-src 'self' data: file:"));
+}
+
+#[test]
+fn attachments_are_found_in_vault_folders_like_obsidian() {
+    let scratch = Scratch::new("vault");
+    std::fs::create_dir_all(scratch.0.join(".obsidian")).unwrap();
+    scratch.write("attachments/Pasted image 1.png", PNG_1X1);
+    scratch.write("Deep/Down/elsewhere.png", PNG_1X1);
+    let note_dir = scratch.0.join("Notes/Sub");
+    std::fs::create_dir_all(&note_dir).unwrap();
+
+    let html = render_document_with_options(
+        "![[Pasted image 1.png]] ![[elsewhere.png]] ![[missing.png]]",
+        "Vault",
+        &ExportOptions {
+            asset_base: Some(&note_dir),
+            vault_root: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(html.matches("src=\"data:image/png;base64,").count(), 2);
+    assert!(html.contains("src=\"missing.png\""));
+}
+
+#[test]
+fn note_embeds_transclude_sections_blocks_and_stop_at_cycles() {
+    let scratch = Scratch::new("transclude");
+    scratch.write(
+        "Plan.md",
+        b"---\ntags: [x]\n---\n# Plan\n\nIntro text.\n\n## Goals\n\nShip it ==now==.\n\n## Later\n\nNot this.\n\nA quotable line. ^quote\n",
+    );
+    scratch.write("Loop.md", b"Loop start ![[Loop]]");
+    let html = render_document_with_options(
+        "![[Plan]]\n\n![[Plan#Goals]]\n\n![[Plan#^quote]]\n\n![[Loop]]\n\n![[Nowhere]]",
+        "Embeds",
+        &ExportOptions {
+            asset_base: Some(&scratch.0),
+            vault_root: None,
+        },
+    )
+    .unwrap();
+    let body = main_of(&html);
+    // Three sections of Plan, and Loop once: its embed of itself is a link.
+    assert_eq!(body.matches("<div class=\"markdown-embed\">").count(), 4);
+    assert!(!body.contains("tags: [x]"), "frontmatter is not shown");
+    assert!(body.contains("<mark>now</mark>"));
+    let goals = body.split("href=\"Plan.md#goals\"").nth(1).unwrap();
+    let goals = &goals[..goals.find("</div></div>").unwrap()];
+    assert!(goals.contains("Ship it") && !goals.contains("Not this"));
+    let quote = body.split("href=\"Plan.md#^quote\"").nth(1).unwrap();
+    let quote = &quote[..quote.find("</div></div>").unwrap()];
+    assert!(quote.contains("A quotable line.") && !quote.contains("Intro"));
+    assert!(body.contains("<a class=\"internal-link embed-link\" href=\"Nowhere.md\">Nowhere</a>"));
+    assert_eq!(body.matches("Loop start").count(), 1);
+    assert!(body.contains("<a class=\"internal-link embed-link\" href=\"Loop.md\">Loop</a>"));
+}
+
+#[test]
+fn wikilinks_resolve_to_notes_in_other_folders() {
+    let scratch = Scratch::new("links");
+    std::fs::create_dir_all(scratch.0.join(".obsidian")).unwrap();
+    scratch.write("Projects/Roadmap.md", b"# Roadmap");
+    let note_dir = scratch.0.join("Daily");
+    std::fs::create_dir_all(&note_dir).unwrap();
+    let html = render_document_with_options(
+        "[[Roadmap]] [[Roadmap#Q3 Goals|goals]]",
+        "Links",
+        &ExportOptions {
+            asset_base: Some(&note_dir),
+            vault_root: None,
+        },
+    )
+    .unwrap();
+    assert!(html.contains("href=\"../Projects/Roadmap.md\""));
+    assert!(html.contains("href=\"../Projects/Roadmap.md#q3-goals\""));
 }

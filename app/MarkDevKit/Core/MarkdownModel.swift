@@ -37,6 +37,11 @@ public enum SpanKind: UInt16, Sendable, CaseIterable {
     case tag = 13
     case highlight = 14
     case inlineHTML = 15
+    /// Obsidian `%%comment%%`, delimiters included. Its whole range is also
+    /// emitted as markers, so it collapses whenever its block is not revealed.
+    case comment = 16
+    /// Obsidian inline footnote `^[text]`; the span covers `text`.
+    case inlineFootnote = 17
 }
 
 /// A block construct that maps to a custom `NSTextLayoutFragment`.
@@ -83,13 +88,42 @@ public enum TableAlignment: UInt32, Sendable, CaseIterable {
     static let mask: UInt32 = (1 << bits) - 1
 }
 
-/// GFM alert flavour, carried in a callout block's `data`.
+/// Callout flavour, carried in the low byte of a callout block's `data`.
+///
+/// Mirrors `CalloutKind` in `core/src/md/model.rs`: GitHub's five alerts,
+/// then Obsidian's built-in types. Aliases (`summary`, `faq`, `error`, …) and
+/// custom types are mapped by the parser; append cases, never renumber.
 public enum CalloutKind: UInt32, Sendable, CaseIterable {
     case note = 0
     case tip = 1
     case important = 2
     case warning = 3
     case caution = 4
+    case abstract = 5
+    case info = 6
+    case todo = 7
+    case success = 8
+    case question = 9
+    case failure = 10
+    case danger = 11
+    case bug = 12
+    case example = 13
+    case quote = 14
+
+    /// Bits of a callout's `data` holding its kind.
+    static let mask: UInt32 = 0xFF
+    /// Shift of the callout's fold state within `data`.
+    static let foldShift: UInt32 = 8
+}
+
+/// Whether an Obsidian callout can fold, and how it starts.
+public enum CalloutFold: UInt32, Sendable {
+    /// `> [!note]` — always open.
+    case fixed = 0
+    /// `> [!note]+` — foldable, starts open.
+    case expanded = 1
+    /// `> [!note]-` — foldable, starts folded.
+    case collapsed = 2
 }
 
 /// An inline range carrying character attributes.
@@ -144,7 +178,12 @@ public struct BlockDescriptor: Sendable, Equatable {
 
     /// The alert flavour, for ``BlockKind/callout`` blocks.
     public var calloutKind: CalloutKind? {
-        kind == .callout ? CalloutKind(rawValue: data) : nil
+        kind == .callout ? CalloutKind(rawValue: data & CalloutKind.mask) : nil
+    }
+
+    /// The fold state, for ``BlockKind/callout`` blocks.
+    public var calloutFold: CalloutFold? {
+        kind == .callout ? CalloutFold(rawValue: data >> CalloutKind.foldShift) ?? .fixed : nil
     }
 
     /// The heading level 1–6, for ``BlockKind/heading`` blocks.

@@ -806,6 +806,18 @@ public enum MarkdownStyler {
                 ], range: range)
             case .taskMarker, .inlineHTML:
                 storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
+            case .comment:
+                // Only ever seen while its block holds the caret: everywhere
+                // else the whole comment collapses. Dimmed so it reads as a
+                // note to self rather than part of the prose.
+                storage.addAttribute(.foregroundColor, value: theme.secondaryColor, range: range)
+            case .inlineFootnote:
+                let noteFont = NSFont.systemFont(
+                    ofSize: max((theme.bodyFont.pointSize * 0.8).rounded(), 9))
+                storage.addAttributes([
+                    .font: noteFont,
+                    .foregroundColor: theme.secondaryColor,
+                ], range: range)
             }
         }
     }

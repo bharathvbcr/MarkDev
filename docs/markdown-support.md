@@ -2,26 +2,27 @@
 
 [Documentation](README.md) / Markdown support
 
-MarkDev preserves Markdown source and renders it with native text and drawing APIs. Its CommonMark parser enables selected extensions. It does not promise complete Obsidian, HTML, LaTeX, Mermaid, or MDX compatibility.
+MarkDev preserves Markdown source and renders it with native text and drawing APIs. Its CommonMark parser enables selected extensions, and reads Obsidian's formatting syntax so an Obsidian vault opens as it was written (see [Obsidian syntax](#obsidian-syntax)). It does not promise complete Obsidian plugin, HTML, LaTeX, Mermaid, or MDX compatibility.
 
 | Content | What to expect |
 | --- | --- |
 | Headings, emphasis, lists, quotes, rules, links | Native styling with source preserved |
 | GFM tables | Drawn cell grids with column alignment; source reveals as a table |
-| Task lists | Checkboxes that update `- [ ]` / `- [x]` with undo |
+| Task lists | Checkboxes that update `- [ ]` / `- [x]` with undo; Obsidian statuses such as `[/]` and `[-]` draw as done and untick to `[ ]` |
 | Footnotes | Superscript references and navigation |
-| Wikilinks | Note targets, heading anchors, and display aliases |
+| Wikilinks | Note targets, heading and `^block` anchors, and display aliases |
 | Math | Inline/display math and supported LaTeX forms, rendered through SwiftMath |
 | Mermaid | Supported flowchart, sequence, class, state, ER, and XY forms; unsupported input stays visible as a failure/source state |
 | Code fences | Native highlighting for supported Rust, Swift, JavaScript, Python, JSON, and Bash grammars |
 | Frontmatter | Structured YAML/TOML display; note indexing extracts supported metadata |
-| Callouts, definition lists, highlights | Selected Markdown extensions with source-preserving styling |
-| Local images | Supported raster, SVG, and PDF inputs under validation and size limits |
+| Callouts | GitHub alerts and every Obsidian callout type, custom titles, and `+`/`-` folding |
+| Definition lists, highlights, tags | Selected Markdown extensions with source-preserving styling |
+| Local images | Supported raster, SVG, and PDF inputs under validation and size limits, including Obsidian `![[picture.png]]` embeds and `\|300` sizes |
 | HTML | A native subset including tables, headings, formatted runs, and local image layouts; not an embedded browser |
 
 ## Compatibility boundaries
 
-Remote images are not fetched. Keep an image alongside the document or in its `assets/` directory and use a local relative destination. Inline image rendering and image ingestion have different limits; see [editor engine](editor-engine.md).
+Remote images are not fetched. Keep an image alongside the document, in its `assets/` directory, or where Obsidian puts pasted pictures — an `attachments`, `assets`, `_attachments`, or `media` folder beside the note or in any folder above it up to the vault root (a folder holding `.obsidian` or `.git`). Inline image rendering and image ingestion have different limits; see [editor engine](editor-engine.md).
 
 Math is constrained by the commands SwiftMath can typeset. MarkDev normalizes supported command spellings and checks delimiters so ordinary currency is less likely to become math. Unsupported expressions must not be treated as successful renders.
 
@@ -29,15 +30,34 @@ HTML source is parsed into supported native content; scripts and arbitrary web l
 
 Smart punctuation is disabled so text offsets remain faithful to the source. The parser's subscript option is also disabled; tilde runs use its enabled strikethrough behavior. Do not infer syntax support from another Markdown editor's extension list.
 
-Wikilink anchor navigation resolves supported headings. Do not assume Obsidian-style block-ID navigation; see [vault resolution](vault-and-graph.md).
+Wikilink anchor navigation resolves supported headings and Obsidian block ids (`[[Note#^id]]`, `[[#^id]]`); see [vault resolution](vault-and-graph.md).
+
+## Obsidian syntax
+
+| Syntax | In the editor | In HTML export |
+| --- | --- | --- |
+| `> [!type] Title` callouts | All Obsidian types — note, abstract/summary/tldr, info, todo, tip/hint, important, success/check/done, question/help/faq, warning/caution/attention, failure/fail/missing, danger/error, bug, example, quote/cite — plus GitHub's five. Unknown types draw as a note titled by their name | Coloured callout with icon and title; Markdown in the title is rendered |
+| `> [!type]-` / `> [!type]+` | Foldable; `-` folds the body to its title line in live preview until the caret enters it (reading mode shows it open) | `<details>`: folds in the browser without script, closed for `-` and open for `+` |
+| `==highlight==` | Highlighted | `<mark>` |
+| `#tag`, `#nested/tag` | Tag pill, indexed by the vault | Tag pill |
+| `%%comment%%`, inline or across lines | Hidden until the caret enters its block, then shown dimmed; nothing inside is a tag, link, or picture. An unclosed `%%` stays text | Removed |
+| `^[inline footnote]` | Small, dimmed note with its brackets collapsed | A numbered footnote |
+| `text ^block-id` | The id collapses; `[[Note#^block-id]]` and `[[#^block-id]]` jump to the block | An anchor; block links navigate to it |
+| `![[Note]]`, `![[Note#Heading]]`, `![[Note#^id]]` | A wikilink to the note (counted as a backlink) | The note, section, or block transcluded in a frame (three levels deep, 2 MiB per note, 8 MiB per export, cycles become links) |
+| `![[picture.png]]`, `![[picture.png\|300]]`, or a Markdown image whose alt text ends in `\|300x200` | The picture, at the requested width when it stands alone in a paragraph | Embedded picture with `width`/`height` |
+| `![[song.mp3]]`, `![[clip.mp4]]`, `![[file.pdf]]` | Drawn where supported (PDF); otherwise the filename | `<audio>` / `<video>` players and a PDF link |
+| `- [/]`, `- [-]`, `- [>]`, any single status character | A done checkbox; clicking unticks to `[ ]` | A checked, struck-through item |
+
+Not supported: Dataview and other plugin query blocks, Canvas files, and live transclusion inside the native editor (an embed there is a link to the note). A folded callout cannot be toggled in reading mode.
 
 ## Export is a separate surface
 
 **Export as HTML…** and **Preview in Browser** (`⌥⌘P`) call the Rust HTML renderer with destination sanitization and payload limits. The page is a single self-contained file that works in current Safari, Chrome, Edge, and Firefox without script or network access:
 
 - Local pictures referenced with Markdown image syntax are copied in as `data:` URIs when their bytes identify as SVG, PNG, JPEG, GIF, WebP, AVIF, BMP, or ICO (up to 8 MiB each, 32 MiB per export). Other files keep their relative destination; remote images are still never fetched.
-- Headings receive GitHub-style `id` anchors, so `#heading` links and `[[#Heading]]` wikilinks navigate within the page. Other wikilinks point at the matching `.md` file.
-- GitHub callouts, task lists, footnotes, definition lists, tables, and code fences are styled for light and dark appearance and for print.
+- Obsidian's `![[picture.png]]` and `![[Note]]` are found the way Obsidian finds them: beside the note, in an attachments folder, or by name anywhere in the vault (the shortest path wins; the search is bounded to 50,000 files).
+- Headings receive GitHub-style `id` anchors, so `#heading` links and `[[#Heading]]` wikilinks navigate within the page. Other wikilinks point at the matching `.md` file, relative to the page when the vault can find it.
+- Callouts, task lists, footnotes, definition lists, tables, code fences, and the rest of the [Obsidian syntax](#obsidian-syntax) are styled for light and dark appearance and for print.
 
 It does not capture the native editor or include a web math/diagram engine: math and Mermaid source appear as labelled text. Inspect exported output before sharing when exact visual fidelity matters.
 

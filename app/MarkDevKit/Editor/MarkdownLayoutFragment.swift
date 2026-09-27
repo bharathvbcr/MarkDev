@@ -35,11 +35,8 @@ struct BlockDecorationPalette: Sendable {
     let accent: CGColor
     /// Contrasts with `accent`, for the tick inside a filled checkbox.
     let checkmark: CGColor
-    let note: CGColor
-    let tip: CGColor
-    let important: CGColor
-    let warning: CGColor
-    let caution: CGColor
+    /// One accent per ``CalloutKind``, indexed by raw value.
+    let callouts: [CGColor]
     let highlightFill: CGColor
     let tagFill: CGColor
 
@@ -63,23 +60,14 @@ struct BlockDecorationPalette: Sendable {
         controlBorder = theme.controlBorder.cgColor
         accent = theme.accentColor.cgColor
         checkmark = NSColor.white.cgColor
-        note = theme.calloutAccent(.note).cgColor
-        tip = theme.calloutAccent(.tip).cgColor
-        important = theme.calloutAccent(.important).cgColor
-        warning = theme.calloutAccent(.warning).cgColor
-        caution = theme.calloutAccent(.caution).cgColor
+        callouts = CalloutKind.allCases.map { theme.calloutAccent($0).cgColor }
         highlightFill = theme.highlightBackground.cgColor
         tagFill = theme.tagBackground.cgColor
     }
 
     func calloutAccent(_ kind: CalloutKind) -> CGColor {
-        switch kind {
-        case .note: note
-        case .tip: tip
-        case .important: important
-        case .warning: warning
-        case .caution: caution
-        }
+        let index = Int(kind.rawValue)
+        return callouts.indices.contains(index) ? callouts[index] : callouts[0]
     }
 }
 
@@ -1534,6 +1522,15 @@ extension EditorTheme {
         case .important: .systemPurple
         case .warning: .systemOrange
         case .caution: .systemRed
+        // Obsidian's own palette for its built-in types.
+        case .abstract: .systemTeal
+        case .info, .todo: .systemBlue
+        case .success: .systemGreen
+        case .question: .systemYellow
+        case .failure, .danger: .systemRed
+        case .bug: .systemPink
+        case .example: .systemIndigo
+        case .quote: .systemGray
         }
     }
 }

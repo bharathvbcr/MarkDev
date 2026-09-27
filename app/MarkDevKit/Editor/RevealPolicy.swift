@@ -208,8 +208,18 @@ extension HiddenRanges {
         } else {
             comments = []
         }
+        // A `> [!note]-` callout folds to its title line in live preview until
+        // the caret enters it, as Obsidian's does. Reading mode has no caret
+        // to unfold it with, so there it stays open rather than unreachable.
+        let folded: [NSRange]
+        if let text, mode == .livePreview {
+            folded = Self.foldedCalloutBodies(in: document, revealed: revealed, text: text)
+        } else {
+            folded = []
+        }
         let replaced =
             rendered.collapsedRanges(revealed: revealed) + tableRows + frontmatter + comments
+            + folded
 
         let hideable = document.markers.lazy
             .filter { !revealed.contains($0.block) }
@@ -227,6 +237,30 @@ extension HiddenRanges {
             // reading reveal policy, but it must restore an ordinary line as
             // soon as the writer clicks back into it.
             compactsReplacedBlockSeparators: mode == .reading)
+    }
+
+    /// The body of every folded callout the caret is not in: from the end of
+    /// its title line to its last character, so the callout draws as one
+    /// labelled line and the text after it keeps its own line.
+    static func foldedCalloutBodies(
+        in document: ParsedDocument, revealed: Set<Int>, text: NSString
+    ) -> [NSRange] {
+        document.blocks.enumerated().compactMap { index, block -> NSRange? in
+            guard block.kind == .callout, block.calloutFold == .collapsed,
+                !revealed.contains(index),
+                block.range.location >= 0, block.range.length > 0,
+                NSMaxRange(block.range) <= text.length
+            else { return nil }
+            let header = text.lineRange(for: NSRange(location: block.range.location, length: 0))
+            let start = NSMaxRange(HiddenRanges.contentRange(of: header, in: text))
+            var end = NSMaxRange(block.range)
+            while end > start {
+                let character = text.character(at: end - 1)
+                guard character == 0x0A || character == 0x0D else { break }
+                end -= 1
+            }
+            return end > start ? NSRange(location: start, length: end - start) : nil
+        }
     }
 
     /// Inline `<!-- … -->` spans, hidden the same way a comment *block* is.
