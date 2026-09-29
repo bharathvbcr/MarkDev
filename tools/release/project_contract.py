@@ -432,25 +432,47 @@ class ProjectVersionTests(unittest.TestCase):
             "Debug tests cannot prove the universal optimized Release bundle links",
         )
 
-    def test_ci_executes_core_and_app_suites_on_apple_silicon_and_intel(self):
-        source = Path(".github/workflows/ci.yml").read_text()
-        for job in ("rust-checks", "macos-app"):
-            with self.subTest(job=job):
-                match = re.search(
-                    rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
-                    source,
+    @staticmethod
+    def _workflow_job(source, job):
+        match = re.search(
+            rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            source,
+        )
+        return None if match is None else match.group("body")
+
+    def test_ci_executes_the_core_suite_on_apple_silicon_and_intel(self):
+        body = self._workflow_job(Path(".github/workflows/ci.yml").read_text(), "rust-checks")
+        self.assertIsNotNone(body, "missing CI job: rust-checks")
+        self.assertIn("fail-fast: false", body)
+        self.assertRegex(
+            body,
+            r"runner:\s*\[\s*macos-26\s*,\s*macos-26-intel\s*\]",
+            "universal slices are not runtime proof on both CPU families",
+        )
+        self.assertIn("runs-on: ${{ matrix.runner }}", body)
+
+    def test_app_jobs_run_on_an_image_that_ships_the_pinned_xcode(self):
+        # `just verify-toolchain` pins Xcode 27.0 (27A266a). The `macos-26`
+        # images top out at Xcode 26.x, so an app job there fails at Xcode
+        # selection and never builds or tests anything. `xcode-27` is arm64
+        # only: no hosted Intel image carries Xcode 27, so the app suite has
+        # no Intel runtime run — the universal Release build still compiles
+        # and links the x86_64 slice.
+        jobs = (
+            (".github/workflows/ci.yml", "macos-app"),
+            (".github/workflows/release.yml", "stage"),
+        )
+        for workflow, job in jobs:
+            with self.subTest(workflow=workflow, job=job):
+                body = self._workflow_job(Path(workflow).read_text(), job)
+                self.assertIsNotNone(body, f"missing job {job} in {workflow}")
+                self.assertRegex(body, r"(?m)^\s*runs-on:\s*xcode-27\s*$")
+                self.assertNotIn("macos-26", body)
+                self.assertLess(
+                    body.index("tools/ci/select-pinned-xcode.sh"),
+                    body.index("just verify-"),
+                    "the pinned Xcode must be selected before it is verified",
                 )
-                self.assertIsNotNone(match, f"missing CI job: {job}")
-                if match is None:
-                    continue
-                body = match.group("body")
-                self.assertIn("fail-fast: false", body)
-                self.assertRegex(
-                    body,
-                    r"runner:\s*\[\s*macos-26\s*,\s*macos-26-intel\s*\]",
-                    "universal slices are not runtime proof on both CPU families",
-                )
-                self.assertIn("runs-on: ${{ matrix.runner }}", body)
 
     def test_release_publisher_uses_a_checksum_pinned_github_cli(self):
         installer = Path("tools/ci/install-pinned-tools.sh").read_text()

@@ -40,13 +40,13 @@ jobs:
       - name: Rust, performance, and release checks
         run: just ci-core
 
+  # The app needs Xcode 27.0 (27A266a), which `just verify-toolchain` pins and
+  # the macos-26 images do not carry. `xcode-27` does, as its default, and is
+  # arm64 only — no hosted Intel image has Xcode 27 — so the x86_64 slice is
+  # proven by the universal Release build linking, not by running tests.
   macos-app:
-    name: macOS App (Debug Tests + Universal Release, ${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-26, macos-26-intel]
-    runs-on: ${{ matrix.runner }}
+    name: macOS App (Debug Tests + Universal Release, xcode-27)
+    runs-on: xcode-27
     needs: rust-checks
     timeout-minutes: 60
     steps:

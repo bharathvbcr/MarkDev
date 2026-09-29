@@ -32,7 +32,8 @@ jobs:
   stage:
     name: Build, verify, and stage the release
     needs: checks
-    runs-on: macos-26
+    # The only hosted image carrying the pinned Xcode 27.0 (27A266a); see ci.yml.
+    runs-on: xcode-27
     timeout-minutes: 60
     permissions:
       contents: write
