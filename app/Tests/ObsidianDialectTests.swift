@@ -143,7 +143,10 @@ final class ObsidianDialectTests: XCTestCase {
     }
 
     func testCalloutLabelsCarryASymbolAndAPlainTitle() {
-        XCTAssertTrue(CalloutKind.allCases.allSatisfy { $0.symbol.hasSuffix("\u{FE0E}") })
+        // Scalars, not `hasSuffix`: a glyph and its variation selector are one
+        // grapheme, so a lone U+FE0E is never a Character-wise suffix of it.
+        XCTAssertTrue(
+            CalloutKind.allCases.allSatisfy { $0.symbol.unicodeScalars.last == "\u{FE0E}" })
         XCTAssertEqual(Set(CalloutKind.allCases.map(\.symbol)).count, CalloutKind.allCases.count)
         XCTAssertEqual(CalloutKind.plainTitle("**Why** [[Plan|this]] ==now=="), "Why this now")
         XCTAssertEqual(CalloutKind.plainTitle("See [docs](https://x.y) and `code`"), "See docs and code")

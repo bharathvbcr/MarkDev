@@ -341,7 +341,13 @@ public struct RenderedBlocks: Sendable, Equatable {
 
         var last = end - 1
         while last > first, isWhitespace(text.character(at: last)) { last -= 1 }
-        return text.character(at: last) == 0x29  // )
+        if text.character(at: last) == 0x29 { return true }  // )
+        // Obsidian's `![[pic.png]]` / `![[Note]]` embed, which ``image`` and
+        // ``noteEmbed`` both handle — rejected here, neither is ever asked.
+        return last >= first + 4
+            && text.character(at: first + 2) == 0x5B  // [
+            && text.character(at: last) == 0x5D  // ]
+            && text.character(at: last - 1) == 0x5D  // ]
     }
 
     /// A block that is one `<img>` tag, a GitHub-README HTML fragment, or an
