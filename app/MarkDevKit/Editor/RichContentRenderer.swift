@@ -2193,7 +2193,7 @@ public final class RichContentRenderer {
     /// folder and each folder above it — plain, and its `attachments`,
     /// `assets`, `_attachments` or `media` subfolder — stopping at the vault
     /// root (a folder holding `.obsidian` or `.git`) and after eight levels.
-    nonisolated static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
+    public nonisolated static func attachmentFallback(for relativePath: String, from folder: URL) -> URL? {
         let fileManager = FileManager.default
         func existingFile(_ candidate: URL) -> URL? {
             var isDirectory: ObjCBool = false

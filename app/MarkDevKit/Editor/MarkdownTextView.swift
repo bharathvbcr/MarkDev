@@ -1617,6 +1617,17 @@ public final class MarkdownTextView: ScrollingTextView {
         return true
     }
 
+    /// Whether a callout currently shows folded, after the reader's clicks.
+    ///
+    /// Compiled in both targets: `calloutLabel` draws the fold glyph in Quick
+    /// Look too, where no click can toggle anything and the answer is simply
+    /// the fold the note was written with.
+    private func isCalloutFolded(_ block: BlockDescriptor) -> Bool {
+        let fold = block.calloutFold ?? .fixed
+        guard fold != .fixed else { return false }
+        return (fold == .collapsed) != toggledCallouts.contains(block.range.location)
+    }
+
     #if MARKDEV_QUICKLOOK
     /// The extension target has one admitted mutation: ``setMarkdown(_:)``
     /// installs the bounded file snapshot. Every AppKit editing route fails
@@ -1690,13 +1701,6 @@ public final class MarkdownTextView: ScrollingTextView {
             toggledCallouts.insert(location)
         }
         restyle()
-    }
-
-    /// Whether a callout currently shows folded, after the reader's clicks.
-    private func isCalloutFolded(_ block: BlockDescriptor) -> Bool {
-        let fold = block.calloutFold ?? .fixed
-        guard fold != .fixed else { return false }
-        return (fold == .collapsed) != toggledCallouts.contains(block.range.location)
     }
 
     /// Whether `point` lands in the gutter the checkbox is drawn into.
