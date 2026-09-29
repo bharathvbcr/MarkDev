@@ -10,10 +10,12 @@ set -euo pipefail
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repository_root=$(cd -- "$script_directory/../.." && pwd -P)
 
-expected_build=$(
+# MARKDEV_CI_XCODE_BUILD overrides the justfile pin, the same variable
+# `just verify-toolchain` honours, for a CI job pinned to an older Xcode.
+expected_build=${MARKDEV_CI_XCODE_BUILD:-$(
     sed -n "s/^[[:space:]]*expected_version=\\$'Xcode [0-9.]*\\\\nBuild version \\([0-9A-Za-z]*\\)'.*/\\1/p" \
         "$repository_root/justfile" | head -n 1
-)
+)}
 if [[ -z "$expected_build" ]]; then
     echo "could not read the pinned Xcode build from justfile" >&2
     exit 1

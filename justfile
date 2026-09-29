@@ -351,6 +351,11 @@ verify-toolchain: verify-core-toolchain
     fi
     version=$(xcodebuild -version)
     expected_version=$'Xcode 27.0\nBuild version 27A266a'
+    # CI can pin an older Xcode while the hosted runners lack the release
+    # pin above; release.yml never sets this, so releases keep the strict pin.
+    if [[ -n "${MARKDEV_CI_XCODE_BUILD:-}" ]]; then
+        expected_version="Xcode ${MARKDEV_CI_XCODE_VERSION:?MARKDEV_CI_XCODE_VERSION must accompany MARKDEV_CI_XCODE_BUILD}"$'\n'"Build version $MARKDEV_CI_XCODE_BUILD"
+    fi
     if [[ "$version" != "$expected_version" ]]; then
         echo "Xcode toolchain mismatch; expected:" >&2
         echo "$expected_version" >&2

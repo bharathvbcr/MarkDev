@@ -114,7 +114,11 @@ branch labels. CI selects Rust 1.98.0 explicitly, and `just
 verify-core-toolchain` checks the exact Rust, Cargo, and Just builds. `just
 verify-toolchain` additionally checks XcodeGen 2.45.4 and Xcode 27.0 build
 27A266a. Release builds depend on that complete verifier, so a check that could
-not run cannot look like an approved release input.
+not run cannot look like an approved release input. Until GitHub's `macos-26`
+runners carry Xcode 27.0, the pull-request CI job sets
+`MARKDEV_CI_XCODE_VERSION=26.6` and `MARKDEV_CI_XCODE_BUILD=17F113`, which
+both `tools/ci/select-pinned-xcode.sh` and `just verify-toolchain` honour;
+the release workflow does not set them.
 
 CI downloads checksum-pinned Just and XcodeGen binaries through the canonical
 `tools/ci/install-pinned-tools.sh` helper. Local package managers may install

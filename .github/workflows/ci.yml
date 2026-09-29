@@ -49,6 +49,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: rust-checks
     timeout-minutes: 60
+    # The macos-26 images carry Xcode 26.6 at newest, not the 27.0 release
+    # pin in justfile. Pin CI to 26.6 until they ship 27.0, then delete this.
+    env:
+      MARKDEV_CI_XCODE_VERSION: "26.6"
+      MARKDEV_CI_XCODE_BUILD: 17F113
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

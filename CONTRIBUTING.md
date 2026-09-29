@@ -37,7 +37,10 @@ Before proposing or implementing changes, you must understand MarkDev's core des
 
 1. **macOS 26.0+**
 2. **Xcode 27.0 (build 27A266a)**: the repository verifies this exact release
-   for CI and release builds rather than accepting any Xcode 26 installation.
+   for release builds rather than accepting any Xcode 26 installation. The
+   pull-request CI job temporarily pins Xcode 26.6 (build 17F113) through
+   `MARKDEV_CI_XCODE_VERSION`/`MARKDEV_CI_XCODE_BUILD`, because GitHub's
+   `macos-26` runners do not carry Xcode 27.0 yet.
 3. **Rust 1.98.0**: the root `rust-toolchain.toml` selects the exact toolchain,
    components, and universal macOS targets without changing your global Rust
    default.
