@@ -99,7 +99,7 @@ rule should be generalized to the whole suite:
 
 ## 4. Incremental Parsing & Property Verification
 
-The incremental parser in `core/src/md/incremental.rs` uses a **shift-only fast path**:
+The incremental parser in `core/crates/markdev-md/src/incremental.rs` uses a **shift-only fast path**:
 - When inert words are typed inside prose without touching block markers, the existing AST is preserved and node offsets are shifted in memory; an earlier local run observed roughly 10 microseconds, but the suite gates the selected `Reparse::Shifted` path rather than that duration.
 - If any ambiguity exists (e.g. typing near fences, indentation, or list prefixes), the parser safely falls back to a complete reparse.
 

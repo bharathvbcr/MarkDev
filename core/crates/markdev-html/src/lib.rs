@@ -21,11 +21,13 @@ use std::path::{Component, Path, PathBuf};
 
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, LinkType, Parser, Tag, TagEnd};
 
-use crate::md::model::{BlockKind, CalloutKind, SpanKind, Utf16Mapper, CALLOUT_FOLD_COLLAPSED};
-use crate::md::obsidian;
-use crate::md::parse::{
+use markdev_md::model::{BlockKind, CalloutKind, SpanKind, Utf16Mapper, CALLOUT_FOLD_COLLAPSED};
+use markdev_md::obsidian;
+use markdev_md::parse::{
     display_math_is_valid, inline_math_is_valid, options, parse_checked, scan_tags,
 };
+
+pub mod site;
 
 /// Rendering is linear but necessarily allocates output proportional to the
 /// document. Refuse pathological inputs before duplicating them across the
@@ -81,6 +83,76 @@ pub struct ExportOptions<'a> {
     /// Set when the page is one of a whole-vault site: links to notes in the
     /// vault point at their `.html` pages in the site instead of `.md` files.
     pub site: Option<SiteLayout<'a>>,
+    /// Which files the render may read — the pictures it embeds and the
+    /// notes it transcludes. Unrestricted by default, which is right for a
+    /// user's own notes; an embedder rendering Markdown nobody vetted, such
+    /// as a cloned repository's README, should use [`FileAccess::Vault`].
+    pub file_access: FileAccess,
+    /// Whether pictures, audio and video may load from `http(s)` URLs. Off by
+    /// default: a remote picture is a request the reader never made, which a
+    /// shared note can use as a beacon. Links are unaffected — following one
+    /// takes a click. Remote pictures are always sent without a referrer.
+    pub remote_media: bool,
+    /// Most raw picture bytes the render copies in, across every picture;
+    /// `None` is [`MAX_EMBEDDED_TOTAL_BYTES`], sized for a one-off export. A
+    /// viewer that re-renders as the note is edited wants far less: every
+    /// byte embedded is read, base64-encoded and handed over on each render.
+    /// Pictures past the budget keep their relative destination. Never more
+    /// than [`MAX_EMBEDDED_TOTAL_BYTES`], whatever is asked.
+    pub max_embedded_bytes: Option<usize>,
+}
+
+/// Which files a render may read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileAccess {
+    /// Any file the note names, including absolute paths and `file:` URLs.
+    #[default]
+    Unrestricted,
+    /// Only regular files whose canonical path — every symlink resolved —
+    /// lies inside the canonical [`ExportOptions::vault_root`]. Absolute
+    /// paths, `file:` URLs, `../` and symlinks that leave the vault resolve
+    /// to nothing, exactly as a missing file does. Without an explicit vault
+    /// root nothing is read: the vault is never guessed from the folders
+    /// above the note, because that guess could climb out of what was vetted.
+    ///
+    /// Confinement is of *contents*: resolving a name may ask whether a path
+    /// outside the vault exists, but nothing outside is ever opened, and the
+    /// answer never reaches the output — a refused file renders exactly as a
+    /// missing one.
+    Vault,
+    /// No file is read: no picture is embedded and no note is transcluded.
+    None,
+}
+
+/// A rendered note body, for embedding in an application's own page.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Fragment {
+    /// Sanitized HTML for the body, without a document shell or stylesheet.
+    ///
+    /// It carries no script, no event-handler attribute and no author HTML
+    /// (raw HTML is shown as text), and every URL has passed the same scheme
+    /// filter as [`render_document`]. What it lacks is the export's closed
+    /// Content-Security-Policy: the embedding page supplies its own.
+    pub html: String,
+    /// The note's own headings in document order, each with the `id` its
+    /// element carries in [`Fragment::html`], so an outline built from this
+    /// list always lands on the heading it names. Headings inside
+    /// transcluded notes are not listed: they belong to another note.
+    pub headings: Vec<FragmentHeading>,
+    /// The text of the note's frontmatter block, between its fences, when it
+    /// opens with one. Not rendered into [`Fragment::html`].
+    pub frontmatter: Option<String>,
+}
+
+/// One heading of a [`Fragment`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct FragmentHeading {
+    /// 1 to 6.
+    pub level: u8,
+    /// The heading's text, without markup or a trailing `^block-id`.
+    pub text: String,
+    /// The `id` attribute of the heading element.
+    pub id: String,
 }
 
 /// Where a whole-vault site mirrors the vault.
@@ -128,19 +200,8 @@ pub fn render_document_with_options(
         });
     }
 
-    // Keep output NUL-free even though Rust and Swift strings allow it. Avoid
-    // copying the ordinary case; the replacement allocation is still bounded
-    // by the source/title checks above.
-    let clean_source: Cow<'_, str> = if source.contains('\0') {
-        Cow::Owned(source.replace('\0', "\u{FFFD}"))
-    } else {
-        Cow::Borrowed(source)
-    };
-    let clean_title: Cow<'_, str> = if title.contains('\0') {
-        Cow::Owned(title.replace('\0', "\u{FFFD}"))
-    } else {
-        Cow::Borrowed(title)
-    };
+    let clean_source = without_nul(source);
+    let clean_title = without_nul(title);
 
     // Render straight into a writer that refuses the first byte beyond the
     // ceiling. Checking a String after `push_html` returns is too late: the
@@ -162,22 +223,7 @@ pub fn render_document_with_options(
     output
         .write_all(DOCUMENT_MIDDLE.as_bytes())
         .map_err(|_| output.error())?;
-
-    let mut context = ExportContext::new(export.asset_base, export.vault_root, export.link_base);
-    context.site = export.site.map(|site| {
-        (
-            absolute_path(site.vault_root),
-            absolute_path(site.output_root),
-        )
-    });
-    let prepared = prepare_source(clean_source.as_ref());
-    let events = ExportEvents::new(
-        prepared.text.as_ref(),
-        prepared.math,
-        export.asset_base.map(Path::to_path_buf),
-        &mut context,
-    );
-    html::write_html_io(&mut output, events).map_err(|_| output.error())?;
+    write_body(&mut output, clean_source.as_ref(), export)?;
     output
         .write_all(DOCUMENT_SUFFIX.as_bytes())
         .map_err(|_| output.error())?;
@@ -185,6 +231,78 @@ pub fn render_document_with_options(
     // Every input to the writer is UTF-8 text generated by pulldown-cmark or
     // by this module's own markup.
     Ok(String::from_utf8(output.into_bytes()).expect("HTML writer emitted invalid UTF-8"))
+}
+
+/// Renders a note body for embedding in an application's own page.
+///
+/// The same pipeline as [`render_document_with_options`] — one dialect, one
+/// sanitizer, one set of limits — without the document shell, plus the
+/// heading outline and frontmatter an embedder would otherwise have to
+/// re-derive (and would derive differently: a second slugger is how an
+/// outline entry comes to point at a heading id that does not exist).
+pub fn render_fragment(
+    source: &str,
+    export: &ExportOptions<'_>,
+) -> Result<Fragment, HTMLExportError> {
+    if source.len() > MAX_SOURCE_BYTES {
+        return Err(HTMLExportError::SourceTooLarge {
+            actual: source.len(),
+            maximum: MAX_SOURCE_BYTES,
+        });
+    }
+    let clean_source = without_nul(source);
+    let initial_capacity = clean_source
+        .len()
+        .saturating_add(16 * 1024)
+        .min(MAX_OUTPUT_BYTES);
+    let mut output = BoundedHTMLWriter::new(MAX_OUTPUT_BYTES, initial_capacity);
+    let body = write_body(&mut output, clean_source.as_ref(), export)?;
+    Ok(Fragment {
+        // As above: everything written is UTF-8 from pulldown-cmark or this
+        // module's own markup.
+        html: String::from_utf8(output.into_bytes()).expect("HTML writer emitted invalid UTF-8"),
+        headings: body.headings,
+        frontmatter: body.frontmatter,
+    })
+}
+
+/// Keeps output NUL-free even though Rust and Swift strings allow it,
+/// without copying the ordinary case. Callers bound the input first, so the
+/// replacement allocation is bounded too.
+fn without_nul(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.replace('\0', "\u{FFFD}"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// What rendering a body learned besides its HTML.
+struct Body {
+    headings: Vec<FragmentHeading>,
+    frontmatter: Option<String>,
+}
+
+/// Renders `source` into `output`: the one body pipeline both entry points
+/// share.
+fn write_body(
+    output: &mut BoundedHTMLWriter,
+    source: &str,
+    export: &ExportOptions<'_>,
+) -> Result<Body, HTMLExportError> {
+    let mut context = ExportContext::new(export);
+    let prepared = prepare_source(source);
+    let mut events = ExportEvents::new(
+        prepared.text.as_ref(),
+        prepared.math,
+        export.asset_base.map(Path::to_path_buf),
+        &mut context,
+    );
+    html::write_html_io(&mut *output, &mut events).map_err(|_| output.error())?;
+    Ok(Body {
+        headings: std::mem::take(&mut events.outline),
+        frontmatter: events.frontmatter.take(),
+    })
 }
 
 /// Math pulldown-cmark does not see (`\(…\)`, `\[…\]`), lifted out of the
@@ -342,7 +460,7 @@ fn prepare_source(source: &str) -> Prepared<'_> {
 /// the editor recognises them: full range, formula range, display.
 fn delimited_math_ranges(
     text: &str,
-    parsed: &crate::md::ParseResult,
+    parsed: &markdev_md::ParseResult,
 ) -> Vec<(Range<usize>, Range<usize>, bool)> {
     let mapper = Utf16Mapper::new(text);
     let mut found: Vec<(Range<usize>, Range<usize>, bool)> = Vec::new();
@@ -444,9 +562,12 @@ fn render_math(latex: &str, display: bool) -> Option<String> {
     // A typesetting bug must cost one formula, not the export.
     let rendered = std::panic::catch_unwind(|| {
         let storage = Storage::new();
-        let events: Vec<_> = LatexParser::new(latex, &storage).collect();
+        let mut events: Vec<_> = LatexParser::new(latex, &storage).collect();
         if events.iter().any(Result::is_err) {
             return None;
+        }
+        for event in events.iter_mut().flatten() {
+            bound_spacing(event);
         }
         let config = RenderConfig {
             display_mode: if display {
@@ -465,6 +586,72 @@ fn render_math(latex: &str, display: bool) -> Option<String> {
     .ok()
     .flatten()?;
     sanitize_mathml(&rendered)
+}
+
+/// Most space one LaTeX spacing command may add or take away, in em.
+///
+/// pulldown-latex writes the author's `\hspace`, `\kern` and `\\[…]` amounts
+/// straight into the page — `\hspace{-1000em}` becomes `margin-left: -1000em`
+/// — so a formula could drag its neighbours, or itself, anywhere on the page
+/// and lay text over text the reader trusts. Real typesetting stays well
+/// inside this: `\qquad` is 2em and `\hspace{2cm}` under 6em.
+#[cfg(feature = "mathml")]
+const MAX_MATH_SPACE_EM: f32 = 8.0;
+
+/// Bounds the author-chosen dimensions in one LaTeX event to
+/// [`MAX_MATH_SPACE_EM`]; every other event is left as written.
+#[cfg(feature = "mathml")]
+fn bound_spacing(event: &mut pulldown_latex::Event<'_>) {
+    use pulldown_latex::event::{EnvironmentFlow, Event};
+    match event {
+        Event::Space {
+            width,
+            height,
+            depth,
+        } => {
+            for dimension in [width, height, depth] {
+                bound_dimension(dimension);
+            }
+        }
+        Event::EnvironmentFlow(EnvironmentFlow::NewLine { spacing, .. }) => {
+            bound_dimension(spacing);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "mathml")]
+fn bound_dimension(dimension: &mut Option<pulldown_latex::event::Dimension>) {
+    use pulldown_latex::event::{Dimension, DimensionUnit};
+    let Some(given) = *dimension else {
+        return;
+    };
+    // TeX's own ratios at a 10pt em (the TeXbook, p. 57): 1em = 10pt = 18mu.
+    // `ex` depends on the font; 0.431 is Computer Modern's.
+    let em_per_unit = match given.unit {
+        DimensionUnit::Em => 1.0,
+        DimensionUnit::Mu => 1.0 / 18.0,
+        DimensionUnit::Ex => 0.431,
+        DimensionUnit::Pt => 0.1,
+        DimensionUnit::Pc => 1.2,
+        DimensionUnit::In => 7.227,
+        DimensionUnit::Bp => 0.100_375,
+        DimensionUnit::Cm => 2.845_276,
+        DimensionUnit::Mm => 0.284_528,
+        DimensionUnit::Dd => 0.107,
+        DimensionUnit::Cc => 1.284,
+        DimensionUnit::Sp => 0.1 / 65_536.0,
+    };
+    let em = given.value * em_per_unit;
+    if em.is_finite() && em.abs() <= MAX_MATH_SPACE_EM {
+        return;
+    }
+    let bounded = if em.is_finite() {
+        em.clamp(-MAX_MATH_SPACE_EM, MAX_MATH_SPACE_EM)
+    } else {
+        0.0
+    };
+    *dimension = Some(Dimension::new(bounded, DimensionUnit::Em));
 }
 
 #[cfg(not(feature = "mathml"))]
@@ -643,29 +830,84 @@ struct ExportContext {
     link_from: Option<PathBuf>,
     /// Whether links should be absolute `file://` URLs.
     file_urls: bool,
+    access: FileAccess,
+    /// The vault root with every symlink resolved, for [`FileAccess::Vault`].
+    /// `None` there means no root was given or it cannot be resolved, and
+    /// then nothing is read.
+    vault_canonical: Option<PathBuf>,
+    remote_media: bool,
 }
 
 impl ExportContext {
-    fn new(base: Option<&Path>, vault_root: Option<&Path>, link_base: LinkBase<'_>) -> Self {
-        let (link_from, file_urls) = match link_base {
+    fn new(export: &ExportOptions<'_>) -> Self {
+        let base = export.asset_base;
+        let (link_from, file_urls) = match export.link_base {
             LinkBase::NoteFolder => (base.map(absolute_path), false),
             LinkBase::Directory(dir) => (Some(absolute_path(dir)), false),
             LinkBase::FileUrl => (None, true),
         };
-        let vault_root = match vault_root {
-            Some(root) => Some(root.to_path_buf()),
-            None => base.and_then(find_vault_root),
+        let vault_root = match (export.vault_root, export.file_access) {
+            (Some(root), FileAccess::Vault) => Some(absolute_path(root)),
+            (Some(root), _) => Some(root.to_path_buf()),
+            // Guessing the vault by walking up from the note is a convenience
+            // for a user's own notes; under confinement it could choose a
+            // folder above the one that was vetted.
+            (None, FileAccess::Unrestricted) => base.and_then(find_vault_root),
+            (None, _) => None,
+        };
+        let vault_canonical = match export.file_access {
+            FileAccess::Vault => vault_root.as_deref().and_then(|r| fs::canonicalize(r).ok()),
+            _ => None,
         };
         Self {
-            images: ImageEmbedder::new(),
+            images: ImageEmbedder::new(
+                export
+                    .max_embedded_bytes
+                    .unwrap_or(MAX_EMBEDDED_TOTAL_BYTES)
+                    .min(MAX_EMBEDDED_TOTAL_BYTES),
+            ),
             transclusion_remaining: MAX_TRANSCLUDED_TOTAL_BYTES,
             depth: 0,
             visited: Vec::new(),
             vault_root,
             vault_files: None,
-            site: None,
+            site: export.site.map(|site| {
+                (
+                    absolute_path(site.vault_root),
+                    absolute_path(site.output_root),
+                )
+            }),
             link_from,
             file_urls,
+            access: export.file_access,
+            vault_canonical,
+            remote_media: export.remote_media,
+        }
+    }
+
+    /// The one gate every file read passes: the path to read `path` through,
+    /// or `None` when [`FileAccess`] forbids it.
+    ///
+    /// Under [`FileAccess::Vault`] the file is resolved through every
+    /// symlink and must land inside the canonical vault root as a regular
+    /// file. The path returned is that location re-expressed under the vault
+    /// root as given, so hrefs computed from it agree with hrefs computed
+    /// from the note's own folder, and opening it follows no symlink below
+    /// the root.
+    fn admit(&self, path: &Path) -> Option<PathBuf> {
+        match self.access {
+            FileAccess::Unrestricted => Some(path.to_path_buf()),
+            FileAccess::None => None,
+            FileAccess::Vault => {
+                let root = self.vault_canonical.as_ref()?;
+                let given = self.vault_root.as_ref()?;
+                let canonical = fs::canonicalize(path).ok()?;
+                let inside = canonical.strip_prefix(root).ok()?;
+                if !fs::metadata(&canonical).ok()?.is_file() {
+                    return None;
+                }
+                Some(given.join(inside))
+            }
         }
     }
 
@@ -700,8 +942,18 @@ impl ExportContext {
     /// Finds a file the way Obsidian does: next to the note, in an
     /// attachments folder of the note or any folder above it inside the
     /// vault, and finally anywhere in the vault by name (the shortest path
-    /// wins, as with Obsidian's "shortest path when possible").
+    /// wins, as with Obsidian's "shortest path when possible"). Whatever is
+    /// found must still pass [`Self::admit`]; a candidate it refuses is a
+    /// miss, not a reason to keep searching for a permitted namesake.
     fn resolve(&mut self, base: &Path, name: &str) -> Option<PathBuf> {
+        if self.access == FileAccess::None {
+            return None;
+        }
+        let found = self.locate(base, name)?;
+        self.admit(&found)
+    }
+
+    fn locate(&mut self, base: &Path, name: &str) -> Option<PathBuf> {
         let name = name.trim().trim_start_matches("./");
         if name.is_empty() || name.contains('\0') || name.ends_with('/') {
             return None;
@@ -720,10 +972,16 @@ impl ExportContext {
             .clone()
             .unwrap_or_else(|| base.to_path_buf());
         // The folder Obsidian's own "Default location for new attachments"
-        // setting names, when the vault has one.
+        // setting names, when the vault has one. Reading that setting is a
+        // file read like any other, so it passes the same gate.
+        let settings_readable = self.vault_root.as_deref().is_some_and(|root| {
+            self.admit(&root.join(".obsidian").join("app.json"))
+                .is_some()
+        });
         if let Some(folder) = self
             .vault_root
             .as_deref()
+            .filter(|_| settings_readable)
             .and_then(|root| attachment_folder(root, base))
         {
             let candidate = folder.join(relative);
@@ -996,14 +1254,23 @@ struct ExportEvents<'a, 'c> {
     context: &'c mut ExportContext,
     /// Events already pulled from the parser, to be processed again.
     replay: VecDeque<(Event<'a>, Range<usize>)>,
-    /// Events ready to hand to the HTML writer.
+    /// Events handled, awaiting [`Self::balance_marks`].
     pending: VecDeque<Event<'a>>,
+    /// Events ready to hand to the HTML writer.
+    ready: VecDeque<Event<'a>>,
+    /// The events of a highlight in progress, held for [`place_marks`].
+    mark: Option<Vec<Event<'a>>>,
     slugs: HashMap<String, usize>,
     heading_anchor: Option<String>,
     quotes: Vec<Quote>,
     /// Source bytes whose events are dropped: a callout's `[!type] Title`
     /// line, or the `[/] ` of a custom task.
     skip: Option<Range<usize>>,
+    /// This note's headings as their elements are written, for
+    /// [`Fragment::headings`].
+    outline: Vec<FragmentHeading>,
+    /// The text of the note's first frontmatter block.
+    frontmatter: Option<String>,
 }
 
 impl<'a, 'c> ExportEvents<'a, 'c> {
@@ -1021,10 +1288,14 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             context,
             replay: VecDeque::new(),
             pending: VecDeque::new(),
+            ready: VecDeque::new(),
+            mark: None,
             slugs: HashMap::new(),
             heading_anchor: None,
             quotes: Vec::new(),
             skip: None,
+            outline: Vec::new(),
+            frontmatter: None,
         }
     }
 
@@ -1116,10 +1387,16 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                     }
                 }
                 // A trailing `^block-id` is not part of the heading's name.
+                let text = self.plain_text(&text);
                 let name = strip_block_id(&text);
                 // Heading attributes are not enabled, so the parser never
                 // supplies an id; derive one so in-page links resolve.
                 let slug = self.unique_slug(name);
+                self.outline.push(FragmentHeading {
+                    level: level as u8,
+                    text: name.trim().to_owned(),
+                    id: slug.clone(),
+                });
                 self.heading_anchor = Some(slug.clone());
                 for item in body.into_iter().rev() {
                     self.replay.push_front(item);
@@ -1232,6 +1509,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                         _ => {}
                     }
                 }
+                let alt = self.plain_text(&alt);
                 let markup = self.render_embed(link_type, &dest_url, &title, &alt);
                 self.html(markup);
             }
@@ -1298,6 +1576,26 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                         )));
                         self.pending.extend(body);
                     }
+                }
+            }
+            Event::Start(Tag::MetadataBlock(kind)) => {
+                // The writer prints nothing inside a metadata block; keep its
+                // events so that stays its decision, and lift the text out.
+                let mut text = String::new();
+                self.pending
+                    .push_back(Event::Start(Tag::MetadataBlock(kind)));
+                while let Some((event, _)) = self.pull() {
+                    let end = matches!(event, Event::End(TagEnd::MetadataBlock(_)));
+                    if let Event::Text(value) = &event {
+                        text.push_str(value);
+                    }
+                    self.pending.push_back(event);
+                    if end {
+                        break;
+                    }
+                }
+                if self.frontmatter.is_none() {
+                    self.frontmatter = Some(text);
                 }
             }
             Event::Text(value) => self.push_text(value, range),
@@ -1535,13 +1833,18 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
         } else {
             alt_text
         };
-        let safe = sanitize_destination(CowStr::Borrowed(destination), false, link_type);
+        let safe = sanitize_destination(
+            CowStr::Borrowed(destination),
+            self.context.remote_media,
+            link_type,
+        );
         let found = match (&self.base, safe.as_ref()) {
             (_, "#") | (None, _) => None,
             (Some(base), dest) => {
                 let base = base.clone();
                 local_image_path(dest, &base)
                     .filter(|path| path.is_file())
+                    .and_then(|path| self.context.admit(&path))
                     .or_else(|| {
                         let decoded = percent_decode(dest)?;
                         let lower = decoded.to_ascii_lowercase();
@@ -1605,8 +1908,18 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
             .as_deref()
             .and_then(|path| self.context.images.embed(path))
             .unwrap_or(href);
+        // A remote picture is a request on the reader's behalf; it need not
+        // also tell the server which note asked for it.
+        let lower = src.to_ascii_lowercase();
+        let referrer =
+            if lower.starts_with("http:") || lower.starts_with("https:") || lower.starts_with("//")
+            {
+                " referrerpolicy=\"no-referrer\""
+            } else {
+                ""
+            };
         format!(
-            "<img src=\"{src}\" alt=\"{}\"{title_attr}{size_attrs} loading=\"lazy\" />",
+            "<img src=\"{src}\" alt=\"{}\"{title_attr}{size_attrs} loading=\"lazy\"{referrer} />",
             escape_html(alt_text)
         )
     }
@@ -1676,10 +1989,19 @@ impl<'a> Iterator for ExportEvents<'a, '_> {
 
     fn next(&mut self) -> Option<Event<'a>> {
         loop {
-            if let Some(event) = self.pending.pop_front() {
+            if let Some(event) = self.ready.pop_front() {
                 return Some(event);
             }
-            let (event, range) = self.pull()?;
+            if let Some(event) = self.pending.pop_front() {
+                self.balance_marks(event);
+                continue;
+            }
+            let Some((event, range)) = self.pull() else {
+                // A highlight still open at the end of the note closes here.
+                let run = self.mark.take()?;
+                self.ready.extend(place_marks(run));
+                continue;
+            };
             let Some((event, range)) = self.apply_skip(event, range) else {
                 continue;
             };
@@ -1688,13 +2010,190 @@ impl<'a> Iterator for ExportEvents<'a, '_> {
     }
 }
 
+impl<'a> ExportEvents<'a, '_> {
+    /// Collects each highlight's events so [`place_marks`] can see its whole
+    /// extent before any `<mark>` is written.
+    fn balance_marks(&mut self, event: Event<'a>) {
+        let opens = matches!(&event, Event::Html(m) if m.as_ref() == MARK_START_TAG);
+        let closes = matches!(&event, Event::Html(m) if m.as_ref() == MARK_END_TAG);
+        match &mut self.mark {
+            None if opens => self.mark = Some(Vec::new()),
+            // A close with nothing open marks nothing.
+            None if closes => {}
+            None => self.ready.push_back(event),
+            // Already inside a highlight: a second opener changes nothing.
+            Some(_) if opens => {}
+            Some(_) if closes => {
+                let run = self.mark.take().unwrap_or_default();
+                self.ready.extend(place_marks(run));
+            }
+            Some(run) => {
+                run.push(event);
+                // Bounds what is held back. Placing the marks for a prefix and
+                // carrying on with a fresh run is still well-nested — an
+                // element left open by the prefix is just one more crossing.
+                if run.len() >= MAX_HELD_MARK_EVENTS {
+                    let prefix = std::mem::take(run);
+                    self.ready.extend(place_marks(prefix));
+                }
+            }
+        }
+    }
+
+    /// Text collected from events, with this module's placeholders turned
+    /// back into what the author wrote: highlight markers dropped, and a
+    /// formula's index replaced by its LaTeX. Without this a heading's outline
+    /// entry carried private-use characters, and `# Euler \(e\)` slugged as
+    /// the formula's position in the note rather than its text.
+    fn plain_text(&self, text: &str) -> String {
+        if !text.contains(PLACEHOLDERS) {
+            return text.to_owned();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find(MATH_OPEN) {
+            out.extend(rest[..open].chars().filter(|c| !PLACEHOLDERS.contains(c)));
+            let after = &rest[open + MATH_OPEN.len_utf8()..];
+            let Some(close) = after.find(MATH_CLOSE) else {
+                rest = after;
+                break;
+            };
+            if let Some(token) = after[..close]
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| self.math.get(index))
+            {
+                out.push_str(&token.latex);
+            }
+            rest = &after[close + MATH_CLOSE.len_utf8()..];
+        }
+        out.extend(rest.chars().filter(|c| !PLACEHOLDERS.contains(c)));
+        out
+    }
+}
+
+const MARK_START_TAG: &str = "<mark>";
+const MARK_END_TAG: &str = "</mark>";
+/// Most events one highlight holds back before its marks are placed.
+const MAX_HELD_MARK_EVENTS: usize = 4096;
+
+/// Writes `<mark>` around a highlight's events so it nests properly.
+///
+/// A highlight's `==` delimiters are found by the editor's rules, which do
+/// not know CommonMark's: `_a==b_ c==` opens a highlight inside an emphasis
+/// and closes it outside. Writing the tags where the delimiters fell
+/// produced `<em>a<mark>b</em> c</mark>`, which a browser silently
+/// restructures. So the mark is split exactly where an element crosses its
+/// edge — one opened before the highlight began, or still open when it
+/// ends — and at block boundaries. An inline element wholly inside stays
+/// wrapped (`==**bold**==` is `<mark><strong>bold</strong></mark>`).
+fn place_marks(run: Vec<Event<'_>>) -> Vec<Event<'_>> {
+    // Which Start/End events pair up inside the run. Parser events nest, so
+    // an End with no open Start here closes something opened before the
+    // highlight, and a Start left on the stack is still open after it.
+    let mut paired = vec![false; run.len()];
+    let mut open = Vec::new();
+    for (index, event) in run.iter().enumerate() {
+        match event {
+            Event::Start(_) => open.push(index),
+            Event::End(_) => {
+                if let Some(start) = open.pop() {
+                    paired[start] = true;
+                    paired[index] = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::with_capacity(run.len() + 4);
+    let mut marked = false;
+    let mark = |out: &mut Vec<Event<'_>>, marked: &mut bool, on: bool| {
+        if *marked != on {
+            out.push(Event::Html(CowStr::Borrowed(if on {
+                MARK_START_TAG
+            } else {
+                MARK_END_TAG
+            })));
+            *marked = on;
+        }
+    };
+    for (index, event) in run.into_iter().enumerate() {
+        match &event {
+            Event::Start(tag) if paired[index] && is_inline_tag(tag) => {
+                mark(&mut out, &mut marked, true)
+            }
+            // Its Start opened the mark, which nothing inside could close.
+            Event::End(end) if paired[index] && is_inline_end(end) => {}
+            Event::Text(_)
+            | Event::Code(_)
+            | Event::FootnoteReference(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_) => mark(&mut out, &mut marked, true),
+            Event::Html(markup) | Event::InlineHtml(markup) => {
+                mark(&mut out, &mut marked, !is_block_markup(markup))
+            }
+            Event::SoftBreak | Event::HardBreak => {}
+            // Every other Start or End — crossing, or block-level — and
+            // rules and task boxes sit outside the mark.
+            _ => mark(&mut out, &mut marked, false),
+        }
+        out.push(event);
+    }
+    mark(&mut out, &mut marked, false);
+    out
+}
+
+fn is_inline_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::Link { .. }
+    )
+}
+
+fn is_inline_end(end: &TagEnd) -> bool {
+    matches!(
+        end,
+        TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript
+            | TagEnd::Link
+    )
+}
+
+/// Whether markup this module wrote is block-level (a callout, an embed,
+/// display math), and so cannot sit inside a `<mark>`.
+fn is_block_markup(markup: &str) -> bool {
+    let markup = markup.trim_start();
+    [
+        "<div",
+        "</div",
+        "<details",
+        "</details",
+        "<summary",
+        "</summary",
+        "<p>",
+        "<p ",
+        "</p>",
+    ]
+    .iter()
+    .any(|prefix| markup.starts_with(prefix))
+}
+
 /// Text with highlight placeholders and `#tags` turned into markup.
 fn push_rich<'a>(body: &str, pieces: &mut Vec<Event<'a>>) {
     let mut at = 0;
     for (index, character) in body.char_indices() {
         let markup = match character {
-            MARK_OPEN => "<mark>",
-            MARK_CLOSE => "</mark>",
+            MARK_OPEN => MARK_START_TAG,
+            MARK_CLOSE => MARK_END_TAG,
             _ => continue,
         };
         push_tagged(&body[at..index], pieces);
@@ -2000,9 +2499,9 @@ struct ImageEmbedder {
 }
 
 impl ImageEmbedder {
-    fn new() -> Self {
+    fn new(budget: usize) -> Self {
         Self {
-            remaining: MAX_EMBEDDED_TOTAL_BYTES,
+            remaining: budget,
             cache: HashMap::new(),
         }
     }

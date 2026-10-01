@@ -1,0 +1,11 @@
+[package]
+name = "markdev-vault"
+version.workspace = true
+edition.workspace = true
+description = "MarkDev vault indexing: notes, the link graph, tags, rename, and search"
+license.workspace = true
+
+[dependencies]
+markdev-md = { path = "../markdev-md" }
+pulldown-cmark.workspace = true
+serde.workspace = true

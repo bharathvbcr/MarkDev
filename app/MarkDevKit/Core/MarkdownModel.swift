@@ -2,7 +2,7 @@
 //  MarkdownModel.swift
 //  MarkDevKit
 //
-//  Swift-native mirrors of the flat model in core/src/md/model.rs.
+//  Swift-native mirrors of the flat model in core/crates/markdev-md/src/model.rs.
 //
 
 import Foundation
@@ -19,7 +19,7 @@ extension BlockDescriptor: RangedValue {}
 /// An inline construct carrying character attributes.
 ///
 /// Raw values are the FFI contract shared with `SpanKind` in
-/// `core/src/md/model.rs` — append cases, never renumber them.
+/// `core/crates/markdev-md/src/model.rs` — append cases, never renumber them.
 public enum SpanKind: UInt16, Sendable, CaseIterable {
     case emphasis = 0
     case strong = 1
@@ -46,7 +46,7 @@ public enum SpanKind: UInt16, Sendable, CaseIterable {
 
 /// A block construct that maps to a custom `NSTextLayoutFragment`.
 ///
-/// Raw values mirror `BlockKind` in `core/src/md/model.rs`.
+/// Raw values mirror `BlockKind` in `core/crates/markdev-md/src/model.rs`.
 public enum BlockKind: UInt16, Sendable, CaseIterable {
     case paragraph = 0
     case heading = 1
@@ -73,7 +73,7 @@ public enum BlockKind: UInt16, Sendable, CaseIterable {
 
 /// How a table column's cells sit in their column.
 ///
-/// Mirrors `TableAlignment` in `core/src/md/model.rs`, packed into a
+/// Mirrors `TableAlignment` in `core/crates/markdev-md/src/model.rs`, packed into a
 /// `tableCell` block's `data` alongside the column index.
 public enum TableAlignment: UInt32, Sendable, CaseIterable {
     /// No `:` in the delimiter row. Lays out left, but stays distinct from an
@@ -90,7 +90,7 @@ public enum TableAlignment: UInt32, Sendable, CaseIterable {
 
 /// Callout flavour, carried in the low byte of a callout block's `data`.
 ///
-/// Mirrors `CalloutKind` in `core/src/md/model.rs`: GitHub's five alerts,
+/// Mirrors `CalloutKind` in `core/crates/markdev-md/src/model.rs`: GitHub's five alerts,
 /// then Obsidian's built-in types. Aliases (`summary`, `faq`, `error`, …) and
 /// custom types are mapped by the parser; append cases, never renumber.
 public enum CalloutKind: UInt32, Sendable, CaseIterable {

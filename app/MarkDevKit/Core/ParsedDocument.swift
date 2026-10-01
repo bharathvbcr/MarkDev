@@ -154,7 +154,7 @@ public struct ParsedDocument: Sendable, Equatable {
 
     /// The markers overlapping `range`, as an index range into ``markers``.
     ///
-    /// The core sorts markers by start offset (`core/src/md/parse.rs`), and the
+    /// The core sorts markers by start offset (`core/crates/markdev-md/src/parse.rs`), and the
     /// incremental parser's shift preserves that order, so the window can be
     /// found by binary search. Callers that ask this per block — the code-fence
     /// highlighter does — would otherwise scan every marker in the document for
@@ -561,7 +561,7 @@ extension ParsedDocument {
 
         /// Spans and markers only.
         ///
-        /// `core/src/md/parse.rs` sorts both explicitly by `(start, end)`
+        /// `core/crates/markdev-md/src/parse.rs` sorts both explicitly by `(start, end)`
         /// before handing them over, so the tie-break is part of their
         /// contract and worth asserting.
         private static func isSortedByStartThenEnd<T: RangedValue>(_ values: [T]) -> Bool {

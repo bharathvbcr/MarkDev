@@ -13,8 +13,8 @@ use markdev::md::{
 #[test]
 fn panic_on_rejection_parse_is_not_exported_to_untrusted_callers() {
     let crate_root = include_str!("../src/lib.rs");
-    let markdown_module = include_str!("../src/md/mod.rs");
-    let parser = include_str!("../src/md/parse.rs");
+    let markdown_module = include_str!("../crates/markdev-md/src/lib.rs");
+    let parser = include_str!("../crates/markdev-md/src/parse.rs");
 
     assert!(
         !crate_root.contains("pub use md::{parse,"),

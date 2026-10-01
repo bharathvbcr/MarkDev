@@ -276,11 +276,21 @@ name = "markdev"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "markdev-highlight",
+ "markdev-html",
+ "markdev-md",
+ "markdev-vault",
  "proptest",
  "pulldown-cmark",
- "pulldown-latex",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "markdev-highlight"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-highlight",
@@ -289,6 +299,34 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-swift",
+]
+
+[[package]]
+name = "markdev-html"
+version = "0.1.0"
+dependencies = [
+ "markdev-md",
+ "pulldown-cmark",
+ "pulldown-latex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "markdev-md"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+ "serde",
+]
+
+[[package]]
+name = "markdev-vault"
+version = "0.1.0"
+dependencies = [
+ "markdev-md",
+ "pulldown-cmark",
+ "serde",
 ]
 
 [[package]]

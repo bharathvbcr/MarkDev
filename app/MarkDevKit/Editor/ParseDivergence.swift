@@ -47,7 +47,7 @@ enum ParseDivergence {
     /// How much of the parse can have changed.
     enum Depth {
         /// The core proved the edit could not change structure and only moved
-        /// offsets — see `Document::apply` in `core/src/md/incremental.rs`.
+        /// offsets — see `Document::apply` in `core/crates/markdev-md/src/incremental.rs`.
         /// The spans and markers are then the old ones with new numbers on
         /// them, by construction, so only the blocks are worth comparing.
         case offsetsOnly

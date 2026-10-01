@@ -12,7 +12,7 @@ import AppKit
 #endif
 
 /// A highlighted token class. Mirrors `HighlightKind` in
-/// `core/src/highlight/mod.rs` — append cases, never renumber.
+/// `core/crates/markdev-highlight/src/lib.rs` — append cases, never renumber.
 public enum HighlightKind: UInt16, Sendable, CaseIterable {
     case keyword = 0
     case string = 1

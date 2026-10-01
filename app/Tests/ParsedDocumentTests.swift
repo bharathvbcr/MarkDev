@@ -278,7 +278,7 @@ final class ParsedDocumentTests: XCTestCase {
     ///
     /// The bridge validates the core's arrays before trusting them, and its
     /// ordering check was written once for all three. Spans and markers *are*
-    /// sorted by `(start, end)` — `core/src/md/parse.rs` sorts them explicitly
+    /// sorted by `(start, end)` — `core/crates/markdev-md/src/parse.rs` sorts them explicitly
     /// — but `blocks` is never sorted at all: a descriptor is pushed when its
     /// construct opens, so a container precedes its contents and, at a shared
     /// start, ends *later* than the child that follows it.

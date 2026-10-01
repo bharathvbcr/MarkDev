@@ -865,7 +865,7 @@ fn delimiter_run(source: &str, range: &Range<usize>, byte: u8) -> usize {
 /// The two pulldown rules — non-space after the opener, non-space before
 /// the closer — are re-checked rather than trusted, so this function stays
 /// correct even if the upstream pairing ever loosens.
-pub(crate) fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub fn inline_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$` at both ends with something between, and both
     // ends on character boundaries so the adjacency reads below cannot slice
@@ -948,7 +948,7 @@ fn crosses_link_destination(bytes: &[u8], content: Range<usize>) -> bool {
 /// own lines ends at a newline or the end of the document and passes
 /// untouched; so does inline display math between words (`text $$x$$ more`),
 /// which notes in the wild rely on.
-pub(crate) fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
+pub fn display_math_is_valid(source: &str, range: &Range<usize>) -> bool {
     let bytes = source.as_bytes();
     // Structural sanity: `$$` at both ends with something between, on
     // character boundaries, for the same reason the inline check insists.
@@ -1215,6 +1215,7 @@ fn collect_delimited_math(
         return Ok(());
     }
     let occupied = occupied_byte_ranges(mapper, result);
+    let mut innermost = InnermostCursor::new(result);
     let mut i = 0;
     let mut added_block = false;
     while i < bytes.len() {
@@ -1228,7 +1229,15 @@ fn collect_delimited_math(
             continue;
         }
 
-        let taken = take_delimited_math(source, mapper, result, &occupied, i, &mut added_block)?;
+        let taken = take_delimited_math(
+            source,
+            mapper,
+            result,
+            &occupied,
+            &mut innermost,
+            i,
+            &mut added_block,
+        )?;
         i = if taken > i { taken } else { i + 1 };
     }
     if added_block {
@@ -1242,6 +1251,7 @@ fn take_delimited_math(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
     occupied: &[(usize, usize)],
+    innermost: &mut InnermostCursor,
     i: usize,
     added_block: &mut bool,
 ) -> Result<usize, ParseError> {
@@ -1272,11 +1282,32 @@ fn take_delimited_math(
         if crosses_link_destination(bytes, inner_start..inner_end) {
             continue;
         }
+        // A formula lives inside one block. `\[` in a paragraph and `\]`
+        // inside the quote below it claimed a range that overlapped the
+        // quote without containing it, and the block list stopped nesting —
+        // which everything reading it assumes.
+        if innermost.crosses_boundary(result, mapper.to_utf16(i), mapper.to_utf16(full_end)) {
+            continue;
+        }
         if display {
-            emit_delimited_math_block(mapper, result, i..full_end, opener.len(), closer.len())?;
+            emit_delimited_math_block(
+                mapper,
+                result,
+                innermost,
+                i..full_end,
+                opener.len(),
+                closer.len(),
+            )?;
             *added_block = true;
         } else {
-            emit_delimited_math_span(mapper, result, i..full_end, opener.len(), closer.len())?;
+            emit_delimited_math_span(
+                mapper,
+                result,
+                innermost,
+                i..full_end,
+                opener.len(),
+                closer.len(),
+            )?;
         }
         return Ok(full_end);
     }
@@ -1300,13 +1331,14 @@ fn find_math_closer(bytes: &[u8], from: usize, closer: &[u8], display: bool) -> 
 fn emit_delimited_math_span(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
+    innermost: &mut InnermostCursor,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
 ) -> Result<(), ParseError> {
     let inner = range.start + opener_len..range.end - closer_len;
     let utf = mapper.to_utf16(range.start);
-    let owner = innermost_block(result, utf).unwrap_or(0) as u32;
+    let owner = innermost.at(result, utf).unwrap_or(0) as u32;
     push_span(result, mapper, &inner, SpanKind::InlineMath, 0, 0)?;
     mark(result, mapper, range.start..range.start + opener_len, owner)?;
     mark(result, mapper, range.end - closer_len..range.end, owner)
@@ -1315,12 +1347,13 @@ fn emit_delimited_math_span(
 fn emit_delimited_math_block(
     mapper: &Utf16Mapper,
     result: &mut ParseAccumulator,
+    innermost: &mut InnermostCursor,
     range: Range<usize>,
     opener_len: usize,
     closer_len: usize,
 ) -> Result<(), ParseError> {
     let utf_start = mapper.to_utf16(range.start);
-    let enclosing = innermost_block(result, utf_start);
+    let enclosing = innermost.at(result, utf_start);
     let depth = enclosing
         .map(|i| result.blocks[i].depth.saturating_add(1))
         .unwrap_or(0);
@@ -1633,63 +1666,37 @@ fn verbatim_byte_ranges(mapper: &Utf16Mapper, result: &ParseResult) -> Vec<Range
 }
 
 /// The innermost block containing each byte position, in one sweep.
-///
-/// Blocks nest, so after sorting by start a stack of open blocks always has
-/// the innermost one on top.
 fn block_owners(
     mapper: &Utf16Mapper,
     result: &ParseResult,
     positions: &[usize],
 ) -> Vec<Option<usize>> {
-    let mut order: Vec<usize> = (0..result.blocks.len()).collect();
-    order.sort_by_key(|&i| {
-        let b = &result.blocks[i];
-        (b.start, std::cmp::Reverse(b.end), i)
-    });
     let mut queries: Vec<(u32, usize)> = positions
         .iter()
         .enumerate()
         .map(|(q, &byte)| (mapper.to_utf16(byte), q))
         .collect();
     queries.sort_unstable();
-
     let mut owners = vec![None; positions.len()];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut next = 0;
+    let mut innermost = InnermostCursor::new(result);
     for (at, q) in queries {
-        while next < order.len() && result.blocks[order[next]].start <= at {
-            let block = &result.blocks[order[next]];
-            while stack
-                .last()
-                .is_some_and(|&top| result.blocks[top].end <= block.start)
-            {
-                stack.pop();
-            }
-            stack.push(order[next]);
-            next += 1;
-        }
-        while stack
-            .last()
-            .is_some_and(|&top| result.blocks[top].end <= at)
-        {
-            stack.pop();
-        }
-        owners[q] = stack
-            .iter()
-            .rev()
-            .find(|&&i| result.blocks[i].start <= at && at < result.blocks[i].end)
-            .copied();
+        owners[q] = innermost.at(result, at);
     }
     owners
 }
 
+/// The innermost block containing a UTF-16 offset, by scanning every block.
+/// The specification [`InnermostCursor`] is tested against: smallest
+/// containing range, and among identical ranges the deepest — the last in
+/// the parser's pre-order.
+#[cfg(test)]
 fn innermost_block(result: &ParseResult, utf16: u32) -> Option<usize> {
     result
         .blocks
         .iter()
         .enumerate()
         .filter(|(_, b)| b.start <= utf16 && utf16 < b.end)
-        .min_by_key(|(_, b)| b.end.saturating_sub(b.start))
+        .min_by_key(|&(i, b)| (b.end.saturating_sub(b.start), std::cmp::Reverse(i)))
         .map(|(i, _)| i)
 }
 
@@ -1742,12 +1749,116 @@ fn occupied_byte_ranges(mapper: &Utf16Mapper, result: &ParseResult) -> Vec<(usiz
     out
 }
 
+/// Whether `pos` lies in one of `occupied`'s intervals.
+///
+/// `occupied` is [`occupied_byte_ranges`]'s output: sorted, merged, and so
+/// disjoint, which is what makes a binary search exact. A linear scan here
+/// ran once per backslash in the document, so a note with many code spans
+/// and many backslashes went quadratic.
 fn range_is_occupied(occupied: &[(usize, usize)], pos: usize) -> bool {
-    occupied.iter().any(|&(s, e)| pos >= s && pos < e)
+    let after = occupied.partition_point(|&(s, _)| s <= pos);
+    after > 0 && pos < occupied[after - 1].1
 }
 
+/// Whether `start..end` overlaps one of `occupied`'s disjoint, sorted
+/// intervals. Only the last interval starting before `end` can: any earlier
+/// one ends before that one starts.
 fn range_overlaps(occupied: &[(usize, usize)], start: usize, end: usize) -> bool {
-    occupied.iter().any(|&(s, e)| start < e && end > s)
+    let before_end = occupied.partition_point(|&(s, _)| s < end);
+    before_end > 0 && occupied[before_end - 1].1 > start
+}
+
+/// The innermost block containing a position, for positions visited in
+/// increasing order — the one sweep both [`block_owners`] and the
+/// delimited-math pass use.
+///
+/// Blocks nest, so after sorting by start a stack of open blocks always has
+/// the innermost one on top: amortised O(1) per query. The math pass used to
+/// scan every block once per formula instead, and since each `\[…\]` adds a
+/// block, a note of N display formulas cost O(N²) — 1.1 s for 128 KiB of
+/// them where pulldown-cmark took 2 ms.
+///
+/// Blocks pushed after the cursor was built (the math blocks that pass adds)
+/// are not seen, which is exact there: each ends where the scan resumes, so
+/// it contains no later position. A query that moves backwards restarts the
+/// sweep rather than answering from a stack that has moved past it.
+struct InnermostCursor {
+    /// Block indices by start, outer before inner; among identical ranges
+    /// the later (deeper, in pre-order) one is pushed last, so it is on top.
+    order: Vec<usize>,
+    next: usize,
+    stack: Vec<usize>,
+    last: u32,
+}
+
+impl InnermostCursor {
+    fn new(result: &ParseResult) -> Self {
+        let mut order: Vec<usize> = (0..result.blocks.len()).collect();
+        order.sort_by_key(|&i| {
+            let b = &result.blocks[i];
+            (b.start, std::cmp::Reverse(b.end), i)
+        });
+        Self {
+            order,
+            next: 0,
+            stack: Vec::new(),
+            last: 0,
+        }
+    }
+
+    fn at(&mut self, result: &ParseResult, utf16: u32) -> Option<usize> {
+        if utf16 < self.last {
+            self.next = 0;
+            self.stack.clear();
+        }
+        self.last = utf16;
+        let blocks = &result.blocks;
+        while let Some(&index) = self
+            .order
+            .get(self.next)
+            .filter(|&&i| blocks[i].start <= utf16)
+        {
+            self.next += 1;
+            while self
+                .stack
+                .last()
+                .is_some_and(|&top| blocks[top].end <= blocks[index].start)
+            {
+                self.stack.pop();
+            }
+            self.stack.push(index);
+        }
+        while self
+            .stack
+            .last()
+            .is_some_and(|&top| blocks[top].end <= utf16)
+        {
+            self.stack.pop();
+        }
+        // The top contains `utf16` whenever blocks nest; searching down
+        // keeps the answer right even for a pair that merely overlaps.
+        self.stack
+            .iter()
+            .rev()
+            .find(|&&i| blocks[i].start <= utf16 && utf16 < blocks[i].end)
+            .copied()
+    }
+
+    /// Whether a construct over `start..end` would cross a block boundary:
+    /// run past the end of the innermost block holding `start`, or contain
+    /// the start of another block.
+    fn crosses_boundary(&mut self, result: &ParseResult, start: u32, end: u32) -> bool {
+        let blocks = &result.blocks;
+        if let Some(owner) = self.at(result, start) {
+            if end > blocks[owner].end {
+                return true;
+            }
+        }
+        let after = self.order.partition_point(|&i| blocks[i].start <= start);
+        self.order
+            .get(after)
+            .is_some_and(|&i| blocks[i].start < end)
+    }
 }
 
 /// pulldown-cmark consumes link reference definitions and emits no event for
@@ -2289,5 +2400,185 @@ mod limit_tests {
         }
         assert_eq!(count, MAX_PARSE_EVENTS);
         assert_eq!(charge_event(&mut count), Err(ParseError::TooManyEvents));
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// Deterministic documents over a construct-heavy alphabet, so a failure
+    /// reproduces from its seed alone.
+    fn documents(count: usize) -> Vec<String> {
+        const TOKENS: &[&str] = &[
+            "# ",
+            "> ",
+            ">",
+            "- ",
+            "  - ",
+            "1. ",
+            "\\[x\\]",
+            "\\(y\\)",
+            "\\\\[z\\\\]",
+            "$$w$$",
+            "$v$",
+            "```\n",
+            "~~~\n",
+            "`c`",
+            "| a | b |\n|-|-|\n| 1 | 2 |\n",
+            "[!NOTE]",
+            "**",
+            "_",
+            "[l](u)",
+            "[[w]]",
+            "<div>",
+            "---\n",
+            "\n",
+            "\n\n",
+            " ",
+            "text",
+            "\\",
+            "é",
+            "😀",
+            "[^1]",
+            "[^1]: n\n",
+            "[r]: /x\n",
+            "%%c%%",
+            "^[n]",
+            "- [ ] ",
+            "==h==",
+            "\r\n",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..count)
+            .map(|_| {
+                let len = (next() % 120) as usize;
+                (0..len)
+                    .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_cursor_answers_exactly_what_a_full_scan_does() {
+        let mut checked = 0usize;
+        for (seed, source) in documents(1_500).iter().enumerate() {
+            let Ok(parsed) = parse_checked(source) else {
+                continue;
+            };
+            let len = Utf16Mapper::new(source).len_utf16();
+            let mut cursor = InnermostCursor::new(&parsed);
+            for at in 0..=len {
+                let (swept, scanned) = (cursor.at(&parsed, at), innermost_block(&parsed, at));
+                assert_eq!(
+                    swept,
+                    scanned,
+                    "seed {seed}, offset {at}: swept {:?}, scanned {:?}",
+                    swept.map(|i| parsed.blocks[i]),
+                    scanned.map(|i| parsed.blocks[i]),
+                );
+                checked += 1;
+            }
+            // Backwards and repeated queries restart rather than misanswer.
+            for at in (0..=len).rev().step_by(3) {
+                assert_eq!(cursor.at(&parsed, at), innermost_block(&parsed, at));
+            }
+        }
+        // Guard against a generator that stopped producing parseable input:
+        // a differential test over nothing passes vacuously.
+        assert!(checked > 50_000, "only {checked} positions compared");
+    }
+
+    #[test]
+    fn blocks_always_nest() {
+        // The contract every reader of the block list assumes. Found broken
+        // by the cursor's differential test: a `\[…\]` formula claimed across
+        // a quote's opening line overlapped the quote without containing it.
+        let mut compared = 0usize;
+        for (seed, source) in documents(1_500).iter().enumerate() {
+            let Ok(parsed) = parse_checked(source) else {
+                continue;
+            };
+            for (index, x) in parsed.blocks.iter().enumerate() {
+                for y in &parsed.blocks[index + 1..] {
+                    let disjoint = x.end <= y.start || y.end <= x.start;
+                    let nested = (x.start <= y.start && y.end <= x.end)
+                        || (y.start <= x.start && x.end <= y.end);
+                    assert!(
+                        disjoint || nested,
+                        "seed {seed}: {x:?} overlaps {y:?} in {source:?}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 10_000, "only {compared} block pairs compared");
+    }
+
+    #[test]
+    fn a_delimited_formula_stays_inside_one_block() {
+        let kinds = |source: &str| {
+            let parsed = parse_checked(source).unwrap();
+            (
+                parsed
+                    .blocks
+                    .iter()
+                    .any(|b| b.kind == BlockKind::MathBlock as u16),
+                parsed
+                    .spans
+                    .iter()
+                    .any(|s| s.kind == SpanKind::InlineMath as u16),
+            )
+        };
+        // Across a quote's opening, a list item, a blank line, table cells.
+        assert_eq!(kinds("\\[a\n> b\\]"), (false, false));
+        assert_eq!(kinds("x \\[a\n- b\\]"), (false, false));
+        assert_eq!(kinds("\\[a\n\nb\\]"), (false, false));
+        assert_eq!(kinds("| \\(a | b\\) |\n|-|-|\n"), (false, false));
+        // Within one block it is still a formula.
+        assert_eq!(kinds("\\[a\nb\\]"), (true, false));
+        assert_eq!(kinds("> \\[a\n> b\\]"), (true, false));
+        assert_eq!(kinds("x \\(y\\) z"), (false, true));
+        assert_eq!(kinds("| \\(a\\) | b |\n|-|-|\n"), (false, true));
+    }
+
+    #[test]
+    fn binary_searches_answer_what_linear_scans_do() {
+        let mut nonempty = 0usize;
+        for source in documents(400) {
+            let Ok(parsed) = parse_checked(&source) else {
+                continue;
+            };
+            let mapper = Utf16Mapper::new(&source);
+            let occupied = occupied_byte_ranges(&mapper, &parsed);
+            nonempty += usize::from(!occupied.is_empty());
+            let inside = |p: usize| occupied.iter().any(|&(s, e)| p >= s && p < e);
+            let overlaps = |a: usize, b: usize| occupied.iter().any(|&(s, e)| a < e && b > s);
+            for start in 0..=source.len() {
+                assert_eq!(
+                    range_is_occupied(&occupied, start),
+                    inside(start),
+                    "{source:?} @{start}"
+                );
+                for end in start..=(start + 6).min(source.len()) {
+                    assert_eq!(
+                        range_overlaps(&occupied, start, end),
+                        overlaps(start, end),
+                        "{source:?} {start}..{end}"
+                    );
+                }
+            }
+        }
+        assert!(
+            nonempty > 200,
+            "only {nonempty} documents had occupied ranges"
+        );
     }
 }

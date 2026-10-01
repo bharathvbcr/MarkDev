@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::html::{
-    encode_path_component, render_document, render_document_with_options, ExportOptions, LinkBase,
-    SiteLayout, MAX_SOURCE_BYTES,
+use crate::{
+    encode_path_component, render_document, render_document_with_options, ExportOptions,
+    FileAccess, LinkBase, SiteLayout, MAX_SOURCE_BYTES,
 };
 
 /// Most notes one site export renders.
@@ -102,6 +102,9 @@ pub fn export_site(vault_root: &Path, output_root: &Path) -> Result<SiteReport, 
                 vault_root: &vault,
                 output_root: &output,
             }),
+            file_access: FileAccess::Unrestricted,
+            remote_media: false,
+            max_embedded_bytes: None,
         };
         let html = match render_document_with_options(&source, &title, &options) {
             Ok(html) => html,

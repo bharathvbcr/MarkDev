@@ -12,7 +12,13 @@ prefix = "MD"
 include = ["StyleSpan", "SyntaxMarker", "BlockDescriptor"]
 
 [parse]
-parse_deps = false
+# The FFI structs and every module's limits now live in the module crates.
+# `include` makes cbindgen parse them; `extra_bindings` makes it emit their
+# top-level items (the `#define` limits Swift reads), which it otherwise does
+# only for the binding crate itself.
+parse_deps = true
+include = ["markdev-md", "markdev-highlight", "markdev-html", "markdev-vault"]
+extra_bindings = ["markdev-md", "markdev-highlight", "markdev-html", "markdev-vault"]
 
 [enum]
 prefix_with_name = true
