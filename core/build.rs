@@ -20,7 +20,7 @@ fn generate_header() {
     let out = crate_dir.join("include").join("markdev.h");
 
     println!("cargo:rerun-if-changed=src/ffi.rs");
-    println!("cargo:rerun-if-changed=src/md/model.rs");
+    println!("cargo:rerun-if-changed=crates/markdev-md/src/model.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
     if let Err(e) = std::fs::create_dir_all(out.parent().expect("include dir")) {

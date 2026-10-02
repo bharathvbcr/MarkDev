@@ -28,7 +28,9 @@ use crate::highlight::{
     highlight_checked, supports_checked, HighlightSpan, MAX_HIGHLIGHT_CODE_BYTES,
     MAX_HIGHLIGHT_LANGUAGE_BYTES,
 };
-use crate::html::{render_document, render_document_with_options, ExportOptions, LinkBase};
+use crate::html::{
+    render_document, render_document_with_options, ExportOptions, FileAccess, LinkBase,
+};
 use crate::md::{
     parse_checked, BlockDescriptor, Document, ParseResult, Reparse, StyleSpan, SyntaxMarker,
     MAX_DOCUMENT_BYTES,
@@ -304,6 +306,10 @@ pub unsafe extern "C" fn md_html_render_with_base(
         vault_root: (!vault.is_empty() && !base.is_empty()).then(|| Path::new(vault)),
         link_base,
         site: None,
+        // The user's own vault, exported by the user: today's behaviour.
+        file_access: FileAccess::Unrestricted,
+        remote_media: false,
+        max_embedded_bytes: None,
     };
     let Ok(html) = render_document_with_options(source, title, &options) else {
         return ptr::null_mut();

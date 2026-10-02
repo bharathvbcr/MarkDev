@@ -19,7 +19,7 @@ import Foundation
 /// — the marker rule already covers a fence's opening and closing lines, a
 /// frontmatter block's `---`, and an indented block's indentation, which are
 /// three patterns to recognise but one gap in the parse. See the module docs in
-/// `core/src/md/parse.rs`.
+/// `core/crates/markdev-md/src/parse.rs`.
 public enum CodeBlockSource {
     /// The code inside `block`, excluding its delimiter lines.
     ///

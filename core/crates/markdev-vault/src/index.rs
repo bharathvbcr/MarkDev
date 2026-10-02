@@ -64,7 +64,7 @@ pub const DEFAULT_MAX_VAULT_BYTES: usize = 256 * 1_048_576;
 /// Accepts only a non-empty lexical path made entirely of normal relative
 /// components. Filesystem mutation and in-memory mutation share this owner so
 /// a caller cannot insert a path the rename boundary would later refuse.
-pub(crate) fn validated_relative_path(value: &str) -> Option<&Path> {
+pub fn validated_relative_path(value: &str) -> Option<&Path> {
     if value.is_empty() || value.contains('\0') {
         return None;
     }
@@ -444,7 +444,7 @@ impl Vault {
                 .iter()
                 .map(|heading| (heading.level, heading.text.as_str()))
                 .collect();
-            crate::md::obsidian::heading_path_index(&outline, anchor)
+            markdev_md::obsidian::heading_path_index(&outline, anchor)
                 .map(|index| note.headings[index].offset)
         });
         Some(Resolution {
@@ -1019,8 +1019,8 @@ fn block_offset(text: &str, id: &str) -> Option<u32> {
     if id.is_empty() {
         return None;
     }
-    let literal = crate::md::obsidian::verbatim_ranges(text);
-    crate::md::obsidian::block_ids(text, &literal)
+    let literal = markdev_md::obsidian::verbatim_ranges(text);
+    markdev_md::obsidian::block_ids(text, &literal)
         .into_iter()
         .find(|block| text[block.id.clone()].eq_ignore_ascii_case(id))
         .map(|block| {

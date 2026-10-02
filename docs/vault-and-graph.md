@@ -14,8 +14,8 @@ The list persists across launches and is shared by all windows. Missing folders 
 
 ## Index and link resolution
 
-The Rust [note parser](../core/src/vault/note.rs) extracts metadata, headings,
-links, and tags. [Vault](../core/src/vault/index.rs) owns resolution, backlinks,
+The Rust [note parser](../core/crates/markdev-vault/src/note.rs) extracts metadata, headings,
+links, and tags. [Vault](../core/crates/markdev-vault/src/index.rs) owns resolution, backlinks,
 unlinked mentions, and the search index. Swift's `VaultIndex` coordinates disk
 scans and UI updates. Vault query data crosses the C ABI as JSON; editor parse
 records use flat structures.
@@ -55,7 +55,7 @@ See [architecture](architecture.md) for the I/O and recovery boundaries.
 
 ## Graph behavior
 
-[Graph::build](../core/src/vault/graph.rs) constructs adjacency, applies focus,
+[Graph::build](../core/crates/markdev-vault/src/graph.rs) constructs adjacency, applies focus,
 depth, tag, and folder filters, and computes a deterministic force-directed
 layout. Nodes start on a golden-angle spiral and use 220 iterations of pairwise
 repulsion and edge attraction. This is an O(n²) repulsion pass, not Barnes–Hut.

@@ -2,10 +2,10 @@
 
 use pulldown_cmark::{Event, LinkType, MetadataBlockKind, Parser, Tag, TagEnd};
 
-use crate::md::obsidian;
+use markdev_md::obsidian;
 use serde::{Deserialize, Serialize};
 
-use crate::md::parse::{options, scan_tags};
+use markdev_md::parse::{options, scan_tags};
 
 /// Markdown extensions the vault treats as notes — same set as the scanner.
 pub const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mdx", "mkd"];

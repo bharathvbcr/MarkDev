@@ -1,0 +1,10 @@
+[package]
+name = "markdev-md"
+version.workspace = true
+edition.workspace = true
+description = "MarkDev's Markdown dialect: the flat, UTF-16-indexed parse model the editor renders from"
+license.workspace = true
+
+[dependencies]
+pulldown-cmark.workspace = true
+serde.workspace = true
