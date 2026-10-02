@@ -623,6 +623,46 @@ fn remote_pictures_load_only_when_asked_and_never_send_a_referrer() {
     assert!(hostile.contains("src=\"#\""), "{hostile}");
 }
 
+#[test]
+fn a_withheld_remote_embed_says_so_and_a_refused_one_does_not() {
+    // Both render as `src="#"`; only the one `remote_media` held back carries
+    // its address, so an embedder can tell "not loaded here" from "refused".
+    let off = html(
+        "![a](https://e.com/p.png?a=1&b=\"2\") ![b](//e.com/q.png) ![c]( HTTPS://e.com/r.png ) \
+         ![d](javascript:alert(1)) ![e](data:image/png;base64,AAAA) ![f](local.png) \
+         ![g](https://e.com/a.mp3) ![[https://e.com/v.mp4]]",
+    );
+    for (address, withheld) in [
+        ("https://e.com/p.png?a=1&amp;b=&quot;2&quot;", true),
+        ("//e.com/q.png", true),
+        ("HTTPS://e.com/r.png", true),
+        ("https://e.com/a.mp3", true),
+        ("https://e.com/v.mp4", true),
+    ] {
+        assert_eq!(
+            off.contains(&format!("data-withheld-src=\"{address}\"")),
+            withheld,
+            "{address}: {off}"
+        );
+    }
+    assert_eq!(off.matches("data-withheld-src=").count(), 5, "{off}");
+    assert!(off.contains("<img src=\"#\" alt=\"d\""), "{off}");
+    assert!(off.contains("<img src=\"#\" alt=\"e\""), "{off}");
+    audit(&off).unwrap();
+
+    let on = render_fragment(
+        "![a](https://e.com/p.png) ![d](javascript:alert(1))",
+        &ExportOptions {
+            file_access: FileAccess::None,
+            remote_media: true,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .html;
+    assert!(!on.contains("data-withheld-src"), "{on}");
+}
+
 // ---------------------------------------------------------------------------
 // File access.
 // ---------------------------------------------------------------------------

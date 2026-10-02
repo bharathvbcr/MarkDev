@@ -92,6 +92,11 @@ pub struct ExportOptions<'a> {
     /// default: a remote picture is a request the reader never made, which a
     /// shared note can use as a beacon. Links are unaffected — following one
     /// takes a click. Remote pictures are always sent without a referrer.
+    ///
+    /// Off, a remote embed renders with `src="#"` — the value a refused
+    /// scheme also gets — plus `data-withheld-src` carrying its address, so
+    /// an embedder can tell the two apart and say which picture was held
+    /// back. A `data-` attribute is never fetched.
     pub remote_media: bool,
     /// Most raw picture bytes the render copies in, across every picture;
     /// `None` is [`MAX_EMBEDDED_TOTAL_BYTES`], sized for a one-off export. A
@@ -1879,15 +1884,22 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
         } else {
             format!(" title=\"{}\"", escape_html(title))
         };
+        // Withheld by `remote_media`, not refused for its scheme: say so, and
+        // keep the address as inert data for the embedder to report.
+        let withheld = if !self.context.remote_media && is_remote(destination) {
+            format!(" data-withheld-src=\"{}\"", escape_html(destination))
+        } else {
+            String::new()
+        };
 
         if obsidian::is_audio_target(destination) {
             return format!(
-                "<audio class=\"media-embed\" controls src=\"{href}\"{title_attr}></audio>"
+                "<audio class=\"media-embed\" controls src=\"{href}\"{withheld}{title_attr}></audio>"
             );
         }
         if obsidian::is_video_target(destination) {
             return format!(
-                "<video class=\"media-embed\" controls src=\"{href}\"{size_attrs}{title_attr}></video>"
+                "<video class=\"media-embed\" controls src=\"{href}\"{withheld}{size_attrs}{title_attr}></video>"
             );
         }
         if destination
@@ -1919,7 +1931,7 @@ impl<'a, 'c> ExportEvents<'a, 'c> {
                 ""
             };
         format!(
-            "<img src=\"{src}\" alt=\"{}\"{title_attr}{size_attrs} loading=\"lazy\"{referrer} />",
+            "<img src=\"{src}\"{withheld} alt=\"{}\"{title_attr}{size_attrs} loading=\"lazy\"{referrer} />",
             escape_html(alt_text)
         )
     }
@@ -2457,11 +2469,7 @@ fn sanitize_destination<'a>(
         return destination;
     }
 
-    let compact: String = destination
-        .chars()
-        .filter(|character| !character.is_ascii_control() && !character.is_ascii_whitespace())
-        .collect();
-    let lower = compact.to_ascii_lowercase();
+    let lower = compact_lower(&destination);
 
     // Protocol-relative image URLs also perform a network request. Links may
     // navigate there only after an explicit click.
@@ -2469,12 +2477,7 @@ fn sanitize_destination<'a>(
         return CowStr::Borrowed("#");
     }
 
-    let scheme = lower.find(':').and_then(|colon| {
-        let boundary = lower.find(['/', '?', '#']).unwrap_or(usize::MAX);
-        (colon < boundary).then_some(&lower[..colon])
-    });
-
-    let allowed = match scheme {
+    let allowed = match scheme_of(&lower) {
         None => true,
         Some("http" | "https") => allow_remote,
         Some("mailto" | "file") => true,
@@ -2485,6 +2488,33 @@ fn sanitize_destination<'a>(
     } else {
         CowStr::Borrowed("#")
     }
+}
+
+/// Whether `destination` is a network address — `http(s):` or a
+/// protocol-relative `//host` — read the way [`sanitize_destination`] reads
+/// it, so the two can never disagree about what `remote_media` withheld.
+fn is_remote(destination: &str) -> bool {
+    let lower = compact_lower(destination);
+    lower.starts_with("//") || matches!(scheme_of(&lower), Some("http" | "https"))
+}
+
+/// `destination` lowercased, without the ASCII controls and whitespace a
+/// browser drops from a URL before reading its scheme.
+fn compact_lower(destination: &str) -> String {
+    destination
+        .chars()
+        .filter(|character| !character.is_ascii_control() && !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// The scheme of a [`compact_lower`]ed destination: what precedes the first
+/// `:`, when that comes before any `/`, `?` or `#`.
+fn scheme_of(lower: &str) -> Option<&str> {
+    lower.find(':').and_then(|colon| {
+        let boundary = lower.find(['/', '?', '#']).unwrap_or(usize::MAX);
+        (colon < boundary).then_some(&lower[..colon])
+    })
 }
 
 /// Copies local pictures into the export as `data:` URIs.
