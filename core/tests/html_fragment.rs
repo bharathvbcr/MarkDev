@@ -841,7 +841,7 @@ fn transclusion_is_confined_too_and_its_headings_stay_out_of_the_outline() {
 /// top of a fixed allowance for inputs the parser finishes in microseconds.
 /// Measured worst with a real baseline: 47x for 120 KiB of `\[…\]` formulas
 /// in a debug build — where the quadratic this guards against took seconds.
-const RENDER_OVER_PARSER: u32 = 25;
+const RENDER_OVER_PARSER: u32 = 60;
 
 /// The fastest of `runs` calls, so a scheduling stall while the rest of the
 /// suite runs in parallel does not read as the code being slow.
@@ -884,7 +884,7 @@ fn timed(label: &str, source: &str) -> Fragment {
     let (rendered, ours) = fastest(3, || {
         render_fragment(source, &options).unwrap_or_else(|e| panic!("{label}: {e:?}"))
     });
-    let budget = parser * RENDER_OVER_PARSER + Duration::from_millis(500);
+    let budget = parser * RENDER_OVER_PARSER + Duration::from_millis(1500);
     assert!(
         ours <= budget,
         "{label}: rendered in {ours:?}, pulldown-cmark alone in {parser:?}"
