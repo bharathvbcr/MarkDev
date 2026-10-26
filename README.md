@@ -93,4 +93,8 @@ These are test thresholds, not a promise about every keystroke or Mac. The [perf
 
 MarkDev's core can be embedded independently through Cargo features. MANVI is optional; neither it nor the rest of the DevCouncil ecosystem is required to write notes.
 
-[MIT license](LICENSE) · [Code of conduct](CODE_OF_CONDUCT.md)
+## License & Acknowledgements
+
+[MIT license](LICENSE) · [Third-party notices](NOTICE) · [Code of conduct](CODE_OF_CONDUCT.md)
+
+Built with [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) (`Raph Levien & contributors`), [SwiftMath](https://github.com/mgriebling/SwiftMath) (`Michael Griebling`, ported from `iosMath` by `Kostub Deshmukh`), [beautiful-mermaid-swift](https://github.com/lukilabs/beautiful-mermaid-swift) (`Luki Labs`), [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`Miguel de Icaza`), and OpenType math fonts from GUST e-foundry and SIL Open Font License authors. Vault wikilink/callout workflows are inspired by [Obsidian](https://obsidian.md/).

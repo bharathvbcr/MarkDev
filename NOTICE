@@ -1,0 +1,24 @@
+MarkDev
+Copyright (c) 2026 Bharath Chandra Vaddaram
+
+Third-Party Software & Font Attributions
+----------------------------------------
+- SwiftMath (https://github.com/mgriebling/SwiftMath)
+  Copyright (c) Michael Griebling (MIT License)
+  Ported from iosMath (https://github.com/kostub/iosMath), Copyright (c) Kostub Deshmukh.
+
+- beautiful-mermaid-swift (https://github.com/lukilabs/beautiful-mermaid-swift)
+  Copyright (c) Luki Labs (MIT License)
+
+- SwiftTerm (https://github.com/migueldeicaza/SwiftTerm)
+  Copyright (c) Miguel de Icaza (MIT License)
+
+- pulldown-cmark (https://github.com/pulldown-cmark/pulldown-cmark)
+  Copyright (c) 2015 Google Inc., Raph Levien & contributors (MIT License)
+
+- Bundled OpenType Math Fonts (`macos/MarkDev/Resources/Fonts/`)
+  - Latin Modern Math & TeX Gyre Termes/Pagella/Bonum/Schola Math: Copyright GUST e-foundry,
+    licensed under the GUST Font License (`macos/MarkDev/Resources/Fonts/GUST-FONT-LICENSE.txt`).
+  - Euler-Math & KP Math: Licensed under the SIL Open Font License 1.1 (`macos/MarkDev/Resources/Fonts/OFL.txt`).
+
+- Vault syntax and knowledge-graph ergonomics inspired by Obsidian (https://obsidian.md/).
